@@ -1,0 +1,14 @@
+{
+  "name": "pet-matting",
+  "private": true,
+  "type": "module",
+  "description": "one-off tool: remove white background from pet candidate images",
+  "dependencies": {
+    "@imgly/background-removal-node": "^1.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "sharp": "0.32.6"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["sharp", "ffmpeg-static"]
+  }
+}

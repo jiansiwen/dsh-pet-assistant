@@ -1,0 +1,48 @@
+{
+  "name": "dsh-personal-assistant",
+  "version": "0.1.0",
+  "description": "Personal computer assistant plugin for DeepSeek Harness: tracks daily computer activity, answers what the user did today, and generates daily reports with long-term preference memory",
+  "type": "module",
+  "main": "dist/index-0906072751.js",
+  "files": [
+    "dist",
+    "assets",
+    "cordis.patch.yml",
+    "cordis.team.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "clean": "node -e \"const fs=require('fs'),p=require('./package.json');const keep=p.main;for(const f of fs.readdirSync('dist')){if(f.endsWith('.js')&&'dist/'+f!==keep){try{fs.unlinkSync('dist/'+f);console.log('cleaned',f)}catch(e){console.log('skip',f,e.code)}}}\"",
+    "dev": "node scripts/build.mjs --watch",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test --disable-warning=ExperimentalWarning \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-subagent": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.27.7",
+    "typescript": "^5.6.0",
+    "zod": "^4.4.3"
+  }
+}

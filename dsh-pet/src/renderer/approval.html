@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!--
+    CSP 收紧到只允许本目录的脚本与样式：这个窗口是批准的签发口，页面上任何一处能执行
+    外来脚本，前面几层保护就都白做了。connect-src 也一并禁掉——卡片的一切数据都走 IPC 从
+    主进程拿，它没有任何理由自己发网络请求。
+  -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  />
+  <title>需要你点头</title>
+  <link rel="stylesheet" href="./approval.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script src="./approval.js"></script>
+</body>
+</html>

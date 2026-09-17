@@ -1,0 +1,387 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  user-select: none;
+}
+
+.stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* ===== 聊天面板（定位在宠物上方，left 由行内样式控制） ===== */
+.panel {
+  position: absolute;
+  bottom: 170px;
+  width: 388px;
+  max-height: 500px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.97);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(30, 40, 60, 0.28);
+  overflow: hidden;
+  z-index: 10;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, #6a8fe7, #8f6ae7);
+  color: #fff;
+}
+
+.panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mode-badge {
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 10px;
+  padding: 2px 8px;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.icon-btn {
+  border: none;
+  background: transparent;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.settings-box {
+  padding: 10px 14px;
+  border-bottom: 1px solid #eee;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  color: #555;
+}
+
+.settings-box input {
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.primary-btn {
+  align-self: flex-end;
+  border: none;
+  background: #6a8fe7;
+  color: #fff;
+  padding: 6px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 140px;
+  max-height: 260px;
+}
+
+.empty-hint {
+  font-size: 13px;
+  color: #888;
+  line-height: 1.7;
+  padding: 8px 4px;
+}
+
+.bubble {
+  max-width: 88%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble.user {
+  align-self: flex-end;
+  background: #6a8fe7;
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.bubble.assistant {
+  align-self: flex-start;
+  background: #f0f2f8;
+  color: #333;
+  border-bottom-left-radius: 4px;
+}
+
+.bubble.error {
+  background: #fdeaea;
+  color: #c0392b;
+}
+
+.tool-hint {
+  align-self: flex-start;
+  font-size: 11px;
+  color: #8f6ae7;
+  padding: 2px 6px;
+}
+
+.quick-row {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px 0;
+  flex-wrap: wrap;
+}
+
+.chip {
+  border: 1px solid #d5dbef;
+  background: #f7f8fd;
+  color: #4a5a8a;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.chip:hover:not(:disabled) {
+  background: #eef1fb;
+}
+
+.chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.input-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  align-items: flex-end;
+}
+
+.mic-btn {
+  border: none;
+  background: #f0f2f8;
+  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  font-size: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mic-btn.listening {
+  background: #fdeaea;
+  animation: micpulse 1s ease-in-out infinite;
+}
+
+@keyframes micpulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+}
+
+.input-box {
+  flex: 1;
+  resize: none;
+  border: 1px solid #d5dbef;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+
+.input-box:focus {
+  border-color: #8f9fe7;
+}
+
+.send-btn {
+  border: none;
+  background: #6a8fe7;
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.send-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ===== 朗读中横条（视觉语言对齐 team.css 的 .approval-banner） ===== */
+.speech-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 5px 12px;
+  background: #f0f2f8;
+  border-top: 1px solid #e3e7f5;
+}
+
+.speech-bar-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6a8fe7;
+  animation: micpulse 1.2s ease-in-out infinite;
+}
+
+.speech-bar-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: #4a5578;
+}
+
+.speech-bar-stop {
+  flex: none;
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid #e0c3c0;
+  border-radius: 7px;
+  background: #fff;
+  color: #a8433c;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.speech-bar-stop:hover {
+  background: #fdeaea;
+}
+
+/* 助理模式徽标 */
+.pet-badge {
+  position: absolute;
+  top: 2px;
+  right: 8px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #4cd964;
+  box-shadow: 0 0 0 3px rgba(76, 217, 100, 0.25);
+  animation: badgepulse 1.6s ease-in-out infinite;
+  z-index: 7;
+}
+
+@keyframes badgepulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.25); opacity: 0.75; }
+}
+
+.toast {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(40, 44, 60, 0.92);
+  color: #fff;
+  font-size: 12px;
+  padding: 8px 16px;
+  border-radius: 10px;
+  z-index: 99;
+  max-width: 80%;
+  text-align: center;
+}
+
+/* 主动提醒气泡（design.md §2.7）：无声、小、挂在角色头顶 —— 需要帮助的是"它"，提醒
+   就该从它头上冒出来。bottom 值与 stage-layout.ts 的 PROACTIVE_BUBBLE_BOTTOM 必须一致：
+   鼠标穿透的命中盒是照着那个常量算的。角色走动时气泡跟着 DOM 一起动，不另算坐标。 */
+.proactive-bubble {
+  position: absolute;
+  left: 50%;
+  bottom: 214px;
+  transform: translateX(-50%);
+  background: rgba(40, 44, 60, 0.94);
+  color: #fff;
+  border-radius: 12px;
+  padding: 10px 14px;
+  width: max-content;
+  max-width: 240px;
+  z-index: 60;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  animation: bubblein 180ms ease-out;
+}
+
+.proactive-text {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.proactive-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.proactive-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+}
+
+/* 主按钮（第一个）更实一点：它才是"正在回答气泡问题"的那个选择。 */
+.proactive-btn:first-child {
+  background: #4a7dff;
+}
+
+.proactive-btn:hover {
+  filter: brightness(1.12);
+}
+
+@keyframes bubblein {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .proactive-bubble { animation: none; }
+}

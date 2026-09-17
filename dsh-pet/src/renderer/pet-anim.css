@@ -1,0 +1,299 @@
+/* 宠物动作动画：容器 [data-action] 驱动各部件 class。 */
+
+.pet-stage {
+  position: absolute;
+  width: 150px;
+  height: 150px;
+  cursor: pointer;
+  z-index: 5;
+}
+
+.pet-svg {
+  display: block;
+  overflow: visible;
+}
+
+.pet-img {
+  display: block;
+  width: 150px;
+  height: 150px;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.action-idle .pet-img { animation: pa-imgbreathe 2.6s ease-in-out infinite; }
+.action-walk .pet-img { animation: pa-bob 0.45s linear infinite; }
+
+/* 序列帧素材自带动作，禁掉叠加的微动画 */
+.pet-frame { animation: none !important; }
+
+/* 姿势过渡补间（消除硬切图） */
+.pose-stack {
+  position: relative;
+  width: 150px;
+  height: 150px;
+}
+.pose-layer {
+  position: absolute;
+  inset: 0;
+}
+.pose-in {
+  animation: pa-posein 0.3s cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+.pose-out {
+  animation: pa-poseout 0.28s ease forwards;
+}
+@keyframes pa-posein {
+  from { opacity: 0; transform: scale(1.08) translateY(3px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes pa-poseout {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.9); }
+}
+
+/* 行走序列帧（sprite 条 4 帧） */
+.pet-walk-frame {
+  width: 150px;
+  height: 150px;
+  overflow: hidden;
+}
+.pet-walk-strip {
+  display: block;
+  width: 900px;
+  height: 150px;
+  user-select: none;
+  -webkit-user-drag: none;
+  animation: pa-walkcycle 0.95s steps(6) infinite;
+}
+.action-walk .pet-walk-frame { animation: pa-bob 0.45s linear infinite; }
+@keyframes pa-walkcycle {
+  from { transform: translateX(0); }
+  to { transform: translateX(-900px); }
+}
+@keyframes pa-imgbreathe {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50% { transform: translateY(-2px) scale(1.02); }
+}
+.action-sit .pet-img,
+.action-read .pet-img,
+.action-play .pet-img,
+.action-write .pet-img { animation: pa-imgbreathe 2.2s ease-in-out infinite; }
+.action-lie .pet-img { animation: pa-liesway 3s ease-in-out infinite; }
+@keyframes pa-liesway {
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  50% { transform: rotate(2deg) translateY(-1px); }
+}
+
+.pet-flip {
+  transform-box: fill-box;
+  transform-origin: 50% 50%;
+}
+.facing-left .pet-flip {
+  transform: scaleX(-1);
+}
+
+/* 默认隐藏的部件 */
+.p-eye-closed,
+.p-zzz,
+.p-sparkle,
+.p-mouth-happy {
+  display: none;
+}
+
+/* ===== idle 呼吸/眨眼/摇尾 ===== */
+.action-idle .p-body { animation: pa-breathe 2.6s ease-in-out infinite; }
+.action-idle .p-head { animation: pa-headtilt 3.4s ease-in-out infinite; }
+.action-idle .p-eye { animation: pa-blink 4.5s infinite; }
+.action-idle .p-tail { animation: pa-tail 2.2s ease-in-out infinite; }
+
+/* ===== walk 走路 ===== */
+.action-walk .p-leg-l { animation: pa-stepA 0.45s linear infinite; }
+.action-walk .p-leg-r { animation: pa-stepB 0.45s linear infinite; }
+.action-walk .p-arm-l { animation: pa-stepB 0.45s linear infinite; }
+.action-walk .p-arm-r { animation: pa-stepA 0.45s linear infinite; }
+.action-walk .p-body { animation: pa-bob 0.45s linear infinite; }
+.action-walk .p-head { animation: pa-bob 0.45s linear infinite; }
+.action-walk .p-tail { animation: pa-tail 0.9s ease-in-out infinite; }
+
+/* ===== jump 跳跃 ===== */
+.action-jump .pet-flip { animation: pa-jump 0.9s ease; }
+
+/* ===== wave 挥手 ===== */
+.action-wave .p-arm-r { animation: pa-wave 0.8s ease-in-out infinite; }
+.action-wave .p-head { animation: pa-headtilt 1.6s ease-in-out infinite; }
+
+/* ===== sleep 睡觉 ===== */
+.action-sleep .p-eye { display: none; }
+.action-sleep .p-eye-closed { display: block; }
+.action-sleep .p-mouth { display: none; }
+.action-sleep .p-zzz { display: block; animation: pa-zzz 2s ease-in-out infinite; }
+.action-sleep .p-body { animation: pa-breathe 3.6s ease-in-out infinite; }
+
+/* ===== happy 点击开心 ===== */
+.action-happy .pet-flip { animation: pa-hop 0.55s ease 2; }
+.action-happy .p-mouth { display: none; }
+.action-happy .p-mouth-happy { display: block; }
+.action-happy .p-sparkle { display: block; animation: pa-sparkle 1s ease; }
+.action-happy .p-arm-r { animation: pa-wave 0.5s ease-in-out infinite; }
+
+/* ===== keyframes ===== */
+@keyframes pa-breathe {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(1.045); }
+}
+@keyframes pa-headtilt {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(3deg); }
+}
+@keyframes pa-blink {
+  0%, 90%, 100% { transform: scaleY(1); }
+  93%, 96% { transform: scaleY(0.12); }
+}
+@keyframes pa-tail {
+  0%, 100% { transform: rotate(-6deg); }
+  50% { transform: rotate(10deg); }
+}
+@keyframes pa-stepA {
+  0%, 100% { transform: rotate(22deg); }
+  50% { transform: rotate(-22deg); }
+}
+@keyframes pa-stepB {
+  0%, 100% { transform: rotate(-22deg); }
+  50% { transform: rotate(22deg); }
+}
+@keyframes pa-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
+@keyframes pa-jump {
+  0% { transform: translateY(0) scale(1, 1); }
+  30% { transform: translateY(2px) scale(1.06, 0.9); }
+  55% { transform: translateY(-34px) scale(0.95, 1.06); }
+  80% { transform: translateY(0) scale(1.04, 0.94); }
+  100% { transform: translateY(0) scale(1, 1); }
+}
+@keyframes pa-wave {
+  0%, 100% { transform: rotate(-40deg); }
+  50% { transform: rotate(-90deg); }
+}
+@keyframes pa-zzz {
+  0% { opacity: 0; transform: translateY(4px); }
+  40% { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-10px); }
+}
+@keyframes pa-sparkle {
+  0% { opacity: 0; transform: scale(0.4); }
+  40% { opacity: 1; transform: scale(1.1); }
+  100% { opacity: 0; transform: scale(0.8); }
+}
+@keyframes pa-hop {
+  0% { transform: translateY(0) scale(1, 1); }
+  35% { transform: translateY(-22px) scale(0.96, 1.05); }
+  70% { transform: translateY(0) scale(1.05, 0.93); }
+  100% { transform: translateY(0) scale(1, 1); }
+}
+
+/* ===== 气泡 ===== */
+.pet-bubble {
+  position: absolute;
+  bottom: 150px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 220px;
+  background: #fff;
+  border: 2px solid #8f9fe7;
+  border-radius: 14px;
+  padding: 8px 12px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #3a466b;
+  font-family: 'Comic Sans MS', 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  box-shadow: 0 4px 14px rgba(60, 80, 160, 0.2);
+  animation: pa-bubblepop 0.25s ease;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 6;
+}
+.pet-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -9px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 8px solid transparent;
+  border-right: 8px solid transparent;
+  border-top: 9px solid #8f9fe7;
+}
+@keyframes pa-bubblepop {
+  0% { opacity: 0; transform: translateX(-50%) scale(0.6); }
+  100% { opacity: 1; transform: translateX(-50%) scale(1); }
+}
+
+/* ── 群体场景道具 ──────────────────────────────────────────────────────────────
+   麻将桌与开黑长桌。素材库里只有角色立绘，一件家具都没有，所以这两件用纯 CSS 画：
+   计划要的是编排动画而不是真实牌局，一个能读出"桌子"的形状就够了（真美术资源另走
+   抠图管线，见 group-scene.ts 的 sceneProp）。
+
+   窗口是透明置顶的，底下是用户的壁纸 —— 可能白也可能黑，所以道具自带深色描边与投影，
+   两边都读得出来，不靠背景衬托。
+
+   一律不加动画：这是常驻窗口，资源目标是空闲时 CPU 不高于 5%，桌子不需要动。 */
+
+.scene-prop {
+  position: absolute;
+  /* 道具不注册命中盒：点它要穿透到桌面，只有角色本身可以点。 */
+  pointer-events: none;
+}
+
+/* 麻将桌：绿呢面、深色包边。 */
+.scene-prop-table {
+  border: 3px solid #1c4130;
+  border-radius: 14px;
+  background: radial-gradient(ellipse at 50% 38%, #439463 0%, #2f7049 58%, #24563b 100%);
+  box-shadow:
+    0 12px 24px rgba(10, 24, 16, 0.42),
+    inset 0 2px 8px rgba(255, 255, 255, 0.16),
+    inset 0 -6px 12px rgba(0, 0, 0, 0.22);
+}
+
+/* 牌墙：中央一排浅色小方块。用 repeating-linear-gradient 画出来，不用素材。 */
+.scene-prop-table::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 52%;
+  height: 30%;
+  transform: translate(-50%, -50%);
+  border-radius: 5px;
+  background: repeating-linear-gradient(90deg, #f4efe3 0 8px, #cdc4b1 8px 11px);
+  box-shadow: 0 2px 6px rgba(8, 20, 13, 0.5), inset 0 -2px 0 rgba(0, 0, 0, 0.18);
+}
+
+/* 开黑长桌：深色桌面。 */
+.scene-prop-desk {
+  border: 2px solid #12151b;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #414958 0%, #2b313c 55%, #1e222a 100%);
+  box-shadow: 0 10px 20px rgba(8, 12, 20, 0.44), inset 0 1px 4px rgba(255, 255, 255, 0.12);
+}
+
+/* 五块显示器的背影，立在桌面后沿上（压住 4px 才不像浮空），挡在角色胸口。
+   用 background-size 等分而不是五个真元素：人数固定是 5，但桌宽随屏幕变，等分才跟着变。
+   和座位不会严格对齐（座位间距是 PET_WIDTH*0.92，等分是桌宽的 20%，极端屏宽下差十几像素），
+   但显示器只是"每人一台设备"的示意，差这一点看不出来。 */
+.scene-prop-desk::before {
+  content: '';
+  position: absolute;
+  left: 2%;
+  right: 2%;
+  bottom: calc(100% - 4px);
+  height: 24px;
+  background-image: linear-gradient(90deg, transparent 0 20%, #d3e6fd 20% 80%, transparent 80% 100%);
+  background-size: 20% 100%;
+  background-repeat: repeat-x;
+  filter: drop-shadow(0 0 7px rgba(150, 200, 255, 0.5));
+}

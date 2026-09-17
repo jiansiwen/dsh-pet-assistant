@@ -1,0 +1,355 @@
+/**
+ * 文档页样式。
+ *
+ * 复用 team.css 的那套面板 token（`--approval-*`、`--task-*`、`--easing`），不另起一套颜色：
+ * 这一页和团队页在同一个白底面板里，两页各配一套灰阶，用户会以为是两个产品。
+ * 这里只新增两个值 —— 选中行的底色和"正在讲"的徽标色，都写在下面并标了实测对比度。
+ */
+
+:root {
+  /* 选中行底色。与 --task-active #1d4ed8 的文字对比 5.90，过 AA。 */
+  --doc-selected-bg: #eef2ff;
+  /* "正在讲"徽标。底色同上，文字用 --task-active，对比 5.90。 */
+  --doc-live-fg: #1d4ed8;
+}
+
+.doc-page {
+  flex: 1 1 auto;
+  /* 和 .team-page 同一个下限：面板是 max-height 500 的硬预算，两页要能互换而不挤掉输入框。 */
+  min-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 8px 12px 12px;
+}
+
+.doc-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.doc-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--approval-heading);
+  letter-spacing: 0.02em;
+}
+
+/* 长标题自己缩，徽标和计数不能被挤掉 —— 被挤掉的是"现在讲到哪儿"这条信息。 */
+.doc-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-count {
+  min-width: 18px;
+  flex: none;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--approval-target-bg);
+  color: var(--approval-target-fg);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+
+.doc-live {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--doc-selected-bg);
+  color: var(--doc-live-fg);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 16px;
+}
+
+.doc-hint {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--runtime-detail);
+}
+
+.doc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.doc-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--approval-border);
+  border-left: 3px solid var(--task-waiting);
+  border-radius: 9px;
+  background: var(--approval-card-bg);
+}
+
+.doc-card-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.doc-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--approval-summary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-path,
+.doc-dir-name {
+  font-size: 10.5px;
+  color: var(--task-idle);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-card-side {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.doc-meta {
+  font-size: 10.5px;
+  color: var(--task-idle);
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-card-actions,
+.doc-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.doc-actions {
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+/* 提纲一行。整行是一个按钮：点哪儿都算选中，不用去瞄左边那个序号。 */
+.doc-outline {
+  gap: 3px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.doc-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms var(--easing), border-color 140ms var(--easing);
+}
+
+.doc-row:hover:not(:disabled) {
+  background: var(--approval-zone-bg);
+  border-color: var(--approval-border);
+}
+
+.doc-row.selected {
+  background: var(--doc-selected-bg);
+  border-color: var(--approve-bg);
+}
+
+.doc-row:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.doc-row-index {
+  flex: none;
+  min-width: 20px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--task-idle);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-row-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--approval-summary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-tag {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--approval-target-bg);
+  color: var(--approval-target-fg);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+}
+
+.doc-tag.done {
+  background: #eaf6ee;
+  color: var(--task-ok);
+}
+
+.doc-tag.quiet {
+  background: transparent;
+  color: var(--task-idle);
+  padding-left: 0;
+}
+
+.doc-btn {
+  flex: none;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--approval-border);
+  border-radius: 8px;
+  background: var(--approval-card-bg);
+  color: var(--approval-summary);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 140ms var(--easing), background 140ms var(--easing);
+}
+
+.doc-btn:hover:not(:disabled) {
+  background: var(--approval-zone-bg);
+}
+
+.doc-btn:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.doc-btn.primary {
+  border-color: transparent;
+  background: var(--approve-bg);
+  color: #fff;
+  font-weight: 700;
+}
+
+.doc-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  background: var(--approve-bg);
+}
+
+.doc-btn.danger {
+  border-color: #e6c9c9;
+  color: var(--risk-high);
+}
+
+.doc-btn.danger:hover:not(:disabled) {
+  background: var(--task-bad-bg);
+}
+
+.doc-btn.small {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+/* 键盘用户要能看出焦点落在哪一行：这一页整行都是按钮，默认的焦点环被圆角裁掉半截。 */
+.doc-row:focus-visible,
+.doc-btn:focus-visible,
+.doc-ask-input:focus-visible {
+  outline: 2px solid var(--approve-bg);
+  outline-offset: 1px;
+}
+
+.doc-dir {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid var(--approval-border);
+  border-radius: 8px;
+  background: var(--approval-card-bg);
+}
+
+.doc-dir-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+}
+
+.doc-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 8px;
+  border: 1px solid var(--approval-border);
+  border-radius: 9px;
+  background: var(--approval-zone-bg);
+}
+
+.doc-ask-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--approval-heading);
+}
+
+.doc-ask-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.doc-ask-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--approval-border);
+  border-radius: 8px;
+  background: var(--approval-card-bg);
+  color: var(--approval-summary);
+  font-size: 11.5px;
+  font-family: inherit;
+}
+
+.doc-ask-input::placeholder {
+  color: var(--task-idle);
+}
+
+.doc-ask-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--task-idle);
+}

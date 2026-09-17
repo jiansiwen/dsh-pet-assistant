@@ -1,0 +1,86 @@
+/* 漩涡通道与宠物退场动画。
+   时间线（与 App.tsx 的 setTimeout 编排一一对应）：
+   0.0s 通道 opening → 0.7s open + 宠物挥手 → 2.0s 转身 → 2.4s 跳入
+   → 3.1s 宠物消失 + 通道 closing → 4.3s 通知主进程退出。 */
+
+/* 通道位于宠物身后：z-index 低于精灵层 */
+.portal {
+  position: absolute;
+  left: 50%;
+  top: 55%;
+  width: 190px;
+  height: 190px;
+  margin-left: -95px;
+  margin-top: -95px;
+  pointer-events: none;
+  z-index: 1;
+}
+.portal-opening { animation: portal-in 0.7s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+.portal-open { opacity: 1; transform: scale(1); }
+.portal-closing { animation: portal-out 1.2s cubic-bezier(0.4, 0, 0.7, 0.2) forwards; }
+
+/* 三层旋臂：conic-gradient 造螺旋纹，radial mask 挖出环形，各层转速与方向不同 */
+.portal-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(127, 119, 221, 0) 0deg,
+    rgba(127, 119, 221, 0.85) 70deg,
+    rgba(175, 169, 236, 0.95) 130deg,
+    rgba(127, 119, 221, 0) 190deg,
+    rgba(83, 74, 183, 0.8) 280deg,
+    rgba(127, 119, 221, 0) 360deg
+  );
+  -webkit-mask: radial-gradient(circle, transparent 26%, #000 42%, #000 74%, transparent 86%);
+  mask: radial-gradient(circle, transparent 26%, #000 42%, #000 74%, transparent 86%);
+}
+.portal-ring-1 { animation: portal-spin 1.6s linear infinite; }
+.portal-ring-2 { inset: 14px; animation: portal-spin 1.1s linear infinite reverse; opacity: 0.85; }
+.portal-ring-3 { inset: 30px; animation: portal-spin 0.75s linear infinite; opacity: 0.7; }
+
+/* 中心暗核：吸入感 */
+.portal-core {
+  position: absolute;
+  inset: 42px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #26215c 0%, #3c3489 45%, rgba(60, 52, 137, 0) 75%);
+  animation: portal-breathe 1.4s ease-in-out infinite;
+}
+
+/* 精灵层保证在通道之上 */
+.pet-stage .pet-svg,
+.pet-stage > .pet-flip {
+  position: relative;
+  z-index: 5;
+}
+
+/* 退场转身 / 跳入（挂在 .pet-stage 上，配合 action-wave 的挥手） */
+.pet-stage.exit-turn .pet-flip { animation: pet-exit-turn 0.4s ease forwards; }
+.pet-stage.exit-jump .pet-flip { animation: pet-exit-jump 0.7s cubic-bezier(0.5, 0, 0.75, 0.4) forwards; }
+
+@keyframes portal-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes portal-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.12); }
+}
+@keyframes portal-in {
+  from { opacity: 0; transform: scale(0.05) rotate(-60deg); }
+  to { opacity: 1; transform: scale(1) rotate(0deg); }
+}
+@keyframes portal-out {
+  from { opacity: 1; transform: scale(1) rotate(0deg); }
+  to { opacity: 0; transform: scale(0.1) rotate(90deg); }
+}
+@keyframes pet-exit-turn {
+  from { transform: rotateY(0deg); }
+  to { transform: rotateY(180deg); }
+}
+@keyframes pet-exit-jump {
+  0% { opacity: 1; transform: rotateY(180deg) translateY(0) scale(1); }
+  25% { opacity: 1; transform: rotateY(180deg) translateY(3px) scale(1.04, 0.92); }
+  100% { opacity: 0; transform: rotateY(180deg) translateY(-48px) scale(0.05); }
+}

@@ -1,0 +1,314 @@
+/**
+ * 专用审批窗口的样式。
+ *
+ * 与 team.css 里那块审批卡**不共用文件**，但共用风险色值：同一个风险等级在舞台面板和
+ * 在这个窗口里必须是同一种颜色，否则用户要把两套颜色语义各记一遍。
+ *
+ * 这里最重要的一条布局不变量：**按钮永远够得着**。
+ * 窗口是固定 480×360，摘要可能很长。如果让内容自然撑开，被挤出窗口的是页脚那三个按钮——
+ * 用户读完了却没地方点，只能关掉窗口重来。所以卡片是列向 flex 铺满视口，
+ * 中间的范围区自己滚动（`min-height: 0` 是让 flex 子项真的能收缩的那一句，漏了就不滚），
+ * 页脚 `flex-shrink: 0` 钉在底部。
+ */
+
+:root {
+  --card-bg: #ffffff;
+  --card-text: #1f2430;
+  --card-label: #5a6070;
+  --card-border: #e4e7ee;
+  --card-note-bg: #f7f8fb;
+  --card-target-bg: #f3f4f8;
+  --card-target-fg: #3f4553;
+  --card-approve-bg: #4f5ac0;
+  --card-approve-fg: #ffffff;
+  --card-failure-bg: #fdf3f3;
+  --card-failure-fg: #b91c1c;
+
+  /* 与 team.css 同一组风险色：白底上文字对比 5.02 / 5.02 / 6.47，全部 AA。 */
+  --risk-low: #15803d;
+  --risk-medium: #b45309;
+  --risk-high: #b91c1c;
+
+  --easing: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--card-bg);
+  color: var(--card-text);
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  /* 固定尺寸的窗口里不该出现整页滚动条：滚动只发生在范围区。 */
+  overflow: hidden;
+}
+
+#root {
+  height: 100%;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 16px 18px 14px;
+  /* 风险用左边框表达，与面板里的审批卡一致：颜色之外还有一条 4px 的实体线，
+     色觉障碍的用户也能看出这三档不一样。 */
+  border-left: 4px solid var(--card-border);
+}
+
+.card.risk-low {
+  border-left-color: var(--risk-low);
+}
+
+.card.risk-medium {
+  border-left-color: var(--risk-medium);
+}
+
+.card.risk-high {
+  border-left-color: var(--risk-high);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.card-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.card-risk {
+  flex-shrink: 0;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 12px;
+  font-weight: 600;
+  /* 徽标是"颜色 + 文字"双重表达：文字本身就是风险等级，不是靠颜色单独承载信息。 */
+}
+
+.card-risk.risk-low {
+  color: var(--risk-low);
+}
+
+.card-risk.risk-medium {
+  color: var(--risk-medium);
+}
+
+.card-risk.risk-high {
+  color: var(--risk-high);
+}
+
+.card-scope {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 12px 0 0;
+}
+
+.card-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--card-border);
+}
+
+.card-row:last-child {
+  border-bottom: none;
+}
+
+.card-row dt {
+  margin: 0;
+  color: var(--card-label);
+  font-size: 13px;
+}
+
+.card-row dd {
+  margin: 0;
+  min-width: 0;
+  /* 目标里是 Windows 绝对路径与命令行，长串没有空格：不换行就会横向溢出，
+     而横向溢出的部分正好是路径末尾——最该看见的那一段。 */
+  overflow-wrap: anywhere;
+}
+
+.card-tool,
+.card-target {
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 13px;
+}
+
+.card-target {
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: var(--card-target-bg);
+  color: var(--card-target-fg);
+}
+
+.card-summary {
+  white-space: pre-wrap;
+}
+
+.card-countdown {
+  /* 等宽数字：倒计时每秒变，比例字体会让这一行左右抖动。 */
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.card-countdown.expired {
+  color: var(--risk-high);
+}
+
+.card-note {
+  flex-shrink: 0;
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--card-note-bg);
+  color: var(--card-label);
+  font-size: 13px;
+}
+
+.card-failure {
+  flex-shrink: 0;
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--card-failure-bg);
+  color: var(--card-failure-fg);
+  font-size: 13px;
+}
+
+.card-failure-detail {
+  display: block;
+  margin-top: 3px;
+  color: var(--card-label);
+  overflow-wrap: anywhere;
+}
+
+.card-blocked {
+  flex-shrink: 0;
+  margin: 10px 0 0;
+  color: var(--card-label);
+  font-size: 13px;
+}
+
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--card-border);
+}
+
+.card-btn {
+  min-height: 36px;
+  padding: 0 16px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--card-bg);
+  color: var(--card-text);
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  transition:
+    background 140ms var(--easing),
+    border-color 140ms var(--easing),
+    transform 140ms var(--easing);
+}
+
+.card-btn:hover:not(:disabled) {
+  border-color: #c8cede;
+  background: #f7f8fb;
+}
+
+.card-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.card-btn:focus-visible {
+  outline: 2px solid var(--card-approve-bg);
+  outline-offset: 2px;
+}
+
+.card-btn:disabled {
+  /* 灰掉只是辅助：为什么点不了写在上面的 .card-blocked 里，不靠这个样式单独承载。 */
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.card-btn.primary {
+  border-color: var(--card-approve-bg);
+  background: var(--card-approve-bg);
+  color: var(--card-approve-fg);
+  font-weight: 600;
+}
+
+.card-btn.primary:hover:not(:disabled) {
+  border-color: #434da8;
+  background: #434da8;
+}
+
+.card-btn.quiet {
+  /* 推到最左边，与两个决定按钮之间留出剩下的全部空间：它不是第三个决定。 */
+  margin-right: auto;
+  border-color: transparent;
+  color: var(--card-label);
+}
+
+.card-btn.quiet:hover:not(:disabled) {
+  border-color: var(--card-border);
+}
+
+.card-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 24px;
+  text-align: center;
+}
+
+.card-empty-loading {
+  color: var(--card-label);
+}
+
+.card-empty-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.card-empty-hint {
+  margin: 0 0 6px;
+  color: var(--card-label);
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card-btn {
+    transition: none;
+  }
+
+  .card-btn:active:not(:disabled) {
+    transform: none;
+  }
+}

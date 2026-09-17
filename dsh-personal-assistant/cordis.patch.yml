@@ -1,0 +1,14 @@
+# 个人助理插件组合层（v2 修正）。
+#
+# 注意：不再插入 storage / storage-json / storage-domain 三行——
+# 已发布的 dsh-web-app bundle 自带这三行（本插件早期版本注释称"等价覆盖"，
+# 实际加载器对同一 insert 合并中的重复 id 直接抛
+# "duplicate loader entry id: storage" 导致 dsh 无法启动）。
+# 插件自身只通过 id: personal-assistant 引用它们提供的服务。
+- insert:
+    - id: personal-assistant
+      name: dsh-personal-assistant
+      config:
+        # 桌面宠物工程目录：召唤宠物时在此执行 pnpm start 自动拉起。
+        # 留空则不会自动拉起，需要手动启动 dsh-pet（自动接入桥接）。
+        petDir: 'D:/work/dsh-pet'

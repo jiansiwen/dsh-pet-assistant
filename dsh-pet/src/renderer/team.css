@@ -1,0 +1,846 @@
+/**
+ * 团队舞台样式：角色名牌、身份色标、选中态、待办警示，以及面板里的标签页、待批提示与团队页。
+ *
+ * 单独成文件而不是并进 styles.css，是因为这一块是团队改造新增的一整层，
+ * 而且它自带一套 token —— styles.css 里全是硬编码颜色，混进去以后就分不清
+ * 哪些值是设计决定、哪些是当年随手写的。
+ *
+ * 三个视觉环境，三套底色，不要混：
+ * - **名牌浮在桌面上**，壁纸是用户定的、可能是任何颜色。所以名牌必须自带底色，
+ *   不能靠"和白底面板协调"来保证可读 —— 它根本不在面板里。
+ * - **面板内的提示与列表**跟着面板的白底走，风险用左边框 + 文字双重表达。
+ * - **专用审批窗口**是另一个窗口、另一份样式（`approval-card.css`）。它必须看起来
+ *   和面板不一样：那是用户真正签发批准的地方，长得像普通面板卡片会让人当成又一次刷新。
+ *   两边共用的是 `--risk-*` 这三档色值和 `main/approval-policy.ts` 里的那套措辞。
+ */
+
+:root {
+  /* 名牌底色就是角色身份色标，由 TeamStage 用行内 --mark 注入。 */
+  --mark: #5e6ad2;
+  /* 名牌文字色：按色标亮度自动挑黑或白，保证 chip 内对比 ≥4.5:1。 */
+  --mark-fg: #ffffff;
+
+  /* 面板内（浅色底） */
+  --approval-zone-bg: #fbfbfd;
+  --approval-card-bg: #ffffff;
+  --approval-border: #e4e7ee;
+  --approval-heading: #4a5060;
+  --approval-summary: #3a3f4d;
+  --approval-meta: #5a6070;
+  --approval-target-bg: #f3f4f8;
+  --approval-target-fg: #555b6b;
+  --approve-bg: #4f5ac0;
+  --reject-fg: #4a5060;
+
+  /* 风险色。三档都用足够深的色值，在白卡上文字对比 5.02 / 5.02 / 6.47，全部 AA。 */
+  --risk-low: #15803d;
+  --risk-medium: #b45309;
+  --risk-high: #b91c1c;
+
+  /*
+    任务语气色。五档在白底上的对比是 6.5 / 5.02 / 5.02 / 6.47 / 4.83，全部 AA。
+    `waiting` 用琥珀而不是和 `active` 同族的蓝：这两档的区别是**要不要用户动手**，
+    进行中的任务用户只能等，等你点头/等你回话的任务用户不做就永远停在那儿。
+  */
+  --task-active: #1d4ed8;
+  --task-waiting: #b45309;
+  --task-ok: #15803d;
+  --task-bad: #b91c1c;
+  --task-idle: #6b7280;
+  --task-waiting-bg: #fdf8ef;
+  --task-bad-bg: #fdf3f3;
+
+  /* 面板标签页。选中项在浅色面板上用一条底部色标 + 加粗文字表达，不靠底色。 */
+  --tab-fg: #6b7280;
+  --tab-active-fg: #3a3f4d;
+
+  /* 运行时状态行（浅色面板内）。语气色与风险色同族但语义不同，不共用变量。 */
+  --runtime-bg: #fbfbfd;
+  --runtime-label: #3a3f4d;
+  --runtime-detail: #5a6070;
+  --runtime-ok: #15803d;
+  --runtime-busy: #b45309;
+  --runtime-idle: #6b7280;
+  --runtime-error: #b91c1c;
+  --runtime-busy-bg: #fdf8ef;
+  --runtime-error-bg: #fdf3f3;
+
+  --easing: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ===== 角色席位 =====
+   席位本身的定位由 pet-anim.css 的 .pet-stage 负责，这里只加团队特有的部分：
+   色标、选中光晕、待办警示。角标要溢出 sprite 的 150×150 盒子，
+   所以它们一律 absolute 定位且不参与布局，避免把 sprite 挤位。 */
+
+/** 面板标题里的色标点：面板 header 是紫蓝渐变，色标直接铺上去会和渐变糊在一起，所以加白环。 */
+.panel-title .character-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--mark);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+  flex: none;
+}
+
+/* 选中态：脚下一圈色标光晕。光晕用 transform/opacity，不动布局。 */
+.character-slot.selected::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -6px;
+  width: 132px;
+  height: 26px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, var(--mark) 0%, transparent 70%);
+  opacity: 0.42;
+  pointer-events: none;
+}
+
+/**
+ * 待办警示：有提案等批准或任务卡在等用户时挂在角色右上。
+ * 用琥珀而不是角色色标 —— 这是"需要你处理"的全局信号，不能和"这是谁"的身份信号混用。
+ */
+.character-alert {
+  position: absolute;
+  top: -6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #f59e0b;
+  color: #1a1206;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 22px;
+  text-align: center;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  animation: alert-pulse 1.6s var(--easing) infinite;
+}
+
+@keyframes alert-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.16);
+    opacity: 0.86;
+  }
+}
+
+/* ===== 面板标签页 =====
+   标签行常驻 34px，算在面板 500px 的预算里：
+   header ~40 + tabs ~34 + runtime-row ~32（摊开说明时 ~66）+ 内容区 + input-row ~70。
+   对话页内容区是 messages（140~260）+ 提示 34 + 快捷指令 ~36；团队页整块伸缩。 */
+
+.panel-tabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px 0;
+  background: var(--approval-zone-bg);
+  border-bottom: 1px solid var(--approval-border);
+}
+
+/**
+ * 选中的标签用底部 2px 色标 + 加粗，不用底色填充。
+ *
+ * 底色填充在这块浅色区域里对比不够，而色标落在标签下沿、正好压住 .panel-tabs 的
+ * 分隔线（所以 margin-bottom 是 -1px），"这一页是打开的"在视觉上就连续了。
+ * 文字加粗是第二重载体 —— 色标只有 2px，色觉障碍或低分辨率下可能看不清。
+ */
+.panel-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: transparent;
+  color: var(--tab-fg);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 160ms var(--easing), border-color 160ms var(--easing);
+}
+
+.panel-tab.active {
+  color: var(--tab-active-fg);
+  font-weight: 700;
+  border-bottom-color: var(--approve-bg);
+}
+
+.panel-tab:hover:not(.active) {
+  color: var(--tab-active-fg);
+}
+
+.panel-tab:focus-visible {
+  outline: 2px solid var(--approve-bg);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* 正在回复的小点。切到团队页之后消息区看不见了，这个点是那边还在跑的唯一记号。 */
+.panel-tab-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--task-waiting);
+  animation: runtime-pulse 1.4s var(--easing) infinite;
+}
+
+/** 待批数量。用"需要你动手"的琥珀，和风险色同值但语义不同 —— 这是待办计数不是风险。 */
+.panel-tab-badge {
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--task-waiting);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  /* 数字宽度不等的话，计数从 9 变 10 会把标签文字推一下。 */
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 待批提示（对话页） =====
+   一行高、固定不伸缩。原来这里是能摊开三四张卡的审批区（min 88 / max 168，还兼泄压阀）；
+   换成一行之后它不再是高度变量，泄压的活交回 messages（flex: 1，min-height 140）。 */
+
+.approval-banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 5px 12px;
+  background: var(--task-waiting-bg);
+  border-top: 1px solid var(--approval-border);
+  border-left: 3px solid var(--task-waiting);
+}
+
+.approval-banner-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--task-waiting);
+  animation: runtime-pulse 1.6s var(--easing) infinite;
+}
+
+.approval-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--approval-summary);
+  /* 提示里带着工具名，可能是 write_file 这种长词，不换行会把按钮挤出面板。 */
+  overflow-wrap: anywhere;
+}
+
+.approval-banner-go {
+  flex: none;
+  height: 26px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 7px;
+  background: var(--approve-bg);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: filter 160ms var(--easing), transform 120ms var(--easing);
+}
+
+.approval-banner-go:hover {
+  filter: brightness(1.08);
+}
+.approval-banner-go:active {
+  transform: scale(0.97);
+}
+.approval-banner-go:focus-visible {
+  outline: 2px solid var(--approve-bg);
+  outline-offset: 2px;
+}
+
+/* ===== 团队页 ===== */
+
+.team-page {
+  flex: 1 1 auto;
+  /*
+    下限 180 是算出来的：500 - header 40 - tabs 34 - runtime-row 66（摊开说明的最坏情况）
+    - input-row 70 = 290，所以 180 不会把别的区域挤掉。再小的话三块区域连标题都摆不下，
+    滚动条会一直动，用户看不清哪一块是刚出现的。
+  */
+  min-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 8px 12px 12px;
+  background: var(--approval-zone-bg);
+}
+
+/**
+ * 团队模式没开时的整页说明。
+ *
+ * 不给一个空面板：空白分不清"没有任务"和"没连上"，而这两件事的处置完全相反 ——
+ * 前者等着就行，后者要去把运行时起来。所以下面那段提示里写了具体按哪个按钮。
+ */
+.team-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 2px;
+}
+
+.team-empty-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--approval-summary);
+}
+
+.team-empty-text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--approval-summary);
+}
+
+.team-empty-hint {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--runtime-detail);
+}
+
+.team-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.team-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--approval-heading);
+  letter-spacing: 0.02em;
+}
+
+.team-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--task-waiting);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 任务数是背景信息不是待办，用中性灰，不和"等你点头"抢注意力。 */
+.team-count.quiet {
+  background: #dfe3ec;
+  color: var(--approval-heading);
+}
+
+.team-none {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--runtime-detail);
+}
+
+.team-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 卡片左边框 3px 是风险/语气的第一重载体，文字标签是第二重 —— 颜色不能是唯一载体。 */
+.team-proposal,
+.team-task {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 9px;
+  background: var(--approval-card-bg);
+  border: 1px solid var(--approval-border);
+  border-left-width: 3px;
+  border-radius: 10px;
+}
+
+.team-proposal {
+  border-left-color: var(--task-waiting);
+}
+.team-proposal.risk-low {
+  border-left-color: var(--risk-low);
+}
+.team-proposal.risk-medium {
+  border-left-color: var(--risk-medium);
+}
+.team-proposal.risk-high {
+  border-left-color: var(--risk-high);
+}
+
+.team-task {
+  border-left-color: var(--task-idle);
+}
+.team-task.tone-active {
+  border-left-color: var(--task-active);
+}
+.team-task.tone-waiting {
+  border-left-color: var(--task-waiting);
+  background: var(--task-waiting-bg);
+}
+.team-task.tone-ok {
+  border-left-color: var(--task-ok);
+}
+.team-task.tone-bad {
+  border-left-color: var(--task-bad);
+  background: var(--task-bad-bg);
+}
+
+.team-proposal-head,
+.team-task-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.team-tool {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: #eef0fb;
+  color: #3d4595;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.team-risk {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+}
+.team-risk.risk-low {
+  color: var(--risk-low);
+}
+.team-risk.risk-medium {
+  color: var(--risk-medium);
+}
+.team-risk.risk-high {
+  color: var(--risk-high);
+}
+
+/* 倒计时用等宽数字：每秒跳动时若数字宽度不等，整行会左右抖动。 */
+.team-countdown {
+  margin-left: auto;
+  flex: none;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--approval-meta);
+}
+
+.team-countdown.expired {
+  color: var(--risk-high);
+}
+
+/*
+  目标通常是 Windows 绝对路径，反斜杠不是断行点：不处理就会把卡片撑出横向溢出，
+  而横向溢出在 overflow: hidden 的面板里等于内容被切掉一半还看不出来。
+  夹两行、全文走 title。
+*/
+.team-target {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--approval-target-bg);
+  color: var(--approval-target-fg);
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+}
+
+.team-summary,
+.team-goal {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--approval-summary);
+}
+
+.team-proposal-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.team-who,
+.team-owner {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--approval-meta);
+}
+
+/**
+ * "批准后还会再确认一次"的预告。
+ *
+ * 高风险操作在专用窗口点完批准，主进程还要弹一个原生确认框。不预告的话用户会以为
+ * 已经批完了，看到第二个框反而怀疑自己点错了什么 —— 而那个框的存在正是为了让人停下来。
+ */
+.team-confirm-hint {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px dashed var(--approval-border);
+  border-radius: 6px;
+  background: #fff;
+  font-size: 10.5px;
+  color: var(--approval-meta);
+}
+
+.team-go {
+  margin-left: auto;
+  flex: none;
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--approve-bg);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: filter 160ms var(--easing), transform 120ms var(--easing);
+}
+
+.team-go:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.team-go:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.team-go:focus-visible {
+  outline: 2px solid var(--approve-bg);
+  outline-offset: 2px;
+}
+
+/* 过期/已决定的提案点了必定失败，所以直接禁用；原因写在下面的 .team-blocked 里，不靠 title。 */
+.team-go:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.team-blocked {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--risk-high);
+  overflow-wrap: anywhere;
+}
+
+.team-status {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--task-idle);
+}
+.team-status.tone-active {
+  color: var(--task-active);
+}
+.team-status.tone-waiting {
+  color: var(--task-waiting);
+}
+.team-status.tone-ok {
+  color: var(--task-ok);
+}
+.team-status.tone-bad {
+  color: var(--task-bad);
+}
+
+.team-artifacts {
+  margin-left: auto;
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--task-ok);
+  font-variant-numeric: tabular-nums;
+}
+
+.team-note {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  font-weight: 600;
+  color: var(--task-waiting);
+  overflow-wrap: anywhere;
+}
+
+/* 「说做完了，但没交出产物」是坏消息，不是提醒：状态已经是绿的"已完成"，只有这句话在纠正它。 */
+.team-task.tone-ok .team-note {
+  color: var(--task-bad);
+}
+
+.team-members {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.team-member {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 5px 9px;
+  background: var(--approval-card-bg);
+  border: 1px solid var(--approval-border);
+  border-left: 3px solid var(--task-idle);
+  border-radius: 9px;
+}
+
+/* 会改动用户文件的成员：左边框换成琥珀。文字那一份在 .team-member-scope 里。 */
+.team-member.can-write {
+  border-left-color: var(--task-waiting);
+}
+
+.team-member-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--approval-summary);
+}
+
+.team-member-scope {
+  flex: none;
+  font-size: 11px;
+  color: var(--approval-meta);
+}
+
+.team-member.can-write .team-member-scope {
+  color: var(--task-waiting);
+  font-weight: 600;
+}
+
+/**
+ * 停用的成员不用降低不透明度。
+ *
+ * 这一行是信息，不是禁用控件 —— WCAG 对禁用控件的对比豁免不适用于它。
+ * 0.6 的透明度会把文字对比拉到 3.4:1，看不清的就正好是"这个人已经不在编制里"这句话。
+ */
+.team-member.off {
+  background: var(--approval-zone-bg);
+}
+
+.team-member.off .team-member-name {
+  color: var(--runtime-detail);
+  font-weight: 600;
+}
+
+.team-member-off {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: #e6e9f0;
+  color: var(--approval-heading);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.team-member-load {
+  margin-left: auto;
+  flex: none;
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--approval-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 运行时状态行（面板内） =====
+   它回答的是"为什么没人应答"：角色在桌面上，团队运行时却可能根本没起来。
+   失败与待办直接摊在面板上，不藏进 title 悬浮提示 —— 那些话里带着下一步该做什么，
+   而悬浮提示对触摸屏和读屏用户等于不存在。 */
+
+.runtime-row {
+  /* 语气色由 tone-* 覆盖，默认是"未连接"的中性灰。 */
+  --tone: var(--runtime-idle);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 14px;
+  background: var(--runtime-bg);
+  border-bottom: 1px solid var(--approval-border);
+}
+
+.runtime-row.tone-ok {
+  --tone: var(--runtime-ok);
+}
+.runtime-row.tone-busy {
+  --tone: var(--runtime-busy);
+  background: var(--runtime-busy-bg);
+}
+.runtime-row.tone-error {
+  --tone: var(--runtime-error);
+  background: var(--runtime-error-bg);
+}
+
+.runtime-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/** 状态点只帮眼睛落位。状态本身由文字说明，颜色不是唯一载体。 */
+.runtime-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tone);
+}
+
+.runtime-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  /* 标签可以换行，不截断：截断会正好吃掉"（你自己启动的运行时）"这种关键区别。 */
+  line-height: 1.45;
+  color: var(--runtime-label);
+}
+
+.runtime-detail {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--runtime-detail);
+  /* 说明里常带 Windows 绝对路径，反斜杠不是断行点，不处理就会把面板撑出横向溢出。 */
+  overflow-wrap: anywhere;
+}
+
+/**
+ * 按钮高 28px，比审批区的 34px 还矮：这是鼠标驱动的桌面窗口，而且状态行是常驻的，
+ * 高了会一直挤占消息区。同一组操作在托盘菜单里也有一份，那里不受这个高度限制。
+ */
+.runtime-btn {
+  flex: none;
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--approve-bg);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: filter 160ms var(--easing), transform 120ms var(--easing);
+}
+
+/* 停止是带后果的次要操作，视觉上退一级。 */
+.runtime-btn.ghost {
+  border: 1px solid var(--approval-border);
+  background: #fff;
+  color: var(--reject-fg);
+}
+
+.runtime-btn:hover {
+  filter: brightness(1.08);
+}
+.runtime-btn.ghost:hover {
+  background: #f5f6f9;
+  filter: none;
+}
+.runtime-btn:active {
+  transform: scale(0.97);
+}
+.runtime-btn:focus-visible {
+  outline: 2px solid var(--approve-bg);
+  outline-offset: 2px;
+}
+
+/* 启动中：脉冲表达"正在进行"。静止的点会被读成卡住了，而卡住和慢是两件不同的事。 */
+.runtime-row.tone-busy .runtime-dot {
+  animation: runtime-pulse 1.4s var(--easing) infinite;
+}
+
+@keyframes runtime-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+
+/* 动效降级：脉冲与过渡只是吸引注意或让点击有反馈，去掉它们不影响任何信息传达。 */
+@media (prefers-reduced-motion: reduce) {
+  .character-alert {
+    animation: none;
+  }
+  .panel-tab,
+  .approval-banner-go,
+  .team-go,
+  .runtime-btn {
+    transition: none;
+  }
+  .panel-tab-dot,
+  .approval-banner-dot {
+    animation: none;
+  }
+  .runtime-row.tone-busy .runtime-dot {
+    animation: none;
+  }
+}
