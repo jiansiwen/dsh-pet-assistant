@@ -29,13 +29,18 @@ export function buildSpansFrom(
   samples: readonly Sample[],
   classifier: Classifier,
   minSpanMs: number,
+  sampleIntervalMs = 5000,
 ): ActivitySpan[] {
   const spans: ActivitySpan[] = []
+  const maxGapMs = Math.max(1000, sampleIntervalMs) * 3
   let current: SpanDraft | null = null
   for (const sample of samples) {
+    if (!Number.isFinite(sample.ts)) continue
     const classified = classifySample(sample, classifier)
     if (
       current
+      && sample.ts >= current.end
+      && sample.ts - current.end <= maxGapMs
       && current.app === classified.app
       && current.category === classified.category
       && current.title === classified.title
@@ -51,10 +56,13 @@ export function buildSpansFrom(
 }
 
 function classifySample(sample: Sample, classifier: Classifier): { app: string; category: string; title: string } {
+  if (sample.excluded) return { app: '', category: 'excluded', title: '' }
   if (sample.idle) return { app: '', category: 'idle', title: '' }
   const proc = sample.proc || 'unknown'
   const classified = classifier.classify(proc, sample.title ?? '')
-  return { app: proc, category: classified.category, title: classified.title }
+  // 长时间无输入仍可能在阅读，只标记观察事实，不推断离席或完成工作。
+  const noInput = Number.isFinite(sample.idleMs) && (sample.idleMs ?? 0) >= 300_000
+  return { app: proc, category: noInput ? 'no-input' : classified.category, title: classified.title }
 }
 
 function finish(span: SpanDraft): ActivitySpan {

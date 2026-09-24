@@ -30,4 +30,4 @@ export function proactiveButtons(suggestDisable: boolean): ProactiveButton[] {
 }
 
 /** 用户点「好」后替他发出的那句话：进入帮助流程的是这句话，模型从这里接手确认范围。 */
-export const PROACTIVE_ACCEPT_MESSAGE = '好的，我们一起看看'
+export const PROACTIVE_ACCEPT_MESSAGE = '我愿意一起排查当前工作。请先问我遇到的问题、项目或文件范围；我确认范围之前不要读取更多资料，也不要修改文件或运行命令。'

@@ -162,9 +162,78 @@ describe('旧偏好导入：保留旧 id、时间和来源，不凭空补证据'
     runMigration(makeDeps(fx.source), { fromDate: null, toDate: null, timezone: 'Asia/Shanghai' })
     // 两条旧偏好正文完全不同，但 topic 都是空。空 topic 意味着"不知道说的是哪件事"，
     // 这种前提下判冲突就是凭空补证据，会把整批旧偏好一起打成不生效。
-    for (const record of deps.memories.injectable({}, NOW)) {
-      assert.equal(record.status, 'confirmed')
+    const records = deps.memories.injectable({}, NOW)
+    assert.equal(records.length, 2)
+    for (const record of records) assert.equal(record.status, 'confirmed')
+    const duplicate = deps.memories.put({
+      kind: 'user_preference', scopeKind: 'global', text: records[0].text, actor: { id: 'user', isUser: true },
+    }, NOW)
+    assert.ok(duplicate.ok)
+    assert.equal(duplicate.record.id, records[0].id, '空主题同文也应复用旧偏好')
+    assert.equal(deps.memories.count(), 2)
+  })
+
+  test('删除后跨日重启，更换日期范围与时区不重跑偏好批次', () => {
+    const fx = fixture()
+    runMigration(makeDeps(fx.source), { toDate: '2026-09-05', timezone: 'Asia/Shanghai' })
+    const removedId = legacyMemoryId('pref-1')
+    deps.memories.delete(removedId, '用户不再需要', NOW)
+    const reopened = { ...makeDeps(fx.source), memories: new MemoryStore(db), migrations: new MigrationStore(db),
+      runId: '第二天启动', now: () => NOW + 86_400_000 }
+    const next = runMigration(reopened, {
+      fromDate: '2026-09-01', toDate: '2026-09-06', timezone: 'UTC',
+    })
+    assert.equal(next.complete, true)
+    assert.equal(next.batches.find(batch => batch.id === 'legacy-preferences')?.state, 'skipped')
+    assert.equal(reopened.memories.get(removedId, NOW + 86_400_000), null)
+    assert.deepEqual(reopened.memories.injectable({}, NOW + 86_400_000).map(item => item.id), [legacyMemoryId('pref-2')])
+    assert.equal(fx.source.preferences().length, 3, '源偏好只读，不能靠删源数据通过测试')
+  })
+
+  test('旧偏好有新增或同内容换 id，重跑只导入真正的新内容', () => {
+    const fx = fixture()
+    const options = { toDate: '2026-09-05', timezone: 'Asia/Shanghai' }
+    runMigration(makeDeps(fx.source), options)
+    const removedId = legacyMemoryId('pref-1')
+    const removed = deps.memories.get(removedId, NOW)
+    assert.ok(removed)
+    deps.memories.delete(removedId, '用户删除', NOW)
+    const originalRows = fx.source.preferences()
+    const source: LegacySource = {
+      ...fx.source,
+      preferences: () => [
+        ...originalRows,
+        { id: 'renamed', text: `  ${removed.text}  `, createdAt: NOW },
+        { id: 'new', text: '回复尽量简短', createdAt: NOW },
+      ],
     }
+    const report = runMigration({ ...makeDeps(source), runId: '源内容更新后导入' }, options)
+    const batch = report.batches.find(item => item.id === 'legacy-preferences')
+    assert.equal(report.complete, true)
+    assert.equal(batch?.state, 'succeeded')
+    assert.equal(batch?.imported, 1)
+    assert.equal(batch?.skippedRows, 4)
+    assert.match(batch?.message ?? '', /已删除/)
+    assert.equal(deps.memories.get(removedId, NOW), null)
+    assert.equal(deps.memories.get(legacyMemoryId('renamed'), NOW), null)
+    assert.ok(deps.memories.get(legacyMemoryId('new'), NOW))
+    assert.equal(deps.memories.count(), 2)
+  })
+
+  test('迁移批次记录丢失时，删除账本仍独立阻止旧偏好复活', () => {
+    const fx = fixture()
+    const options = { timezone: 'Asia/Shanghai' }
+    runMigration(makeDeps(fx.source), options)
+    deps.memories.delete(legacyMemoryId('pref-1'), '用户删除', NOW)
+    db.exec('DELETE FROM migrations')
+    const report = runMigration(makeDeps(fx.source), options)
+    const batch = report.batches.find(item => item.id === 'legacy-preferences')
+    assert.equal(report.complete, true)
+    assert.equal(batch?.state, 'succeeded')
+    assert.equal(batch?.imported, 0)
+    assert.equal(batch?.skippedRows, 3)
+    assert.deepEqual(deps.memories.injectable({}, NOW).map(item => item.id), [legacyMemoryId('pref-2')])
+    assert.equal(deps.memories.ledgerSize(), 1)
   })
 })
 

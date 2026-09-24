@@ -4,13 +4,36 @@
  * 规则和 I/O 分开是有意的 —— 授权边界那部分要能被 `node --test` 穷举，一旦沾上 electron
  * 就跑不起来了。这里只负责把能力和限额落实，判断一律交回 `document.ts`。
  *
- * 这个文件由 esbuild 打包、不被测试导入，所以本地导入按仓库惯例写 `.js` 说明符。
+ * electron 只在显式系统关联打开时加载，磁盘出口可直接用 Node 测试。
  */
-import { shell } from 'electron'
-import { createHash } from 'node:crypto'
-import { readdir, readFile, realpath as realpathFs, stat as statFs } from 'node:fs/promises'
+import { open, readdir, realpath as realpathFs, stat as statFs } from 'node:fs/promises'
 import path from 'node:path'
-import { type DocFile, type DocFileSystem } from './document.ts'
+import { DocSizeError, fingerprintBytes, MAX_DOC_BYTES, type DocFile, type DocFileSystem } from './document.ts'
+
+/** 句柄级再次验体积，并逐块守限，防止文件在 stat 之后增长。所有退出路径都关闭句柄。 */
+async function readBoundedBytes(target: string, signal?: AbortSignal): Promise<Uint8Array> {
+  signal?.throwIfAborted()
+  const handle = await open(target, 'r')
+  try {
+    const info = await handle.stat()
+    if (!info.isFile()) throw new Error('目标不是普通文件')
+    if (info.size > MAX_DOC_BYTES) throw new DocSizeError(info.size)
+    const chunks: Buffer[] = []
+    let length = 0
+    for (;;) {
+      signal?.throwIfAborted()
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_DOC_BYTES + 1 - length))
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null)
+      if (bytesRead === 0) break
+      length += bytesRead
+      if (length > MAX_DOC_BYTES) throw new DocSizeError(length)
+      chunks.push(chunk.subarray(0, bytesRead))
+    }
+    return Buffer.concat(chunks, length)
+  } finally {
+    await handle.close()
+  }
+}
 
 /**
  * 递归深度上限。
@@ -76,30 +99,27 @@ export function createDocFileSystem(): DocFileSystem {
       }
     },
 
-    async realpath(target: string): Promise<string> {
-      try {
-        return await realpathFs(target)
-      } catch {
-        // 契约是原样返回而不是抛：解不动就按字面路径做包含判断，那是拒绝，不是放行。
-        return target
-      }
-    },
+    realpath: realpathFs,
 
     async read(target: string): Promise<string> {
-      return readFile(target, 'utf8')
+      if (path.extname(target).toLowerCase() === '.pdf') throw new Error('禁止将 PDF 按 UTF-8 解码')
+      const bytes = Buffer.from(await readBoundedBytes(target))
+      // 文件改了扩展名仍不该把 PDF 原始字节送去 UTF-8 解码。
+      if (bytes.subarray(0, 1024).includes(Buffer.from('%PDF-'))) throw new Error('禁止将 PDF 按 UTF-8 解码')
+      return bytes.toString('utf8')
     },
 
-    async fingerprint(target: string): Promise<string> {
-      // 整份读进来算 sha256：体积上限已经在 open 那一侧挡过（8MB），这个量级一次读完不算贵，
-      // 而按 mtime 判改动会漏掉"改了又改回去"和"复制过来 mtime 一致但内容不同"两种情况。
-      const buffer = await readFile(target)
-      return `${buffer.length}:${createHash('sha256').update(buffer).digest('hex')}`
+    readBytes: readBoundedBytes,
+
+    async fingerprint(target: string, signal?: AbortSignal): Promise<string> {
+      return fingerprintBytes(await readBoundedBytes(target, signal))
     },
 
     async openWithAssociatedApp(target: string): Promise<void> {
       // shell.openPath 把路径交给系统的文件关联，不拼 shell 命令。关联本身可能指向一个
       // 可执行程序，所以能交给它的扩展名由 document.ts 的白名单先挡一道。
       // 它不抛异常：成功返回空串，失败返回原因。
+      const { shell } = await import('electron')
       const failure = await shell.openPath(target)
       if (failure !== '') throw new Error(failure)
     },

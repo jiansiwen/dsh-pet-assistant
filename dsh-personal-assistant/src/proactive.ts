@@ -38,6 +38,11 @@ export interface ProactiveInput {
   focusMode: boolean
   /** 角色是否在桌面上可见；被隐藏时用户没要它出现，更不该弹气泡。 */
   stageVisible: boolean
+  captureActive: boolean
+  sampleAt: number | null
+  sampleIntervalMs: number
+  developmentApp: boolean
+  taskRunning: boolean
 }
 
 export type ProactiveDecision =
@@ -47,6 +52,10 @@ export type ProactiveDecision =
 
 export type ProactiveSkipReason =
   | 'disabled'
+  | 'capture-inactive'
+  | 'stale-sample'
+  | 'not-development-app'
+  | 'task-running'
   | 'focus-mode'
   | 'stage-hidden'
   | 'no-idle-data'
@@ -99,7 +108,7 @@ export function evaluateProactive(
 
   // 空闲期边界：用户一有输入（idleMs 回落或拿不到数据视为活动），当前空闲期结束。
   // 拿不到 idleMs 视为活动而不是"继续空闲"：数据缺失时不该把上一拍的空闲当成这一拍的。
-  const active = input.idleMs !== null && input.idleMs < config.idleMs
+  const active = input.idleMs === null || !Number.isFinite(input.idleMs) || input.idleMs < config.idleMs
   if (active) {
     next.idlePeriodStart = null
     next.notifiedInPeriod = false
@@ -116,7 +125,13 @@ export function evaluateProactive(
   if (state.disabled || !config.enabled) return skip('disabled')
   if (input.focusMode) return skip('focus-mode')
   if (!input.stageVisible) return skip('stage-hidden')
-  if (input.idleMs === null) return skip('no-idle-data')
+  if (!input.captureActive) return skip('capture-inactive')
+  const maxAgeMs = Math.max(15_000, input.sampleIntervalMs * 3)
+  if (input.sampleAt === null || !Number.isFinite(input.sampleAt)
+    || input.sampleAt > input.now || input.now - input.sampleAt > maxAgeMs) return skip('stale-sample')
+  if (!input.developmentApp) return skip('not-development-app')
+  if (input.taskRunning) return skip('task-running')
+  if (input.idleMs === null || !Number.isFinite(input.idleMs) || input.idleMs < 0) return skip('no-idle-data')
   if (input.idleMs < config.idleMs) return skip('not-idle-enough')
   if (next.notifiedInPeriod) return skip('already-reminded-in-period')
   if (state.lastNotifiedAt !== null && input.now - state.lastNotifiedAt < config.cooldownMs) {

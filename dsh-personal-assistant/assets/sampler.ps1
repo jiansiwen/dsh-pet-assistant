@@ -18,6 +18,24 @@ if ($interval -lt 1000) { $interval = 1000 }
 # GetWindowText at all, so unauthorized text never reaches the JSONL file in the first place.
 $captureTitles = $true
 if ($env:DSH_SAMPLE_TITLES -eq '0') { $captureTitles = $false }
+$excludedProcesses = @('KeePass', 'KeePassXC', '1Password', 'Bitwarden')
+$excludedTitles = @()
+if ($env:DSH_SAMPLE_EXCLUDED_PROCESSES) { $excludedProcesses = @($env:DSH_SAMPLE_EXCLUDED_PROCESSES | ConvertFrom-Json) }
+if ($env:DSH_SAMPLE_EXCLUDED_TITLES) { $excludedTitles = @($env:DSH_SAMPLE_EXCLUDED_TITLES | ConvertFrom-Json) }
+
+function Protect-Sample([hashtable]$sample) {
+    $excluded = $excludedProcesses -contains $sample.proc
+    if (-not $excluded -and $sample.ContainsKey('title')) {
+        foreach ($keyword in $excludedTitles) {
+            if ($keyword -and $sample.title.IndexOf([string]$keyword, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $excluded = $true
+                break
+            }
+        }
+    }
+    if ($excluded) { return @{ ts = $sample.ts; excluded = $true } }
+    return $sample
+}
 
 Add-Type @"
 using System;
@@ -80,12 +98,12 @@ while ($true) {
                 proc = $procName
             }
             if ($null -ne $idleMs) { $obj['idleMs'] = $idleMs }
-            if ($captureTitles) {
+            if ($captureTitles -and $excludedProcesses -notcontains $procName) {
                 $sb = New-Object System.Text.StringBuilder 1024
                 [void][DshWin32]::GetWindowText($hwnd, $sb, 1024)
                 $obj['title'] = $sb.ToString()
             }
-            $line = $obj | ConvertTo-Json -Compress
+            $line = (Protect-Sample $obj) | ConvertTo-Json -Compress
         }
         $date = Get-Date -Format 'yyyy-MM-dd'
         $file = Join-Path $dir ($date + '.jsonl')

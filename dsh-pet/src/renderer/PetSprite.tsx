@@ -6,69 +6,73 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { SkinImages, SkinImageKey } from './usePetImage.js'
+import { nextFrame, oneShot } from './pet-interaction.js'
 
 export type PetSkin = 'panda' | 'girl-glasses' | 'boy-glasses'
 
 type Pose =
   | { id: string; kind: 'walk'; src: string }
   | { id: string; kind: 'img'; src: string }
-  | { id: string; kind: 'frames'; frames: string[]; fps: number }
+  | { id: string; kind: 'frames'; frames: string[]; fps: number; once: boolean }
 
-/** 序列帧播放帧率：与抽帧帧率一致，1 倍速原速回放。 */
 const DEFAULT_FPS = 10
 
-/** 逐帧播放器：帧内切换不做淡入，连贯播放形成动画。 */
-function FrameSequence({ frames, fps }: { frames: string[]; fps: number }) {
+/** 完成事件在计时器中发出，不在 React 状态更新器内发出，避免严格模式重复通知。 */
+function FrameSequence({ frames, fps, once, active, onComplete }: {
+  frames: string[]; fps: number; once: boolean; active: boolean; onComplete?: () => void
+}) {
   const [idx, setIdx] = useState(0)
-
+  const index = useRef(0)
+  const completed = useRef(false)
+  const callback = useRef(onComplete)
+  callback.current = onComplete
   useEffect(() => {
-    setIdx(0)
-    if (frames.length < 2) return
-    const timer = window.setInterval(() => setIdx(i => (i + 1) % frames.length), 1000 / fps)
+    if (!active || completed.current) return
+    const timer = window.setInterval(() => {
+      const next = nextFrame(index.current, frames.length, once)
+      index.current = next.index
+      setIdx(next.index)
+      if (next.complete) {
+        if (once) { completed.current = true; window.clearInterval(timer) }
+        callback.current?.()
+      }
+    }, 1000 / fps)
     return () => window.clearInterval(timer)
-  }, [frames, fps])
-
+  }, [frames, fps, once, active])
   return <img className="pet-img pet-frame" src={frames[Math.min(idx, frames.length - 1)]} alt="" draggable={false} />
 }
 
-function renderPose(pose: Pose) {
+function renderPose(pose: Pose, active: boolean, onComplete?: () => void) {
   if (pose.kind === 'walk') {
-    return (
-      <div className="pet-walk-frame">
-        <img className="pet-walk-strip" src={pose.src} alt="" draggable={false} />
-      </div>
-    )
+    return <div className="pet-walk-frame"><img className="pet-walk-strip" src={pose.src} alt="" draggable={false} /></div>
   }
   if (pose.kind === 'frames') {
-    return <FrameSequence frames={pose.frames} fps={pose.fps} />
+    return <FrameSequence frames={pose.frames} fps={pose.fps} once={pose.once} active={active} onComplete={onComplete} />
   }
   return <img className="pet-img" src={pose.src} alt="" draggable={false} />
 }
 
-/** 交叉淡入淡出 + 缩放补间，让姿势切换像动画过渡而非硬切图。 */
-function AnimatedPose({ pose }: { pose: Pose }) {
+/** 旧层保留原组件及其帧位置，只冻结淡出；它永远不能发出完成事件。 */
+function AnimatedPose({ pose, onComplete }: { pose: Pose; onComplete?: () => void }) {
   const [curr, setCurr] = useState(pose)
   const [prev, setPrev] = useState<Pose | null>(null)
   const timer = useRef<number>(0)
-  const currIdRef = useRef(pose.id)
-
   useEffect(() => {
-    // 只用 id 判断是否换姿势：重渲染产生的新 pose 对象不会误触切换，
-    // 也不能在这里 cleanup 定时器（否则重渲染会取消"移除旧层"的定时器）
-    if (pose.id === currIdRef.current) return
-    currIdRef.current = pose.id
+    if (pose.id === curr.id) return
     setPrev(curr)
     setCurr(pose)
     window.clearTimeout(timer.current)
     timer.current = window.setTimeout(() => setPrev(null), 300)
   }, [pose, curr])
-
   useEffect(() => () => window.clearTimeout(timer.current), [])
-
   return (
     <div className="pose-stack">
-      {prev && <div className="pose-layer pose-out">{renderPose(prev)}</div>}
-      <div className={`pose-layer pose-in${prev ? ' pose-over' : ''}`}>{renderPose(curr)}</div>
+      {[...(prev ? [prev] : []), curr].map(layer => {
+        const active = layer.id === pose.id
+        return <div key={layer.id} className={layer === curr ? `pose-layer pose-in${prev ? ' pose-over' : ''}` : 'pose-layer pose-out'}>
+          {renderPose(layer, active, active ? onComplete : undefined)}
+        </div>
+      })}
     </div>
   )
 }
@@ -119,26 +123,31 @@ const joint = (ox: string, oy: string) => ({
 })
 
 export default function PetSprite({
-  skin,
-  images,
-  frames = {},
-  action,
-  dragging = false,
+  skin, images, frames = {}, action, dragging = false, animationVersion = 0, onComplete,
 }: {
   skin: PetSkin
   images: SkinImages
   frames?: Partial<Record<string, string[]>>
   action?: string
   dragging?: boolean
+  animationVersion?: number
+  onComplete?: (action: string, version: number) => void
 }) {
   const p = PALETTES[skin]
   const isPanda = skin === 'panda'
-
   const effective = dragging && frames['grab']?.length ? 'grab' : action
   const frameList = effective ? frames[effective] : undefined
-
+  const callback = useRef(onComplete)
+  callback.current = onComplete
+  // 没有该动作素材的备用皮肤沿用静态降级，但不能让交互状态永远卡住。
+  useEffect(() => {
+    if (dragging || frameList?.length || !action || (!oneShot(action) && action !== 'write')) return
+    const durations: Record<string, number> = { drop: 3900, lie: 5000, 'laptop-in': 3500, 'laptop-out': 2300, write: 1600, 'walk-stop': 300 }
+    const timer = window.setInterval(() => callback.current?.(action, animationVersion), durations[action])
+    return () => window.clearInterval(timer)
+  }, [action, animationVersion, dragging, frameList])
   const pose: Pose | null = frameList?.length
-    ? { id: `frames:${effective}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS }
+    ? { id: `frames:${skin}:${effective}:${animationVersion}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS, once: oneShot(effective) }
     : effective === 'walk' && images.walk
       ? { id: `walk:${images.walk}`, kind: 'walk', src: images.walk }
       : (() => {
@@ -150,11 +159,14 @@ export default function PetSprite({
   if (pose) {
     return (
       <div className="pet-flip">
-        <AnimatedPose pose={pose} />
+        <AnimatedPose pose={pose} onComplete={!dragging && action ? () => onComplete?.(action, animationVersion) : undefined} />
       </div>
     )
   }
 
+  // 素材没到位就不显示，避免看到不匹配的默认形象。
+  return null
+  // eslint-disable-next-line no-unreachable
   return (
     <svg className="pet-svg" viewBox="0 0 200 200" width="150" height="150">
       <g className="pet-flip">

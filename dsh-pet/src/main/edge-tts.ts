@@ -29,6 +29,7 @@ export interface TtsOptions {
   readonly voice: string
   readonly rate: string
   readonly pitch: string
+  readonly signal?: AbortSignal
 }
 
 /** 可注入依赖：测试用假 WebSocket，不出网也能测协议装配。 */
@@ -78,6 +79,7 @@ function protocolHeader(path: string, extra: Record<string, string>): string {
 
 /** 合成一句，返回 MP3 字节。 */
 export async function synthesizeSpeech(options: TtsOptions, deps: TtsDeps = {}, timeoutMs = 30000): Promise<Buffer> {
+  options.signal?.throwIfAborted()
   if (options.text.trim() === '') throw new Error('要合成的文本为空')
   if (options.text.length > 5000) throw new Error('文本超过单次合成上限')
 
@@ -94,17 +96,20 @@ export async function synthesizeSpeech(options: TtsOptions, deps: TtsDeps = {}, 
   const chunks: Buffer[] = []
   let settled = false
   await new Promise<void>((resolvePromise, reject) => {
-    const timer = setTimeout(() => {
-      try { socket.close() } catch { /* 已关 */ }
-      reject(new Error('语音合成超时，请检查网络'))
-    }, timeoutMs)
-    const finish = (): void => {
+    const timer = setTimeout(() => finish(new Error('语音合成超时，请检查网络')), timeoutMs)
+    const abort = (): void => finish(new Error('语音合成已取消'))
+    const finish = (error?: Error): void => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
+      options.signal?.removeEventListener('abort', abort)
       try { socket.close() } catch { /* 已关 */ }
-      resolvePromise()
+      if (error) reject(error)
+      else resolvePromise()
     }
 
     socket.addEventListener('open', () => {
+      if (settled) return
       const config = protocolHeader('speech.config', { 'Content-Type': 'application/json; charset=utf-8' })
         + JSON.stringify({
           context: {
@@ -122,22 +127,16 @@ export async function synthesizeSpeech(options: TtsOptions, deps: TtsDeps = {}, 
         socket.send(config)
         socket.send(ssml)
       } catch (error) {
-        clearTimeout(timer)
-        reject(error instanceof Error ? error : new Error(String(error)))
+        finish(error instanceof Error ? error : new Error(String(error)))
       }
     })
 
     socket.addEventListener('message', (event) => {
+      if (settled) return
       const data = event.data
       if (typeof data === 'string') {
         if (data.includes('Path:turn.end')) {
-          if (chunks.length === 0) {
-            clearTimeout(timer)
-            reject(new Error('服务端结束合但未返回音频'))
-          } else if (!settled) {
-            settled = true
-            finish()
-          }
+          finish(chunks.length === 0 ? new Error('服务端结束合成但未返回音频') : undefined)
         }
         return
       }
@@ -149,21 +148,10 @@ export async function synthesizeSpeech(options: TtsOptions, deps: TtsDeps = {}, 
       }
     })
 
-    socket.addEventListener('error', () => {
-      clearTimeout(timer)
-      reject(new Error('edge-tts 连接失败（网络不可达或被拦截）'))
-    })
-
-    socket.addEventListener('close', () => {
-      if (settled) return
-      clearTimeout(timer)
-      if (chunks.length > 0) {
-        settled = true
-        finish()
-      } else {
-        reject(new Error('edge-tts 连接在收到音频前关闭'))
-      }
-    })
+    socket.addEventListener('error', () => finish(new Error('edge-tts 连接失败（网络不可达或被拦截）')))
+    socket.addEventListener('close', () => finish(new Error('edge-tts 连接在合成完成前关闭')))
+    options.signal?.addEventListener('abort', abort, { once: true })
+    if (options.signal?.aborted) abort()
   })
 
   const audio = Buffer.concat(chunks)

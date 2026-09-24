@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { ApprovalError, ApprovalService } from '../src/approval.ts'
+import { ApprovalError, ApprovalService, type GateCall } from '../src/approval.ts'
 import { TeamService, type TeamOptions } from '../src/team.ts'
 import { TEAM_SCHEMA_VERSION, TeamStore } from '../src/team-domain.ts'
 
@@ -74,24 +74,24 @@ const logs: string[] = []
 let disposed = 0
 let nextResult: FakeResult = { output: [], stopReason: 'completed' }
 
-/** 装到假子代理 agent-scoped ctx 上的守卫；测试直接调用它来验证门禁行为。 */
-const installedGuards: Array<{ agentId: string; guard: (execution: any) => string | undefined }> = []
+/** 装到假 ctx 上的守卫；测试直接调用它来验证门禁行为。agentId 区分宿主层与子代理层。 */
+const installedGuards: Array<{ agentId: string; guard: (execution: any) => string | undefined; agent?: unknown }> = []
 let guardDisposals = 0
 
 function fakeChildAgent(agentId: string) {
-  return {
-    id: agentId,
-    ctx: {
-      tools: {
-        guard(guard: (execution: any) => string | undefined) {
-          installedGuards.push({ agentId, guard })
-          return () => {
-            guardDisposals += 1
-          }
-        },
+  const ctx: any = {
+    tools: {
+      guard(guard: (execution: any) => string | undefined) {
+        installedGuards.push({ agentId, guard, agent: ctx.agent })
+        return () => {
+          guardDisposals += 1
+        }
       },
     },
   }
+  // installReadOnlyGate 要求「精确的 agent.ctx」：ctx.agent.ctx 必须指回 ctx 本身。
+  ctx.agent = { id: agentId, ctx }
+  return { id: agentId, ctx }
 }
 
 /** 假子代理运行；`localAgent` 可空正是远程 provider 的真实形状，门禁装不上就得失败关闭。 */
@@ -135,6 +135,14 @@ const fakeCtx = {
   },
   tools: {
     get: (name: string) => (existingTools.has(name) ? {} : undefined),
+    // 宿主层 tools.guard：installDelegationReadOnlyGate 装在总助理会话的 ctx 上，
+    // 覆盖 start() 返回前的调用窗口。
+    guard(guard: (execution: any) => string | undefined) {
+      installedGuards.push({ agentId: 'host', guard })
+      return () => {
+        guardDisposals += 1
+      }
+    },
   },
 }
 
@@ -144,7 +152,9 @@ const options: Omit<TeamOptions, 'approvals'> = {
   maxConcurrentInference: 2,
   maxConcurrentSideEffect: 1,
   taskTimeoutMs: 60_000,
-  defaultBudgetTokens: 1000,
+  // 当前宿主无法硬约束累计 token 预算：非零预算的任务会在启动前被拒（budget-unsupported）。
+  // 套件默认 0（= 不设累计预算），委派链路才真的跑得起来；非零预算的拒绝单独断言。
+  defaultBudgetTokens: 0,
   seats: [],
   denyExpertTools: ['web_fetch', 'nonexistent_tool_xyz'],
   logger: {
@@ -193,7 +203,8 @@ async function main(): Promise<void> {
   const approvals = new ApprovalService(store, { ttlMs: 60_000, runtimeEpoch: 'epoch-smoke' })
   const team = new TeamService(fakeCtx as never, store, { ...options, approvals })
   const signal = new AbortController().signal
-  const parentAgent = { session: { id: 'parent-smoke' } } as never
+  // id 是启动期定向守卫的匹配键（session.header.parentSession === String(parentAgent.id)）。
+  const parentAgent = { id: 'parent-agent-smoke', session: { id: 'parent-smoke' } } as never
 
   console.log('== 存储层')
   check('建库落盘 schema 版本，重复打开可用', () => {
@@ -343,8 +354,13 @@ async function main(): Promise<void> {
     assert.equal(read.toolScope, 'read-only')
   })
 
-  check('未知承接人与不存在的依赖都被拒绝', () => {
-    assert.throws(() => team.submitTask({ goal: 'x', ownerId: 'member-nezha' }), /unknown assistant/)
+  check('未知承接人、未启用席位与不存在的依赖都被拒绝', () => {
+    assert.throws(() => team.submitTask({ goal: 'x', ownerId: 'member-nezha' }), /成员不存在或未启用：member-nezha/)
+    assert.throws(
+      () => team.submitTask({ goal: 'x', ownerId: 'member-shaseng' }),
+      /成员不存在或未启用：member-shaseng/,
+      '存在但未启用的席位同样不能接单，不静默换人',
+    )
     assert.throws(() => team.submitTask({ goal: 'x', dependsOn: ['no-such-task'] }), /does not exist/)
     const a = team.submitTask({ goal: 'a', ownerId: 'member-wukong' })
     const b = team.submitTask({ goal: 'b', ownerId: 'member-wukong', dependsOn: [a.taskId] })
@@ -371,18 +387,30 @@ async function main(): Promise<void> {
   })
 
   console.log('\n== 审批链路')
-  const proposalTask = team.submitTask({ goal: '需要副作用的任务', ownerId: 'member-tangseng' })
+  // consume 只认「运行中的副作用任务」：任务先按 side-effect 范围提交并置成 running，
+  // 提案与门禁调用（GateCall）都绑定这个修订号，任何一项对不上都消费不掉。
+  const proposalTask = team.submitTask({ goal: '需要副作用的任务', ownerId: 'member-tangseng', toolScope: 'side-effect' })
+  assert.ok(store.updateTask(proposalTask.taskId, proposalTask.revision, { status: 'running' }))
+  const runningTask = store.getTask(proposalTask.taskId)!
+  const gateCall: GateCall = {
+    taskId: runningTask.taskId,
+    assistantId: 'member-tangseng',
+    tool: 'write',
+    target: 'D:/tmp/report.md',
+    params: { mode: 'append' },
+    inputRevision: runningTask.revision,
+  }
 
   let proposalId = ''
   check('提交提案不产生外部效果，只落一条待决记录', () => {
     const proposal = approvals.propose({
-      taskId: proposalTask.taskId,
-      assistantId: 'member-wukong',
+      taskId: gateCall.taskId,
+      assistantId: gateCall.assistantId,
       summary: '把结论写进 report.md',
-      tool: 'write',
-      target: 'D:/tmp/report.md',
-      params: { mode: 'append' },
-      inputRevision: proposalTask.revision,
+      tool: gateCall.tool,
+      target: gateCall.target,
+      params: gateCall.params,
+      inputRevision: gateCall.inputRevision,
       risk: 'medium',
     })
     proposalId = proposal.proposalId
@@ -393,7 +421,7 @@ async function main(): Promise<void> {
   })
 
   check('未签发批准时不能执行', () => {
-    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, 'write-file'))), 'NOT_FOUND')
+    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, 'write', gateCall))), 'NOT_FOUND')
   })
 
   check('不可信主体签发批准被拒，提案保持待决', () => {
@@ -416,17 +444,40 @@ async function main(): Promise<void> {
     assert.equal(store.getApproval(approval.approvalId)!.consumedAt, null)
   })
 
+  check('GateCall 与提案逐项绑定：参数、目标、成员、工具或输入版本变了都消费不掉', () => {
+    const mutations: GateCall[] = [
+      { ...gateCall, params: { mode: 'overwrite' } },
+      { ...gateCall, target: 'D:/tmp/other.md' },
+      { ...gateCall, inputRevision: gateCall.inputRevision + 1 },
+      { ...gateCall, assistantId: 'member-wukong' },
+      { ...gateCall, tool: 'edit' },
+    ]
+    for (const changed of mutations) {
+      assert.equal(
+        approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, changed.tool, changed))),
+        'DIGEST_MISMATCH',
+        `${JSON.stringify(changed)} 与批准的计划不符，必须拒绝`,
+      )
+    }
+    assert.equal(
+      store.getApproval(store.approvalForProposal(proposalId)!.approvalId)!.consumedAt,
+      null,
+      '失败的消费不得把批准用掉',
+    )
+    assert.equal(approvals.operations(proposalTask.taskId).length, 0, '被拒的调用不得留下副作用账目')
+  })
+
   let operationId = ''
   check('凭提案消费批准，批准 id 不必进入模型上下文', () => {
-    const operation = approvals.consumeByProposal(proposalId, 'write-file')
+    const operation = approvals.consumeByProposal(proposalId, 'write', gateCall)
     operationId = operation.operationId
     assert.equal(operation.state, 'planned')
     assert.equal(operation.taskId, proposalTask.taskId)
-    assert.equal(operation.kind, 'write-file')
+    assert.equal(operation.kind, 'write', 'kind 用真实工具名，不用模型自报的分类')
   })
 
   check('同一条批准只能消费一次（防重放）', () => {
-    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, 'write-file'))), 'ALREADY_CONSUMED')
+    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, 'write', gateCall))), 'ALREADY_CONSUMED')
     assert.equal(approvals.operations(proposalTask.taskId).length, 1)
   })
 
@@ -446,13 +497,13 @@ async function main(): Promise<void> {
   check('过期提案不能签发批准，并被标记为 expired', () => {
     const stale = approvals.propose(
       {
-        taskId: proposalTask.taskId,
-        assistantId: 'member-tangseng',
+        taskId: gateCall.taskId,
+        assistantId: gateCall.assistantId,
         summary: '过期的提案',
         tool: 'write',
         target: 'D:/tmp/stale.md',
         params: null,
-        inputRevision: 1,
+        inputRevision: gateCall.inputRevision,
         risk: 'low',
       },
       -1,
@@ -463,18 +514,18 @@ async function main(): Promise<void> {
 
   check('用户拒绝后不能执行', () => {
     const rejected = approvals.propose({
-      taskId: proposalTask.taskId,
-      assistantId: 'member-tangseng',
+      taskId: gateCall.taskId,
+      assistantId: gateCall.assistantId,
       summary: '会被拒绝的提案',
       tool: 'write',
       target: 'D:/tmp/nope.md',
       params: null,
-      inputRevision: 1,
+      inputRevision: gateCall.inputRevision,
       risk: 'high',
     })
     approvals.reject(rejected.proposalId, { channel: 'desktop-shell' }, true)
     assert.equal(store.getProposal(rejected.proposalId)?.state, 'rejected')
-    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(rejected.proposalId, 'write-file'))), 'NOT_FOUND')
+    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(rejected.proposalId, 'write', gateCall))), 'NOT_FOUND')
     assert.equal(approvalCode(thrownBy(() => approvals.reject(rejected.proposalId, { channel: 'local-ui' }, false))), 'UNTRUSTED_SUBJECT')
   })
 
@@ -491,7 +542,8 @@ async function main(): Promise<void> {
   })
 
   let wukongTaskId = ''
-  await checkAsync('只读专家：委派带人设、结构化 schema，deny 名单只含真实存在的工具', async () => {
+  await checkAsync('只读专家：委派带人设与结构化 schema，工具面按已核实的 allow 名单收敛', async () => {
+    installedGuards.length = 0
     nextResult = {
       output: [{ type: 'text', text: '兜底文本' }],
       structured: {
@@ -511,9 +563,10 @@ async function main(): Promise<void> {
       originChannel: 'desktop-pet',
     })
     wukongTaskId = task.taskId
-    const outcome = await team.runTask(task.taskId, parentAgent, signal)
+    const runController = new AbortController()
+    const outcome = await team.runTask(task.taskId, parentAgent, runController.signal)
     assert.ok(outcome)
-    assert.equal(outcome.task.status, 'done')
+    assert.equal(outcome.task.status, 'awaiting-approval', '有 needsApproval 的任务停在待批，不伪装完成')
     assert.deepEqual(outcome.task.artifacts, ['src/a.ts:12 未判空', 'src/b.ts:40 未判空'])
     assert.equal(outcome.report?.summary, '找到两处空指针风险')
     assert.equal(outcome.stopReason, 'completed')
@@ -524,29 +577,69 @@ async function main(): Promise<void> {
     assert.match(request.persona, /孙悟空/)
     assert.ok(request.outputSchema.required.includes('summary'))
     assert.equal(request.parent, parentAgent)
-    assert.equal(request.signal, signal)
-    const deny = request.toolFilter.deny as string[]
-    for (const name of ['subagent', 'subagent_fork', 'workflow', 'ralph']) {
-      assert.ok(deny.includes(name), `${name} 能起子代理，必须被禁掉，否则专家可以再开孙级会话`)
-    }
-    assert.ok(deny.includes('send_message'))
-    assert.ok(deny.includes('interrupt_agent'))
-    for (const name of ['bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'skill', 'job_kill', 'todo_write', 'create_goal', 'update_goal']) {
-      assert.ok(deny.includes(name), `${name} 有副作用，「只读」席位必须默认禁掉`)
-    }
-    for (const name of ['read', 'glob', 'grep', 'job_list', 'get_goal']) {
-      assert.equal(deny.includes(name), false, `${name} 是纯观测工具，禁掉专家就什么都查不了`)
-    }
-    assert.equal(deny.includes('report'), false, '禁掉 report 等于让专家交不回结论')
-    assert.ok(deny.includes('web_fetch'), 'denyExpertTools 里点名的真实工具要生效')
-    assert.equal(deny.includes('write_file'), false, '本运行时的写文件工具叫 write，write_file 是猜名，进了 deny 会被宿主拒绝')
-    for (const name of ['task', 'agent', 'delegate', 'nonexistent_tool_xyz']) {
-      assert.equal(deny.includes(name), false, `${name} 在运行时不存在，进了 deny 会被宿主大声拒绝`)
+    // 委派拿到的是「调用方信号 + 运行自身控制器」的合成信号（AbortSignal.any）：
+    // 取消父信号必须传导到子代理，超时/取消也走同一条通道。
+    assert.ok(request.signal instanceof AbortSignal)
+    assert.equal(request.signal.aborted, false, '任务运行期间委派信号未中止')
+    runController.abort('aborted')
+    assert.equal(request.signal.aborted, true, '父信号取消要传导进委派，否则取消穿不透到子代理')
+    const run = store.listRuns(task.taskId)[0]
+    assert.equal(request.label, run.runId, 'label 就是运行 id，启动期定向守卫靠它匹配持久描述符')
+
+    // 工具面是白名单：只有已核实的观测工具进得来，report 留在子代理自身层。
+    const allow = request.toolFilter.allow as string[]
+    assert.deepEqual(
+      allow,
+      ['read', 'read_image', 'glob', 'grep', 'job_list', 'job_output', 'get_goal', 'web_search'],
+      'allow 名单 = 已核实观测集合 - report - denyExpertTools；多一个都是扩权',
+    )
+    for (const name of ['bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'skill', 'job_kill', 'todo_write', 'create_goal', 'update_goal', 'subagent', 'subagent_fork', 'workflow', 'ralph', 'send_message', 'interrupt_agent', 'web_fetch', 'report', 'task', 'agent', 'delegate', 'nonexistent_tool_xyz', 'personal_assistant_start']) {
+      assert.equal(allow.includes(name), false, `${name} 绝不能进 allow 名单`)
     }
     assert.match(request.prompt[0].text, /排查空指针/)
     assert.match(request.prompt[0].text, /用户报错原文/)
     assert.match(request.prompt[0].text, /只读/)
-    assert.match(request.label, /孙悟空/)
+
+    // 双重门禁：宿主 ctx 上的启动期定向守卫 + 子代理自身 ctx 的只读门禁。
+    assert.equal(installedGuards.length, 2, '每次委派要装宿主层与子代理层各一道守卫')
+    const notAborted = new AbortController().signal
+    const child = installedGuards.find(entry => entry.agentId !== 'host')!
+    assert.equal(child.guard({ name: 'read', arguments: {}, agent: child.agent, signal: notAborted }), undefined)
+    assert.equal(child.guard({ name: 'report', arguments: {}, agent: child.agent, signal: notAborted }), undefined, 'report 是专家交回结论的通道，不能拦')
+    assert.match(
+      String(child.guard({ name: 'write', arguments: { file_path: 'x' }, agent: child.agent, signal: notAborted })),
+      /已拦截 write/,
+      '副作用工具在子代理层被拦',
+    )
+    assert.match(
+      String(child.guard({ name: 'web_fetch', arguments: {}, agent: child.agent, signal: notAborted })),
+      /已拦截 web_fetch/,
+      'denyExpertTools 点名的工具即使可观测也要拦',
+    )
+    assert.match(
+      String(child.guard({ name: 'read', arguments: {}, agent: { id: 'intruder' }, signal: notAborted })),
+      /不允许继承给其他代理/,
+      '别的代理不能借用这道门禁',
+    )
+    assert.equal(
+      child.guard({ name: 'read', arguments: {}, agent: child.agent, signal: AbortSignal.abort('aborted') }),
+      '任务已经取消',
+    )
+
+    // 启动期定向守卫只匹配「本父会话 + 本运行标签」的持久描述符，别的会话一律放行给宿主自己的门禁。
+    const host = installedGuards.find(entry => entry.agentId === 'host')!
+    const childSession = {
+      header: { parentSession: 'parent-agent-smoke' },
+      events: [{ type: 'subagent/descriptor', data: { label: run.runId } }],
+    }
+    const unrelatedSession = { header: { parentSession: 'other-session' }, events: [] }
+    assert.equal(host.guard({ name: 'write', arguments: {}, agent: { session: unrelatedSession }, signal: notAborted }), undefined, '不匹配的会话不归这道门禁管')
+    assert.equal(host.guard({ name: 'read', arguments: {}, agent: { session: childSession }, signal: notAborted }), undefined)
+    assert.match(
+      String(host.guard({ name: 'write', arguments: {}, agent: { session: childSession }, signal: notAborted })),
+      /已拦截 write/,
+      'start() 返回前的调用窗口也要挡住副作用',
+    )
   })
 
   check('每次委派只留一条运行记录，且回填子会话 id', () => {
@@ -568,12 +661,12 @@ async function main(): Promise<void> {
     assert.equal(payload.assistantId, 'member-wukong')
     assert.equal(payload.displayName, '孙悟空')
     assert.equal(payload.skinId, 'boy-glasses')
-    assert.equal(payload.status, 'done')
+    assert.equal(payload.status, 'awaiting-approval')
     assert.deepEqual(payload.needsApproval, ['需要写入修复补丁'])
     assert.equal(events.filter((event) => event.type === 'task/artifact' && event.taskId === wukongTaskId).length, 2)
   })
 
-  await checkAsync('跑完但拿不出验收产物 → 复核，不伪装成功', async () => {
+  await checkAsync('跑完但存在阻碍 → 复核，不伪装成功', async () => {
     nextResult = {
       output: [{ type: 'text', text: '我看过了' }],
       structured: { summary: '我看过了', artifacts: [], blockers: ['拿不到日志'], needsApproval: [] },
@@ -583,11 +676,12 @@ async function main(): Promise<void> {
     const outcome = await team.runTask(task.taskId, parentAgent, signal)
     assert.ok(outcome)
     assert.equal(outcome.task.status, 'review')
+    assert.match(outcome.diagnostic ?? '', /存在阻碍/)
     assert.equal(outcome.report?.summary, '我看过了')
     assert.deepEqual(outcome.report?.blockers, ['拿不到日志'])
   })
 
-  await checkAsync('没有验收条件时，跑完即算完成', async () => {
+  await checkAsync('跑完也不自动算完成：自由文本产物没有可信核验器，一律进复核', async () => {
     nextResult = {
       output: [],
       structured: { summary: '无需产物', artifacts: [], blockers: [], needsApproval: [] },
@@ -596,7 +690,8 @@ async function main(): Promise<void> {
     const task = team.submitTask({ goal: '没有验收条件', ownerId: 'member-wukong' })
     const outcome = await team.runTask(task.taskId, parentAgent, signal)
     assert.ok(outcome)
-    assert.equal(outcome.task.status, 'done')
+    assert.equal(outcome.task.status, 'review')
+    assert.match(outcome.diagnostic ?? '', /尚未独立核验/)
   })
 
   await checkAsync('子代理失败 → 任务失败，并保留诊断', async () => {
@@ -623,103 +718,74 @@ async function main(): Promise<void> {
     assert.equal((done[0].payload as Record<string, any>).text, '纯文本结论')
   })
 
-  await checkAsync('总助理是副作用席位：不加只读工具禁用，但装执行点门禁', async () => {
-    installedGuards.length = 0
-    nextResult = {
-      output: [],
-      structured: { summary: '已汇总', artifacts: ['汇总结果'], blockers: [], needsApproval: ['需要写 D:/tmp/out.md'] },
-      stopReason: 'completed',
-    }
-    const task = team.submitTask({ goal: '汇总专家结论', ownerId: 'member-tangseng' })
+  await checkAsync('副作用委派在启动前被拒：当前宿主没有启动前审批门禁，不硬跑', async () => {
+    const before = delegations.length
+    const task = team.submitTask({ goal: '要动磁盘的任务', ownerId: 'member-tangseng', toolScope: 'side-effect' })
     const outcome = await team.runTask(task.taskId, parentAgent, signal)
     assert.ok(outcome)
-    assert.equal(outcome.task.status, 'done')
-    assert.equal(outcome.task.toolScope, 'side-effect')
-    assert.equal(delegations.at(-1)!.request.toolFilter, undefined)
-    assert.equal(installedGuards.length, 1, '副作用席位必须在子代理自己的 agent ctx 上装一个守卫')
+    assert.equal(outcome.task.status, 'review')
+    assert.equal(outcome.stopReason, 'side-effect-unsupported')
+    assert.match(outcome.diagnostic ?? '', /副作用委派尚未接入启动前审批门禁/)
+    assert.equal(delegations.length, before, '被拒的任务不得委派子代理')
+    assert.equal(store.listRuns(task.taskId).length, 0, '没启动就不该留下运行记录')
+  })
 
-    const guard = installedGuards[0].guard
-    // 观测面与团队自有工具照常放行，否则总助理连读文件、交结论都做不了
-    assert.equal(guard({ name: 'read', arguments: { file_path: 'D:/tmp/out.md' } }), undefined)
-    assert.equal(guard({ name: 'grep', arguments: { pattern: '空指针' } }), undefined)
-    assert.equal(guard({ name: 'report', arguments: {} }), undefined)
-    assert.equal(guard({ name: 'desktop_team_propose_action', arguments: {} }), undefined)
+  await checkAsync('非零累计预算在启动前被拒：宿主无法硬约束预算，不假装能守住', async () => {
+    const before = delegations.length
+    const task = team.submitTask({ goal: '带预算的任务', ownerId: 'member-wukong', budgetTokens: 500 })
+    const outcome = await team.runTask(task.taskId, parentAgent, signal)
+    assert.ok(outcome)
+    assert.equal(outcome.task.status, 'review')
+    assert.equal(outcome.stopReason, 'budget-unsupported')
+    assert.equal(delegations.length, before, '被拒的任务不得委派子代理')
+  })
 
-    const writeCall = { name: 'write', arguments: { file_path: 'D:/tmp/out.md', content: '结论' } }
-    const blocked = guard(writeCall)
-    assert.ok(typeof blocked === 'string', '没有批准时必须拒绝，光靠提示词拦不住模型')
-    assert.match(blocked, /desktop_team_propose_action/, '拒绝理由要告诉模型去提案')
-    assert.match(blocked, /tool="write"/, '拒绝理由要点名该填的工具名，否则模型猜不对')
-    assert.match(blocked, /D:\/tmp\/out\.md/, '拒绝理由要给出该填的 target')
-    assert.equal(approvals.operations(task.taskId).length, 0, '被拦下的调用不得留下副作用账目')
+  await checkAsync('未核实的 provider 在启动前被拒：只读隔离目前只核实过 spawn', async () => {
+    const before = delegations.length
+    const forkTeam = new TeamService(fakeCtx as never, store, { ...options, provider: 'fork', approvals })
+    const task = forkTeam.submitTask({ goal: '换个 provider 跑', ownerId: 'member-wukong' })
+    const outcome = await forkTeam.runTask(task.taskId, parentAgent, signal)
+    assert.ok(outcome)
+    assert.equal(outcome.task.status, 'review')
+    assert.equal(outcome.stopReason, 'provider-unsupported')
+    assert.equal(delegations.length, before, '被拒的任务不得委派子代理')
+  })
 
-    // 看不懂参数就放行是最坏的失败方向
-    const missing = guard({ name: 'write', arguments: { content: '没有路径' } })
-    assert.ok(typeof missing === 'string', '缺 file_path 时必须拒绝')
-    assert.match(missing, /file_path/)
-    assert.ok(typeof guard({ name: 'write', arguments: 'not-an-object' }) === 'string', '参数不是对象也要拒绝')
-
-    // str_replace_editor 的 view 是纯读的，不该要批准；改文件的三个子命令要
-    assert.equal(guard({ name: 'str_replace_editor', arguments: { command: 'view', path: 'D:/tmp/out.md' } }), undefined)
-    assert.ok(
-      typeof guard({ name: 'str_replace_editor', arguments: { command: 'str_replace', path: 'D:/tmp/out.md' } }) === 'string',
-      'str_replace 会改磁盘，必须获批',
-    )
-
-    const proposal = approvals.propose({
-      taskId: task.taskId,
-      assistantId: 'member-tangseng',
-      summary: '把结论落盘',
-      tool: 'write',
-      target: 'D:/tmp/out.md',
-      params: null,
-      inputRevision: task.revision,
-      risk: 'low',
+  check('崩溃遗留的 running 任务与运行记录被恢复流程对账成 unknown，不重发', () => {
+    const crashed = team.submitTask({ goal: '上个进程崩在运行中的任务', ownerId: 'member-wukong' })
+    assert.ok(store.updateTask(crashed.taskId, crashed.revision, { status: 'running' }))
+    store.insertRun({
+      runId: 'run-crashed', taskId: crashed.taskId, assistantId: 'member-wukong',
+      childSessionId: null, messageId: null, state: 'running', stopReason: null,
+      outputDigest: null, startedAt: Date.now(), endedAt: null,
     })
-    approvals.issue(proposal.proposalId, { channel: 'desktop-shell', windowId: 3 }, true)
-
-    assert.equal(guard(writeCall), undefined, '获批后同一次调用要放行')
-    const operations = approvals.operations(task.taskId)
-    assert.equal(operations.length, 1, '门禁放行时就地建一条 planned 记录')
-    assert.equal(operations[0].state, 'planned')
-    assert.equal(operations[0].kind, 'write', 'kind 用真实工具名，不用模型自报的分类')
-
-    const replay = guard(writeCall)
-    assert.ok(typeof replay === 'string', '同一条批准只能执行一次')
-    assert.match(replay, /ALREADY_CONSUMED/)
-    assert.equal(approvals.operations(task.taskId).length, 1, '重放不得再建记录')
-
-    assert.ok(
-      typeof guard({ name: 'write', arguments: { file_path: 'D:/tmp/other.md', content: 'x' } }) === 'string',
-      '批准绑定作用目标，换个文件就得重新提案',
-    )
-
-    const settled = approvals.settleByProposal(proposal.proposalId, 'succeeded', 'digest-gate')
-    assert.equal(settled.state, 'succeeded')
-    assert.equal(approvals.operations(task.taskId)[0].state, 'succeeded', '结账要落在门禁建的那条记录上')
+    // 同一个库、新的服务实例 = 一次重启；启动装配（mountTeam）会调用 recoverInterruptedTasks。
+    const restarted = new TeamService(fakeCtx as never, store, { ...options, approvals })
+    restarted.recoverInterruptedTasks()
+    assert.equal(store.getTask(crashed.taskId)!.status, 'unknown', '恢复只对账，不重发、不伪装完成')
+    const runs = store.listRuns(crashed.taskId)
+    assert.equal(runs.length, 1)
+    assert.equal(runs[0].state, 'unknown')
+    assert.equal(runs[0].stopReason, 'runtime-interrupted')
+    const ended = store
+      .eventsSince(0, 5000)
+      .filter((event) => event.type === 'run/ended' && event.taskId === crashed.taskId)
+    assert.equal(ended.length, 1, '对账要留下可追溯的事件，供桥接与桌面壳投影')
   })
 
-  await checkAsync('只读席位不装门禁：它的工具面已经被 deny 名单削掉了', async () => {
-    installedGuards.length = 0
-    nextResult = { output: [], structured: { summary: '查完了', artifacts: [], blockers: [], needsApproval: [] }, stopReason: 'completed' }
-    const task = team.submitTask({ goal: '排查空指针', ownerId: 'member-wukong' })
-    await team.runTask(task.taskId, parentAgent, signal)
-    assert.equal(installedGuards.length, 0, '只读席位手里没有可放的副作用，装门禁只会白拦')
-  })
-
-  await checkAsync('远程 provider 装不上门禁时失败关闭，不让不受约束的副作用代理跑起来', async () => {
+  await checkAsync('远程 provider 拿不到进程内 agent ctx 时失败关闭，不让不受约束的代理跑起来', async () => {
     const restore = startImpl
     const disposedBefore = disposed
     startImpl = remoteStart
-    const task = team.submitTask({ goal: '需要副作用但门禁装不上', ownerId: 'member-tangseng' })
+    const task = team.submitTask({ goal: '被派到远程运行的任务', ownerId: 'member-wukong' })
     const outcome = await team.runTask(task.taskId, parentAgent, signal)
     startImpl = restore
     assert.ok(outcome)
     assert.equal(outcome.task.status, 'failed')
-    assert.equal(outcome.stopReason, 'start-rejected')
-    assert.match(outcome.diagnostic ?? '', /门禁/)
-    assert.match(outcome.diagnostic ?? '', /localAgent/)
-    assert.equal(disposed > disposedBefore, true, '装不上门禁要把已经起来的 run 释放掉，不能留个孤儿代理')
+    assert.equal(outcome.stopReason, 'infrastructure-error')
+    assert.match(outcome.diagnostic ?? '', /进程内 spawn/)
+    assert.match(outcome.diagnostic ?? '', /不能接受远程运行/)
+    assert.equal(disposed > disposedBefore, true, '跑不起来的 run 也要释放掉，不能留个孤儿代理')
   })
 
   await checkAsync('宿主拒绝委派时任务置失败，并记下原因', async () => {
@@ -735,7 +801,10 @@ async function main(): Promise<void> {
     assert.equal(outcome.stopReason, 'start-rejected')
     assert.match(outcome.diagnostic ?? '', /unknown tool/)
     assert.equal(store.listRuns(task.taskId)[0].state, 'failed')
-    assert.ok(logs.some((line) => line.startsWith('error ')))
+    const ended = store
+      .eventsSince(0, 5000)
+      .filter((event) => event.type === 'run/ended' && event.taskId === task.taskId)
+    assert.match(String((ended.at(-1)!.payload as Record<string, any>).diagnostic), /unknown tool/, '失败原因要落进事件账目')
   })
 
   await checkAsync('取消任务：非终态置 cancelled，不存在的任务返回 null', async () => {
@@ -747,12 +816,14 @@ async function main(): Promise<void> {
     assert.equal(approvals.operations(proposalTask.taskId).length, 1, '取消不影响已登记副作用的账目')
   })
 
-  await checkAsync('终态任务再次执行直接返回，不重复委派', async () => {
+  await checkAsync('非新建/排队状态的任务再次执行直接返回，不重复委派', async () => {
     const before = delegations.length
     const outcome = await team.runTask(wukongTaskId, parentAgent, signal)
     assert.ok(outcome)
-    assert.equal(outcome.task.status, 'done')
+    assert.equal(outcome.task.status, 'awaiting-approval')
+    assert.equal(outcome.stopReason, 'awaiting-approval')
     assert.equal(outcome.report, null)
+    assert.match(outcome.diagnostic ?? '', /只领取新建或排队任务/, '待批任务不能被重新领取，避免重发已发生的副作用')
     assert.equal(delegations.length, before)
   })
 

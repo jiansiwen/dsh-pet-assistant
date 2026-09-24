@@ -4,9 +4,20 @@
  * 纯类型导入，运行时被擦除，不会把 electron 拖进渲染层的包。
  */
 import type { CompanionState } from '../main/companion-host.js'
+import type {
+  MeetingConsentInput,
+  MinutesRecord,
+  TranscriptSegment,
+} from '../main/meeting-store.js'
+import type { MeetingRuntimeState } from '../main/meeting-recorder.js'
 import type { SkinOverrides } from './character-manifest.js'
+import type { VoiceApiInput, VoiceApiKind, VoiceApiResult } from '../voice-api-types.js'
+import type { SessionCommand, SessionResult, SessionUpdate } from '../session-types.js'
+import type { Box } from './stage-layout.js'
 
-export type { CompanionState, SkinOverrides }
+export type SettingsPage = 'general' | 'team' | 'doc' | 'meeting'
+
+export type { CompanionState, MeetingConsentInput, MeetingRuntimeState, MinutesRecord, SkinOverrides, TranscriptSegment }
 
 export interface PetPosition {
   x: number
@@ -28,6 +39,9 @@ export interface CharacterMenuTarget {
 
 export interface PetState {
   pet: string
+  voiceConversation?: boolean
+  idleSleepMinutes?: number
+  sleepMinutes?: number
   /** 旧单宠物时代的位置，升级后由渲染层映射到对应角色。 */
   bounds?: PetPosition
   /** 各角色座位，键是 assistantId。 */
@@ -38,6 +52,9 @@ export interface PetState {
 }
 
 export interface PetSettingsPatch {
+  voiceConversation?: boolean
+  idleSleepMinutes?: number
+  sleepMinutes?: number
   bounds?: PetPosition
   positions?: Record<string, PetPosition>
 }
@@ -89,6 +106,12 @@ export interface TeamTaskSnapshot {
 
 /** 待批准的副作用计划。批准凭据与聊天令牌互不通用，模型自己调不到审批端点。 */
 export interface TeamProposalSnapshot {
+  kind?: 'report' | 'team'
+  reportId?: string
+  revision?: number
+  digest?: string
+  content?: string
+  epoch?: string
   proposalId: string
   taskId?: string | null
   assistantId?: string | null
@@ -118,6 +141,17 @@ export interface BridgeEventPayload {
   id?: string
   ok?: boolean
   reply?: string
+  /** delta：本次增量文本片段，只用于气泡显示。 */
+  text?: string
+  /**
+   * delta 的形态：`text` 正文、`think` 思考过程、`tool` 工具调用、`user` 输入。
+   * 缺省按 `text` 处理。宠物要和 DSH 会话完全绑定，四类都要按发生顺序显示。
+   */
+  kind?: 'text' | 'think' | 'tool' | 'user'
+  /** kind='tool' 时的工具名（如 `Read` / `Grep`）。 */
+  name?: string
+  /** kind='tool' 时的参数摘要（如 `dsh-pet/README.md`）。 */
+  arg?: string
   error?: string
   /** task：来自子代理运行结果；interval：来自轮次区间，非因果归属。 */
   attribution?: 'task' | 'interval' | string
@@ -140,6 +174,12 @@ export interface DecideApprovalResult {
   ok: boolean
   approvalId?: string
   decision?: 'rejected'
+  confirmed?: boolean
+  savedPath?: string
+  revision?: number
+  digest?: string
+  modeExited?: boolean
+  message?: string
   error?: string
 }
 
@@ -210,9 +250,73 @@ export interface DocReplyResult {
   readonly error?: string
 }
 
+// ===== 会议闭环（P6）=====
+
+/** 通用回执。error 非空时是给用户看的那句拒绝/故障原因。 */
+export interface SimpleOkResult {
+  readonly ok: boolean
+  readonly error?: string
+  readonly seq?: number
+}
+
+export interface MeetingStartResult {
+  readonly ok: boolean
+  readonly meetingId?: string
+  readonly error?: string
+}
+
+/** 主进程通知渲染层"开始采音"的载荷。 */
+export interface MeetingStartedPayload {
+  readonly meetingId: string
+  readonly sources: 'mic' | 'mic+loopback'
+  readonly name: string
+  /** 渲染层必须按这个采样率重采样后推块（主进程拼 wav 头时写死它）。 */
+  readonly sampleRate: number
+}
+
+export interface MeetingSpeakerBrief {
+  readonly speaker: string
+  readonly label: string
+  readonly count: number
+}
+
+export interface MeetingSpeakersResult {
+  readonly ok: boolean
+  readonly error?: string
+  readonly revision?: number
+  readonly segments?: TranscriptSegment[]
+  readonly speakers?: MeetingSpeakerBrief[]
+}
+
+/** 说话人修订与纪要确认的回执。revision 是修订后的段版本号。 */
+export interface MeetingEditResult {
+  readonly ok: boolean
+  readonly error?: string
+  readonly revision?: number
+  readonly confirmedAt?: number
+}
+
+export interface MeetingMinutesResult {
+  readonly ok: boolean
+  readonly error?: string
+  readonly minutes?: MinutesRecord | null
+}
+
 export interface PetApi {
   getState(): Promise<PetState>
+  getSession(beforeSeq?: number, bindingId?: string): Promise<SessionResult>
+  sessionCommand(command: SessionCommand): Promise<SessionResult>
+  onSessionUpdate(callback: (update: SessionUpdate) => void): () => void
+  onSessionConnection(callback: (status: string) => void): () => void
+  onSettingsOpen(callback: (page: SettingsPage) => void): () => void
+  onOverlayDismiss(callback: () => void): () => void
+  onOverlayError(callback: (message: string) => void): () => void
+  overlayState(open: boolean, boxes: Box[], settingsOpen: boolean): void
   saveSettings(patch: PetSettingsPatch): Promise<{ ok: boolean }>
+  voiceApiState(): Promise<VoiceApiResult>
+  voiceApiSave(input: VoiceApiInput): Promise<VoiceApiResult>
+  voiceApiRemove(id: string): Promise<VoiceApiResult>
+  voiceApiSelect(kind: VoiceApiKind, id: string | null): Promise<VoiceApiResult>
   mouseState(interactive: boolean): void
   /** 在某个角色上弹原生菜单（换形象、隐藏、退出）。 */
   contextMenu(target: CharacterMenuTarget): void
@@ -260,7 +364,7 @@ export interface PetApi {
   onExitRequested(callback: () => void): void
   /** 全局快捷键唤起输入模式。 */
   onSummon(callback: () => void): void
-  /** 语音唤醒词命中（说"小潘"）：宠物回应并弹出输入框。 */
+  /** 语音唤醒词命中（说"小潘小潘"）：宠物回应并弹出输入框。 */
   onWake(callback: () => void): void
   /** 桥接事件：成员/任务/提案变化都从这里来，界面只是投影。 */
   onTeamEvent(callback: (event: BridgeEventPayload) => void): void
@@ -277,6 +381,21 @@ export interface PetApi {
   respondProactive(kind: 'accept' | 'decline' | 'disable' | 'enable'): void
   /** 讲解播放状态：是否在出声（界面据此显示停止按钮），以及念不出来时的原因。 */
   onSpeechState(callback: (status: SpeechStatus) => void): void
+  /**
+   * 会话流水：正文 / 思考过程 / 工具调用 / 用户输入，**按发生顺序**推来。
+   *
+   * 与 `chat` 的返回值分工：流水负责「发生了什么」（含网页侧发起的轮次），
+   * 返回值负责「这条回复归属谁、有没有出错」。宿主不吐增量时一次都不会触发，
+   * 界面必须能接受整段回复一次到达。
+   */
+  onChatDelta(callback: (delta: BridgeEventPayload) => void): void
+  /**
+   * 语音识别的流式增量。
+   *
+   * mimo 等服务在识别过程中逐字返回文本；本地识别（sherpa-onnx）走 asrStreamFeed 不经过这里。
+   * 最终文本以 `asrTranscribe` 的返回值为准（到达时整体替换），增量只用于实时显示。
+   */
+  onAsrDelta(callback: (delta: { text: string }) => void): void
   /** 用系统关联的应用打开一份文档。返回的 reply 是一句能直接显示的话。 */
   openDoc(path: string): Promise<DocReplyResult>
   /**
@@ -300,6 +419,39 @@ export interface PetApi {
   onDocReply(callback: (reply: { index: number; text: string }) => void): void
   /** 一句话提示（讲完了、某段讲不下去）。它不属于状态，显示完就过去。 */
   onDocNotice(callback: (message: string) => void): void
+  /**
+   * 开一场会议录制。consent 必填项缺一个都会被拒：名字、来源、知情同意文本、
+   * 勾选状态、保留天数。拒绝原因在 error 里，是要显示给用户的那句话。
+   */
+  meetingStart(consent: MeetingConsentInput): Promise<MeetingStartResult>
+  /** 请求停止当前会议：主进程先让渲染层停流冲刷，再结算转写。 */
+  meetingStop(meetingId?: string): Promise<SimpleOkResult>
+  /** 推一块 base64 PCM（16kHz mono Int16）。主进程收到立即加密落盘。 */
+  meetingChunk(meetingId: string, chunkBase64: string): Promise<SimpleOkResult>
+  /** 某条音轨拿不到（loopback 采集失败）时如实上报，不伪造静音块。 */
+  meetingTrackMissing(meetingId: string, kind: 'mic' | 'loopback'): Promise<SimpleOkResult>
+  /** 渲染层停流并推完最后一块后回报，触发结算与转写。 */
+  meetingFlushDone(meetingId: string): Promise<SimpleOkResult>
+  /** 拉一次会议运行时状态（录音中/停止中/转写进度/最近会议）。 */
+  meetingState(): Promise<MeetingRuntimeState>
+  /** 手动重跑转写（转写失败后的重试入口）。录音始终保留。 */
+  meetingTranscribe(meetingId: string): Promise<SimpleOkResult>
+  /** 说话人修订列表：段 + 说话人汇总 + 当前 revision。 */
+  meetingSpeakers(meetingId: string): Promise<MeetingSpeakersResult>
+  /** 说话人改名/合并/拆分。每次修订 bump revision，并让已确认的纪要退回草稿。 */
+  meetingSpeakerRename(meetingId: string, speaker: string, label: string): Promise<MeetingEditResult>
+  meetingSpeakerMerge(meetingId: string, fromSpeaker: string, intoSpeaker: string): Promise<MeetingEditResult>
+  meetingSpeakerSplit(meetingId: string, indexes: number[], label: string): Promise<MeetingEditResult>
+  /** 取纪要（本地模板生成的草稿或已确认版）。 */
+  meetingMinutes(meetingId: string): Promise<MeetingMinutesResult>
+  /** 确认纪要。只有用户亲手点这个按钮才会置 confirmed；段修订过会被拒。 */
+  meetingMinutesConfirm(meetingId: string): Promise<MeetingEditResult>
+  /** 会议开始：渲染层收到后开 getUserMedia 采音并逐块推 meetingChunk。 */
+  onMeetingStarted(callback: (payload: MeetingStartedPayload) => void): void
+  /** 主进程请求停流：渲染层停轨、冲刷最后一块后调 meetingFlushDone。 */
+  onMeetingStopping(callback: (payload: { meetingId: string }) => void): void
+  /** 会议运行时状态变更的推送投影。 */
+  onMeetingState(callback: (state: MeetingRuntimeState) => void): void
   /** 退场动画播完，通知主进程退出应用。 */
   exitDone(): void
 }

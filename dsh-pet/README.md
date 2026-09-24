@@ -14,14 +14,21 @@ DeepSeek Harness 的桌面客户端 —— 配合 [dsh-personal-assistant](../ds
 
 **说话与听**
 
-- **语音唤醒**：喊「小潘」把角色唤回来并弹出输入框，角色隐藏时也管用（纯本地，不上传）
-- **按键听写**：说话录音在窗口里完成，说完自动停。识别两条路自动选择：
-  1. **本地 SenseVoice**（默认安装后生效）：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-local-asr.ps1` 下载约 230MB 模型到 `%APPDATA%\dsh-pet\local-asr`，之后**完全离线**、中文准确
-  2. Windows 旧引擎兜底：模型没装时走它，能用但准确率有限
+- **语音唤醒**：喊「小潘小潘」把角色唤回来并弹出输入框，角色隐藏时也管用（纯本地，不上传）。
+  喊两遍是刻意的 —— 单个「小潘」只有两个音节，日常对话里太容易误触发；
+  四个音节既能明显降低误触发，说起来也不费劲。**仅 Windows**（用 `System.Speech` 离线识别器）；
+  macOS/Linux 上用快捷键或点角色代替
+- **按键听写**：说话录音在窗口里完成，说完自动停。识别走**进程内**解码（不 spawn 任何外部程序），
+  所以模型装好后三个平台都能用：
+  - Windows：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-local-asr.ps1`
+  - macOS / Linux：`bash scripts/setup-local-asr.sh`
+  - 模型约 700MB，落在 `%APPDATA%\dsh-pet\local-asr`（macOS 为 `~/Library/Application Support/dsh-pet/local-asr`），之后**完全离线**
+  - Windows 上没装模型时还会回退系统自带的 `System.Speech` 引擎（能用但准确率有限）；其他系统没有这个兜底
   - 录音只在本机处理，不上传任何音频
 - **回答朗读**：语音发起的那一轮会把回答念出来；打字问的**不出声**（突然出声是用户没要求过的行为）。
   声音是微软 edge-tts 神经语音（默认「晓晓」，免费无需密钥）；**断网时自动回退本机合成**（音色机械但照常说话）。
-  这一步会把要念的**文字**发到微软的合成服务；不接受的话拔网线用，回退路径不联网
+  - Windows 用 PowerShell 的 MCI 播放，macOS 用系统自带的 `afplay` / `say`；**Linux 未实现**
+  - 这一步会把要念的**文字**发到微软的合成服务；不接受的话拔网线用，回退路径不联网
 - **打断**：朗读时界面出现「正在朗读」横条，点停止立刻闭嘴，排队的句子一起丢掉。打断后再问，交给模型的上下文只包含**实际念出来的那一半**
 
 **面板（三页）**
@@ -68,7 +75,56 @@ dsh-pet (Electron)
 1. 已安装 Node.js ≥ 22
 2. 插件已装到某个 profile，且该 profile 有团队覆盖层（托盘的「启动助理团队」只列出真具备条件的）
 3. 凭据沿用 dsh 已有配置（`~/.dsh/.credentials.yaml`），无需额外配置
-4. 语音相关功能依赖 Windows 中文语音包：设置 → 时间和语言 → 语音 → 添加中文语音
+4. 语音相关功能：装本地识别模型（Windows 见下；macOS/Linux 跑 `bash scripts/setup-local-asr.sh`）
+
+## 平台支持
+
+窗口层（透明、置顶、鼠标穿透、拖拽、动画、托盘）在三个系统上都可用。
+**「说话与听」这一块按平台分档** —— 差异都收在 `src/main/platform.ts` 一处。
+
+| 能力 | Windows | macOS | Linux |
+|---|---|---|---|
+| 角色显示 / 悬浮 / 拖拽 | ✅ | ✅ | ✅ |
+| 跟随切换桌面、浮在全屏之上 | ❌（系统限制） | ✅ | ✅ |
+| 托盘显示/隐藏角色 | ✅ 单击 | ✅ 右键菜单 | ✅ 单击 |
+| 面板分页 / 文档讲解 / 团队状态 | ✅ | ✅ | ✅ |
+| 麦克风听写（按键说话） | ✅ | ✅ 需授权 | ✅ 需授权 |
+| 本地语音识别（离线） | ✅ | ✅ | ✅ |
+| 回答朗读 | ✅ | ✅ 走 `say` / `afplay` | ❌ 未实现 |
+| 语音唤醒「小潘小潘」 | ✅ | ❌ 系统无对应能力 | ❌ |
+| 会议录音 + 加密落盘 | ✅ DPAPI | ✅ 钥匙串 | ✅ libsecret |
+| 「点面板外面自动收起」 | ✅ | ❌ | ❌ |
+| 前台活动记录（插件侧） | ✅ | ❌ | ❌ |
+
+**macOS 上比 Windows 多一件事**：`setVisibleOnAllWorkspaces` 在 Windows 上是空操作，
+只有 macOS/Linux 才真正生效 —— 所以 Mac 上宠物能跟着你切换桌面、能浮在全屏应用之上。
+
+**macOS 上少三件事**，都是系统层面没有对应实现，不是没做：
+
+- **语音唤醒**：Windows 用的是 `System.Speech` 离线识别器，macOS 没有等价物。
+  替代入口：全局快捷键 `Cmd+Option+P`，或直接点角色。
+- **点面板外面收起**：需要全局鼠标钩子 + 辅助功能授权。替代入口：按 `Esc`，或点角色本身。
+- **活动记录**（插件侧）：采样器读的是 Windows 前台窗口 API。
+
+### 在 macOS 上运行
+
+```bash
+cd dsh-pet
+pnpm install                                    # 必须重新装，不能拷 Windows 的 node_modules
+bash scripts/setup-local-asr.sh                 # 装识别模型（约 700MB，只需一次）
+pnpm run start
+```
+
+打包成独立 `.app`：
+
+```bash
+pnpm run pack:mac    # 用 build/electron-builder.yml，含 Info.plist 权限声明
+```
+
+> **为什么打包配置不是可选的**：macOS 10.14+ 起，访问麦克风必须在 Info.plist 里声明
+> `NSMicrophoneUsageDescription`，否则调 `getUserMedia` 时系统会**直接终止进程**
+> —— 不是报错、不是拒绝，是进程消失。开发态 `pnpm start` 跑的是 Electron 自己的
+> Info.plist（已声明），所以那时能说话；打包后才必须有这份配置。
 
 ## 运行
 

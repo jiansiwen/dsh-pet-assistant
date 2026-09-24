@@ -23,6 +23,14 @@ export interface SpeechRequest {
   readonly utteranceId: string
   readonly text: string
   readonly origin?: SpeechOrigin
+  readonly fromIndex?: number
+  /**
+   * 本次请求的第一句从第几号开始编号。
+   *
+   * 流式朗读要一段一段地喂同一句话，编号必须在各次之间接得上 —— 否则队列里会出现两个
+   * 「#0」，续讲按序号定位时落在哪一句就说不准了。单次请求（文档整段、整条回复）不用传。
+   */
+  readonly indexBase?: number
 }
 
 /** 切好的一句，是播放与打断的最小单位。 */
@@ -67,36 +75,47 @@ const WORTH_SPEAKING = /[\p{L}\p{N}]/u
  * 序号是"播放位置"的一部分，续讲要靠它接着往下走。
  */
 export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
-  const text = request.text
-  const pieces: string[] = []
-  let current = ''
+  const { sentences, rest } = drainSentences(request.text)
+  const pieces = rest.length > 0 ? [...sentences, rest] : sentences
 
-  for (const char of text) {
-    current += char
-    if (SENTENCE_ENDERS.has(char)) {
-      pieces.push(current)
-      current = ''
-    } else if (current.length >= MAX_SEGMENT_CHARS) {
-      // 退到逗号上切的时候，逗号之后那截还没说完，得留着继续攒 —— 清空就是把字吞了。
-      const cut = cutSoftly(current)
-      pieces.push(cut)
-      current = current.slice(cut.length)
-    }
-  }
-  if (current.length > 0) pieces.push(current)
-
+  const base = request.indexBase ?? 0
   const segments: Segment[] = []
   for (const piece of pieces) {
     const trimmed = piece.trim()
     if (!WORTH_SPEAKING.test(trimmed)) continue
     segments.push({
       utteranceId: request.utteranceId,
-      index: segments.length,
+      index: base + segments.length,
       text: trimmed,
       ...(request.origin ? { origin: request.origin } : {}),
     })
   }
   return segments
+}
+
+/**
+ * 把已经攒到的文本切成"能念的整句"，末尾没说完的一截原样退回。
+ *
+ * 流式朗读靠它一段一段地推进：只有完整的句子才值得送去合成，半句送过去会切在词中间。
+ * `splitIntoSegments` 与 `Narrator.feed` 共用这一份切法 —— 两处各写一套，接缝处迟早会吞字或重念。
+ */
+export function drainSentences(text: string): { sentences: readonly string[]; rest: string } {
+  const sentences: string[] = []
+  let current = ''
+
+  for (const char of text) {
+    current += char
+    if (SENTENCE_ENDERS.has(char)) {
+      sentences.push(current)
+      current = ''
+    } else if (current.length >= MAX_SEGMENT_CHARS) {
+      // 退到逗号上切的时候，逗号之后那截还没说完，得留着继续攒 —— 清空就是把字吞了。
+      const cut = cutSoftly(current)
+      sentences.push(cut)
+      current = current.slice(cut.length)
+    }
+  }
+  return { sentences, rest: current }
 }
 
 /** 到了长度上限还没有句末标点：优先退到最近的逗号或空格上切。 */
@@ -183,7 +202,7 @@ function at(state: SpeechState, effects: readonly SpeechEffect[] = []): SpeechTr
 export function nextSpeech(state: SpeechState, event: SpeechEvent): SpeechTransition {
   switch (event.type) {
     case 'enqueue': {
-      const segments = splitIntoSegments(event.request)
+      const segments = splitIntoSegments(event.request).filter(segment => segment.index >= (event.request.fromIndex ?? 0))
       if (segments.length === 0) return at(state)
       return at({ ...state, queue: [...state.queue, ...segments] })
     }

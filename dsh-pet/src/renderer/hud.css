@@ -1,0 +1,681 @@
+/* 会话定位仅由实时锚点驱动，不夹边；正文与工具过程各自保持可读。 */
+.chat-hud {
+  --hud-bg: rgba(16, 35, 51, 0.78);
+  --hud-edge: #75cae8;
+  --hud-text: #eaf5fa;
+  --hud-muted: #9eb4c2;
+  --hud-warning: #e8bc78;
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 80;
+  width: 440px;
+  max-width: calc(100vw - 16px);
+  max-height: 560px;
+  display: flex;
+  flex-direction: column;
+  color: var(--hud-text);
+  background: var(--hud-bg);
+  border: 1px solid rgba(117, 202, 232, 0.55);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(3, 15, 25, 0.24), 0 0 14px rgba(117, 202, 232, 0.08);
+  font: 13px/1.65 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  color-scheme: dark;
+  user-select: text;
+}
+
+.chat-hud :is(button, select, textarea) {
+  min-width: 0;
+  font: inherit;
+  color: var(--hud-text);
+  border: 1px solid rgba(117, 202, 232, 0.25);
+  border-radius: 6px;
+  background: rgba(16, 35, 51, 0.72);
+}
+
+.chat-hud button {
+  cursor: pointer;
+  user-select: none;
+}
+
+.chat-hud button:hover:not(:disabled),
+.chat-hud select:hover:not(:disabled) {
+  border-color: var(--hud-edge);
+  background: #203f52;
+}
+
+.chat-hud :is(button, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--hud-edge);
+  outline-offset: 2px;
+}
+
+.chat-hud :disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.chat-hud ::selection {
+  background: #397b98;
+  color: #fff;
+}
+
+.chat-hud .hud-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px 12px;
+  border-bottom: 1px solid rgba(117, 202, 232, 0.18);
+  border-radius: 11px 11px 0 0;
+  background: rgba(16, 35, 51, 0.35);
+}
+
+.chat-hud .hud-indicator {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--hud-muted);
+}
+
+.chat-hud .hud-indicator.active {
+  background: var(--hud-edge);
+  box-shadow: 0 0 6px rgba(117, 202, 232, 0.45);
+}
+
+.chat-hud .hud-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-hud .hud-status {
+  flex: none;
+  color: var(--hud-muted);
+  font: 11px/1.5 'Cascadia Code', Consolas, 'Microsoft YaHei UI', monospace;
+}
+
+.chat-hud .hud-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--hud-edge);
+}
+
+.chat-hud .hud-header .hud-icon {
+  width: 26px;
+  height: 26px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 20px;
+}
+
+.chat-hud .hud-icon.recording {
+  color: var(--hud-warning);
+  border-color: var(--hud-warning);
+  background: rgba(232, 188, 120, 0.14);
+}
+
+.chat-hud .hud-messages {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 140px;
+  max-height: 360px;
+  min-width: 0;
+  padding: 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+}
+
+.chat-hud .hud-messages > * {
+  flex-shrink: 0;
+}
+
+.chat-hud .hud-message {
+  min-width: 0;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.chat-hud .hud-message-user {
+  align-self: flex-end;
+  max-width: 90%;
+  padding: 8px 11px;
+  background: rgba(117, 202, 232, 0.13);
+  border: 1px solid rgba(117, 202, 232, 0.22);
+  border-radius: 8px 8px 2px 8px;
+}
+
+.chat-hud .hud-message-assistant {
+  align-self: stretch;
+  padding: 0 2px;
+}
+
+.chat-hud .hud-message-system {
+  color: var(--hud-muted);
+  font-size: 12px;
+  padding: 6px 10px;
+  border-left: 1px solid var(--hud-muted);
+  background: rgba(16, 35, 51, 0.3);
+}
+
+.chat-hud .hud-message.is-streaming {
+  border-inline-start: 2px solid var(--hud-edge);
+  padding-inline-start: 10px;
+}
+
+.chat-hud .hud-process {
+  min-width: 0;
+  border: 1px solid rgba(117, 202, 232, 0.16);
+  border-radius: 6px;
+  color: var(--hud-muted);
+  background: rgba(16, 35, 51, 0.3);
+  font: 12px/1.6 'Cascadia Code', Consolas, 'Microsoft YaHei UI', monospace;
+}
+
+.chat-hud .hud-process summary {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.chat-hud .hud-process summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-hud .hud-process summary > span:nth-child(2) {
+  flex: 0 1 auto;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-hud .hud-process-mark {
+  flex: none;
+  color: var(--hud-edge);
+}
+
+.chat-hud .hud-process[open] .hud-process-mark {
+  transform: rotate(90deg);
+}
+
+.chat-hud .hud-process-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-hud .hud-process-think {
+  border-style: dashed;
+}
+
+.chat-hud .hud-process-tool summary > span:nth-child(2) {
+  color: var(--hud-edge);
+}
+
+.chat-hud .hud-process pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px 10px;
+  border-top: 1px solid rgba(117, 202, 232, 0.12);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  font: inherit;
+  color: var(--hud-text);
+  user-select: text;
+}
+
+.chat-hud .hud-process .hud-tool-result {
+  color: var(--hud-muted);
+}
+
+.chat-hud .hud-empty {
+  padding: 24px 12px;
+  color: var(--hud-muted);
+  background: rgba(16, 35, 51, 0.3);
+  border-radius: 6px;
+}
+
+.chat-hud .hud-empty > span {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--hud-text);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.chat-hud .hud-history,
+.chat-hud .hud-latest {
+  flex: none;
+  align-self: center;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--hud-edge);
+}
+
+.chat-hud .hud-latest {
+  margin: 0 14px 8px;
+}
+
+.chat-hud .hud-error {
+  flex: none;
+  max-height: 72px;
+  overflow-y: auto;
+  margin: 0 12px 8px;
+  padding: 6px 9px;
+  border-left: 2px solid var(--hud-warning);
+  background: rgba(16, 35, 51, 0.45);
+  color: var(--hud-warning);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.chat-hud .hud-speech {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  gap: 8px;
+  padding: 5px 12px;
+  border-top: 1px solid rgba(117, 202, 232, 0.18);
+  background: rgba(16, 35, 51, 0.3);
+  color: var(--hud-muted);
+  font-size: 12px;
+}
+
+.chat-hud .hud-speech button {
+  padding: 2px 8px;
+  color: var(--hud-warning);
+}
+
+.chat-hud .hud-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px 12px;
+  border-top: 1px solid rgba(117, 202, 232, 0.24);
+}
+
+.chat-hud .hud-composer textarea {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  min-height: 56px;
+  max-height: 120px;
+  padding: 7px 9px;
+  resize: none;
+  overflow-y: auto;
+  user-select: text;
+}
+
+.chat-hud .hud-composer textarea::placeholder {
+  color: var(--hud-muted);
+  opacity: 1;
+}
+
+.chat-hud .hud-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.chat-hud .hud-toolbar select {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  height: 30px;
+  padding: 3px 4px;
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+
+.chat-hud .hud-toolbar .hud-model {
+  flex: 1.45 1 0;
+  font-family: 'Cascadia Code', Consolas, 'Microsoft YaHei UI', monospace;
+}
+
+/* 原生下拉菜单不能继承透明底，否则系统菜单里的文字不可读。 */
+.chat-hud select option,
+.chat-hud select optgroup {
+  color: #eaf5fa;
+  background: #102333;
+}
+
+.chat-hud .hud-send {
+  flex: none;
+  width: 32px;
+  height: 30px;
+  padding: 0;
+  border-color: var(--hud-edge);
+  color: var(--hud-edge);
+  font-size: 18px;
+  line-height: 1;
+}
+
+/* 唯一装饰：从面板底部中心连向宠物的短连接，不参与命中检测。 */
+.chat-hud .hud-anchor {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 22px;
+  height: 8px;
+  transform: translateX(-50%);
+  border-top: 1px solid var(--hud-edge);
+  pointer-events: none;
+}
+
+.chat-hud .hud-anchor::after {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 7px;
+  margin: 0 auto;
+  background: var(--hud-edge);
+  box-shadow: 0 0 4px rgba(117, 202, 232, 0.3);
+}
+
+.chat-hud :is(.hud-messages, .hud-process pre, textarea, .hud-error) {
+  scrollbar-width: thin;
+  scrollbar-color: #527589 transparent;
+}
+
+.chat-hud ::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.chat-hud ::-webkit-scrollbar-thumb {
+  background: #527589;
+  border-radius: 3px;
+}
+
+.chat-hud ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 管理区独立留在可见工作区；不套用会话暗色到文档、会议与语音授权组件。 */
+.pet-management {
+  position: absolute;
+  right: 16px;
+  top: 16px;
+  z-index: 90;
+  width: 430px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #91bbce;
+  border-radius: 12px;
+  background: rgba(245, 249, 252, 0.98);
+  box-shadow: 0 8px 28px rgba(16, 35, 51, 0.2);
+  color: #243b4b;
+  font: 13px/1.6 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  color-scheme: light;
+  user-select: text;
+}
+
+.pet-management .management-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #d6e5ed;
+  background: #eaf3f8;
+}
+
+.pet-management .management-header h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.pet-management .management-header button {
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #466173;
+  cursor: pointer;
+  font-size: 21px;
+}
+
+.pet-management .management-tabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid #d6e5ed;
+}
+
+.pet-management .management-tabs button {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #536d7e;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pet-management .management-tabs button[aria-current='page'] {
+  background: #dcecf4;
+  border-color: #a5c8d9;
+  color: #194b65;
+  font-weight: 600;
+}
+
+.pet-management .management-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9eb4c2 transparent;
+}
+
+.pet-management .management-general {
+  padding: 14px;
+}
+
+.pet-management .management-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.pet-management .management-section:last-child {
+  margin-bottom: 0;
+}
+
+.pet-management .management-section h3,
+.pet-management .management-page-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pet-management .management-page-title {
+  padding: 10px 12px 4px;
+}
+
+.pet-management .management-hint,
+.pet-management .management-diagnostic {
+  color: #526c7b;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.pet-management .management-content > .management-hint {
+  padding: 8px 12px;
+}
+
+.pet-management .management-diagnostic code {
+  font: 12px 'Cascadia Code', Consolas, monospace;
+  color: #243b4b;
+  user-select: text;
+}
+
+.pet-management .management-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pet-management .management-button {
+  align-self: flex-start;
+  padding: 5px 10px;
+  border: 1px solid #adc7d5;
+  border-radius: 6px;
+  background: #fff;
+  color: #24526b;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pet-management .management-sleep,
+.pet-management .management-voice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pet-management .management-sleep span {
+  flex: 1;
+  min-width: 0;
+}
+
+.pet-management .management-sleep input {
+  width: 64px;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid #adc7d5;
+  border-radius: 5px;
+  background: #fff;
+  color: #243b4b;
+  font: inherit;
+}
+
+.pet-management .management-voice input {
+  flex: none;
+  accent-color: #337b9a;
+}
+
+.pet-management .management-doc-results {
+  margin: 8px 12px 12px;
+  padding: 10px;
+  border: 1px solid #d6e5ed;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.pet-management .management-doc-results h4 {
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.pet-management .management-doc-log {
+  max-height: 160px;
+  overflow-y: auto;
+  margin-top: 8px;
+  scrollbar-width: thin;
+  user-select: text;
+}
+
+.pet-management .management-doc-log p {
+  padding: 6px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid #e3edf3;
+}
+
+.pet-management .management-doc-log p:last-child {
+  border-bottom: none;
+}
+
+.pet-management .management-doc-log .is-error {
+  color: #98400f;
+}
+
+/* 整页由管理容器滚动，保留业务组件内部的提纲、转写和纪要滚动区。 */
+.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) {
+  min-height: 0;
+  overflow: visible;
+}
+
+.pet-management .runtime-row {
+  border: 1px solid #d6e5ed;
+  border-radius: 7px;
+}
+
+.pet-management select option,
+.pet-management select optgroup {
+  background: #fff;
+  color: #243b4b;
+}
+
+.pet-management :is(.management-header button, .management-tabs button, .management-button):hover:not(:disabled) {
+  background: #dcecf4;
+  border-color: #91bbce;
+}
+
+.pet-management :is(button, input, select, textarea, summary):focus-visible {
+  outline: 2px solid #337b9a;
+  outline-offset: 2px;
+}
+
+.pet-management .management-button:disabled,
+.pet-management .management-sleep input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pet-management ::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.pet-management ::-webkit-scrollbar-thumb {
+  background: #9eb4c2;
+  border-radius: 3px;
+}
+
+.pet-management ::-webkit-scrollbar-track {
+  background: transparent;
+}

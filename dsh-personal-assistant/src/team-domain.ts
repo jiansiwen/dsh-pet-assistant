@@ -533,7 +533,7 @@ export class TeamStore {
       revision: current.revision + 1,
       updatedAt: Date.now(),
     }
-    this.db
+    const result = this.db
       .prepare(
         `UPDATE tasks SET owner_id = ?, status = ?, revision = ?, artifacts = ?, budget_tokens = ?, deadline_at = ?, updated_at = ?
          WHERE task_id = ? AND revision = ?`,
@@ -549,7 +549,7 @@ export class TeamStore {
         taskId,
         expectedRevision,
       )
-    return this.getTask(taskId)
+    return Number(result.changes) === 1 ? this.getTask(taskId) : null
   }
 
   /** 依赖环检查：写入前拒绝任何会形成环的依赖边。 */
@@ -596,10 +596,12 @@ export class TeamStore {
     this.db.prepare('UPDATE task_runs SET child_session_id = ? WHERE run_id = ?').run(childSessionId, runId)
   }
 
-  finishRun(runId: string, state: RunState, stopReason: string | null, outputDigest: string | null): void {
-    this.db
-      .prepare('UPDATE task_runs SET state = ?, stop_reason = ?, output_digest = ?, ended_at = ? WHERE run_id = ?')
+  /** 首次结算后不可被迟到的结果覆盖。 */
+  finishRun(runId: string, state: RunState, stopReason: string | null, outputDigest: string | null): boolean {
+    const result = this.db
+      .prepare("UPDATE task_runs SET state = ?, stop_reason = ?, output_digest = ?, ended_at = ? WHERE run_id = ? AND state = 'running'")
       .run(state, text(stopReason), text(outputDigest), Date.now(), runId)
+    return Number(result.changes) === 1
   }
 
   listRuns(taskId: string): TaskRun[] {
@@ -654,14 +656,17 @@ export class TeamStore {
    * 门禁查找：同一任务下、同一工具、同一作用目标、已获批准的提案，最新的一条。
    * 走 idx_proposals_gate；这是每次副作用工具调用前的热路径。
    */
-  findGateProposal(taskId: string, tool: string, target: string): ActionProposal | null {
+  findGateProposal(taskId: string, tool: string, target: string,
+    binding?: Pick<ActionProposal, 'assistantId' | 'inputRevision' | 'paramsDigest'>,
+  ): ActionProposal | null {
     const row = this.db
       .prepare(
         `SELECT * FROM action_proposals
           WHERE task_id = ? AND tool = ? AND target = ? AND state = 'approved'
+          ${binding ? 'AND assistant_id = ? AND input_revision = ? AND params_digest = ?' : ''}
           ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(taskId, tool, target) as Row | undefined
+      .get(taskId, tool, target, ...(binding ? [binding.assistantId, binding.inputRevision, binding.paramsDigest] : [])) as Row | undefined
     return row ? rowToProposal(row) : null
   }
 

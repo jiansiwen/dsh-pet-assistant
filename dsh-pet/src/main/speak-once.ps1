@@ -1,36 +1,28 @@
-# Offline fallback for one utterance: System.Speech synthesizes a wav, then
-# MCI-plays it, blocking until playback finishes. Killed process = interrupted.
-# Input text arrives base64-encoded so the file can stay pure ASCII
-# (PowerShell 5.1 parses BOM-less UTF-8 as GBK).
-
+﻿# 单句离线回退：先合成到文件，再复用播放器，任何阶段失败都返回非 0。
+# 文本通过 Base64 传入；文件保留 UTF-8 BOM，兼容 PowerShell 5.1。
 param([string]$B64, [string]$OutPath)
 
+$ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Add-Type -AssemblyName System.Speech
-Add-Type -Namespace WinMM -Name MCI -MemberDefinition '[DllImport("winmm.dll", CharSet = CharSet.Auto)] public static extern int mciSendString(string command, System.Text.StringBuilder buffer, int bufferSize, System.IntPtr hwndCallback);' | Out-Null
+$exitCode = 0
+try {
+    $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($B64))
+    Add-Type -AssemblyName System.Speech
+    $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+    try {
+        $synth.SetOutputToWaveFile($OutPath)
+        $synth.Speak($text)
+        $synth.SetOutputToNull()
+    } finally {
+        $synth.Dispose()
+    }
 
-function Send-Mci([string]$command) {
-    $buffer = New-Object System.Text.StringBuilder 256
-    [void][WinMM.MCI]::mciSendString($command, $buffer, 256, [System.IntPtr]::Zero)
-    return $buffer.ToString()
+    # 共享正确的 MCI 命令、返回码检查和设备释放逻辑，不再维护第二份播放器。
+    & (Join-Path $PSScriptRoot 'play.ps1') -Path $OutPath
+    $exitCode = $LASTEXITCODE
+} catch {
+    $exitCode = 1
 }
-
-$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($B64))
-
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.SetOutputToWaveFile($OutPath)
-$synth.Speak($text)
-$synth.SetOutputToNull()
-$synth.Dispose()
-
-$null = Send-Mci ('open "' + $OutPath + '" type waveaudio alias ttsseg')
-$null = Send-Mci ('ttsseg play')
-while ($true) {
-    Start-Sleep -Milliseconds 100
-    $mode = Send-Mci ('ttsseg status mode')
-    if ($mode -ne 'playing') { break }
-}
-$null = Send-Mci ('ttsseg close')
-exit 0
+exit $exitCode

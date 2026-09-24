@@ -1,0 +1,22 @@
+   10  import { SessionBridge } from './bridge.ts'
+   62  on(event: 'agent/status' | 'agent/disposed', listener: (payload: { agent: unknown; status?: string }) => void): unknown
+  173  // 会话桥接：宠物消息经 agent.followup 注入召唤它的那个会话，
+  175  const bridge = new SessionBridge({
+  194  bridge.onProactiveFeedback(kind => {
+  208  const pet = bridge.getPetState()
+  226  bridge.pushProactive(decision.message, decision.kind === 'suggest-disable')
+  241  bridge.attachReportApprovals(new ReportApprovalService(db, reports, {
+  242  epoch: bridge.epoch,
+  256  teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log })
+  267  bridge.detachTeam()
+  301  bridge,
+  325  // 会话桥接生命周期：agent 空闲时回传宠物消息的回复；会话销毁时通知宠物退场。
+  326  ctx.on('agent/status', payload => {
+  327  if (payload.status === 'idle') bridge.onAgentIdle(payload.agent)
+  329  ctx.on('agent/disposed', payload => {
+  330  bridge.onAgentDisposed(payload.agent)
+  333  ctx.effect(() => () => bridge.dispose(), 'personal-assistant:bridge')
+  367  bridge: SessionBridge
+  395  runtimeEpoch: deps.bridge.epoch,
+  424  unregisterTools = registerTeamTools(ctx as never, { team, approvals, bridge: deps.bridge })
+  429  deps.bridge.attachTeam(team, approvals)

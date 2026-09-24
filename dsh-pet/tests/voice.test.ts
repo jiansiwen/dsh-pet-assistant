@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { buildSsml, generateSecMsGec, synthesizeSpeech, type WebSocketFactory, type WebSocketLike } from '../src/main/edge-tts.ts'
-import { parseSenseVoiceText, trimSilence } from '../src/main/asr.ts'
+import { cleanSenseVoiceText, trimSilence } from '../src/main/asr.ts'
 import { encodeWav, frameRms, noiseBaseline, pcm16Base64, resampleTo16k, speechThreshold, arrayBufferToBase64, BASELINE_FRAMES } from '../src/renderer/dictation.ts'
 
 // ── edge-tts 协议 ──
@@ -83,6 +83,60 @@ test('合成：turn.end 先于任何音频 = 服务端拒绝，抛错而不是�
   await new Promise((resolve) => setTimeout(resolve, 0))
   deliver('Path:turn.end')
   await assert.rejects(pending, /未返回音频/)
+})
+
+test('默认合成在请求前取消时不创建连接', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(synthesizeSpeech(
+    { text: '不应发出', voice: 'zh-CN-XiaoxiaoNeural', rate: '+0%', pitch: '+0Hz', signal: controller.signal },
+    { webSocketFactory: () => { throw new Error('不应创建连接') } },
+  ), { name: 'AbortError' })
+})
+
+for (const phase of ['连接前', '收到部分音频'] as const) {
+  test(`默认合成${phase}取消会关闭连接，迟到事件不恢复请求`, async () => {
+    const handlers = new Map<string, (event?: unknown) => void>()
+    let closed = 0
+    let sent = 0
+    const factory: WebSocketFactory = () => ({
+      addEventListener(type, listener) { handlers.set(type, listener as (event?: unknown) => void) },
+      send() { sent++ },
+      close() { closed++; handlers.get('close')?.() },
+    })
+    const controller = new AbortController()
+    const pending = synthesizeSpeech(
+      { text: '取消这段语音', voice: 'zh-CN-XiaoxiaoNeural', rate: '+0%', pitch: '+0Hz', signal: controller.signal },
+      { webSocketFactory: factory },
+    )
+    if (phase === '收到部分音频') {
+      handlers.get('open')?.()
+      handlers.get('message')?.({ data: Buffer.from([0, 0, 1, 2, 3]) })
+    }
+    const previous = sent
+    controller.abort()
+    await assert.rejects(pending, /已取消/)
+    handlers.get('open')?.()
+    handlers.get('message')?.({ data: 'Path:turn.end' })
+    assert.equal(closed, 1)
+    assert.equal(sent, previous)
+  })
+}
+
+test('默认合成连接提前关闭不能将半截音频当成功', async () => {
+  const handlers = new Map<string, (event?: unknown) => void>()
+  const factory: WebSocketFactory = () => ({
+    addEventListener(type, listener) { handlers.set(type, listener as (event?: unknown) => void) },
+    send() {},
+    close() {},
+  })
+  const pending = synthesizeSpeech(
+    { text: '还没讲完', voice: 'zh-CN-XiaoxiaoNeural', rate: '+0%', pitch: '+0Hz' },
+    { webSocketFactory: factory },
+  )
+  handlers.get('message')?.({ data: Buffer.from([0, 0, 1, 2, 3]) })
+  handlers.get('close')?.()
+  await assert.rejects(pending, /合成完成前关闭/)
 })
 
 // ── wav 静音裁剪 ──
@@ -173,12 +227,16 @@ test('裁静音：解析不动的字节原样返回，不猜', () => {
   assert.deepEqual(trimSilence(junk), junk)
 })
 
-test('SenseVoice 输出解析：v1.13+ 的 JSON 行优先，旧 Text: 行兜底', () => {
-  const jsonOut = '----\nnum threads: 2\n{"lang": "<|zh|>", "emotion": "<|NEUTRAL|>", "text": "今天下午三点开会请提前准备会议材料", "timestamps": [0.18]}\n'
-  assert.equal(parseSenseVoiceText(jsonOut), '今天下午三点开会请提前准备会议材料')
-  assert.equal(parseSenseVoiceText('Text: 今天| 1|天气| 2|不错| 3|'), '今天 天气 不错')
-  assert.equal(parseSenseVoiceText('{"text": "| 3|"}'), null, '只剩时间戳标记等于没听到')
-  assert.equal(parseSenseVoiceText('没有任何输出'), null)
+test('SenseVoice 文本清洗：去掉时间戳标记，只剩标记等于没听到', () => {
+  // 旧实现是解析 `sherpa-onnx-offline.exe` 的 stdout（JSON 行 / 旧 Text: 行两种格式），
+  // 现在改成进程内调 Node API，那层 stdout 解析连同 `.exe` 一起删掉了 —— 结果对象直接有
+  // `text` 字段，不用猜格式。留下的只有"清洗"这一步，它仍然必要：
+  // SenseVoice 会把时间戳标记（`| 1|`）混在正文里。
+  assert.equal(cleanSenseVoiceText('今天下午三点开会请提前准备会议材料'), '今天下午三点开会请提前准备会议材料')
+  assert.equal(cleanSenseVoiceText('今天| 1|天气| 2|不错| 3|'), '今天 天气 不错')
+  assert.equal(cleanSenseVoiceText('| 3|'), null, '只剩时间戳标记等于没听到')
+  assert.equal(cleanSenseVoiceText('   '), null)
+  assert.equal(cleanSenseVoiceText('|1.00|真的吗'), '真的吗')
 })
 
 // ── 渲染层录音 ──

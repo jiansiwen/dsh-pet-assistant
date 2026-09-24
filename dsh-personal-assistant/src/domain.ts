@@ -12,7 +12,7 @@ export const activitySpanSchema = z.object({
   end: z.number(),
   /** 前台进程名。 */
   app: z.string(),
-  /** 分类：chat/browser/document/dev/meeting/ai/terminal/idle/other。 */
+  /** 分类：chat/browser/document/dev/meeting/ai/terminal/idle/no-input/excluded/other；no-input不代表离席。 */
   category: z.string(),
   /** 提取后的有效标题（文档名/网页标题/聊天对象等）。 */
   title: z.string(),
@@ -83,6 +83,8 @@ export const modeStateSchema = z.object({
   active: z.boolean(),
   startedAt: z.number(),
   pid: z.number().optional(),
+  /** 运行时对标题采集的覆盖；缺省沿用插件配置。撤销标题授权后立即生效并重启采样。 */
+  captureTitles: z.boolean().optional(),
 })
 export type ModeState = z.infer<typeof modeStateSchema>
 

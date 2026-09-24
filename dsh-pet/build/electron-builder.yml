@@ -1,0 +1,64 @@
+# macOS 打包配置：权限声明与签名能力。
+#
+# 这个文件**不是可选的**。macOS 10.14+ 起：
+#
+#   应用访问麦克风必须在 Info.plist 里声明 `NSMicrophoneUsageDescription`，
+#   否则调用 `getUserMedia` 时系统会**直接终止进程** —— 不是返回错误、不是弹窗拒绝，
+#   是进程消失。用户看到的是"宠物点一下说话就没了"，而日志里什么都留不下。
+#
+# 用法（在 dsh-pet 目录）：
+#   npx electron-builder --mac --config build/electron-builder.yml
+#
+# 注意：**开发态直接 `pnpm start` 不走这里**。那时进程是 `Electron.app`，
+# 麦克风权限取决于 Electron 自己的 Info.plist（它已声明了麦克风用途），
+# 所以开发时能说话。只有打包成独立 .app 之后才必须有这份配置。
+
+appId: com.dsh.pet
+productName: dsh 桌面助理团
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - package.json
+  # 语音脚本与模型目录：.ps1 在 macOS 上用不到，但 wake.ps1 / play.ps1 等
+  # 是 build.mjs 的拷贝目标，少一个不会崩（运行时会走平台分支），留着也不碍事。
+  - '!**/*.map'
+
+extraResources:
+  # 素材走 resources 而不是 asar：逐帧探测要按真实路径读文件，
+  # 打进 asar 之后 fs 读不到（Electron 的 asar 补丁能读，但路径语义会变）。
+  - from: assets
+    to: assets
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  # 宠物要常驻桌面，不需要 Dock 图标（代码里也会调 app.dock.hide()，
+  # LSUIElement 让它在 Dock 里从启动那一刻就不出现，避免闪一下）。
+  extendInfo:
+    LSUIElement: true
+    NSMicrophoneUsageDescription: 桌面助理需要麦克风来听你说话（语音唤醒与按键听写）。录音只在本机处理，不上传任何音频。
+    NSCameraUsageDescription: 桌面助理不使用摄像头；这一项仅为满足系统对媒体权限的完整性检查。
+    NSAppleEventsUsageDescription: 桌面助理需要它来读取前台应用信息，用于生成你的活动记录（仅在你开启「活动记录」后）。
+  # 硬件访问能力。没有 audio-input，即使声明了用途说明也拿不到麦克风。
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  # Windows 上麦克风权限由系统隐私设置管，不需要 Info.plist 那样的声明。
+
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+  category: Utility

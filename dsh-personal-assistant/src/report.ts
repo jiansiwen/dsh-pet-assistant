@@ -133,6 +133,10 @@ export class ReportStore {
   saveDraft(reportId: string, content: string, now: number): ReportRevision {
     return inTransaction(this.db, () => {
       const latest = this.current(reportId)
+      // 文件发布是异步的：从作业登记到收尾期间锁住改稿，避免旧版 rename 覆盖新版。
+      if (this.db.prepare("SELECT 1 FROM publish_jobs WHERE report_id = ? AND state = 'running'").get(reportId)) {
+        throw new Error('日报正在发布或等待恢复核对，暂时不能修改；不会自动重发')
+      }
       const revision = (latest?.revision ?? 0) + 1
       if (latest && latest.state !== 'revoked' && latest.state !== 'archived') {
         this.markRevoked(reportId, latest.revision, '内容已更新，旧版本的确认随之作废')
@@ -268,13 +272,20 @@ export class ReportStore {
   beginPublish(operationId: string, record: ReportRevision, now: number): PublishJob | null {
     if (record.state !== 'approved') return null
     return inTransaction(this.db, () => {
+      // 不信调用方缓存的 approved：重复点击、旧版本与目标占用都在真实执行点拦住。
+      const current = this.current(record.reportId)
+      if (!current || current.revision !== record.revision || current.state !== 'approved'
+        || !current.targetPath || current.targetPath !== record.targetPath
+        || current.digest !== record.digest || sha256(current.content) !== record.digest) return null
+      if (this.job(operationId)) return null
+      if (this.db.prepare("SELECT 1 FROM publish_jobs WHERE target_path = ? AND state = 'running'").get(current.targetPath)) return null
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO publish_jobs
+          `INSERT INTO publish_jobs
              (operation_id, report_id, revision, target_path, digest, state, started_at)
            VALUES (?, ?, ?, ?, ?, 'running', ?)`,
         )
-        .run(operationId, record.reportId, record.revision, record.targetPath ?? '', record.digest, now)
+        .run(operationId, record.reportId, record.revision, current.targetPath, record.digest, now)
       this.db
         .prepare(`UPDATE reports SET state = 'publishing' WHERE report_id = ? AND revision = ?`)
         .run(record.reportId, record.revision)
@@ -361,8 +372,8 @@ export async function publishRevisionFile(
   revision: number,
 ): Promise<PublishOutcome> {
   const tempPath = tempPathFor(targetPath, revision)
-  await mkdir(path.dirname(targetPath), { recursive: true })
   try {
+    await mkdir(path.dirname(targetPath), { recursive: true })
     await writeFile(tempPath, content, 'utf8')
   } catch (error) {
     return { ok: false, reason: 'write_failed', message: describe(error) }

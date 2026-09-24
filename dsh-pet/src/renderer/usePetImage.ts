@@ -99,9 +99,34 @@ export type SkinImages = Partial<Record<SkinImageKey, string>>
 
 const fileFor = (skin: string, key: SkinImageKey) => (key === 'idle' ? `${skin}.png` : `${skin}-${key}.png`)
 
-/** 可能有绿幕视频序列帧的动作（含拖拽专用的 grab）。 */
-const FRAME_ACTIONS = ['idle', 'walk', 'read', 'play', 'lie', 'write', 'jump', 'wave', 'sleep', 'grab'] as const
-const FRAME_MAX = 64
+/**
+ * 可能有绿幕视频序列帧的动作（含拖拽专用的 grab / drop）。
+ *
+ * `laptop-in` / `laptop-out` 是「操作电脑」弧线里的两段过渡：
+ * 坐下掏电脑 / 笑+合上+伸懒腰。带短横线是刻意的 ——
+ * 路径按 `frames/<skin>/<action>/fNNN.png` 拼，动作名不参与别处解析。
+ */
+export const FRAME_ACTIONS = [
+  'idle', 'walk', 'read', 'play', 'lie', 'write', 'jump', 'wave', 'sleep', 'grab', 'drop',
+  'think', 'laptop-in', 'laptop-out',
+  // 打盹三步：躺下 → 睡（循环）→ 起身。三段同源同尺度，接在一起不会一大一小。
+  'sleep-in', 'sleep-loop', 'sleep-out',
+  // 走路收步：3 帧，走姿 → 站定。走到目标时插在 walk 与 idle 之间，消除硬切。
+  'walk-stop',
+] as const
+
+/**
+ * 每动作最多探测的帧数。导出供测试断言探测次数，避免测试里再抄一份常量。
+ *
+ * 原为 64：64 帧 @10fps 只能播 2.13 秒，导致素材被压到 50~60 帧、
+ * 长动作（如 8 秒的灵动待机）被迫抽帧到 64 帧，眨眼等短动作随之被压缩。
+ * 提高到 96 后可容纳 9.6 秒 @10fps，动作可按完整时长出片。
+ *
+ * 探测按连续前缀截断（探到 f001 起，遇到第一个缺失即停），
+ * 因此实际帧数少于 96 时不会产生额外请求。
+ * 代价：满载时每皮肤最多 10×96=960 次图片加载（原 640 次）。
+ */
+export const FRAME_MAX = 96
 
 const frameUrl = (skin: string, action: string, n: number) =>
   `../assets/pets/frames/${skin}/${action}/f${String(n).padStart(3, '0')}.png`
@@ -118,7 +143,7 @@ const framesCache = new Map<string, Promise<SkinFrames>>()
  * 话三个 effect 会在同一轮里同时 miss，照样读三遍盘、跑三遍漫水填充抠图；缓存 Promise
  * 才能让后两个直接挂到第一个的在途请求上。
  *
- * 序列帧探测的代价是每皮肤最多 10×64=640 次图片加载，panda 三份就是 1920 次。
+ * 序列帧探测的代价是每皮肤最多 10×96=960 次图片加载，panda 三份就是 2880 次。
  */
 export function loadSkinImages(skin: string): Promise<SkinImages> {
   const cached = imagesCache.get(skin)

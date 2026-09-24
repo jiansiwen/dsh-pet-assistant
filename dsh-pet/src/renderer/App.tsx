@@ -2,17 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import TeamStage, { type TeamStageHandle } from './TeamStage.js'
 import TeamPanel from './TeamPanel.js'
 import DocPanel from './DocPanel.js'
+import MeetingPanel from './meeting-panel.js'
+import VoiceApiSettings from './VoiceApiSettings.js'
+import ChatOverlay from './ChatOverlay.js'
+import PetSettingsPanel from './PetSettingsPanel.js'
+import { useSession } from './useSession.js'
 import {
   clearStageHitboxes,
   hitTest,
+  isWorking,
   projectTaskStatuses,
-  registerPanelHitbox,
+  stageHitboxes,
   type ExitStage,
   type StageMember,
   type StageTaskStatus,
 } from './stage-layout.js'
 import { manifestFor, manifestForLegacySkin } from './character-manifest.js'
-import { PET_WIDTH, STAGE_MARGIN } from './pet-metrics.js'
 import { PROACTIVE_ACCEPT_MESSAGE } from './proactive-ui.js'
 import { arrayBufferToBase64, pcm16Base64, recordDictation, stopDictation } from './dictation.js'
 import { approvalBanner } from './team-panel.js'
@@ -26,6 +31,7 @@ import type {
   DocRoots,
   DocState,
   PetPosition,
+  SettingsPage,
   SkinOverrides,
   SpeechStatus,
   TeamProposalSnapshot,
@@ -34,14 +40,18 @@ import type {
 import './pet-anim.css'
 import './portal.css'
 import './team.css'
-
-interface Message {
-  role: 'user' | 'assistant'
-  text: string
-  error?: boolean
-}
+import './hud.css'
 
 const QUICK_COMMANDS = ['开启个人助理模式', '我今天干了啥？', '总结今日工作内容']
+
+/**
+ * 宠物界面的构建标识，显示在通用设置的诊断区。
+ *
+ * 有个说不清的显示问题时，第一件要排除的事就是「跑的是不是这个构建」——
+ * 插件与宠物都是**进程内加载 + 模块缓存**，重建磁盘文件对已运行的进程毫无影响。
+ * 看一眼这个标记就知道，不用再靠猜。
+ */
+const UI_BUILD = '0923-hud1'
 
 /** 语音唤醒命中时的应答。角色被隐藏时这句要等舞台挂回来再补说，所以提成常量。 */
 const WAKE_GREETING = '我在呢！找我什么事？'
@@ -64,10 +74,9 @@ function speechErrorText(code: string): string {
   return `${text}（${code}），这一轮只显示文字`
 }
 
-/** 面板宽度。定位夹边用它；高度是内容驱动的，命中盒靠实测，所以这里只有一个常量。 */
-const PANEL_WIDTH = 388
-
 export default function App() {
+  const mirror = useSession()
+  const { session } = mirror
   const [pet, setPet] = useState('panda')
   /**
    * 用户在本机为每个角色挑的形象，键是 assistantId。
@@ -77,20 +86,19 @@ export default function App() {
    */
   const [characters, setCharacters] = useState<SkinOverrides>({})
   const [panelOpen, setPanelOpen] = useState(false)
-  /**
-   * 面板当前停在哪一页。
-   *
-   * 对话页回答"我刚才那句话有没有人接"，团队页回答"今天谁在做什么、哪件事卡在我这儿"。
-   * 分成两页是因为面板高度是 max-height 500 的硬预算：任务列表和消息区都要伸缩，
-   * 挤在一页里的话被裁掉的是输入框——面板最不能没有的东西。
-   * 默认是对话页，那是用户点开面板时最常在做的动作。
-   */
-  const [panelTab, setPanelTab] = useState<'chat' | 'team' | 'doc'>('chat')
-  const [panelPos, setPanelPos] = useState<PetPosition | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
+  /** 管理页与会话显隐独立，切页不影响输入草稿或后台任务。 */
+  const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null)
+  const [delegateId, setDelegateId] = useState('')
+  const [delegateText, setDelegateText] = useState('')
+  const [delegating, setDelegating] = useState(false)
+  const [delegateResult, setDelegateResult] = useState('')
   const [input, setInput] = useState('')
+  /** 仅锁住提交到回执这段时间，不锁住原生会话的整个运行周期。 */
   const [busy, setBusy] = useState(false)
   const [listening, setListening] = useState(false)
+  const [voiceConversation, setVoiceConversation] = useState(false)
+  const listeningRef = useRef(false)
+  const busyRef = useRef(false)
   /** 角色是不是正在念回答。念的时候面板上要给一个能让它闭嘴的按钮。 */
   const [speech, setSpeech] = useState<SpeechStatus>({ speaking: false })
   /**
@@ -103,8 +111,9 @@ export default function App() {
   const [docState, setDocState] = useState<DocState>({ kind: 'idle' })
   const [docRoots, setDocRoots] = useState<DocRoots>({ roots: [], recent: [] })
   const [docBusy, setDocBusy] = useState(false)
-  const [assistantActive, setAssistantActive] = useState(false)
+  const [docResults, setDocResults] = useState<Array<{ text: string; error: boolean }>>([])
   const [toast, setToast] = useState('')
+  const toastTimer = useRef(0)
 
   /** 团队编制。null 表示桥接还没给过数据 —— 那时按旧的单宠物模式渲染一个角色。 */
   const [members, setMembers] = useState<StageMember[] | null>(null)
@@ -113,8 +122,6 @@ export default function App() {
   const [statusByAssistant, setStatusByAssistant] = useState<Record<string, StageTaskStatus>>({})
   /** 待批准的副作用提案。这是唯一必须用户点头才能继续的事，要在面板里显眼。 */
   const [proposals, setProposals] = useState<TeamProposalSnapshot[]>([])
-  /** 团队模式是否开启。关闭时不显示成员与审批区，界面退回单助理形态。 */
-  const [teamEnabled, setTeamEnabled] = useState(false)
   /**
    * 整份团队快照，给团队页用。
    *
@@ -138,9 +145,9 @@ export default function App() {
   const positionsRef = useRef(positions)
   positionsRef.current = positions
 
-  const listRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const interactiveRef = useRef(false)
+  const dragCleanupRef = useRef<(() => void) | null>(null)
   /** 最近一次鼠标位置：角色会自己走动，不能只在 mousemove 时判断命中。 */
   const lastMouseRef = useRef({ x: -1, y: -1 })
   /** 唤醒去抖：连续识别到唤醒词时只响应一次。 */
@@ -174,11 +181,19 @@ export default function App() {
     return found ?? cast[0] ?? null
   }, [cast, selectedId])
 
-  /** 面板标题跟着选中的角色走：名字与身份色标都取自同一份清单，避免两处各写一份。 */
-  const selectedManifest = useMemo(
-    () => (selectedMember ? manifestFor(selectedMember, characters) : null),
-    [selectedMember, characters],
-  )
+  const wakeConversation = useCallback((event: React.SyntheticEvent) => {
+    if (selectedMember && event.target instanceof Element && event.target.closest('.chat-hud')) {
+      stageRef.current?.wakeOf(selectedMember.assistantId)
+    }
+  }, [selectedMember])
+
+  /** 会话只临时补充选中角色的工作状态；已有团队任务优先，结束后恢复原投影。 */
+  const stageStatuses = useMemo(() => {
+    if (!selectedMember || (session?.status !== 'running' && session?.status !== 'waiting')) return statusByAssistant
+    const who = selectedMember.assistantId
+    if (isWorking(statusByAssistant[who])) return statusByAssistant
+    return { ...statusByAssistant, [who]: session.status === 'waiting' ? 'awaiting-user' as const : 'running' as const }
+  }, [selectedMember, session?.status, statusByAssistant])
 
   // ---- 退场编排（时间线见 portal.css 顶部注释，总长 4.3s）----
   // none → wave（挥手拜拜）→ turn（转身）→ jump（跳入通道）→ gone（消失，通道消散）
@@ -215,7 +230,9 @@ export default function App() {
   useEffect(() => {
     void window.petApi.getState().then((state) => {
       setPet(state.pet)
+      setVoiceConversation(state.voiceConversation === true)
       setCharacters(state.characters ?? {})
+      setSleepSettings({ idleSleepMinutes: state.idleSleepMinutes ?? 2, sleepMinutes: state.sleepMinutes ?? 20 })
       if (state.positions && Object.keys(state.positions).length > 0) {
         setPositions(state.positions)
         positionsRef.current = state.positions
@@ -232,16 +249,6 @@ export default function App() {
   }, [])
 
   /**
-   * 消息区滚到底。
-   *
-   * `panelTab` 也在依赖里：切到团队页时消息区整块被卸载，切回来那是个新的 DOM 元素、
-   * scrollTop 归零。不重滚一次的话，用户从团队页切回来看到的是对话开头，而不是最新那一句。
-   */
-  useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
-  }, [messages, busy, panelTab])
-
-  /**
    * 应用一次团队快照。
    *
    * 快照是唯一权威：事件只用来触发"该重新看一眼了"，不用来逐字段改状态。
@@ -250,7 +257,6 @@ export default function App() {
    */
   const applySnapshot = useCallback((next: TeamSnapshot) => {
     setSnapshot(next)
-    setTeamEnabled(next.team === true)
     const roster = next.members ?? []
     // 团队没开或编制为空时交回 null，让 cast 退回降级单角色，桌面上不会空无一人。
     setMembers(roster.length > 0 ? roster : null)
@@ -283,7 +289,7 @@ export default function App() {
         if (payload) applySnapshot(payload)
         return
       }
-      // 回复类事件由 chat() 的等待逻辑处理；流式增量尤其频繁，拿它触发重拉纯属浪费。
+      // 回复由会话镜像同步，不用高频正文事件触发团队重拉。
       if (event.type === 'reply' || event.type.startsWith('reply/') || event.type === 'session-ended') return
       requestRefresh()
     })
@@ -291,13 +297,25 @@ export default function App() {
   }, [applySnapshot, requestRefresh])
 
   const showToast = useCallback((text: string) => {
+    window.clearTimeout(toastTimer.current)
     setToast(text)
-    setTimeout(() => setToast(''), 4000)
+    toastTimer.current = window.setTimeout(() => setToast(''), 4000)
   }, [])
 
-  const handleSelect = useCallback((assistantId: string, position: PetPosition) => {
+  useEffect(() => {
+    const stopSettings = window.petApi.onSettingsOpen(setSettingsPage)
+    const stopDismiss = window.petApi.onOverlayDismiss(() => setPanelOpen(false))
+    const stopError = window.petApi.onOverlayError(showToast)
+    return () => { stopSettings(); stopDismiss(); stopError(); window.clearTimeout(toastTimer.current) }
+  }, [showToast])
+
+  useEffect(() => {
+    if (mirror.error) showToast(mirror.error)
+  }, [mirror.error, showToast])
+
+  // 选宠物只切换舞台锚点，不改变原生会话绑定或发送对象。
+  const handleSelect = useCallback((assistantId: string) => {
     setSelectedId(assistantId)
-    setPanelPos(position)
   }, [])
 
   const handlePersist = useCallback((assistantId: string, x: number, y: number) => {
@@ -308,67 +326,69 @@ export default function App() {
   }, [])
 
   /**
-   * 点名策略：选中总助理时**不**传 assistantId。
-   *
-   * 总助理走的是主会话直连路径（agent.followup），"开启个人助理模式""总结今日工作"这些
-   * 既有能力都在这条路上。点名会让它绕去建任务、起子代理 —— 对一个简单的开关指令来说
-   * 纯属绕远，还会让这些指令的表现和改造前不一致。专家才需要委派。
-   *
-   * 判据是 `roleId === 'tangseng'`，不是"编制里第一个"：数组顺序是数据库读出来的，
-   * 换个查询就可能变，而 roleId 是成员的稳定语义标识。
-   */
-  const targetAssistantId = useMemo(() => {
-    if (!teamEnabled || !selectedMember) return undefined
-    return selectedMember.roleId === 'tangseng' ? undefined : selectedMember.assistantId
-  }, [teamEnabled, selectedMember])
-
-  /**
    * 这一轮的输入是不是从麦克风来的。
    *
    * 只有语音发起的那一轮回答才念出来 —— 打字问的话突然出声，是用户没要求过的行为。
    * 用 ref 而不是 state：它只在 send 那一刻被读一次，不值得为它触发一次重渲染。
    */
   const voiceRoundRef = useRef(false)
+  const [sleepSettings, setSleepSettings] = useState({ idleSleepMinutes: 2, sleepMinutes: 20 })
+  const [savingSleep, setSavingSleep] = useState(false)
+  /** 隐藏或卸载后忽略迟到的听写结果，不自动提交或重开会话。 */
+  const dictationCancelled = useRef(false)
+  /** 语音识别流式增量的累积文本；最终文本以 asrTranscribe 返回值为准。 */
+  const asrDeltaText = useRef('')
+  const saveSleep = useCallback(async (key: 'idleSleepMinutes' | 'sleepMinutes', value: number) => {
+    if (!Number.isInteger(value) || value < 1 || value > 120) { showToast('请输入 1–120 之间的整数分钟'); return }
+    setSavingSleep(true)
+    try {
+      const result = await window.petApi.saveSettings({ [key]: value })
+      if (result.ok) setSleepSettings(previous => ({ ...previous, [key]: value }))
+      else showToast('睡眠设置未保存')
+    } catch { showToast('睡眠设置未保存') }
+    finally { setSavingSleep(false) }
+  }, [showToast])
 
   const send = useCallback(
-    async (raw: string, assistantIdOverride?: string) => {
+    async (raw: string) => {
       const text = raw.trim()
-      if (!text || busy) return
+      if (!text || busyRef.current) return
+      setPanelOpen(true)
+      const restoreDraft = () => setInput(draft => !draft || draft.trim() === text ? raw : `${raw}\n${draft}`)
+      if (!session?.capabilities.prompt) {
+        restoreDraft()
+        showToast('当前会话暂不能发送，请连接原生 dsh 后重试')
+        return
+      }
+      busyRef.current = true
+      setBusy(true)
       const spoken = voiceRoundRef.current
       voiceRoundRef.current = false
-      setInput('')
-      setMessages((prev) => [...prev, { role: 'user', text }])
-      setBusy(true)
+      // 快捷命令不清除尚未提交的其他草稿；消息只从原生镜像进入界面。
+      setInput(draft => draft.trim() === text ? '' : draft)
       try {
-        // 主动提醒的「好」要发给总助理而不是当前选中的专家：提醒是唐僧的职责（§2.2），
-        // 用户顺手选中了悟空也不该让这句话被点名带跑。
-        const result = await window.petApi.chat(text, assistantIdOverride ?? targetAssistantId, spoken)
-        if (result.ok) {
-          setMessages((prev) => [...prev, { role: 'assistant', text: result.reply || '（无回复）' }])
-          if (/记一下|帮我记|记录/.test(text)) {
-            const who = selectedId ?? cast[0]?.assistantId
-            if (who) stageRef.current?.writeOf(who)
-          }
-          if (/开启/.test(text) && /已开启|开始记录/.test(result.reply ?? '')) setAssistantActive(true)
-          if (/已退出|已关闭/.test(result.reply ?? '')) setAssistantActive(false)
-        } else {
-          setMessages((prev) => [...prev, { role: 'assistant', text: `出错了：${result.error}`, error: true }])
+        const result = await mirror.command({ kind: 'prompt', bindingId: session.bindingId, text, spoken })
+        if (result.notice) showToast(result.notice)
+        if (!result.ok) {
+          restoreDraft()
+          showToast(result.error ?? '消息未提交，请重试')
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        setMessages((prev) => [...prev, { role: 'assistant', text: `出错了：${message}`, error: true }])
+        restoreDraft()
+        showToast(error instanceof Error ? error.message : String(error))
       } finally {
+        busyRef.current = false
         setBusy(false)
       }
     },
-    [busy, selectedId, cast, targetAssistantId],
+    [session?.bindingId, session?.capabilities.prompt, mirror.command, showToast],
   )
 
   /** 主动提醒气泡上的点选（§2.7）：先撤气泡再回执，「好」把用户带进帮助流程。 */
   const handleProactive = useCallback((kind: 'accept' | 'decline' | 'disable') => {
     setProactive(null)
     window.petApi.respondProactive(kind)
-    if (kind === 'accept') void send(PROACTIVE_ACCEPT_MESSAGE, undefined)
+    if (kind === 'accept') { voiceRoundRef.current = false; void send(PROACTIVE_ACCEPT_MESSAGE) }
   }, [send])
 
   /**
@@ -390,7 +410,7 @@ export default function App() {
     [showToast],
   )
 
-  /** 对话页上那条紧凑提示。完整列表在团队页，这里只负责让人打字时也知道有东西在等。 */
+  /** 团队管理页顶部的待批摘要；实际审批仍在主进程专用窗口完成。 */
   const banner = useMemo(() => approvalBanner(proposals), [proposals])
 
   /**
@@ -407,15 +427,25 @@ export default function App() {
     [snapshot],
   )
 
-  const startListen = useCallback(async () => {
-    // 录音中再点一次 = 手动停止：立刻收尾，已录到的话照常转写。
-    if (listening) {
-      stopDictation()
+  const startListen = useCallback(async (autoSend = false) => {
+    if (listeningRef.current) {
+      if (!autoSend) stopDictation()
       return
     }
-    if (busy) return
+    if (busyRef.current && !autoSend) return
+    listeningRef.current = true
+    dictationCancelled.current = false
+    window.petApi.stopSpeech()
     setListening(true)
-    // 🔴 必须灭：无论录音还是转写哪一步抛错，finally 都会把状态收回来。
+    asrDeltaText.current = ''
+    const accept = async (text: string): Promise<void> => {
+      if (dictationCancelled.current) return
+      voiceRoundRef.current = true
+      setInput(text)
+      if (autoSend && !busyRef.current) void send(text)
+      else if (autoSend) showToast('上一条消息尚未提交完成，语音已保留在输入框，请稍后发送')
+    }
+    // 无论录音还是转写哪一步抛错，finally 都会把状态收回来。
     // 红灯在申请仲裁前就亮：双击的第二下会走进上面的停止分支，而不是发出第二个请求。
     try {
       const granted = await window.petApi.asrBegin()
@@ -423,52 +453,60 @@ export default function App() {
         showToast(granted.error || '麦克风正被占用')
         return
       }
+      if (dictationCancelled.current) {
+        if (granted.streaming) await window.petApi.asrStreamStop()
+        else await window.petApi.asrTranscribe('')
+        return
+      }
       // 流式模式：每帧 PCM 送给主进程的流式识别器，部分文本实时回显输入框——
       // 说一个字出一个字。喂数串行化（并发 invoke 会乱序）；单帧失败不影响最终收尾。
       const streaming = granted.streaming === true
       let feedChain: Promise<void> = Promise.resolve()
-      const { wav, error } = await recordDictation(
-        streaming
-          ? {
-              onChunk: (pcm16k) => {
-                feedChain = feedChain
-                  .then(() => window.petApi.asrStreamFeed(pcm16Base64(pcm16k)))
-                  .then((partial) => {
-                    if (partial.text) setInput(partial.text)
-                  })
-                  .catch(() => undefined)
-              },
-            }
-          : {},
-      )
+      const { wav, error } = await recordDictation({
+        onChunk: (pcm16k) => {
+          // 若隐藏发生在申请麦克风期间，首个音频帧也要补停，不能重新开始听写。
+          if (dictationCancelled.current) { stopDictation(); return }
+          if (!streaming) return
+          feedChain = feedChain
+            .then(() => dictationCancelled.current ? { text: '' } : window.petApi.asrStreamFeed(pcm16Base64(pcm16k)))
+            .then((partial) => {
+              if (partial.text && !dictationCancelled.current) setInput(partial.text)
+            })
+            .catch(() => undefined)
+        },
+      })
+      if (dictationCancelled.current) {
+        await feedChain
+        if (streaming) await window.petApi.asrStreamStop()
+        else await window.petApi.asrTranscribe('')
+        return
+      }
       if (streaming) {
         // 双模型接力：流式文本**立即**上屏（体验），随后同一份录音交给 SenseVoice
         // 整句精修（准确），精修结果非空则无感替换。两个模型都在本地。
+        await feedChain
         const partial = await window.petApi.asrStreamStop()
+        if (dictationCancelled.current) return
         if (partial.text) {
           voiceRoundRef.current = true
           setInput(partial.text)
         }
         if (wav === null) {
-          if (!partial.text) showToast('没有听到说话内容，请靠近麦克风再说一次')
+          if (partial.text) await accept(partial.text)
+          else showToast('没有听到说话内容，请靠近麦克风再说一次')
           return
         }
         const refined = await window.petApi.asrTranscribe(arrayBufferToBase64(wav))
-        if (refined.ok && refined.text) {
-          voiceRoundRef.current = true
-          setInput(refined.text)
-        } else if (!partial.text) {
-          showToast(refined.error || '未识别到语音内容')
-        }
+        if (refined.ok && refined.text) await accept(refined.text)
+        else if (partial.text) await accept(partial.text)
+        else showToast(refined.error || '未识别到语音内容')
         return
       }
       if (wav !== null) {
         // 整句回退路径（流式模型没装）：wav 在渲染层转 base64 后交给主进程识别。
         const result = await window.petApi.asrTranscribe(arrayBufferToBase64(wav))
         if (result.ok && result.text) {
-          // 这一轮是用户开口问的，回答该念出来。识别失败不置 —— 那之后他是打字。
-          voiceRoundRef.current = true
-          setInput((prev) => (prev + result.text).trim())
+          await accept(result.text)
         } else {
           showToast(result.error || '未识别到语音内容')
         }
@@ -483,8 +521,7 @@ export default function App() {
         showToast(error)
         const result = await window.petApi.asrRecordFallback()
         if (result.ok && result.text) {
-          voiceRoundRef.current = true
-          setInput((prev) => (prev + result.text).trim())
+          await accept(result.text)
         } else if (result.error) {
           showToast(result.error)
         } else {
@@ -498,65 +535,76 @@ export default function App() {
       void window.petApi.asrTranscribe('')
       showToast(error instanceof Error ? error.message : '语音输入出错，请重试')
     } finally {
+      listeningRef.current = false
       setListening(false)
     }
-  }, [listening, busy, showToast])
+  }, [send, showToast])
 
   const onDragStart = useCallback((event: React.MouseEvent, behavior: PetBehavior) => {
     if (event.button !== 0 || exitingRef.current) return
     event.preventDefault()
     const { startDrag, dragMove, endDrag, poke } = behavior
+    interactiveRef.current = true
     window.petApi.mouseState(true) // 拖拽期间保持接收鼠标事件
     startDrag()
-    const onMove = (ev: MouseEvent) => dragMove(ev.clientX, ev.clientY)
+    const origin = { x: event.clientX, y: event.clientY }
+    let initialized = false
+    const onMove = (ev: MouseEvent) => {
+      // 首次移动先种下按下位置，只有一次移动事件的快速拖拽也能正确识别。
+      if (!initialized) { dragMove(origin.x, origin.y); initialized = true }
+      dragMove(ev.clientX, ev.clientY)
+    }
     const onUp = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('blur', onBlur)
       const moved = endDrag()
+      dragCleanupRef.current = null
+      interactiveRef.current = false
       window.petApi.mouseState(false)
       if (!moved) {
         poke()
         setPanelOpen((v) => !v)
       }
     }
+    const onBlur = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('blur', onBlur)
+      endDrag()
+      dragCleanupRef.current = null
+      interactiveRef.current = false
+      window.petApi.mouseState(false)
+    }
+    dragCleanupRef.current = onBlur
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
+    window.addEventListener('blur', onBlur)
   }, [])
 
-  const anchor = panelPos ?? {
-    x: Math.round(window.innerWidth * 0.7),
-    y: window.innerHeight - PET_WIDTH - STAGE_MARGIN,
-  }
-  const panelLeft = Math.min(Math.max(anchor.x - 120, 8), window.innerWidth - PANEL_WIDTH - 8)
+  const reportOverlay = useCallback(() => {
+    window.petApi.overlayState(stageVisible && panelOpen, [...stageHitboxes().values()], stageVisible && settingsPage !== null)
+  }, [stageVisible, panelOpen, settingsPage])
 
-  /**
-   * 面板命中盒：实测，不按常量算。
-   *
-   * 面板 CSS 是 `max-height` + `overflow: hidden`，真实高度随内容变化。按固定 500px 登记的话，
-   * 面板上方那片空白也会被判成"可交互"，鼠标在那儿点击就被窗口吃掉、穿不到桌面 —— 用户看到的
-   * 是桌面点不动了。ResizeObserver 让审批区出现/消失、消息增减时都重新量一次。
-   */
-  const panelRef = useRef<HTMLDivElement | null>(null)
+  // 显隐变化立即上报；实时位置与命中盒由两个面板自行登记。
+  useEffect(() => { reportOverlay() }, [reportOverlay])
+
   useEffect(() => {
-    if (!panelOpen) {
-      registerPanelHitbox(null)
+    if (!stageVisible) {
+      clearStageHitboxes()
+      window.petApi.overlayState(false, [], false)
       return
     }
-    const element = panelRef.current
-    if (!element) return
-    const measure = () => {
-      const rect = element.getBoundingClientRect()
-      registerPanelHitbox({ x1: rect.left, y1: rect.top, x2: rect.right, y2: rect.bottom })
-    }
-    measure()
-    const observer = new ResizeObserver(measure)
-    observer.observe(element)
     return () => {
-      observer.disconnect()
-      // 面板收起后必须摘掉盒子，否则留一个永远点不到的区域挡着穿透。
-      registerPanelHitbox(null)
+      dictationCancelled.current = true
+      stopDictation()
+      dragCleanupRef.current?.()
+      clearStageHitboxes()
+      interactiveRef.current = false
+      window.petApi.mouseState(false)
+      window.petApi.overlayState(false, [], false)
     }
-  }, [panelOpen, panelLeft])
+  }, [stageVisible])
 
   /**
    * 鼠标穿透判断：命中盒检测。
@@ -571,7 +619,7 @@ export default function App() {
     // 重新显示时 effect 重挂，末尾那次 update() 会立刻按最新命中盒校准一次穿透状态。
     if (!stageVisible) return
     const update = () => {
-      if (exitingRef.current) return
+      if (exitingRef.current || dragCleanupRef.current) return
       const { x, y } = lastMouseRef.current
       if (x < 0) return
       const interactive = hitTest(x, y)
@@ -585,28 +633,18 @@ export default function App() {
       update()
     }
     window.addEventListener('mousemove', onMove)
-    const ticker = window.setInterval(update, 100)
+    const ticker = window.setInterval(() => { update(); reportOverlay() }, 100)
     update()
     return () => {
       window.removeEventListener('mousemove', onMove)
       window.clearInterval(ticker)
     }
-  }, [stageVisible])
+  }, [stageVisible, reportOverlay])
 
-  // 快捷键 / 语音唤醒唤起：打开面板并聚焦输入框
+  // 快捷键 / 语音唤醒只展开会话，不切换独立管理页。
   useEffect(() => {
-    /**
-     * 唤起一律切回对话页。
-     *
-     * 团队页上没有输入框，停在那一页时 `inputRef.current` 是 null，聚焦会静默失败 ——
-     * 用户按了 Ctrl+Alt+P 或者喊了一声"小潘"，看到的是一个能看不能打字的面板。
-     * 而这个快捷键存在的唯一理由就是唤起输入框。
-     */
     const summon = () => {
       if (exitingRef.current) return
-      const position = stageRef.current?.anchorPosition()
-      if (position) setPanelPos(position)
-      setPanelTab('chat')
       setPanelOpen(true)
       window.setTimeout(() => inputRef.current?.focus(), 60)
     }
@@ -627,8 +665,9 @@ export default function App() {
         pendingGreetingRef.current = true
       }
       summon()
+      if (voiceConversation) void startListen(true)
     })
-  }, [selectedId, cast])
+  }, [selectedId, cast, voiceConversation, startListen])
 
   /** 壳推来的两件事：启动握手走到哪一步、角色该不该在桌面上。 */
   useEffect(() => {
@@ -654,32 +693,41 @@ export default function App() {
   useEffect(() => {
     window.petApi.onSpeechState((status) => {
       setSpeech(status)
+      // 语音归属与合成由主进程处理；停止朗读不改变原生会话状态。
       if (status.error) showToast(speechErrorText(status.error))
     })
   }, [showToast])
 
   /**
-   * 文档讲解的三条推送各归各处。
-   *
-   * 逐段正文和一句话提示都铺进对话页，不在文档页再开一个滚动区：同一段话有两个家的话，
-   * 两边会各自滚到不同位置，用户不知道该看哪个。文档页只留状态 —— 提纲、进度、授权范围。
+   * 语音识别的流式增量（mimo 等服务）：边识别边出字，最终文本以 asrTranscribe 返回值为准。
+   * 本地流式识别走 asrStreamFeed，不经过这里。
    */
   useEffect(() => {
-    window.petApi.onDocState(setDocState)
-    window.petApi.onDocReply((reply) => {
-      setMessages((prev) => [...prev, { role: 'assistant', text: reply.text }])
+    window.petApi.onAsrDelta((delta) => {
+      if (delta.text === '' || !listeningRef.current || dictationCancelled.current) return
+      asrDeltaText.current += delta.text
+      setInput(asrDeltaText.current)
     })
-    window.petApi.onDocNotice((message) => {
-      if (message !== '') setMessages((prev) => [...prev, { role: 'assistant', text: message }])
-    })
-    void window.petApi.docRoots().then(setDocRoots)
   }, [])
+
+  /** 文档回执不属于原生会话，最近六条仅保存在文档管理结果区。 */
+  const addDocResult = useCallback((text: string, error = false) => {
+    if (!text.trim()) return
+    setDocResults(previous => previous[0]?.text === text && previous[0]?.error === error
+      ? previous : [{ text, error }, ...previous].slice(0, 6))
+  }, [])
+
+  useEffect(() => {
+    window.petApi.onDocState(setDocState)
+    window.petApi.onDocReply(reply => addDocResult(reply.text))
+    window.petApi.onDocNotice(message => addDocResult(message))
+    void window.petApi.docRoots().then(setDocRoots)
+  }, [addDocResult])
 
   /**
    * 文档操作的统一收口。
    *
-   * 按住按钮是因为连点会排出两条讲解链；回执铺到对话页是因为文档页上没有消息区，而失败
-   * 只弹一个 toast 的话三秒就没了 —— "这份文档读不出结构"是用户要照着做决定的信息。
+   * 按住按钮避免连点排出两条讲解链；回执留在文档结果区，失败信息不会随提示消失。
    * 措辞全在主进程，界面不重写一遍：两处各写一份，早晚会一边说"已打开"一边说"打不开"。
    */
   const runDoc = useCallback(
@@ -688,17 +736,17 @@ export default function App() {
       try {
         const result = await action()
         const said = result.reply ?? (result.ok ? null : (result.error ?? '这件事没做成'))
-        if (said !== null) {
-          setMessages((prev) => [...prev, { role: 'assistant', text: said, error: !result.ok }])
-        }
+        if (said !== null) addDocResult(said, !result.ok)
         if (!result.ok) showToast(result.error ?? '这件事没做成')
       } catch (error) {
-        showToast(error instanceof Error ? error.message : String(error))
+        const message = error instanceof Error ? error.message : String(error)
+        addDocResult(message, true)
+        showToast(message)
       } finally {
         setDocBusy(false)
       }
     },
-    [showToast],
+    [showToast, addDocResult],
   )
 
   const docOpen = useCallback((path: string) => void runDoc(() => window.petApi.openDoc(path)), [runDoc])
@@ -733,7 +781,7 @@ export default function App() {
   /**
    * 舞台挂回来之后，补上被隐藏时错过的那句应答。
    *
-   * 不补的话用户对着桌面喊一声"小潘"，角色出现了却没人应，看起来像唤醒坏了。
+   * 不补的话用户对着桌面喊一声"小潘小潘"，角色出现了却没人应，看起来像唤醒坏了。
    * 子组件的 ref 在父组件的 effect 之前就赋好了，所以这里能直接拿到舞台句柄。
    */
   useEffect(() => {
@@ -780,227 +828,171 @@ export default function App() {
   }
 
   return (
-    <div className="stage">
-      {toast && <div className="toast">{toast}</div>}
+    <div className="stage" onMouseDownCapture={wakeConversation} onKeyDownCapture={wakeConversation}>
+      {toast && <div className="toast" role="status">{toast}</div>}
 
       {panelOpen && (
-        <div ref={panelRef} className="panel" data-interactive style={{ left: panelLeft }}>
-          <div className="panel-header">
-            <span className="panel-title">
-              {selectedManifest && (
-                <span
-                  className="character-dot"
-                  style={{ ['--mark' as string]: selectedManifest.markColor }}
-                  aria-hidden
-                />
-              )}
-              {selectedManifest?.displayName ?? '桌面宠物'}
-              {assistantActive && <span className="mode-badge">助理中</span>}
-            </span>
-            <div className="panel-actions">
-              <button className="icon-btn" title="日报文件夹" onClick={() => void window.petApi.openReportDir()}>
-                📁
-              </button>
-              <button className="icon-btn" title="收起" onClick={() => setPanelOpen(false)}>
-                ✕
-              </button>
-            </div>
-          </div>
+        <ChatOverlay
+          session={session}
+          error={mirror.error}
+          stageRef={stageRef}
+          inputRef={inputRef}
+          input={input}
+          setInput={value => { voiceRoundRef.current = false; setInput(value) }}
+          onSend={() => void send(input)}
+          onClose={() => setPanelOpen(false)}
+          onCommand={mirror.command}
+          onListen={() => void startListen()}
+          listening={listening}
+          sending={busy}
+          speaking={speech.speaking}
+          onStopSpeech={() => window.petApi.stopSpeech()}
+          loadingOlder={mirror.loadingOlder}
+          loadOlder={mirror.loadOlder}
+        />
+      )}
 
-          <div className="panel-tabs" role="tablist" aria-label="面板分页">
-            <button
-              type="button"
-              role="tab"
-              id="panel-tab-chat"
-              aria-selected={panelTab === 'chat'}
-              className={`panel-tab${panelTab === 'chat' ? ' active' : ''}`}
-              onClick={() => setPanelTab('chat')}
-            >
-              对话
-              {/* 切到团队页之后消息区就看不见了，正在回复得留个记号，否则用户以为那句话没人接。 */}
-              {busy && <span className="panel-tab-dot" aria-hidden />}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              id="panel-tab-team"
-              aria-selected={panelTab === 'team'}
-              className={`panel-tab${panelTab === 'team' ? ' active' : ''}`}
-              onClick={() => setPanelTab('team')}
-            >
-              团队
-              {/* 待批数量挂在标签上而不是藏在页里：这是用户切过去的主要理由。
-                  已经在团队页时不显示 —— 那一页的「等你点头」标题上就写着数量。 */}
-              {banner && panelTab !== 'team' && <span className="panel-tab-badge">{banner.count}</span>}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              id="panel-tab-doc"
-              aria-selected={panelTab === 'doc'}
-              className={`panel-tab${panelTab === 'doc' ? ' active' : ''}`}
-              onClick={() => setPanelTab('doc')}
-            >
-              文档
-              {/*
-                只有"重名待挑"挂角标：那是文档页唯一在等用户动手的状态。提纲和进度不挂 ——
-                讲解本来就在自己往前走，一直亮着一个数字只会让人以为出了什么事。
-              */}
-              {docState.kind === 'choose' && panelTab !== 'doc' && (
-                <span className="panel-tab-badge">{docState.hits.length}</span>
-              )}
-            </button>
-          </div>
-
-          {runtime && (
-            <div className={`runtime-row tone-${runtime.tone}`} role="status">
-              <div className="runtime-line">
-                <span className="runtime-dot" aria-hidden />
-                <span className="runtime-label">{runtime.label}</span>
-                {runtime.canStart && (
-                  <button className="runtime-btn" onClick={() => void startRuntime()}>
-                    启动团队
-                  </button>
-                )}
-                {runtime.ownPid !== null && (
-                  <button className="runtime-btn ghost" onClick={() => void stopRuntime()}>
-                    停止
-                  </button>
-                )}
-              </div>
-              {/* 出错或等待召唤时摊开说明：那句话里带着下一步该做什么，藏进 title 就等于没说。 */}
-              {runtime.detail && <div className="runtime-detail">{runtime.detail}</div>}
-            </div>
-          )}
-
-          {panelTab === 'chat' ? (
-            <>
-              <div className="messages" id="panel-page-chat" role="tabpanel" aria-labelledby="panel-tab-chat" ref={listRef}>
-                {messages.length === 0 && (
-                  <div className="empty-hint">
-                    你好！试试对我说：
-                    <br />「开启个人助理模式」
-                    <br />
-                    我会默默记录你今天的工作，随时可以问我「我今天干了啥」，下班时说「总结今日工作内容」就能生成日报啦。
+      {settingsPage !== null && (
+        <PetSettingsPanel page={settingsPage} onPage={setSettingsPage} onClose={() => setSettingsPage(null)}>
+          {settingsPage === 'general' ? (
+            <div className="management-general">
+              <section className="management-section" aria-label="运行时与诊断">
+                <h3>运行时与诊断</h3>
+                {runtime ? (
+                  <div className={`runtime-row tone-${runtime.tone}`} role="status">
+                    <div className="runtime-line">
+                      <span className="runtime-dot" aria-hidden />
+                      <span className="runtime-label">{runtime.label}</span>
+                      {runtime.canStart && <button className="runtime-btn" onClick={() => void startRuntime()}>启动团队</button>}
+                      {runtime.ownPid !== null && <button className="runtime-btn ghost" onClick={() => void stopRuntime()}>停止</button>}
+                    </div>
+                    {runtime.detail && <div className="runtime-detail">{runtime.detail}</div>}
                   </div>
-                )}
-                {messages.map((message, index) => (
-                  <div key={index} className={`bubble ${message.role}${message.error ? ' error' : ''}`}>
-                    {message.text}
-                  </div>
+                ) : <p className="management-hint">正在获取运行时状态…</p>}
+                <p className="management-diagnostic">界面构建 <code>{UI_BUILD}</code></p>
+                {companion && <p className="management-diagnostic">运行配置 <code>{companion.profile}</code></p>}
+                <button className="management-button" onClick={() => void mirror.refresh().catch(error => showToast(String(error)))}>重新同步会话</button>
+              </section>
+              <section className="management-section" aria-label="睡眠与唤醒">
+                <h3>睡眠与唤醒</h3>
+                {(['idleSleepMinutes', 'sleepMinutes'] as const).map(key => (
+                  <label className="management-sleep" key={`${key}-${sleepSettings[key]}`}>
+                    <span>{key === 'idleSleepMinutes' ? '无互动多久后入睡' : '每次睡眠时长'}</span>
+                    <input type="number" min={1} max={120} step={1} defaultValue={sleepSettings[key]} disabled={savingSleep}
+                      onBlur={event => {
+                        const value = Number(event.currentTarget.value)
+                        event.currentTarget.value = String(sleepSettings[key])
+                        if (value !== sleepSettings[key]) void saveSleep(key, value)
+                      }} />分钟
+                  </label>
                 ))}
-                {busy && (
-                  <div className="tool-hint">
-                    {targetAssistantId && selectedManifest
-                      ? `${selectedManifest.displayName}正在处理，请稍候…`
-                      : '助理正在思考，请稍候（可能需要十几秒）…'}
-                  </div>
-                )}
-              </div>
-
+                <label className="management-voice">
+                  <input type="checkbox" checked={voiceConversation} disabled={listening}
+                    onChange={async event => {
+                      const enabled = event.target.checked
+                      try {
+                        const result = await window.petApi.saveSettings({ voiceConversation: enabled })
+                        if (result.ok) setVoiceConversation(enabled)
+                        else showToast('语音对话设置未保存')
+                      } catch { showToast('语音对话设置未保存') }
+                    }} />
+                  唤醒后自动听取并发送本次语音
+                </label>
+              </section>
+              <VoiceApiSettings />
+              <section className="management-section" aria-label="快捷操作">
+                <h3>快捷操作</h3>
+                <div className="management-quick">
+                  {QUICK_COMMANDS.map(command => (
+                    <button className="management-button" key={command} disabled={busy} onClick={() => {
+                      voiceRoundRef.current = false
+                      void send(command)
+                    }}>{command}</button>
+                  ))}
+                  <button className="management-button" onClick={() => void window.petApi.openReportDir()
+                    .then(result => { if (!result.ok) showToast('日报文件夹未能打开') })
+                    .catch(() => showToast('日报文件夹未能打开'))}>打开日报文件夹</button>
+                </div>
+              </section>
+            </div>
+          ) : settingsPage === 'team' ? (
+            <>
+              <h3 className="management-page-title" id="panel-tab-team">团队管理</h3>
               {banner && (
                 <div className="approval-banner" role="status">
                   <span className="approval-banner-dot" aria-hidden />
                   <span className="approval-banner-text">{banner.headline}</span>
-                  {/*
-                    一条时直接开审批窗口；多条时先去团队页看列表。
-                    两种情况下按钮做的都和提示文字说的对得上：提示只点名了一条操作，
-                    按钮却把 N 条里的第一条放行的话，用户会以为自己批了全部。
-                  */}
-                  {banner.count === 1 ? (
-                    <button
-                      type="button"
-                      className="approval-banner-go"
-                      onClick={() => void openApproval(banner.proposalId)}
-                    >
-                      去审批
-                    </button>
-                  ) : (
-                    <button type="button" className="approval-banner-go" onClick={() => setPanelTab('team')}>
-                      看 {banner.count} 条
-                    </button>
-                  )}
+                  {banner.count === 1 && <button type="button" className="approval-banner-go"
+                    onClick={() => void openApproval(banner.proposalId)}>去审批</button>}
                 </div>
               )}
-
-              <div className="quick-row">
-                {QUICK_COMMANDS.map((command) => (
-                  <button key={command} className="chip" disabled={busy} onClick={() => void send(command)}>
-                    {command}
-                  </button>
-                ))}
-              </div>
+              <p className="management-hint">运行时启停与连接诊断请到通用设置。</p>
+              <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} />
+              {snapshot?.team && <form className="management-section" onSubmit={async event => {
+                event.preventDefault()
+                if (!delegateId || !delegateText.trim() || delegating) return
+                setDelegating(true)
+                setDelegateResult('')
+                try {
+                  const result = await window.petApi.chat(delegateText.trim(), delegateId, false)
+                  setDelegateResult(result.reply ?? result.error ?? '任务已完成')
+                  if (result.ok) setDelegateText('')
+                } catch (error) { setDelegateResult(String(error)) }
+                finally { setDelegating(false) }
+              }}>
+                <h3>委派专家任务</h3>
+                <select aria-label="任务接收成员" value={delegateId} onChange={event => setDelegateId(event.target.value)} disabled={delegating}>
+                  <option value="">选择成员</option>
+                  {snapshot.members?.filter(member => member.roleId !== 'tangseng').map(member =>
+                    <option key={member.assistantId} value={member.assistantId}>{member.displayName || member.assistantId}</option>)}
+                </select>
+                <textarea aria-label="专家任务内容" value={delegateText} onChange={event => setDelegateText(event.target.value)} rows={3} disabled={delegating} />
+                <button type="submit" className="management-button" disabled={delegating || !delegateId || !delegateText.trim()}>{delegating ? '正在处理…' : '委派任务'}</button>
+                {delegateResult && <p role="status">{delegateResult}</p>}
+              </form>}
             </>
-          ) : panelTab === 'team' ? (
-            <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} />
+          ) : settingsPage === 'meeting' ? (
+            <MeetingPanel />
           ) : (
-            <DocPanel
-              state={docState}
-              roots={docRoots}
-              busy={docBusy}
-              speaking={speech.speaking}
-              onOpen={docOpen}
-              onExplain={docExplain}
-              onAsk={docAsk}
-              onStop={() => window.petApi.stopSpeech()}
-              onAddRoot={() => void docAddRoot()}
-              onRemoveRoot={(dir) => void docRemoveRoot(dir)}
-              onForgetDir={(dir) => void docForgetDir(dir)}
-            />
+            <>
+              <h3 className="management-page-title" id="panel-tab-doc">文档管理</h3>
+              <section className="management-doc-results" aria-label="文档操作结果">
+                <h4>最近结果</h4>
+                <p className="management-hint">文档讲解与问答显示在这里，不进入原生会话。</p>
+                <div className="management-doc-log" role="log" aria-live="polite" aria-relevant="additions text">
+                  {docResults.length ? docResults.map((result, index) => (
+                    <p key={index} className={result.error ? 'is-error' : undefined}>{result.text}</p>
+                  )) : <p>尚无文档操作结果。</p>}
+                </div>
+              </section>
+              <DocPanel
+                state={docState}
+                roots={docRoots}
+                busy={docBusy}
+                speaking={speech.speaking}
+                onOpen={docOpen}
+                onExplain={docExplain}
+                onAsk={docAsk}
+                onStop={() => window.petApi.stopSpeech()}
+                onAddRoot={() => void docAddRoot()}
+                onRemoveRoot={dir => void docRemoveRoot(dir)}
+                onForgetDir={dir => void docForgetDir(dir)}
+              />
+            </>
           )}
-
-          {/*
-            正在念的时候给一条能让它闭嘴的横条。
-
-            放在输入行上方而不是塞进输入行里：横条出现会挤压上面的消息区（那块自己会滚），
-            塞进输入行则会把正在打字的输入框顶窄一截。两个标签页共用，切到团队页也能停。
-          */}
-          {speech.speaking && (
-            <div className="speech-bar" role="status">
-              <span className="speech-bar-dot" aria-hidden />
-              <span className="speech-bar-text">正在朗读</span>
-              <button type="button" className="speech-bar-stop" onClick={() => window.petApi.stopSpeech()}>
-                停止
-              </button>
-            </div>
-          )}
-
-          <div className="input-row">
-            <button
-              className={`mic-btn${listening ? ' listening' : ''}`}
-              title={listening ? '正在聆听…' : '语音输入'}
-              disabled={busy}
-              onClick={() => void startListen()}
-            >
-              {listening ? '🔴' : '🎤'}
-            </button>
-            <textarea
-              ref={inputRef}
-              className="input-box"
-              rows={2}
-              placeholder={listening ? '正在聆听，请说话…' : '输入消息，Enter 发送'}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  void send(input)
-                }
-              }}
-            />
-            <button className="send-btn" disabled={busy || !input.trim()} onClick={() => void send(input)}>
-              {busy ? '…' : '发送'}
-            </button>
-          </div>
-        </div>
+        </PetSettingsPanel>
       )}
 
       <TeamStage
         members={cast}
-        assistantActive={assistantActive}
-        statusByAssistant={statusByAssistant}
+        idleSleepMinutes={sleepSettings.idleSleepMinutes}
+        sleepMinutes={sleepSettings.sleepMinutes}
+        // 共享协议没有个人助理模式字段，不从回答措辞猜测模式开关。
+        assistantActive={false}
+        statusByAssistant={stageStatuses}
         positions={positions}
         selectedId={selectedId}
+        chatOpen={panelOpen}
         onSelect={handleSelect}
         exitStage={exitStage}
         portalPhase={portalPhase}

@@ -45,7 +45,7 @@ class FakeFs implements DocFileSystem {
   readonly mtimes = new Map<string, number>()
   /** 读取黑名单：加密文档、被独占的文件都走这条。 */
   readonly unreadable = new Set<string>()
-  /** realpath 解不动的路径。契约是原样返回而不是抛，抛了会把查找整个炸掉。 */
+  /** realpath 解不动时抛出，文档库必须拒绝读取。 */
   readonly unresolvable = new Set<string>()
   readonly openedWithApp: string[] = []
   readonly listedRoots: string[] = []
@@ -65,7 +65,7 @@ class FakeFs implements DocFileSystem {
 
   async realpath(target: string): Promise<string> {
     const start = norm(target)
-    if (this.unresolvable.has(start)) return start
+    if (this.unresolvable.has(start)) throw new Error('无法确认真实路径')
     let current = start
     for (let hop = 0; hop < 8; hop++) {
       const next = this.links.get(current)
@@ -112,6 +112,10 @@ class FakeFs implements DocFileSystem {
     const content = this.tree.get(real)
     if (content === undefined) throw new Error('文件不存在')
     return content
+  }
+
+  async readBytes(target: string): Promise<Uint8Array> {
+    throw new Error(`文本规则测试不应读取二进制：${target}`)
   }
 
   async fingerprint(target: string): Promise<string> {
@@ -194,13 +198,14 @@ describe('授权边界', () => {
     assert.equal(h.fs.readCount, 0)
   })
 
-  test('realpath 解不动时原样比较，结果是拒绝而不是放行', async () => {
+  test('realpath 解不动时拒绝，不以字面路径绕过真实路径授权', async () => {
     const h = seeded()
     h.fs.unresolvable.add('/docs/设计文档.md')
-    // 解不动就退回字面路径，字面路径仍在授权目录里，所以这条应当照常打开 ——
-    // 真正要紧的是它不会因此被当成越界，也不会因此绕过检查。
     const result = await h.library.open('/docs/设计文档.md')
-    assert.equal(result.kind, 'opened')
+    assert.equal(result.kind, 'denied')
+    assert.equal(h.fs.readCount, 0)
+    assert.equal((await h.library.search('/docs/设计文档.md')).kind, 'denied')
+    assert.equal((await h.library.reveal('/docs/设计文档.md', () => {})).ok, false)
   })
 
   test('open 自己也判一次包含关系：界面点过的路径不是 IPC 上来的路径的担保', async () => {
@@ -476,7 +481,7 @@ describe('结构化提取', () => {
 
   test('能打开的格式多于能讲的格式，这两件事分开', () => {
     assert.equal(canOpenWithApp('扫描.pdf'), true, '打不开的话用户连自己看都做不到')
-    assert.equal(canOutline('扫描.pdf'), false, '读不出结构就不能假装讲得出来')
+    assert.equal(canOutline('文字.pdf'), true, 'PDF 支持本地文字提取，扫描无文本由解析结果明确报告')
     assert.equal(canOutline('设计.md'), true)
   })
 
@@ -487,7 +492,7 @@ describe('结构化提取', () => {
     for (const extension of OUTLINE_EXTENSIONS) {
       assert.equal(canOutline(`文件${extension}`), true, `${extension} 在名单里却讲不了`)
     }
-    for (const extension of ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.png', '.docm']) {
+    for (const extension of ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.png', '.docm']) {
       assert.equal(canOutline(`文件${extension}`), false, `${extension} 不该讲得了`)
     }
   })

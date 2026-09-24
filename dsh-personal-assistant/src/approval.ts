@@ -39,11 +39,9 @@ export class ApprovalError extends Error {
   }
 }
 
-/** 副作用计划摘要：操作、目标、参数与输入修订一起参与哈希，改任何一项都会让旧批准失效。 */
-export function planDigestOf(proposal: Pick<ActionProposal, 'target' | 'paramsDigest' | 'inputRevision' | 'taskId'>): string {
-  return createHash('sha256')
-    .update(`${proposal.taskId}\n${proposal.target}\n${proposal.paramsDigest}\n${proposal.inputRevision}`)
-    .digest('hex')
+/** 工具、成员、任务、目标、参数与输入修订共同绑定批准。 */
+export function planDigestOf(proposal: Pick<ActionProposal, 'tool' | 'assistantId' | 'target' | 'paramsDigest' | 'inputRevision' | 'taskId'>): string {
+  return digestOf([proposal.taskId, proposal.assistantId, proposal.tool, proposal.target, proposal.paramsDigest, proposal.inputRevision])
 }
 
 /**
@@ -60,7 +58,7 @@ function sortDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortDeep)
   if (typeof value === 'object' && value !== null) {
     const source = value as Record<string, unknown>
-    const sorted: Record<string, unknown> = {}
+    const sorted: Record<string, unknown> = Object.create(null)
     for (const key of Object.keys(source).sort()) sorted[key] = sortDeep(source[key])
     return sorted
   }
@@ -89,6 +87,8 @@ export interface GateCall {
   readonly assistantId: string
   readonly tool: string
   readonly target: string
+  readonly params: unknown
+  readonly inputRevision: number
 }
 
 /** 放行时带上就地建好的操作记录 id；拒绝时带上模型能照着纠正的原因。 */
@@ -179,7 +179,8 @@ export class ApprovalService {
       approvalId: randomUUID(),
       proposalId,
       planDigest: planDigestOf(proposal),
-      scope: `${proposal.target}|${subject.channel}`,
+      // 使用已有持久字段绑定代次；旧版非 JSON 范围一律失效，无需改业务库结构。
+      scope: canonicalJson({ target: proposal.target, channel: subject.channel, runtimeEpoch: this.options.runtimeEpoch }),
       issuedAt: now,
       expiresAt: Math.min(proposal.expiresAt, now + this.options.ttlMs),
       consumedAt: null,
@@ -229,42 +230,56 @@ export class ApprovalService {
    * 消费批准并预登记副作用操作，两者同事务。重放、过期、摘要不符都拒绝，
    * 调用方拿到的是「可以执行这一次」的凭据，不是长期权限。
    */
-  consume(approvalId: string, kind: string, taskId: string): OperationRecord {
-    const now = Date.now()
-    const existing = this.store.getApproval(approvalId)
-    if (!existing) throw new ApprovalError('NOT_FOUND', `approval ${approvalId} does not exist`)
-    if (existing.consumedAt !== null) {
-      throw new ApprovalError('ALREADY_CONSUMED', `approval ${approvalId} was consumed at ${existing.consumedAt}`)
-    }
-    if (existing.expiresAt <= now) throw new ApprovalError('EXPIRED', `approval ${approvalId} expired at ${existing.expiresAt}`)
-
-    const operation: OperationRecord = {
-      operationId: randomUUID(),
-      taskId,
-      approvalId,
-      kind,
-      state: 'planned',
-      resultDigest: null,
-      startedAt: now,
-      endedAt: null,
-    }
-    const consumed = this.store.transaction(() => {
-      const ok = this.store.consumeApproval(approvalId, existing.planDigest, now)
-      if (!ok) return false
+  consume(approvalId: string, kind: string, taskId: string, call?: GateCall): OperationRecord {
+    return this.store.transaction(() => {
+      const now = Date.now()
+      const existing = this.store.getApproval(approvalId)
+      if (!existing) throw new ApprovalError('NOT_FOUND', `批准 ${approvalId} 不存在`)
+      let scope: { runtimeEpoch?: string; target?: string } | null = null
+      try { scope = JSON.parse(existing.scope) } catch { /* 旧版批准没有代次，拒绝消费。 */ }
+      this.assertEpoch(scope?.runtimeEpoch ?? '')
+      if (existing.consumedAt !== null) throw new ApprovalError('ALREADY_CONSUMED', '批准已经消费')
+      if (existing.expiresAt <= now) throw new ApprovalError('EXPIRED', '批准已过期')
+      const proposal = this.store.getProposal(existing.proposalId)
+      if (!proposal || proposal.state !== 'approved') throw new ApprovalError('NOT_FOUND', '没有有效的已批准提案')
+      if (proposal.expiresAt <= now) throw new ApprovalError('EXPIRED', '提案已过期')
+      if (!call || !Object.hasOwn(call, 'params') || kind !== call.tool || taskId !== call.taskId ||
+          scope?.target !== call.target || existing.planDigest !== planDigestOf(proposal) ||
+          proposal.taskId !== call.taskId || proposal.assistantId !== call.assistantId ||
+          proposal.tool !== call.tool || proposal.target !== call.target ||
+          proposal.inputRevision !== call.inputRevision || proposal.paramsDigest !== digestOf(call.params)) {
+        throw new ApprovalError('DIGEST_MISMATCH', '实际调用的任务、成员、工具、目标、完整参数或输入版本与批准不符')
+      }
+      const task = this.store.getTask(call.taskId)
+      const member = this.store.getMember(call.assistantId)
+      if (!task || task.revision !== call.inputRevision || task.ownerId !== call.assistantId ||
+          task.status !== 'running' || task.toolScope !== 'side-effect' ||
+          !member?.enabled || member.toolPolicy.mode !== 'side-effect' || member.toolPolicy.denyTools.includes(kind)) {
+        throw new ApprovalError('DIGEST_MISMATCH', '任务版本、执行状态或成员权限已变化，必须重新复核')
+      }
+      if (this.operations(taskId).some(item => ['planned', 'running', 'unknown'].includes(item.state))) {
+        throw new ApprovalError('ALREADY_CONSUMED', '存在尚未核实的副作用，禁止盲重发')
+      }
+      const operation: OperationRecord = {
+        operationId: randomUUID(), taskId, approvalId, kind, state: 'planned',
+        resultDigest: null, startedAt: now, endedAt: null,
+      }
+      if (!this.store.consumeApproval(approvalId, planDigestOf(proposal), now)) {
+        throw new ApprovalError('ALREADY_CONSUMED', '批准已不可消费')
+      }
       this.store.insertOperation(operation)
-      return true
+      this.store.appendEvent('operation/updated',
+        { operationId: operation.operationId, state: operation.state, kind, proposalId: proposal.proposalId },
+        { taskId, assistantId: call.assistantId })
+      return operation
     })
-    if (!consumed) {
-      throw new ApprovalError('ALREADY_CONSUMED', `approval ${approvalId} is no longer consumable`)
-    }
-    return operation
   }
 
   /**
    * 凭提案消费它已签发的批准。批准 id 刻意不暴露给模型上下文：模型只知道自己提了什么，
    * 能不能执行取决于是否有可信主体签发过批准，以及摘要、期限与单次消费校验。
    */
-  consumeByProposal(proposalId: string, kind: string): OperationRecord {
+  consumeByProposal(proposalId: string, kind: string, call?: GateCall): OperationRecord {
     const proposal = this.store.getProposal(proposalId)
     if (!proposal) throw new ApprovalError('NOT_FOUND', `proposal ${proposalId} does not exist`)
     if (proposal.state !== 'approved') {
@@ -272,13 +287,7 @@ export class ApprovalService {
     }
     const approval = this.store.approvalForProposal(proposalId)
     if (!approval) throw new ApprovalError('NOT_FOUND', `proposal ${proposalId} has no issued approval`)
-    const operation = this.consume(approval.approvalId, kind, proposal.taskId)
-    this.store.appendEvent(
-      'operation/updated',
-      { operationId: operation.operationId, state: operation.state, kind, proposalId },
-      { taskId: proposal.taskId, assistantId: proposal.assistantId },
-    )
-    return operation
+    return this.consume(approval.approvalId, kind, proposal.taskId, call)
   }
 
   /**
@@ -289,7 +298,9 @@ export class ApprovalService {
    * 命中时单次消费批准并就地建 planned 操作记录 —— 「批准一次、执行一次」。
    */
   authorizeCall(call: GateCall): GateOutcome {
-    const proposal = this.store.findGateProposal(call.taskId, call.tool, call.target)
+    const proposal = this.store.findGateProposal(call.taskId, call.tool, call.target, {
+      assistantId: call.assistantId, inputRevision: call.inputRevision, paramsDigest: digestOf(call.params),
+    })
     if (!proposal) {
       return {
         ok: false,
@@ -303,7 +314,7 @@ export class ApprovalService {
       return { ok: false, reason: `提案 ${proposal.proposalId} 的批准窗口已过期，需要重新提案。` }
     }
     try {
-      const operation = this.consumeByProposal(proposal.proposalId, call.tool)
+      const operation = this.consumeByProposal(proposal.proposalId, call.tool, call)
       return { ok: true, operationId: operation.operationId }
     } catch (error) {
       const code = error instanceof ApprovalError ? error.code : 'NOT_FOUND'
@@ -331,15 +342,26 @@ export class ApprovalService {
     return { ...operation, state, resultDigest }
   }
 
-  /** 副作用结束记账。超时或结果不明时写 unknown，由调用方核查真实外部状态后再决定。 */
+  /** 只读返回真实调用记录，模型工具不能用自报结果修改该记录。 */
+  operationByProposal(proposalId: string): OperationRecord | null {
+    const approval = this.store.approvalForProposal(proposalId)
+    return approval ? this.store.operationForApproval(approval.approvalId) : null
+  }
+
+  /** 仅供可信执行器或人工核查流程调用；不能直接暴露为模型结账能力。 */
   settle(operationId: string, state: OperationState, resultDigest: string | null): void {
     this.store.transaction(() => {
-      this.store.setOperationState(operationId, state, resultDigest)
       const operation = this.store.getOperation(operationId)
+      if (!operation) throw new ApprovalError('NOT_FOUND', `操作 ${operationId} 不存在`)
+      if (operation.state === 'succeeded' || operation.state === 'failed') {
+        if (operation.state === state && operation.resultDigest === resultDigest) return
+        throw new ApprovalError('ALREADY_CONSUMED', '已结算的操作不能被迟到结果覆盖')
+      }
+      this.store.setOperationState(operationId, state, resultDigest)
       this.store.appendEvent(
         'operation/updated',
-        { operationId, state, kind: operation?.kind ?? null },
-        { taskId: operation?.taskId ?? null },
+        { operationId, state, kind: operation.kind },
+        { taskId: operation.taskId },
       )
     })
   }

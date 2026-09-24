@@ -1,0 +1,113 @@
+.pet-settings-details.voice-conversation-option {
+  display: block;
+  flex: 0 1 auto;
+  min-height: 30px;
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.pet-settings-details > summary {
+  cursor: pointer;
+  padding-bottom: 6px;
+}
+
+.panel:has(.pet-settings-details[open]) .messages {
+  min-height: 0;
+}
+
+.voice-api-settings {
+  border-top: 1px solid #e5e7eb;
+  margin-top: 8px;
+  padding: 8px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.voice-api-settings h3,
+.voice-api-settings p {
+  margin: 0 0 8px;
+}
+
+.voice-api-settings fieldset {
+  min-width: 0;
+  margin: 10px 0 0;
+  padding: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}
+
+.voice-api-settings label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.voice-api-settings input:not([type='checkbox']),
+.voice-api-settings select {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  margin-top: 4px;
+  padding: 6px;
+  border: 1px solid #cbd0dc;
+  border-radius: 4px;
+  background: #fff;
+  color: #333a48;
+  font: inherit;
+}
+
+.voice-api-settings button {
+  padding: 4px 8px;
+  border: 1px solid #cbd0dc;
+  border-radius: 4px;
+  background: #f5f7fb;
+  color: #333a48;
+  cursor: pointer;
+  font: inherit;
+}
+
+.voice-api-settings :disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.voice-api-settings :focus-visible {
+  outline: 2px solid #6a8fe7;
+  outline-offset: 2px;
+}
+
+.voice-api-settings ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.voice-api-settings li {
+  margin-bottom: 10px;
+}
+
+.voice-api-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.voice-api-settings .voice-api-clear-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.voice-api-error {
+  color: #a62d36;
+}
+
+.voice-api-confirm {
+  border-left: 3px solid #a62d36;
+  padding-left: 8px;
+  margin-bottom: 10px;
+}

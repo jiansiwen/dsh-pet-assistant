@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 import {
   INITIAL_SPEECH_STATE,
   describeRecords,
+  drainSentences,
   nextSpeech,
   pendingDispatch,
   resumeIndex,
@@ -28,6 +29,7 @@ import {
   type SpeechState,
   type SpokenRecord,
 } from './speech.ts'
+import type { ResolvedVoiceApi } from '../voice-api-types.ts'
 
 /** 合成进程报回来的事件，一行一个 JSON。协议见 `tts-edge-worker.ts` 头部。 */
 export type TtsWorkerEvent =
@@ -52,6 +54,7 @@ export interface NarratorHooks {
   onRequestTaskCancel?: () => void
   /** 出声状态变了。界面据此显示"正在讲解"和停止按钮。 */
   onSpeaking?: (speaking: boolean) => void
+  onSpoken?: (record: SpokenRecord) => void
   /** 挑中的合成音色。只有英文音色时用户需要能看见这件事，否则他只会觉得"读得怪"。 */
   onVoice?: (voice: string) => void
   /** 合成进程起不来或中途没了。 */
@@ -66,6 +69,7 @@ export interface NarratorHooks {
 export class Narrator {
   private readonly open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport
   private readonly hooks: NarratorHooks
+  private readonly ttsApi: () => ResolvedVoiceApi | null
   private state: SpeechState = INITIAL_SPEECH_STATE
   /** 当前这一轮播出的句子。跨轮的完整记录在 reducer 的 `state.spoken` 里。 */
   private roundSpoken: SpokenRecord[] = []
@@ -81,10 +85,16 @@ export class Narrator {
   private awaitingStop = false
   private speaking = false
   private disposed = false
+  /** 流式朗读的攒句缓冲，按 utteranceId 分开：一轮回答一个。 */
+  private feeds = new Map<string, { buffer: string; nextIndex: number }>()
 
-  constructor(open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport, hooks: NarratorHooks = {}) {
+  constructor(open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport, hooks: NarratorHooks = {}, options: {
+    /** 当前选中的自定义 TTS 服务；null 走默认合成。派发时才取，用户中途换服务不用重启播放器。 */
+    ttsApi?: () => ResolvedVoiceApi | null
+  } = {}) {
     this.open = open
     this.hooks = hooks
+    this.ttsApi = options.ttsApi ?? (() => null)
   }
 
   /** 排一段要念的内容。整段回答或整份文档的一次讲话请求就是一个 request。 */
@@ -92,6 +102,43 @@ export class Narrator {
     if (this.disposed) return
     this.apply({ type: 'enqueue', request })
     this.pump()
+  }
+
+  /**
+   * 流式喂入一段还在长的文本：攒到完整句子就立刻排进去，剩下的留在缓冲里等下一段。
+   *
+   * 这是"边收边合成"的入口：第一个句子一凑齐就开始念，用户不用等整段回答算完。
+   * 半句不派给合成器 —— 切在词中间念出来是断的。
+   */
+  feed(utteranceId: string, chunk: string): void {
+    if (this.disposed || chunk.length === 0) return
+    const entry = this.feeds.get(utteranceId) ?? { buffer: '', nextIndex: 0 }
+    const { sentences, rest } = drainSentences(entry.buffer + chunk)
+    entry.buffer = rest
+    for (const sentence of sentences) {
+      this.speak({ utteranceId, text: sentence, indexBase: entry.nextIndex })
+      entry.nextIndex += 1
+    }
+    this.feeds.set(utteranceId, entry)
+  }
+
+  /**
+   * 流结束：把缓冲里最后没标点的一截也念完。
+   *
+   * 没喂过任何增量时这里什么都不做 —— 调用方要据此退回"整段一次朗读"，别让一段回答
+   * 既没被喂过、又不再整段送出去，那就变成哑巴了。
+   */
+  feedEnd(utteranceId: string): void {
+    const entry = this.feeds.get(utteranceId)
+    if (entry === undefined) return
+    this.feeds.delete(utteranceId)
+    const tail = entry.buffer.trim()
+    if (tail.length > 0) this.speak({ utteranceId, text: tail, indexBase: entry.nextIndex })
+  }
+
+  /** 这一轮不念了（被打断/出错）：把缓冲丢掉，之后迟到的增量不会再开口。 */
+  dropFeed(utteranceId: string): void {
+    this.feeds.delete(utteranceId)
   }
 
   generationStarted(): void {
@@ -148,6 +195,7 @@ export class Narrator {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.feeds.clear()
     this.transport?.close()
     this.transport = null
     this.ready = false
@@ -158,8 +206,10 @@ export class Narrator {
   private apply(event: SpeechEvent): void {
     const turn = nextSpeech(this.state, event)
     // spoken 只增不减，按旧长度切出来的正好是这次新增的记录。必须在覆盖 this.state 之前算。
-    this.roundSpoken.push(...turn.state.spoken.slice(this.state.spoken.length))
+    const records = turn.state.spoken.slice(this.state.spoken.length)
+    this.roundSpoken.push(...records)
     this.state = turn.state
+    for (const record of records) this.hooks.onSpoken?.(record)
     for (const effect of turn.effects) {
       if (effect === 'stop-audio') {
         this.awaitingStop = true
@@ -190,7 +240,22 @@ export class Narrator {
     }
     if (!this.ready) return
     const id = `${segment.utteranceId}#${segment.index}`
-    this.transport.write(JSON.stringify({ speak: { id, b64: Buffer.from(segment.text, 'utf8').toString('base64') } }))
+    // 配置读不出来就停在这里报错：悄悄退回默认服务等于把用户挑的服务换掉。
+    let api: ResolvedVoiceApi | null = null
+    try {
+      api = this.ttsApi()
+    } catch (error) {
+      this.fail(error instanceof Error ? error.message : String(error))
+      return
+    }
+    // 配置随这句传进 worker：用户中途换服务，下一句就走新的；密钥只走 stdin，不上命令行。
+    this.transport.write(JSON.stringify({
+      speak: {
+        id,
+        b64: Buffer.from(segment.text, 'utf8').toString('base64'),
+        ...(api === null ? {} : { api }),
+      },
+    }))
     this.apply({ type: 'dispatched' })
   }
 
@@ -212,8 +277,10 @@ export class Narrator {
       return
     }
     if ('cancelled' in event) {
-      // 只有我们写过 stop 才会收到这条，所以队列该不该继续由那次打断的层级决定：
-      // 第二层以上队列已经空了，第一层则接着播下一句。
+      if (!this.awaitingStop) {
+        this.fail('语音播放未正常完成，请检查音频设备后重试')
+        return
+      }
       this.awaitingStop = false
       this.apply({ type: 'cut' })
       this.pump()
@@ -236,7 +303,9 @@ export class Narrator {
    */
   private fail(reason: string): void {
     this.ready = false
+    const transport = this.transport
     this.transport = null
+    transport?.close()
     // 先报错再打断：下面的 apply 会触发 onSpeaking(false)，而逐段讲解的链条正是在那个回调里
     // 推进下一段的。顺序反了就是每失败一次先白打一次模型，然后才被 onError 停住。
     this.hooks.onError?.(reason)

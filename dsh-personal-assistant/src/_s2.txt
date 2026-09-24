@@ -1,0 +1,35 @@
+   12  * handleChat 先用 createUserMessage 造出带稳定 id 的 UserMessage 并记住这个 id，再 followup 注入；
+   13  * onAgentIdle 时在 agent.session.events 里按 id 定位本消息进入的那个轮次（entered），只有该轮次的
+   17  * 失败，绝不拿别人的轮次或半截输出冒充回复。超时先 inbox.remove(messageId)：撤回成功报 cancelled，已被
+   39  followup(message: unknown): void
+   41  * 可选收件箱句柄：仅在超时撤回时用。`remove(messageId)` 返回 true 表示这条消息还在等待、
+   46  remove(messageId: string): boolean
+   98  messageId: string
+  166  /** {@link settleFromEvents} 的定位输入：只需要本条消息的稳定 id。 */
+  168  messageId: string
+  172  * {@link settleFromEvents} 的判定：
+  212  * 结算（{@link settleFromEvents}）与流式推送共用这一套判定：两处各写一份，早晚会出现
+  226  export function locateTurn(events: BridgeAgent['session']['events'], messageId: string): TurnLocation {
+  230  if (event.type === 'user/message' && (event.data as { id?: unknown }).id === messageId) {
+  247  export function settleFromEvents(
+  251  const messageId = pending.messageId
+  254  const located = locateTurn(events, messageId)
+  284  if (data.id === messageId) continue
+  494  this.stopStream(pending)
+  551  onAgentIdle(agent: unknown): void {
+  554  const outcome = settleFromEvents(this.agent.session.events, pending)
+  558  this.stopStream(pending)
+  588  * 最终文本仍由 {@link settleFromEvents} 折叠给出，宠物收到 reply 后整体替换。
+  593  const events = agent.session?.events ?? []
+  595  const located = locateTurn(events, pending.messageId)
+  605  if (data.id !== pending.messageId && data.source?.kind === 'user') {
+  623  private startStream(pending: PendingRequest, agent: BridgeAgent): void {
+  638  private stopStream(pending: PendingRequest): void {
+  712  this.stopStream(pending)
+ 1034  const messageId = message.id as string
+ 1045  this.stopStream(pending)
+ 1049  removed = agent.inbox?.remove(messageId) ?? false
+ 1065  messageId,
+ 1072  agent.followup(message)
+ 1075  this.stopStream(pending)
+ 1083  this.startStream(pending, agent)

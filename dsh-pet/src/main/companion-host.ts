@@ -28,6 +28,7 @@ import { once } from 'node:events'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { probeHealth, readBridgeInfo } from './harness.ts'
+import { platformOf } from './platform.ts'
 import {
   decideStartAction,
   listLaunchableProfiles,
@@ -447,12 +448,27 @@ export class CompanionHost {
 
   private createTray(): void {
     // 图标用现成的角色素材：托盘上那只熊猫和桌面上那只是同一个形象。
-    const iconPath = path.join(this.options.mainDir, '../assets/pets/panda.png')
+    //
+    // macOS 要用 **Template Image**（文件名以 `Template` 结尾、16×16 + 32×32@2x）：
+    // 系统据此把它当"单色蒙版"，跟随浅色/深色菜单栏自动反色。用彩色 PNG 的话，
+    // 深色菜单栏上会是一块不协调的亮斑。仓库里 `assets/tray/pandaTemplate.png` 是这个版本，
+    // 没有就退回彩色图 —— 能显示，只是不那么合群。
+    const trayDir = path.join(this.options.mainDir, '../assets/tray')
+    const template = path.join(trayDir, 'pandaTemplate.png')
+    const plain = path.join(this.options.mainDir, '../assets/pets/panda.png')
+    const isMac = platformOf() === 'darwin'
+    const iconPath = isMac && existsSync(template) ? template : plain
     const image = existsSync(iconPath)
       ? nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 })
       : nativeImage.createEmpty()
+    if (isMac && iconPath === template) image.setTemplateImage(true)
     this.tray = new Tray(image)
     // 单击托盘 = 显示/隐藏角色。这是"关掉舞台但壳还在"最常用的那一下。
+    //
+    // ⚠️ **macOS 上这个回调不会来**：一旦 `setContextMenu` 设过菜单，点击托盘图标会直接
+    // 弹出菜单，系统不再派发 click 事件（官方文档明说 `mouse-up` 同理不派发）。
+    // 所以 macOS 的等价入口是菜单里的「隐藏角色 / 显示角色」项 —— 那个一直都在。
+    // 这里照旧注册：Windows/Linux 上它仍然是最快的那一下，macOS 上只是静默不触发。
     this.tray.on('click', () => this.setStageVisible(!this.state.stageVisible))
     this.rebuildTray()
   }
@@ -486,7 +502,7 @@ export class CompanionHost {
         {
           // 唤醒监听初始化失败后会粘住、不自动重试（否则每三秒刷一条错误日志，用户看到的
           // 是一只一直在报错的宠物）。所以修好麦克风、装好中文语音包之后得有地方能把它叫回来。
-          label: '重新监听唤醒词（"小潘"）',
+          label: '重新监听唤醒词（"小潘小潘"）',
           click: () => this.callbacks.onRetryWake(),
         },
         {

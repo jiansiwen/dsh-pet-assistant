@@ -1,4 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type { SessionCommand, SessionResult, SessionUpdate } from '../session-types.js'
+import type { SettingsPage } from '../renderer/types.js'
+import type { Box } from '../renderer/stage-layout.js'
+import type { VoiceApiInput, VoiceApiKind, VoiceApiResult } from '../voice-api-types.js'
 import type {
   BridgeEventPayload,
   CharacterMenuTarget,
@@ -6,8 +10,16 @@ import type {
   DocReplyResult,
   DocRoots,
   DocState,
+  MeetingConsentInput,
+  MeetingEditResult,
+  MeetingMinutesResult,
+  MeetingRuntimeState,
+  MeetingSpeakersResult,
+  MeetingStartResult,
+  MeetingStartedPayload,
   PetSettingsPatch,
   PetState,
+  SimpleOkResult,
   SkinOverrides,
   SpeechStatus,
   TeamSnapshot,
@@ -19,9 +31,28 @@ function subscribe(channel: string, callback: (...args: unknown[]) => void): voi
   ipcRenderer.on(channel, (_event, ...args) => callback(...args))
 }
 
+function listen<T>(channel: string, callback: (payload: T) => void): () => void {
+  const listener = (_event: Electron.IpcRendererEvent, payload: T) => callback(payload)
+  ipcRenderer.on(channel, listener)
+  return () => ipcRenderer.removeListener(channel, listener)
+}
+
 contextBridge.exposeInMainWorld('petApi', {
   getState: () => ipcRenderer.invoke('get-state') as Promise<PetState>,
+  getSession: (beforeSeq?: number, bindingId?: string) => ipcRenderer.invoke('session-get', beforeSeq, bindingId) as Promise<SessionResult>,
+  sessionCommand: (command: SessionCommand) => ipcRenderer.invoke('session-command', command) as Promise<SessionResult>,
+  onSessionUpdate: (callback: (update: SessionUpdate) => void) => listen('session-update', callback),
+  onSessionConnection: (callback: (status: string) => void) => listen('bridge-status', callback),
+  onSettingsOpen: (callback: (page: SettingsPage) => void) => listen('settings-open', callback),
+  onOverlayDismiss: (callback: () => void) => listen('overlay-dismiss', callback),
+  onOverlayError: (callback: (message: string) => void) => listen('overlay-error', callback),
+  overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
   saveSettings: (patch: PetSettingsPatch) => ipcRenderer.invoke('save-settings', patch) as Promise<{ ok: boolean }>,
+  voiceApiState: () => ipcRenderer.invoke('voice-api-state') as Promise<VoiceApiResult>,
+  voiceApiSave: (input: VoiceApiInput) => ipcRenderer.invoke('voice-api-save', input) as Promise<VoiceApiResult>,
+  voiceApiRemove: (id: string) => ipcRenderer.invoke('voice-api-remove', id) as Promise<VoiceApiResult>,
+  voiceApiSelect: (kind: VoiceApiKind, id: string | null) =>
+    ipcRenderer.invoke('voice-api-select', kind, id) as Promise<VoiceApiResult>,
   mouseState: (interactive: boolean) => ipcRenderer.send('mouse-state', interactive),
   contextMenu: (target: CharacterMenuTarget) => ipcRenderer.send('context-menu', target),
   chat: (text: string, assistantId?: string, spoken?: boolean) =>
@@ -70,7 +101,7 @@ contextBridge.exposeInMainWorld('petApi', {
   onSummon: (callback: () => void) => {
     subscribe('pet-summon', () => callback())
   },
-  /** 语音唤醒词命中（说"小潘"）。 */
+  /** 语音唤醒词命中（说"小潘小潘"）。 */
   onWake: (callback: () => void) => {
     subscribe('wake-triggered', () => callback())
   },
@@ -96,6 +127,14 @@ contextBridge.exposeInMainWorld('petApi', {
   onSpeechState: (callback: (status: SpeechStatus) => void) => {
     subscribe('speech-state', status => callback(status as SpeechStatus))
   },
+  /** 会话流水（正文/思考/工具/输入）：按发生顺序显示，归属与出错以 chat 的返回值为准。 */
+  onChatDelta: (callback: (delta: BridgeEventPayload) => void) => {
+    subscribe('chat-delta', payload => callback(payload as BridgeEventPayload))
+  },
+  /** 语音识别的流式增量：mimo 等服务边识别边出字，最终文本以 asrTranscribe 返回值为准。 */
+  onAsrDelta: (callback: (delta: { text: string }) => void) => {
+    subscribe('asr-delta', payload => callback(payload as { text: string }))
+  },
   openDoc: (path: string) => ipcRenderer.invoke('doc-open', path) as Promise<DocReplyResult>,
   explainDoc: (path: string, from?: number, speak?: boolean, assistantId?: string) =>
     ipcRenderer.invoke('doc-explain', path, from ?? 0, speak !== false, assistantId) as Promise<DocReplyResult>,
@@ -113,6 +152,50 @@ contextBridge.exposeInMainWorld('petApi', {
   },
   onDocNotice: (callback: (message: string) => void) => {
     subscribe('doc-notice', message => callback(typeof message === 'string' ? message : ''))
+  },
+  // ===== 会议闭环（P6）=====
+  // 音频采集在渲染层（getUserMedia），主进程只做加密落盘、仲裁与转写。
+  // 停止是两段式：meeting-stop 让渲染层停流并冲刷最后一块，渲染层推完再调
+  // meeting-flush-done 触发结算——顺序反了会丢会议最后几秒。
+  meetingStart: (consent: MeetingConsentInput) =>
+    ipcRenderer.invoke('meeting-start', consent) as Promise<MeetingStartResult>,
+  meetingStop: (meetingId?: string) =>
+    ipcRenderer.invoke('meeting-stop', meetingId) as Promise<SimpleOkResult>,
+  /** 渲染层推一块 base64 PCM（16kHz mono Int16），到主进程立即加密落盘。 */
+  meetingChunk: (meetingId: string, chunkBase64: string) =>
+    ipcRenderer.invoke('meeting-chunk', meetingId, chunkBase64) as Promise<SimpleOkResult>,
+  /** 某条音轨拿不到（loopback 采集失败）时如实上报，主进程标缺失、不伪造静音。 */
+  meetingTrackMissing: (meetingId: string, kind: 'mic' | 'loopback') =>
+    ipcRenderer.invoke('meeting-track-missing', meetingId, kind) as Promise<SimpleOkResult>,
+  /** 渲染层停流并推完最后一块后回报，触发结算与转写。 */
+  meetingFlushDone: (meetingId: string) =>
+    ipcRenderer.invoke('meeting-flush-done', meetingId) as Promise<SimpleOkResult>,
+  meetingState: () => ipcRenderer.invoke('meeting-state') as Promise<MeetingRuntimeState>,
+  meetingTranscribe: (meetingId: string) =>
+    ipcRenderer.invoke('meeting-transcribe', meetingId) as Promise<SimpleOkResult>,
+  meetingSpeakers: (meetingId: string) =>
+    ipcRenderer.invoke('meeting-speakers', meetingId) as Promise<MeetingSpeakersResult>,
+  meetingSpeakerRename: (meetingId: string, speaker: string, label: string) =>
+    ipcRenderer.invoke('meeting-speaker-rename', meetingId, speaker, label) as Promise<MeetingEditResult>,
+  meetingSpeakerMerge: (meetingId: string, fromSpeaker: string, intoSpeaker: string) =>
+    ipcRenderer.invoke('meeting-speaker-merge', meetingId, fromSpeaker, intoSpeaker) as Promise<MeetingEditResult>,
+  meetingSpeakerSplit: (meetingId: string, indexes: number[], label: string) =>
+    ipcRenderer.invoke('meeting-speaker-split', meetingId, indexes, label) as Promise<MeetingEditResult>,
+  meetingMinutes: (meetingId: string) =>
+    ipcRenderer.invoke('meeting-minutes', meetingId) as Promise<MeetingMinutesResult>,
+  meetingMinutesConfirm: (meetingId: string) =>
+    ipcRenderer.invoke('meeting-minutes-confirm', meetingId) as Promise<MeetingEditResult>,
+  /** 会议开始：渲染层据此开 getUserMedia 采音。 */
+  onMeetingStarted: (callback: (payload: MeetingStartedPayload) => void) => {
+    subscribe('meeting-started', payload => callback(payload as MeetingStartedPayload))
+  },
+  /** 主进程请求停流：渲染层停 getUserMedia、冲刷最后一块后调 meetingFlushDone。 */
+  onMeetingStopping: (callback: (payload: { meetingId: string }) => void) => {
+    subscribe('meeting-stopping', payload => callback(payload as { meetingId: string }))
+  },
+  /** 会议运行时状态投影（录音/停止/转写进度/最近会议）。 */
+  onMeetingState: (callback: (state: MeetingRuntimeState) => void) => {
+    subscribe('meeting-state-changed', state => callback(state as MeetingRuntimeState))
   },
   exitDone: () => ipcRenderer.send('exit-done'),
 })

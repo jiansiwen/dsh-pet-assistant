@@ -61,6 +61,7 @@ export class ApprovalWindow {
   private readonly queue: ApprovalProposal[] = []
   private readonly queuedRequesters = new Map<string, string | null>()
   private disposed = false
+  private deciding = false
   private readonly bridge: BridgeClient
 
   // 显式字段而不是参数属性：Node 的 strip-only TypeScript 只擦类型、不改写语法，
@@ -139,7 +140,7 @@ export class ApprovalWindow {
 
     ipcMain.handle('approval-card-read', event => {
       // 读卡片也要核发信者：这个 preload 只挂在审批窗口上，但 ipcMain 收到的是所有窗口的调用。
-      const check = this.verify(event)
+      const check = this.verify(event, this.current?.proposalId ?? '')
       if (!check.ok || !this.current) return null
       return this.view()
     })
@@ -153,7 +154,7 @@ export class ApprovalWindow {
 
     // 关掉卡片不等于驳回：提案在宿主那边仍然是待批的，到期才失效。
     ipcMain.on('approval-card-close', event => {
-      if (!this.verify(event).ok) return
+      if (!this.verify(event, this.current?.proposalId ?? '').ok) return
       const next = this.queue.shift()
       if (next) {
         const requester = this.queuedRequesters.get(next.proposalId) ?? null
@@ -199,23 +200,28 @@ export class ApprovalWindow {
       return { ok: false, error: view.blockedReason ?? '这条提案现在不能决定' }
     }
 
-    if (decision === 'approve' && needsNativeConfirm(proposal)) {
-      const confirmed = await this.confirmNatively(view)
-      if (!confirmed) {
-        // 这不是失败，是用户在第二道关口改了主意。措辞要说清提案还没被批准。
-        return { ok: false, error: '你在确认框里选择了不批准，这条提案还没有被批准' }
-      }
-    }
-
-    const windowId = this.win && !this.win.isDestroyed() ? this.win.id : undefined
-    let result: DecideApprovalResult
+    if (this.deciding) return { ok: false, error: '正在处理当前决定，请勿重复点击' }
+    this.deciding = true
     try {
-      result = await this.bridge.decideApproval(proposal.proposalId, decision as ApprovalDecision, windowId)
+      if (decision === 'approve' && needsNativeConfirm(proposal)) {
+        const confirmed = await this.confirmNatively(view)
+        if (!confirmed) return { ok: false, error: '你在确认框里选择了不批准，这条提案还没有被批准' }
+      }
+      const recheck = this.verify(event, proposal.proposalId)
+      if (!recheck.ok || this.current !== proposal || this.disposed) {
+        return { ok: false, error: '审批窗口或提案已变化，请重新查看待办' }
+      }
+      const currentView = cardView(proposal, this.currentRequester, Date.now())
+      if (!currentView.canDecide) return { ok: false, error: currentView.blockedReason ?? '提案已失效' }
+      const result = await this.bridge.decideApproval(proposal.proposalId, decision as ApprovalDecision,
+        event.sender.id, proposal.kind === 'report' ? 'report' : 'team', proposal.epoch)
+      if (result.ok) this.retire(proposal.proposalId)
+      return result
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    } finally {
+      this.deciding = false
     }
-    if (result.ok) this.retire(proposal.proposalId)
-    return result
   }
 
   /**
@@ -332,6 +338,7 @@ export class ApprovalWindow {
     win.once('ready-to-show', () => {
       // 加载完成之后才登记 webContents.id：在此之前收到的任何回执都因为"没登记过"被拒。
       this.registeredId = win.webContents.id
+      win.webContents.send('approval-card-changed')
       win.show()
       win.focus()
     })
@@ -365,6 +372,12 @@ export class ApprovalWindow {
     const found = snapshot?.proposals?.find(item => item.proposalId === proposalId)
     if (!found) return null
     const proposal: ApprovalProposal = {
+      kind: found.kind,
+      reportId: found.reportId,
+      revision: found.revision,
+      digest: found.digest,
+      content: found.content,
+      epoch: found.epoch ?? snapshot?.epoch,
       proposalId: found.proposalId,
       taskId: found.taskId ?? null,
       assistantId: found.assistantId ?? null,

@@ -20,6 +20,12 @@ export type Risk = 'low' | 'medium' | 'high'
  * 都集中在本文件，界面拿到的 `ApprovalCardView` 里不再有可空字段需要各自处理。
  */
 export interface ApprovalProposal {
+  kind?: 'report' | 'team'
+  reportId?: string
+  revision?: number
+  digest?: string
+  content?: string
+  epoch?: string
   proposalId: string
   taskId?: string | null
   assistantId?: string | null
@@ -159,6 +165,7 @@ export function ellipsizeMiddle(text: string, max: number): string {
 
 export interface ApprovalCardView {
   proposalId: string
+  report: { reportId: string; revision: number; digest: string; content: string } | null
   tool: string
   target: string | null
   summary: string | null
@@ -223,10 +230,23 @@ export function cardView(
     blockedReason = `这个提案已经${state === 'approved' ? '批准' : state === 'rejected' ? '驳回' : '结束'}了`
   }
 
+  const isReport = proposal.kind === 'report'
+  const report = isReport && typeof proposal.reportId === 'string'
+    && Number.isInteger(proposal.revision) && (proposal.revision ?? 0) > 0
+    && typeof proposal.digest === 'string' && /^[a-f0-9]{64}$/.test(proposal.digest)
+    && typeof proposal.content === 'string' && typeof proposal.epoch === 'string' && proposal.epoch.length > 0
+    && typeof proposal.target === 'string' && proposal.target.length > 0
+    && typeof proposal.expiresAt === 'number' && Number.isFinite(proposal.expiresAt)
+    ? { reportId: proposal.reportId, revision: proposal.revision!, digest: proposal.digest, content: proposal.content }
+    : null
+  if (isReport && !report) blockedReason = '日报全文、版本或绑定信息缺失，不能批准，请重新提交'
+
   return {
     proposalId: proposal.proposalId,
+    report,
     tool: proposal.tool || '未知操作',
-    target: ellipsizeMiddle(normalizeTarget(proposal.target) ?? '', 160) || null,
+    // 日报目标必须完整显示，不能把中间的目录截断成省略号。
+    target: isReport ? proposal.target ?? null : ellipsizeMiddle(normalizeTarget(proposal.target) ?? '', 160) || null,
     summary: proposal.summary?.trim() || null,
     risk,
     riskLabel: RISK_LABEL[risk],
@@ -268,6 +288,7 @@ export function confirmDialogSpec(
   const lines = [
     `操作：${view.tool}`,
     view.target ? `目标：${view.target}` : null,
+    view.report ? `日报：${view.report.reportId}，第 ${view.report.revision} 版\n摘要：${view.report.digest}` : null,
     view.summary ? `说明：${view.summary}` : null,
     `提请：${who}`,
     `风险：${view.riskLabel}`,

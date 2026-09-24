@@ -22,6 +22,10 @@ export const LAYOUT_VERSION = 1
 
 export interface PetSettings {
   pet: PetId
+  voiceConversation?: boolean
+  /** 分钟，范围 1–120；缺省分别为 2 和 20。 */
+  idleSleepMinutes?: number
+  sleepMinutes?: number
   /** 旧单宠物时代的位置。升级后由渲染层映射到对应角色的座位，只读不写。 */
   bounds?: { x: number; y: number }
   /** 各角色当前座位，键是 assistantId。 */
@@ -68,6 +72,11 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
     merged.runtimeProfile = DEFAULTS.runtimeProfile
   }
   if (typeof merged.trayResident !== 'boolean') merged.trayResident = false
+  merged.voiceConversation = merged.voiceConversation === true
+  for (const [key, fallback] of [['idleSleepMinutes', 2], ['sleepMinutes', 20]] as const) {
+    const value = merged[key]
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 120) merged[key] = fallback
+  }
 
   // 位置要逐个校验：分辨率变化或手工编辑过设置文件后，坐标可能落在屏幕外，
   // 那样角色会待在看不见的地方，用户只会觉得"宠物不见了"。夹紧交给渲染层做，

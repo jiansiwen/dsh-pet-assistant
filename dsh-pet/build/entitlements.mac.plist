@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS entitlements：应用「被允许做什么」。
+
+  这份清单是**最小集**，每一条都有明确理由 —— 多给一条就等于多开一个攻击面：
+
+  - `com.apple.security.device.audio-input`：麦克风。**没有它，即使 Info.plist 里
+    写了 NSMicrophoneUsageDescription，getUserMedia 依然拿不到音频流。** 语音唤醒、
+    按键听写、会议录音全靠它。
+  - `com.apple.security.cs.allow-jit`：Electron 的 V8 需要 JIT。macOS 的 hardened runtime
+    默认禁止可写+可执行内存，不给这条，Electron 启动即崩。
+  - `com.apple.security.cs.allow-unsigned-executable-memory`：V8 还需要它来做
+    代码生成。同样是 Electron 在 hardened runtime 下的必备项。
+  - `com.apple.security.cs.disable-library-validation`：**这一条是为了原生模块**。
+    sherpa-onnx 的 `.node` 与 Electron 不是同一个签名主体，开启库校验后加载会被拒。
+    代价是放宽了动态库校验 —— 换取语音识别能用。若将来 sherpa 出官方签名包，这条可以去掉。
+
+  刻意**没有**的权限（列出来是为了下次改动时不必重新推敲）：
+  - 摄像头（camera）：本项目从不调摄像头
+  - 网络客户端/服务端：Electron 应用默认就有网络能力，不需要额外 entitlement
+  - 磁盘访问（files.*）：文档讲解走的是用户主动授权的目录 + 系统文件关联，不申请全盘
+  - 辅助功能（accessibility）：macOS 上的全局鼠标监听本就没有实现（见 platform.ts）
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

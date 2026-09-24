@@ -10,8 +10,8 @@
  * 这样互斥规则能被单测钉住，不必真开麦克风 —— 而真开麦克风恰恰是测试里最难稳定的部分。
  */
 
-/** 可能持有麦克风的两个使用者。 */
-export type MicUser = 'wake' | 'dictation'
+/** 可能持有麦克风的使用者。meeting 是显式会议录制：一开就是长时间独占。 */
+export type MicUser = 'wake' | 'dictation' | 'meeting'
 
 export interface AudioState {
   /** 当前谁在收音。null 就是设备空闲。 */
@@ -38,6 +38,12 @@ export type AudioEvent =
   | { readonly type: 'focus'; readonly on: boolean }
   | { readonly type: 'dictation-requested' }
   | { readonly type: 'dictation-finished' }
+  /**
+   * 显式开一场会议录制。专注模式不阻止它（会议本来就是用户在专注场景里亲手开的），
+   * 但会议期间唤醒词必须停：参会者的谈话不能被当成指令。
+   */
+  | { readonly type: 'meeting-requested' }
+  | { readonly type: 'meeting-finished' }
   | { readonly type: 'wake-lost' }
   | { readonly type: 'wake-retry' }
 
@@ -86,14 +92,38 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
         // 比直接告诉他"这一次听完再按"糟得多。
         return done(state, [], '正在听你说，这一次听完再按')
       }
+      if (state.holder === 'meeting') {
+        // 会议与听写互斥：两者都要独占设备。会议是长事务，听写让路——
+        // 中途插进来一段听写，会把参会者的话喂给命令识别器。
+        return done(state, [], '正在录制会议，结束会议后再用听写')
+      }
       const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake'] : []
       return done({ ...state, holder: 'dictation' }, effects)
     }
 
     case 'dictation-finished': {
       // 超时和正常结束可能各触发一次收尾，第二次必须什么都不做 —— 否则会把刚拉起来的
-      // 唤醒监听又停掉，用户下一次喊"小潘"没人应。
+      // 唤醒监听又停掉，用户下一次喊"小潘小潘"没人应。
       if (state.holder !== 'dictation') return done(state)
+      const idle = { ...state, holder: null }
+      if (canStartWake(idle)) return done({ ...idle, holder: 'wake' }, ['start-wake'])
+      return done(idle)
+    }
+
+    case 'meeting-requested': {
+      if (state.holder === 'meeting') return done(state, [], '已经有一场会议在录制')
+      if (state.holder === 'dictation') {
+        // 听写最多二十秒就收尾，等它说完再开会议，不掐断用户已经说出口的话。
+        return done(state, [], '正在听写，这一句收完再开会议')
+      }
+      // 专注模式不拦显式会议；唤醒在听就先停掉——会议期间参会者的话不是指令。
+      const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake'] : []
+      return done({ ...state, holder: 'meeting' }, effects)
+    }
+
+    case 'meeting-finished': {
+      // 与听写收尾同理：重复收尾必须幂等，否则会把唤醒监听错误地停掉。
+      if (state.holder !== 'meeting') return done(state)
       const idle = { ...state, holder: null }
       if (canStartWake(idle)) return done({ ...idle, holder: 'wake' }, ['start-wake'])
       return done(idle)

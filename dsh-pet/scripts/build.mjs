@@ -21,7 +21,16 @@ const targets = [
     platform: 'node',
     format: 'esm',
     // sherpa-onnx 系列是 N-API 原生模块，必须 external（bundle 内联会丢 .node 二进制）。
-    external: ['electron', '@deepseek-ai/*', 'sherpa-onnx-node', 'sherpa-onnx-win-x64'],
+    external: ['electron', '@deepseek-ai/*', 'sherpa-onnx-node', 'sherpa-onnx-win-x64', 'pdfjs-dist'],
+  },
+  {
+    // PDF.js 与其 worker/CMap/标准字体保留在同一外部依赖包内，不拷贝素材或加载远端 CDN。
+    name: 'pdf-worker',
+    entryPoints: [path.join(root, 'src/main/doc-pdf-worker.ts')],
+    outfile: path.join(root, 'dist/main/doc-pdf-worker.js'),
+    platform: 'node',
+    format: 'esm',
+    external: ['pdfjs-dist'],
   },
   {
     // TTS worker 独立进程：以 ELECTRON_RUN_AS_NODE 跑，stdin/stdout 与 Narrator 对话，
@@ -77,8 +86,21 @@ function copyStatic() {
   cpSync(path.join(root, 'src/renderer/index.html'), path.join(root, 'dist/renderer/index.html'))
   cpSync(path.join(root, 'src/renderer/approval.html'), path.join(root, 'dist/renderer/approval.html'))
   cpSync(path.join(root, 'src/renderer/styles.css'), path.join(root, 'dist/renderer/styles.css'))
+  // ⚠️ 这里只做「覆盖拷贝」，**不删除**目标里多余的文件。
+  //
+  // 但动作素材是按 `frames/<skin>/<action>/fNNN.png` 逐帧探测的（FRAME_MAX = 96，
+  // 遇到第一个缺失才停），所以旧素材多出来的尾巴会让引擎多探到几十帧，
+  // 播起来变成「先播新版、再播旧版」——同一动作冒出两种形态。
+  //
+  // 清理由单独的脚本负责（不在这里删除东西）：
+  //   python tools/matting/sync-frames.py
+  // 它会把 dist 里多余的帧改名为 `*.stale`（引擎探测不到，文件也不丢）。
   cpSync(path.join(root, 'assets'), path.join(root, 'dist/assets'), { recursive: true })
   cpSync(path.join(root, 'src/main/wake.ps1'), path.join(root, 'dist/main/wake.ps1'))
+  // 唤醒词的 grammar 构造器：wake.ps1 用点源加载它，不拷过去运行时就会 grammar-failed。
+  // 单独成文件是为了让离线探针（_verify/wake-grammar-probe.ps1）用同一份构造器，
+  // 否则探针验的是一份可能已经漂移的副本。
+  cpSync(path.join(root, 'src/main/wake-grammar.ps1'), path.join(root, 'dist/main/wake-grammar.ps1'))
   cpSync(path.join(root, 'src/main/record.ps1'), path.join(root, 'dist/main/record.ps1'))
   cpSync(path.join(root, 'src/main/play.ps1'), path.join(root, 'dist/main/play.ps1'))
   cpSync(path.join(root, 'src/main/speak-once.ps1'), path.join(root, 'dist/main/speak-once.ps1'))

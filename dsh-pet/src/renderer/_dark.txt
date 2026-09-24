@@ -1,0 +1,7 @@
+pet-anim.css          262  background: radial-gradient(ellipse at 50% 38%, #439463 0%, #2f7049 58%, #24563b 100%);
+pet-anim.css          287  background: linear-gradient(180deg, #414958 0%, #2b313c 55%, #1e222a 100%);
+portal.css             48  background: radial-gradient(circle, #26215c 0%, #3c3489 45%, rgba(60, 52, 137, 0) 75%);
+styles.css            330  background: rgba(40, 44, 60, 0.92);
+styles.css            348  background: rgba(40, 44, 60, 0.94);
+styles.css            508  background: #3557d6;
+styles.css            688  background: rgba(30, 40, 90, 0.05);

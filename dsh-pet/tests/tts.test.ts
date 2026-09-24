@@ -95,6 +95,45 @@ const ready: TtsWorkerEvent = { ready: true, voice: 'Microsoft Huihui Desktop' }
 const finished = (id: string): TtsWorkerEvent => ({ finished: { id } })
 const cancelled = (id: string): TtsWorkerEvent => ({ cancelled: { id } })
 
+test('从实际播完的句子之后续讲，保留原句编号', () => {
+  const h = makeHarness()
+  const request = { utteranceId: 'resume', text: '第一句。第二句。第三句。' }
+  h.narrator.speak(request)
+  h.deliver(ready)
+  h.deliver(finished('resume#0'))
+  h.narrator.interrupt('drop-queue')
+  h.deliver(cancelled('resume#1'))
+  assert.equal(h.narrator.resumeFrom('resume'), 1)
+  h.narrator.speak({ ...request, fromIndex: h.narrator.resumeFrom('resume') })
+  assert.deepEqual(h.transport.speaks.at(-1), { id: 'resume#1', text: '第二句。' })
+})
+
+test('未主动停止却收到取消属于播放失败，不自动继续下一句', () => {
+  const h = makeHarness()
+  h.narrator.speak({ utteranceId: 'failed', text: '第一句。第二句。' })
+  h.deliver(ready)
+  h.deliver(cancelled('failed#0'))
+  assert.equal(h.errors.length, 1)
+  assert.equal(h.transport.speaks.length, 1)
+  assert.equal(h.narrator.isSpeaking(), false)
+  assert.equal(h.transport.closeCount, 1)
+})
+
+test('只有完成回执才记录播出，进度先更新再通知播放结束', () => {
+  const events: string[] = []
+  let deliver!: (event: TtsWorkerEvent) => void
+  const transport = new FakeTransport()
+  const narrator = new Narrator(callback => { deliver = callback; return transport }, {
+    onSpoken: record => events.push(`record:${record.segment.index}:${record.complete}`),
+    onSpeaking: value => events.push(`speaking:${value}`),
+  })
+  narrator.speak({ utteranceId: 'progress', text: '这一句。' })
+  deliver(ready)
+  assert.deepEqual(events, ['speaking:true'])
+  deliver(finished('progress#0'))
+  assert.deepEqual(events, ['speaking:true', 'record:0:true', 'speaking:false'])
+})
+
 describe('一次只交给合成进程一句', () => {
   test('进程没就绪就先不派句子，就绪事件到了才派', () => {
     const h = makeHarness()
@@ -144,6 +183,107 @@ describe('一次只交给合成进程一句', () => {
       h.transport.speaks.map((item) => item.text),
       ['第一段。', '第二段。'],
     )
+  })
+})
+
+describe('边收边合成（流式朗读）', () => {
+  test('第一句一凑齐就派出去，不必等整段回答', () => {
+    const h = makeHarness()
+    h.narrator.feed('u1', '你好，今天')
+    assert.equal(h.calls.opened, 0, '半句不值得为它拉起合成进程')
+    h.narrator.feed('u1', '做了三件事。')
+    h.deliver(ready)
+    assert.deepEqual(
+      h.transport.speaks.map((item) => item.text),
+      ['你好，今天做了三件事。'],
+    )
+    assert.equal(h.transport.speaks[0].id, 'u1#0')
+  })
+
+  test('feedEnd 把最后没标点的一截也念完，序号接着上一句', () => {
+    const h = makeHarness()
+    h.narrator.feed('u1', '开头有标点。尾部还没说完')
+    h.deliver(ready)
+    h.narrator.feedEnd('u1')
+    assert.deepEqual(h.transport.speaks.map((item) => item.text), ['开头有标点。'], '一次只派一句，尾句在队列里等')
+    h.deliver(finished('u1#0'))
+    assert.deepEqual(
+      h.transport.speaks.map((item) => item.text),
+      ['开头有标点。', '尾部还没说完'],
+    )
+    assert.deepEqual(h.transport.speaks.map((item) => item.id), ['u1#0', 'u1#1'], '两次之间序号要接得上')
+  })
+
+  test('多段喂入的句子按到达顺序排队，不重新编号', () => {
+    const h = makeHarness()
+    h.narrator.feed('u1', '第一句。')
+    h.narrator.feed('u1', '第二句。')
+    h.deliver(ready)
+    assert.deepEqual(h.transport.speaks.map((item) => item.id), ['u1#0'])
+    h.deliver(finished('u1#0'))
+    assert.deepEqual(h.transport.speaks.map((item) => item.id), ['u1#0', 'u1#1'])
+  })
+
+  test('打断后丢掉缓冲：残留的半句不会被补念出去', () => {
+    const h = makeHarness()
+    h.narrator.feed('u1', '只说到一半没有标点')
+    h.narrator.dropFeed('u1')
+    h.narrator.feedEnd('u1')
+    assert.equal(h.transport.speaks.length, 0)
+  })
+
+  test('没喂过任何增量的轮次不受影响，整段朗读照常', () => {
+    const h = makeHarness()
+    h.narrator.feedEnd('u9')
+    h.narrator.speak({ utteranceId: 'u9', text: '整段回答。' })
+    h.deliver(ready)
+    assert.deepEqual(
+      h.transport.speaks.map((item) => item.text),
+      ['整段回答。'],
+      '宿主不吐增量时要能退回整段朗读',
+    )
+  })
+})
+
+describe('自定义 TTS 服务的派发', () => {
+  test('选了自定义服务，配置随这一句传进 worker；没选就不带这个字段', () => {
+    const transport = new FakeTransport()
+    const api = {
+      id: 'p1', kind: 'tts' as const, name: '我的服务', endpoint: 'https://example.com/v1',
+      model: 'tts-1', voice: 'alloy', apiKey: 'sk-test', provider: 'openai' as const,
+    }
+    let deliver: (event: TtsWorkerEvent) => void = () => { throw new Error('worker 未就绪') }
+    const narrator = new Narrator(
+      (onEvent) => { deliver = onEvent; return transport },
+      {},
+      { ttsApi: () => api },
+    )
+    narrator.speak({ utteranceId: 'u1', text: '第一句。' })
+    deliver(ready)
+    const command = JSON.parse(transport.lines[0]) as { speak?: { api?: unknown } }
+    assert.deepEqual(command.speak?.api, api, '配置要随句子下发，用户中途换服务下一句就走新的')
+
+    const plain = new FakeTransport()
+    const plainNarrator = new Narrator(() => plain, {})
+    plainNarrator.speak({ utteranceId: 'u1', text: '第一句。' })
+    const plainCommand = JSON.parse(plain.lines.find(line => line.startsWith('{"speak"')) ?? '{"speak":{}}') as { speak?: Record<string, unknown> }
+    assert.equal('api' in (plainCommand.speak ?? {}), false, '没选服务就不带配置字段')
+  })
+
+  test('配置读不出来要如实停，不悄悄退回默认服务', () => {
+    const transport = new FakeTransport()
+    const errors: string[] = []
+    let deliver: (event: TtsWorkerEvent) => void = () => { throw new Error('worker 未就绪') }
+    const narrator = new Narrator(
+      (onEvent) => { deliver = onEvent; return transport },
+      { onError: reason => errors.push(reason) },
+      { ttsApi: () => { throw new Error('密钥解不开') } },
+    )
+    narrator.speak({ utteranceId: 'u1', text: '第一句。' })
+    deliver(ready)
+    assert.deepEqual(errors, ['密钥解不开'])
+    assert.equal(transport.speaks.length, 0, '一句都不该派出去')
+    assert.equal(narrator.isSpeaking(), false)
   })
 })
 

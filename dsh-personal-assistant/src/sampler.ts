@@ -7,13 +7,14 @@
  * PID 文件仅用于诊断与陈旧进程排查，不作为存活判据（以子进程句柄为准）。
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { closeSync, fstatSync, openSync, readSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { closeSync, fstatSync, openSync, readSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 export interface Sample {
   /** epoch 毫秒。 */
   ts: number
   idle?: boolean
+  excluded?: boolean
   pid?: number
   proc?: string
   title?: string
@@ -56,6 +57,8 @@ export interface SamplerOptions {
    * 因此未授权的标题不会先落进 JSONL 再被过滤——分级授权必须落在采集侧。
    */
   readonly captureTitles: boolean
+  readonly excludedProcesses?: readonly string[]
+  readonly excludedTitleKeywords?: readonly string[]
 }
 
 /**
@@ -88,6 +91,8 @@ export function launchSampler(
         DSH_SAMPLE_DIR: sampleDir,
         DSH_SAMPLE_INTERVAL_MS: String(intervalMs),
         DSH_SAMPLE_TITLES: options.captureTitles ? '1' : '0',
+        DSH_SAMPLE_EXCLUDED_PROCESSES: JSON.stringify(options.excludedProcesses ?? []),
+        DSH_SAMPLE_EXCLUDED_TITLES: JSON.stringify(options.excludedTitleKeywords ?? []),
       },
     },
   )
@@ -110,15 +115,18 @@ function wrapSamplerChild(child: ChildProcess): SamplerProcess {
       if (killed) return
       killed = true
       if (child.exitCode !== null || child.signalCode !== null) return
-      // taskkill /T 覆盖子进程树；失败时退回 Node 的 kill。
-      try {
-        const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
-          windowsHide: true,
-          stdio: 'ignore',
-        })
-        if (result.status === 0) return
-      } catch {
-        // taskkill 不可用（非 Windows）时走下面的兜底
+      // Windows 上 `taskkill /T` 才能带走整棵进程树（PowerShell 会再拉起识别器子进程）；
+      // POSIX 上直接给子进程发信号即可 —— 那里没有 taskkill，硬调只会 spawn 失败一次。
+      if (process.platform === 'win32') {
+        try {
+          const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          })
+          if (result.status === 0) return
+        } catch {
+          // taskkill 不可用（非 Windows 或 PATH 里没有）时走下面的兜底
+        }
       }
       try {
         child.kill()
@@ -131,6 +139,15 @@ function wrapSamplerChild(child: ChildProcess): SamplerProcess {
 
 /** 终止采样进程（含子树）；进程已不存在时静默返回。 */
 export function killSampler(pid: number): void {
+  if (process.platform !== 'win32') {
+    // 没有进程句柄时（插件重载后只剩 pid）只能按 pid 发信号。
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch {
+      // 进程可能已退出
+    }
+    return
+  }
   try {
     spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
   } catch {
@@ -172,6 +189,37 @@ export function readSamples(filePath: string): Sample[] {
 
 /** 采样原文的严格命名。同目录下的 sampler.pid 之类不匹配，因此不会被保留期清理误删。 */
 const SAMPLE_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/
+
+/**
+ * 删除某一天采样原文里落在 [startMs, endMs) 的样本，返回删除条数。
+ * 调用方必须先停掉采样进程：边重写边追加会丢新样本或留下半行。
+ */
+export function pruneSampleRange(filePath: string, startMs: number, endMs: number): number {
+  let content: string
+  try {
+    content = readFileSync(filePath, 'utf8')
+  } catch {
+    return 0
+  }
+  const kept: string[] = []
+  let removed = 0
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let ts: unknown
+    try {
+      ts = (JSON.parse(trimmed) as Sample).ts
+    } catch {
+      kept.push(trimmed)
+      continue
+    }
+    if (typeof ts === 'number' && ts >= startMs && ts < endMs) removed += 1
+    else kept.push(trimmed)
+  }
+  if (removed === 0) return 0
+  writeFileSync(filePath, kept.length > 0 ? kept.join('\n') + '\n' : '', 'utf8')
+  return removed
+}
 
 /** 只读文件尾部这么多字节来找最新一条采样；一天的 JSONL 有上万行，全读只为一拍太浪费。 */
 const TAIL_BYTES = 8192

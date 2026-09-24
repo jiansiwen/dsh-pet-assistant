@@ -21,6 +21,8 @@ import { Config, type Config as ConfigType } from '../src/config.ts'
 import type { DayRecord, ModeState, Preference, ReportMeta, SemanticEvent } from '../src/domain.ts'
 import { apply } from '../src/index.ts'
 import { sampleFileOf } from '../src/sampler.ts'
+import type { Task } from '../src/team-domain.ts'
+import { TeamStore } from '../src/team-domain.ts'
 import { localDateOf, startOfLocalDate } from '../src/time.ts'
 
 const DAY = 86_400_000
@@ -29,10 +31,17 @@ const TODAY = localDateOf(NOW)
 const YESTERDAY = localDateOf(NOW - DAY)
 const STALE = localDateOf(NOW - 12 * DAY)
 
+// 装配必须接上的核心工具清单。断言用「全覆盖 + 前缀守卫」而不是逐一相等：
+// 工具面在活跃演进（帮助上下文、采集范围都是近期加的），冒烟要守住的是
+// 「入口把该注册的都注册了、没注册进来路不明的东西」，不是把清单钉死在某一版。
 const EXPECTED_TOOLS = [
   'personal_assistant_summon_pet',
   'personal_assistant_set_team_mode',
   'personal_assistant_start',
+  'personal_assistant_ack_capture_scope',
+  'personal_assistant_revoke_report',
+  'personal_assistant_delete_activity',
+  'personal_assistant_set_capture_titles',
   'personal_assistant_stop',
   'personal_assistant_status',
   'personal_assistant_today',
@@ -43,8 +52,23 @@ const EXPECTED_TOOLS = [
   'personal_assistant_submit_report',
   'personal_assistant_confirm_report',
   'personal_assistant_remember_preference',
+  'personal_assistant_resolve_preference',
   'personal_assistant_list_preferences',
   'personal_assistant_forget_preference',
+  'personal_assistant_help_context',
+  'personal_assistant_list_help_contexts',
+  'personal_assistant_forget_help_context',
+  'personal_assistant_read_project_evidence',
+]
+
+/** 团队模式挂载后额外注册的委派工具（desktop_team_*）。 */
+const EXPECTED_TEAM_TOOLS = [
+  'desktop_team_start',
+  'desktop_team_assign',
+  'desktop_team_status',
+  'desktop_team_cancel',
+  'desktop_team_propose_action',
+  'desktop_team_finish_operation',
 ]
 
 let passed = 0
@@ -158,7 +182,7 @@ interface Harness {
   readonly disposalOrder: string[]
   readonly listeners: string[]
   toolNames(): string[]
-  callTool(name: string, args?: unknown): Promise<Record<string, unknown>>
+  callTool(name: string, args?: unknown, exec?: unknown): Promise<Record<string, unknown>>
   variable(name: string): string | undefined
   section(name: string): string
   dispose(): void
@@ -204,17 +228,17 @@ function createHarness(domain: FakeDomain): Harness {
       tools: {
         register(definition: RegisteredTool) {
           tools.set(definition.name, definition)
-          return () => undefined
+          return () => { tools.delete(definition.name) }
         },
       },
       systemPrompt: {
         section(section: { name: string; text: string }) {
           sections.set(section.name, section.text)
-          return () => undefined
+          return () => { sections.delete(section.name) }
         },
         variable(name: string, provider: () => string | undefined) {
           variables.set(name, provider)
-          return () => undefined
+          return () => { variables.delete(name) }
         },
       },
     } as never,
@@ -224,10 +248,10 @@ function createHarness(domain: FakeDomain): Harness {
     disposalOrder,
     listeners,
     toolNames: () => [...tools.keys()],
-    async callTool(name: string, args: unknown = {}) {
+    async callTool(name: string, args: unknown = {}, exec: unknown = {}) {
       const tool = tools.get(name)
       assert.ok(tool, `工具没注册：${name}`)
-      const raw = await tool.execute(args, {})
+      const raw = await tool.execute(args, exec)
       assert.equal(typeof raw, 'string', `${name} 的输出应该是 JSON 字符串`)
       return JSON.parse(raw as string) as Record<string, unknown>
     },
@@ -261,6 +285,17 @@ function countRows(storePath: string, sql: string): number {
   }
 }
 
+/** 库里第一列的原始值（可能是文本）；查不到行返回 undefined。 */
+function readCell(storePath: string, sql: string): unknown {
+  const db = new DatabaseSync(storePath, { readOnly: true })
+  try {
+    const row = db.prepare(sql).get() as Record<string, unknown> | undefined
+    return row ? Object.values(row)[0] : undefined
+  } finally {
+    db.close()
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 场景一：正常升级——旧数据搬进来、超期原文清掉、采集开关照配置生效
 // ---------------------------------------------------------------------------
@@ -271,9 +306,11 @@ async function scenarioUpgrade(root: string): Promise<void> {
   mkdirSync(sampleDir, { recursive: true })
 
   // 三天的采样原文：12 天前（超出 7 天保留期）、昨天、今天。今天的按迁移口径要排除。
+  // 采样间隔必须落在聚合口径的合并窗口内（≤ 3×sampleIntervalMs）：孤立的单点采样
+  // start==end，会被 minSpanMs 当噪声丢掉，库里就看不到 activity_span 了。
   const seedSamples = (date: string, title: string): void => {
     const base = startOfLocalDate(date) + 9 * 3_600_000
-    const lines = [0, 30_000, 60_000].map(offset => JSON.stringify({ ts: base + offset, pid: 4242, proc: 'WINWORD', title }))
+    const lines = [0, 5_000, 10_000].map(offset => JSON.stringify({ ts: base + offset, pid: 4242, proc: 'WINWORD', title }))
     writeFileSync(sampleFileOf(sampleDir, date), `${lines.join('\n')}\n`)
   }
   seedSamples(STALE, '旧季度总结.docx - Microsoft Word')
@@ -326,7 +363,14 @@ async function scenarioUpgrade(root: string): Promise<void> {
     await checkAsync('入口装配跑通：库建出来了，工具与提示词都注册上了', async () => {
       await apply(harness.ctx, config)
       assert.ok(existsSync(storePath), `助理库没建出来：${storePath}`)
-      assert.deepEqual(harness.toolNames().sort(), [...EXPECTED_TOOLS].sort())
+      const names = harness.toolNames()
+      for (const name of EXPECTED_TOOLS) {
+        assert.ok(names.includes(name), `核心工具没注册：${name}`)
+      }
+      assert.ok(
+        names.every(name => name.startsWith('personal_assistant_')),
+        `助理插件注册了来路不明的工具：${names.filter(name => !name.startsWith('personal_assistant_')).join(', ')}`,
+      )
       assert.ok(harness.section('personal-assistant').includes('已确认的记忆'))
       // 提示词变量在**空库**下逐个真调一次：宿主把"变量没有值"当装配错误直接炸，
       // 而这条链路只有真机渲染提示词才走得到 —— 空态返回 undefined 的 bug 就是这么溜过去的。
@@ -402,8 +446,21 @@ async function scenarioUpgrade(root: string): Promise<void> {
     const draftOne = '# 今日日报\n\n- 写季度总结 1 小时\n'
     const draftTwo = '# 今日日报（改过）\n\n- 写季度总结 1 小时\n- 需求评审 30 分钟\n'
     let confirmedDigest = ''
+    let submittedProposalId = ''
+    let approvalCredential: { port: number; epoch: string; reportApprovalToken: string }
+    const approveOverHttp = async () => {
+      const response = await fetch(`http://127.0.0.1:${approvalCredential.port}/report-approval`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', connection: 'close', 'x-dsh-approval-token': approvalCredential.reportApprovalToken },
+        body: JSON.stringify({ proposalId: submittedProposalId, decision: 'approve', epoch: approvalCredential.epoch }),
+        signal: AbortSignal.timeout(5000),
+      })
+      return { status: response.status, body: await response.json() as Record<string, unknown> }
+    }
 
-    await checkAsync('日报流程：存草稿 → 提交确认 → 落盘；摘要对不上就不写文件', async () => {
+    await checkAsync('日报流程：提交和聊天确认均只待批，可信 HTTP 批准才落盘并停止模式', async () => {
+      // 只模拟持久化模式标记，不启采样、不编造可能误杀真实进程的 pid。
+      await harness.domain.global.set({ active: true, startedAt: NOW })
       const saved = await harness.callTool('personal_assistant_save_draft', { content: draftOne })
       assert.equal(saved.revision, 1)
       assert.equal(saved.state, 'draft')
@@ -413,28 +470,39 @@ async function scenarioUpgrade(root: string): Promise<void> {
       assert.equal(submitted.revision, 1)
       assert.equal(submitted.digest, saved.digest, '提交给用户的摘要必须就是这一版的摘要')
       assert.equal(submitted.targetPath, targetFile)
-
-      // 模型替用户"确认"时最容易编的就是摘要。编出来的摘要必须被挡住，且一个字都不落盘。
-      const forged = await harness.callTool('personal_assistant_confirm_report', {
-        revision: 1,
-        digest: '编出来的摘要',
-      })
-      assert.equal(forged.confirmed, false)
-      assert.equal(forged.reason, 'digest_mismatch')
-      assert.equal(existsSync(targetFile), false, '确认没通过就不该创建目标文件')
-
+      assert.equal(existsSync(targetFile), false)
+      submittedProposalId = String(submitted.proposalId)
       confirmedDigest = String(submitted.digest)
-      const confirmed = await harness.callTool('personal_assistant_confirm_report', {
-        revision: submitted.revision,
-        digest: submitted.digest,
+
+      // 摘要无论真伪，模型调用 confirm 都不能批准、写文件或停止采集。
+      for (const digest of ['编出来的摘要', submitted.digest]) {
+        const confirmed = await harness.callTool('personal_assistant_confirm_report', { revision: 1, digest })
+        assert.equal(confirmed.confirmed, false)
+        assert.equal(confirmed.reason, 'trusted_approval_required')
+        assert.equal(confirmed.proposalId, submitted.proposalId)
+        assert.equal(existsSync(targetFile), false)
+        assert.equal(harness.domain.global.get().active, true)
+      }
+
+      const bound = await harness.callTool('personal_assistant_summon_pet', {}, {
+        agent: { session: { events: [] }, followup() { assert.fail('测试不得调用真实模型') } },
       })
-      assert.equal(confirmed.confirmed, true)
-      assert.equal(confirmed.modeExited, true, '定稿之后该自动退出助理模式')
-      assert.equal(readFileSync(String(confirmed.savedPath), 'utf8'), draftOne)
+      assert.equal(bound.ok, true)
+      assert.equal(bound.petLaunched, false)
+      assert.equal(bound.teamMode, false)
+      approvalCredential = JSON.parse(readFileSync(path.join(home, 'personal-assistant', 'bridge-approval.json'), 'utf8'))
+      assert.equal(typeof approvalCredential.reportApprovalToken, 'string')
+      assert.equal(JSON.stringify(submitted).includes(approvalCredential.reportApprovalToken), false)
+      const confirmed = await approveOverHttp()
+      assert.equal(confirmed.status, 200)
+      assert.equal(confirmed.body.confirmed, true)
+      assert.equal(confirmed.body.modeExited, true, '定稿之后该自动退出助理模式')
+      assert.equal(harness.domain.global.get().active, false)
+      assert.equal(readFileSync(String(confirmed.body.savedPath), 'utf8'), draftOne)
       assert.deepEqual(readdirSync(reportDir), [`${TODAY}.md`], '版本化临时产物不该留下')
     })
 
-    await checkAsync('定稿之后再改草稿：出新版本、旧确认作废、已归档的文件不被覆盖', async () => {
+    await checkAsync('定稿之后再改草稿：出新版本、旧批准不能重放、已归档的文件不被覆盖', async () => {
       const saved = await harness.callTool('personal_assistant_save_draft', { content: draftTwo })
       assert.equal(saved.revision, 2, '内容变了就该是新版本，不能在归档版本上改')
 
@@ -443,7 +511,10 @@ async function scenarioUpgrade(root: string): Promise<void> {
         digest: confirmedDigest,
       })
       assert.equal(replay.confirmed, false)
-      assert.equal(replay.reason, 'stale_revision')
+      assert.equal(replay.reason, 'trusted_approval_required')
+      const httpReplay = await approveOverHttp()
+      assert.equal(httpReplay.status, 409)
+      assert.equal(httpReplay.body.error, 'ALREADY_CONSUMED')
       assert.equal(readFileSync(targetFile, 'utf8'), draftOne, '新草稿还没确认，磁盘上必须还是定稿那份')
 
       const draft = await harness.callTool('personal_assistant_get_draft')
@@ -562,6 +633,145 @@ async function scenarioBrokenLegacy(root: string): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 场景三：团队模式装配——挂载即对账中断任务，关闭团队模式不丢账
+// ---------------------------------------------------------------------------
+
+async function scenarioTeam(root: string): Promise<void> {
+  const home = path.join(root, 'team')
+  mkdirSync(path.join(home, 'personal-assistant', 'samples'), { recursive: true })
+  const teamStorePath = path.join(home, 'desktop-team', 'team.sqlite')
+  const assistantStorePath = path.join(home, 'personal-assistant', 'assistant.sqlite')
+
+  // 造一个「上个进程崩在运行中」的团队库：running 任务 + running 运行记录。
+  // 挂载时的 recoverInterruptedTasks 必须把它们对账成 unknown，而不是留着 running
+  // 让下一次执行流程重发已经发生过的副作用。
+  mkdirSync(path.dirname(teamStorePath), { recursive: true })
+  const seed = new TeamStore(teamStorePath)
+  seed.upsertMember({
+    assistantId: 'member-wukong',
+    roleId: 'wukong',
+    displayName: '孙悟空',
+    skinId: 'boy-glasses',
+    persona: '你是孙悟空。',
+    voiceProfile: 'bright-male',
+    toolPolicy: { mode: 'read-only', denyTools: [] },
+    enabled: true,
+    revision: 1,
+  })
+  const crashedTask: Task = {
+    taskId: 'task-crashed',
+    teamId: 'desktop-team', // config.teamId 的默认值；恢复按 teamId 过滤
+    ownerId: 'member-wukong',
+    goal: '上个进程崩在运行中的任务',
+    inputEvidence: [],
+    acceptance: [],
+    toolScope: 'read-only',
+    budgetTokens: 0,
+    deadlineAt: null,
+    dependsOn: [],
+    status: 'running',
+    revision: 2,
+    artifacts: [],
+    originRequestId: null,
+    originChannel: null,
+    createdAt: NOW - 3_600_000,
+    updatedAt: NOW - 3_600_000,
+  }
+  seed.insertTask(crashedTask)
+  seed.insertRun({
+    runId: 'run-crashed',
+    taskId: crashedTask.taskId,
+    assistantId: 'member-wukong',
+    childSessionId: null,
+    messageId: null,
+    state: 'running',
+    stopReason: null,
+    outputDigest: null,
+    startedAt: NOW - 3_600_000,
+    endedAt: null,
+  })
+  seed.close()
+
+  const domain = new FakeDomain({
+    preferences: fakeTable<Preference>() as unknown as FakeTable<never>,
+    days: fakeTable<DayRecord>() as unknown as FakeTable<never>,
+    reports: fakeTable<ReportMeta>() as unknown as FakeTable<never>,
+  })
+  const harness = createHarness(domain)
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    // 采集关掉：本场景验的是团队装配与恢复，不该真去启采样进程。
+    const config = configWith({ teamEnabled: true, captureActivity: false })
+    await checkAsync('团队挂载即对账：崩溃遗留的 running 任务/运行被记成 unknown，不重发', async () => {
+      await apply(harness.ctx, config)
+      assert.equal(
+        readCell(teamStorePath, `SELECT status FROM tasks WHERE task_id = 'task-crashed'`),
+        'unknown',
+        '挂载必须调用恢复对账，不能让 running 状态带着旧账上岗',
+      )
+      assert.equal(
+        readCell(teamStorePath, `SELECT state FROM task_runs WHERE run_id = 'run-crashed'`),
+        'unknown',
+      )
+      assert.equal(
+        readCell(teamStorePath, `SELECT stop_reason FROM task_runs WHERE run_id = 'run-crashed'`),
+        'runtime-interrupted',
+      )
+    })
+
+    check('团队工具、提示词段与编制变量随挂载注册', () => {
+      const names = harness.toolNames()
+      for (const name of EXPECTED_TEAM_TOOLS) {
+        assert.ok(names.includes(name), `团队工具没注册：${name}`)
+      }
+      assert.ok(harness.section('desktop-team').includes('桌面专家助理团'))
+      const roster = harness.variable('desktop_team_roster') ?? ''
+      assert.match(roster, /孙悟空/, '编制变量要能读到已启用成员')
+      assert.equal(countRows(teamStorePath, 'SELECT COUNT(*) AS n FROM assistants'), 5, 'ensureRoster 补齐五人编制')
+      assert.equal(
+        String(readCell(assistantStorePath, `SELECT value FROM user_flags WHERE key = 'team_mode_enabled'`)),
+        'true',
+        '配置开启的团队模式也要落用户标记，重启后不丢',
+      )
+    })
+
+    await checkAsync('关闭团队模式：无运行任务时立即生效，账目原样落盘不丢', async () => {
+      // 关闭之前，团队工具走的是挂载好的运行时：状态投影必须能看到编制与任务账。
+      const before = await harness.callTool('desktop_team_status')
+      assert.equal(before.teamEnabled, true)
+      assert.equal((before.members as unknown[]).length, 5)
+
+      const result = await harness.callTool('personal_assistant_set_team_mode', { enabled: false })
+      assert.equal(result.ok, true)
+      assert.equal(result.teamMode, false)
+      assert.equal(
+        String(readCell(assistantStorePath, `SELECT value FROM user_flags WHERE key = 'team_mode_enabled'`)),
+        'false',
+      )
+      // disableTeamMode 会 await 释放（对账 → 关库）；库里的账必须还在且已对清。
+      assert.equal(readCell(teamStorePath, `SELECT status FROM tasks WHERE task_id = 'task-crashed'`), 'unknown')
+      assert.equal(countRows(teamStorePath, 'SELECT COUNT(*) AS n FROM assistants'), 5)
+      const endedEvents = countRows(
+        teamStorePath,
+        `SELECT COUNT(*) AS n FROM events_outbox WHERE type = 'run/ended' AND task_id = 'task-crashed'`,
+      )
+      assert.ok(endedEvents >= 1, '中断对账要留下事件账目，桌面壳投影靠它')
+      assert.equal(harness.toolNames().some(name => name.startsWith('desktop_team_')), false)
+      assert.equal(harness.variable('desktop_team_roster'), undefined)
+      assert.equal((await harness.callTool('personal_assistant_set_team_mode', { enabled: true })).ok, true)
+      assert.equal((await harness.callTool('desktop_team_status')).teamEnabled, true)
+      assert.equal((await harness.callTool('personal_assistant_set_team_mode', { enabled: false })).ok, true)
+      assert.equal(harness.toolNames().some(name => name.startsWith('desktop_team_')), false)
+    })
+  } finally {
+    harness.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+}
+
 async function main(): Promise<void> {
   const root = mkdtempSync(path.join(os.tmpdir(), 'dsh-apply-'))
   try {
@@ -569,6 +779,8 @@ async function main(): Promise<void> {
     await scenarioUpgrade(root)
     console.log('\n== 场景二：旧数据读不出来')
     await scenarioBrokenLegacy(root)
+    console.log('\n== 场景三：团队模式装配与中断恢复')
+    await scenarioTeam(root)
     console.log(`\n全部通过：${passed} 项`)
   } finally {
     rmSync(root, { recursive: true, force: true })

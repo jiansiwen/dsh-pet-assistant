@@ -80,6 +80,7 @@ const appHandlers = new Map<string, (event?: unknown, ...rest: unknown[]) => voi
 const quitCalls: number[] = []
 const registeredShortcuts: string[] = []
 let shortcutsCleared = 0
+let dockHideCalls = 0
 const windows: FakeBrowserWindow[] = []
 const trays: FakeTray[] = []
 
@@ -157,6 +158,15 @@ const fakeElectron = {
       quitCalls.push(Date.now())
     },
     getPath: (name: string) => path.join(sandbox, `electron-${name}`),
+    // macOS 上装配会调 app.dock.hide() 把宠物从 Dock 里拿掉。测试跑在任意平台上，
+    // 所以这里必须提供 dock —— 缺了就是 "Cannot read properties of undefined"。
+    dock: { hide: () => { dockHideCalls += 1 } },
+  },
+  // 装配时会问一次麦克风权限（macOS 上没声明用途说明会被系统直接终止进程）。
+  // 这里给一个"已授权"的替身：测试不该弹系统对话框。
+  systemPreferences: {
+    getMediaAccessStatus: () => 'granted',
+    askForMediaAccess: () => Promise.resolve(true),
   },
   BrowserWindow: FakeBrowserWindow,
   ipcMain: {
@@ -175,6 +185,16 @@ const fakeElectron = {
     removeAllListeners: (channel: string) => {
       ipcListeners.delete(channel)
       ipcRemoved.push({ kind: 'on', channel })
+    },
+  },
+  // 系统密钥库替身：只加前缀就够验"落盘是密文、读回一致"，真加密归真机验。
+  safeStorage: {
+    isEncryptionAvailable: () => true,
+    encryptString: (value: string) => Buffer.from(`enc:${value}`),
+    decryptString: (value: Buffer) => {
+      const text = value.toString('utf8')
+      if (!text.startsWith('enc:')) throw new Error('解不开')
+      return text.slice(4)
     },
   },
   screen: {
@@ -203,8 +223,10 @@ const fakeElectron = {
     openExternal: () => Promise.resolve(),
   },
   nativeImage: {
-    createFromPath: () => ({ resize: () => ({}) }),
-    createEmpty: () => ({}),
+    // resize 返回的对象要能接 setTemplateImage —— macOS 分支会调它把图标标成
+    // 跟随菜单栏主题反色的单色蒙版。
+    createFromPath: () => ({ resize: () => ({ setTemplateImage: () => {} }) }),
+    createEmpty: () => ({ setTemplateImage: () => {} }),
   },
   Tray: FakeTray,
 }
@@ -233,13 +255,17 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
 test('通道清单：舞台侧注册的每一条都该在，一条不多', () => {
   const expectedOn = [
     'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'stage-set-visible', 'stage-set-focus',
-    'proactive-respond',
+    'proactive-respond', 'overlay-state',
   ]
   const expectedHandle = [
-    'get-state', 'save-settings', 'chat-send',
+    'get-state', 'save-settings', 'chat-send', 'session-get', 'session-command',
     'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir', 'doc-open', 'doc-explain', 'doc-ask',
     'team-get', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
+    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select',
+    'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
+    'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
+    'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
   ]
   assert.deepEqual([...ipcListeners.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedOn].sort())
   assert.deepEqual([...ipcHandlers.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedHandle].sort())
@@ -263,15 +289,28 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
   // 界面看起来"点了没反应"，而日志上一切正常 —— 这类断裂只有对清单才看得出来。
   const exposed = [
     'get-state', 'save-settings', 'mouse-state', 'context-menu', 'chat-send', 'speech-stop',
+    'session-get', 'session-command', 'overlay-state',
     'team-get', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
-    'asr-stream-feed', 'asr-stream-stop', 'open-report-dir', 'runtime-start', 'runtime-stop',
+    'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
+    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'runtime-start', 'runtime-stop',
     'stage-set-visible', 'stage-set-focus',
     'doc-open', 'doc-explain', 'doc-ask', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
+    'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
+    'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
+    'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
     'exit-done',
   ]
   for (const channel of exposed) {
     assert.ok(ipcHandlers.has(channel) || ipcListeners.has(channel), `preload 暴露了 ${channel}，主进程没接`)
   }
+})
+
+test('会话和浮层通道拒绝非舞台窗口的调用', async () => {
+  assert.deepEqual(await ipcHandlers.get('session-get')?.({}), { ok: false, error: '会话请求来源无效' })
+  assert.deepEqual(await ipcHandlers.get('session-command')?.({}, { kind: 'permission', bindingId: 'x', value: 'danger-full-access' }),
+    { ok: false, error: '会话操作参数或来源无效' })
+  ipcListeners.get('overlay-state')?.({}, { open: true, settingsOpen: false, boxes: [] })
+  assert.equal(lastSent('overlay-dismiss'), undefined)
 })
 
 test('stage-set-focus：专注模式掐掉唤醒监听，退出专注再恢复 —— 麦克风只有一个主人', () => {

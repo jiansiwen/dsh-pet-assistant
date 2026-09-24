@@ -1,143 +1,118 @@
-/**
- * ApprovalService 的单测（真 TeamStore + 临时目录库）。
- *
- * 这条链路原先只有 smoke 覆盖，进不了单测的原因是本文件用了构造函数参数属性 ——
- * 已改成显式字段。审批是安全核心，这里的每一条都对应一次"本不该发生的副作用"：
- * 不可信主体签发、过期批准、重放、无批准调用、代次错位。
- */
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import path from 'node:path'
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
+import { ApprovalError, ApprovalService, digestOf, planDigestOf, type GateCall } from '../src/approval.ts'
+import { TeamStore, type Task } from '../src/team-domain.ts'
 
-import { ApprovalError, ApprovalService, planDigestOf } from '../src/approval.ts'
-import { TeamStore } from '../src/team-domain.ts'
-
-function service(ttlMs = 60_000): { approvals: ApprovalService; store: TeamStore; dir: string } {
-  const dir = mkdtempSync(path.join(tmpdir(), 'approval-test-'))
-  const store = new TeamStore(path.join(dir, 'team.sqlite'))
-  return {
-    approvals: new ApprovalService(store, { ttlMs, runtimeEpoch: 'epoch-1' }),
-    store,
-    dir,
-  }
+function fixture(t: TestContext) {
+  const store = new TeamStore(':memory:')
+  t.after(() => store.close())
+  store.upsertMember({ assistantId: 'chief', roleId: 'tangseng', displayName: '总助理', skinId: 'test', persona: '',
+    voiceProfile: '', enabled: true, revision: 1, toolPolicy: { mode: 'side-effect', denyTools: [] } })
+  const task: Task = { taskId: 'task-1', teamId: 'test', ownerId: 'chief', goal: '测试', inputEvidence: [], acceptance: [],
+    toolScope: 'side-effect', budgetTokens: 0, deadlineAt: null, dependsOn: [], status: 'running', revision: 1,
+    artifacts: [], originRequestId: null, originChannel: null, createdAt: 1, updatedAt: 1 }
+  store.insertTask(task)
+  const approvals = new ApprovalService(store, { ttlMs: 60_000, runtimeEpoch: 'epoch-1' })
+  const call: GateCall = { taskId: task.taskId, assistantId: 'chief', tool: 'write', target: 'test.txt',
+    params: { file_path: 'test.txt', content: '测试内容', options: { a: 1, b: 2 } }, inputRevision: 1 }
+  const propose = () => approvals.propose({ ...call, summary: '写入测试内容', risk: 'medium' })
+  const issue = () => { const proposal = propose(); return { proposal, approval: approvals.issue(proposal.proposalId, { channel: 'desktop-shell' }, true) } }
+  return { store, approvals, task, call, propose, issue }
 }
 
-function input(taskId = 'task-1') {
-  return {
-    taskId,
-    assistantId: 'member-wukong',
-    summary: '写一份修改计划到仓库',
-    tool: 'write',
-    target: 'repo/README.md',
-    params: { content: 'hello' },
-    inputRevision: 1,
-    risk: 'medium' as const,
-  }
-}
+const code = (expected: string) => (error: unknown) => error instanceof ApprovalError && error.code === expected
 
-test('凭据校验：正确 token 通过，错的和缺的都不过（常量时间比较）', () => {
-  const { approvals, store, dir } = service()
-  try {
-    assert.equal(approvals.verifyCapabilityToken(approvals.approvalCapabilityToken), true)
-    assert.equal(approvals.verifyCapabilityToken('x'.repeat(36)), false)
-    assert.equal(approvals.verifyCapabilityToken(undefined), false)
-  } finally {
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
-  }
+test('凭据和可信主体签发校验', t => {
+  const { approvals, propose } = fixture(t)
+  assert.equal(approvals.verifyCapabilityToken(approvals.approvalCapabilityToken), true)
+  assert.equal(approvals.verifyCapabilityToken(undefined), false)
+  assert.equal(approvals.verifyCapabilityToken('x'.repeat(36)), false)
+  assert.throws(() => approvals.issue(propose().proposalId, { channel: 'desktop-shell' }, false), code('UNTRUSTED_SUBJECT'))
 })
 
-test('提案 → 签发 → 消费 → 重放被拒：批准一次、执行一次', () => {
-  const { approvals, store, dir } = service()
-  try {
-    const proposal = approvals.propose(input())
-    assert.equal(proposal.state, 'pending')
-
-    const subject = { channel: 'desktop-shell' as const, windowId: 7 }
-    assert.throws(() => approvals.issue(proposal.proposalId, subject, false), (error: unknown) =>
-      error instanceof ApprovalError && error.code === 'UNTRUSTED_SUBJECT',
-      '不可信主体不得签发')
-
-    const approval = approvals.issue(proposal.proposalId, subject, true)
-    assert.equal(approval.planDigest, planDigestOf(proposal))
-    assert.equal(approval.scope, 'repo/README.md|desktop-shell')
-
-    const operation = approvals.consumeByProposal(proposal.proposalId, 'write')
-    assert.equal(operation.state, 'planned')
-
-    assert.throws(() => approvals.consumeByProposal(proposal.proposalId, 'write'), (error: unknown) =>
-      error instanceof ApprovalError && error.code === 'ALREADY_CONSUMED',
-      '同一条批准只能执行一次')
-    assert.equal(approvals.operations('task-1').length, 1, '操作账目只有一条')
-  } finally {
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
-  }
+test('真实完整参数匹配、键序无关、单次消费并原子登记', t => {
+  const { approvals, call, issue, store } = fixture(t)
+  assert.equal(approvals.authorizeCall(call).ok, false)
+  const { proposal, approval } = issue()
+  assert.equal(approval.planDigest, planDigestOf(proposal))
+  assert.equal(JSON.parse(approval.scope).runtimeEpoch, 'epoch-1')
+  const reordered = { ...call, params: { options: { b: 2, a: 1 }, content: '测试内容', file_path: 'test.txt' } }
+  assert.equal(approvals.authorizeCall(reordered).ok, true)
+  assert.equal(approvals.authorizeCall(call).ok, false)
+  assert.equal(approvals.operations(call.taskId).length, 1)
+  assert.equal(store.eventsSince(0).filter(event => event.type === 'operation/updated').length, 1)
 })
 
-test('过期提案签发被拒并标记 expired；pendingProposals 不把过期提案报给用户', () => {
-  const { approvals, store, dir } = service()
-  try {
-    const proposal = approvals.propose(input(), 1) // 1ms TTL
-    const subject = { channel: 'desktop-shell' as const }
-    assert.throws(() => approvals.issue(proposal.proposalId, subject, true), (error: unknown) =>
-      error instanceof ApprovalError && error.code === 'EXPIRED')
-    assert.equal(store.getProposal(proposal.proposalId)?.state, 'expired')
-    assert.equal(approvals.pendingProposals().length, 0, '过期提案不算待办')
-  } finally {
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
+test('同目标的内容、成员、版本、工具和任务错配均不消费批准', t => {
+  const { approvals, call, issue, store } = fixture(t)
+  const { approval, proposal } = issue()
+  const mutations: Partial<GateCall>[] = [
+    { params: { file_path: 'test.txt', content: '替换成恶意内容' } }, { assistantId: 'other' },
+    { inputRevision: 2 }, { tool: 'edit' }, { taskId: 'other-task' }, { target: 'other.txt' },
+  ]
+  for (const change of mutations) {
+    const changed = { ...call, ...change }
+    assert.equal(approvals.authorizeCall(changed).ok, false)
+    assert.throws(() => approvals.consume(approval.approvalId, changed.tool, changed.taskId, changed), code('DIGEST_MISMATCH'))
   }
+  assert.throws(() => approvals.consumeByProposal(proposal.proposalId, 'write'), code('DIGEST_MISMATCH'))
+  assert.equal(store.getApproval(approval.approvalId)?.consumedAt, null)
+  assert.equal(approvals.authorizeCall(call).ok, true)
 })
 
-test('驳回后的提案没有批准可消费', () => {
-  const { approvals, store, dir } = service()
-  try {
-    const proposal = approvals.propose(input())
-    approvals.reject(proposal.proposalId, { channel: 'desktop-shell' as const }, true)
-    assert.throws(() => approvals.consumeByProposal(proposal.proposalId, 'write'), (error: unknown) =>
-      error instanceof ApprovalError && error.code === 'NOT_FOUND')
-    assert.equal(approvals.operations('task-1').length, 0, '被拒绝的提案不留下任何副作用账目')
-  } finally {
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
-  }
+test('任务修订、状态、权限变化使已批准计划失效', t => {
+  const { approvals, call, issue, store, task } = fixture(t)
+  const { approval } = issue()
+  store.updateTask(task.taskId, task.revision, { status: 'cancelled' })
+  assert.throws(() => approvals.consume(approval.approvalId, call.tool, call.taskId, call), code('DIGEST_MISMATCH'))
+  assert.equal(approvals.operations().length, 0)
 })
 
-test('运行时代次变化：旧代次 presented 直接 EPOCH_MISMATCH', () => {
-  const { approvals, store, dir } = service()
-  try {
-    approvals.assertEpoch('epoch-1')
-    assert.throws(() => approvals.assertEpoch('epoch-of-a-dead-process'), (error: unknown) =>
-      error instanceof ApprovalError && error.code === 'EPOCH_MISMATCH')
-  } finally {
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
-  }
+test('旧代次和旧版无代次批准在真实消费路径上拒绝', t => {
+  const { approvals, store, call, issue } = fixture(t)
+  const { proposal, approval } = issue()
+  const restarted = new ApprovalService(store, { ttlMs: 60_000, runtimeEpoch: 'epoch-2' })
+  assert.throws(() => restarted.consumeByProposal(proposal.proposalId, call.tool, call), code('EPOCH_MISMATCH'))
+  assert.equal(restarted.authorizeCall(call).ok, false)
+  store.insertApproval({ ...approval, approvalId: 'old-format', scope: 'test.txt|desktop-shell' })
+  assert.throws(() => approvals.consume('old-format', call.tool, call.taskId, call), code('EPOCH_MISMATCH'))
+  assert.equal(approvals.operations().length, 0)
 })
 
-test('执行点门禁：没提案给纠正话术，批准过才放行，且放行即消费', () => {
-  const { approvals, store, dir } = service()
-  try {
-    const call = { taskId: 'task-1', assistantId: 'member-wukong', tool: 'write', target: 'repo/README.md' }
+test('过期和已驳回提案不可消费，过期待批不展示', t => {
+  const { approvals, call, propose } = fixture(t)
+  const expired = approvals.propose({ ...call, summary: '已过期', risk: 'low' }, -1)
+  assert.throws(() => approvals.issue(expired.proposalId, { channel: 'local-ui' }, true), code('EXPIRED'))
+  assert.equal(approvals.pendingProposals().length, 0)
+  const rejected = propose()
+  approvals.reject(rejected.proposalId, { channel: 'local-ui' }, true)
+  assert.throws(() => approvals.consumeByProposal(rejected.proposalId, call.tool, call), code('NOT_FOUND'))
+})
 
-    const blocked = approvals.authorizeCall(call)
-    assert.equal(blocked.ok, false)
-    if (!blocked.ok) assert.match(blocked.reason, /propose_action/, '拒绝话术要教模型走提案')
+test('计划摘要包含工具及成员，特殊 JSON 键不丢失', t => {
+  const { propose } = fixture(t)
+  const proposal = propose()
+  assert.notEqual(planDigestOf(proposal), planDigestOf({ ...proposal, tool: 'bash' }))
+  assert.notEqual(planDigestOf(proposal), planDigestOf({ ...proposal, assistantId: 'other' }))
+  assert.notEqual(digestOf(JSON.parse('{"__proto__":{"content":"x"}}')), digestOf({}))
+})
 
-    const proposal = approvals.propose(input())
-    approvals.issue(proposal.proposalId, { channel: 'desktop-shell' as const }, true)
+test('未知操作阻止新批准盲重发，终态不可被迟到结果覆盖', t => {
+  const { approvals, call, issue } = fixture(t)
+  const first = issue()
+  const operation = approvals.consumeByProposal(first.proposal.proposalId, call.tool, call)
+  approvals.settle(operation.operationId, 'unknown', '待核查')
+  const next = issue()
+  assert.throws(() => approvals.consumeByProposal(next.proposal.proposalId, call.tool, call), code('ALREADY_CONSUMED'))
+  approvals.settle(operation.operationId, 'succeeded', '可信核查')
+  assert.throws(() => approvals.settle(operation.operationId, 'failed', '迟到模型报告'), code('ALREADY_CONSUMED'))
+  assert.throws(() => approvals.settle('missing', 'succeeded', null), code('NOT_FOUND'))
+})
 
-    const allowed = approvals.authorizeCall(call)
-    assert.equal(allowed.ok, true)
-    if (allowed.ok) assert.ok(allowed.operationId)
-
-    const replay = approvals.authorizeCall(call)
-    assert.equal(replay.ok, false, '同一批准不消费第二次')
-  } finally {
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
-  }
+test('操作插入失败时批准消费一并回滚', t => {
+  const { approvals, call, issue, store } = fixture(t)
+  const { approval } = issue()
+  store.insertOperation = () => { throw new Error('模拟存储失败') }
+  assert.throws(() => approvals.consume(approval.approvalId, call.tool, call.taskId, call), /模拟存储失败/)
+  assert.equal(store.getApproval(approval.approvalId)?.consumedAt, null)
 })

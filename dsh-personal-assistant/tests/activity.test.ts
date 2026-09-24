@@ -8,14 +8,15 @@
  */
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Classifier } from '../src/classifier.ts'
 import { ObservationStore } from '../src/observation.ts'
-import { listSampleDates, pruneSampleFiles, sampleFileOf, type Sample } from '../src/sampler.ts'
+import { listSampleDates, pruneSampleFiles, pruneSampleRange, sampleFileOf, type Sample } from '../src/sampler.ts'
 import { buildSpansFrom } from '../src/spans.ts'
+import { effectiveCaptureTitles } from '../src/tracker.ts'
 import { localDateOf, retentionStartDate, startOfLocalDate } from '../src/time.ts'
 
 const T0 = 1_757_000_000_000
@@ -23,6 +24,69 @@ const T0 = 1_757_000_000_000
 function sample(ts: number, over: Partial<Sample> = {}): Sample {
   return { ts, proc: 'chrome', title: '示例页面 - Google Chrome', ...over }
 }
+
+describe('删除时间段：采样原文按区间裁剪', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'dsh-prune-range-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('只删区间内样本，区间外与损坏行保留', () => {
+    const file = sampleFileOf(dir, '2026-09-10')
+    writeFileSync(file, [
+      JSON.stringify(sample(1000)),
+      JSON.stringify(sample(2000)),
+      JSON.stringify(sample(3000)),
+      '{broken',
+      '',
+    ].join('\n') + '\n', 'utf8')
+    assert.equal(pruneSampleRange(file, 2000, 3000), 1)
+    const lines = readFileSync(file, 'utf8').split('\n').filter(line => line.trim() !== '')
+    assert.deepEqual(lines, [JSON.stringify(sample(1000)), JSON.stringify(sample(3000)), '{broken'])
+  })
+
+  test('没有命中时不重写文件', () => {
+    const file = sampleFileOf(dir, '2026-09-10')
+    writeFileSync(file, JSON.stringify(sample(1000)) + '\n', 'utf8')
+    assert.equal(pruneSampleRange(file, 5000, 6000), 0)
+    assert.equal(readFileSync(file, 'utf8'), JSON.stringify(sample(1000)) + '\n')
+  })
+
+  test('观察库重叠删除只碰指定来源', () => {
+    const db = new DatabaseSync(':memory:')
+    const observations = new ObservationStore(db)
+    const put = (id: string, source: 'activity_span' | 'user_note', start: number, end: number) => {
+      assert.equal(observations.put({
+        id, source, scopeKind: 'global', scopeId: '', startAt: start, endAt: end,
+        timezone: 'local', summary: id, payloadRef: null, sensitivity: 'normal', legacyId: null, importBatch: null,
+      }), true)
+    }
+    put('span-in', 'activity_span', 1500, 2500)
+    put('span-out', 'activity_span', 5000, 6000)
+    put('note-in', 'user_note', 1500, 2500)
+    assert.deepEqual(observations.listOverlap('activity_span', 1000, 2000).map(row => row.id), ['span-in'])
+    assert.equal(observations.deleteOverlap('activity_span', 1000, 2000), 1)
+    assert.deepEqual(observations.listInRange(0, 9999).map(row => row.id).sort(), ['note-in', 'span-out'])
+    db.close()
+  })
+})
+
+describe('标题采集授权：运行时覆盖优先于配置', () => {
+  test('没有覆盖时沿用配置', () => {
+    assert.equal(effectiveCaptureTitles({}, true), true)
+    assert.equal(effectiveCaptureTitles({}, false), false)
+  })
+
+  test('用户撤销后即使配置开启也不再采标题；重新授权后恢复', () => {
+    assert.equal(effectiveCaptureTitles({ captureTitles: false }, true), false)
+    assert.equal(effectiveCaptureTitles({ captureTitles: true }, false), true)
+  })
+})
 
 describe('聚合口径：跟踪器与迁移共用同一套片段算法', () => {
   const classifier = new Classifier([])
@@ -92,6 +156,45 @@ describe('聚合口径：跟踪器与迁移共用同一套片段算法', () => {
 
   test('空采样返回空片段，不返回一段从 0 开始的假活动', () => {
     assert.deepEqual(build([]), [])
+  })
+
+  test('同一个窗口断档一小时后不拼成一小时工作', () => {
+    const spans = build([sample(T0), sample(T0 + 15_000), sample(T0 + 3_600_000), sample(T0 + 3_615_000)])
+    assert.equal(spans.length, 2)
+    assert.deepEqual(spans.map(span => span.end - span.start), [15_000, 15_000])
+  })
+
+  test('断档阈值使用实际采样周期', () => {
+    const samples = [sample(T0), sample(T0 + 30_000)]
+    assert.equal(buildSpansFrom(samples, classifier, 10_000, 10_000).length, 1)
+    assert.equal(buildSpansFrom(samples, classifier, 10_000, 5000).length, 0)
+  })
+
+  test('长时间无输入保留窗口线索，但不与普通活动合并', () => {
+    const spans = build([
+      sample(T0, { idleMs: 0 }), sample(T0 + 15_000, { idleMs: 15_000 }),
+      sample(T0 + 30_000, { idleMs: 300_000 }), sample(T0 + 45_000, { idleMs: 315_000 }),
+      sample(T0 + 60_000, { idleMs: 0 }), sample(T0 + 75_000, { idleMs: 15_000 }),
+    ])
+    assert.deepEqual(spans.map(span => span.category), ['browser', 'no-input', 'browser'])
+    assert.equal(spans[1].title, '示例页面')
+    assert.equal(spans[1].app, 'chrome')
+  })
+
+  test('被排除的窗口只保留隐私间隔，不泄漏应用标题也不拼接前后工作', () => {
+    const spans = build([
+      sample(T0), sample(T0 + 15_000),
+      sample(T0 + 30_000, { excluded: true }), sample(T0 + 45_000, { excluded: true }),
+      sample(T0 + 60_000), sample(T0 + 75_000),
+    ])
+    assert.deepEqual(spans.map(span => span.category), ['browser', 'excluded', 'browser'])
+    assert.equal(spans[1].app, '')
+    assert.equal(spans[1].title, '')
+  })
+
+  test('倒序时间和非法时间不延伸当前活动', () => {
+    const spans = build([sample(T0), sample(T0 + 15_000), sample(NaN), sample(T0 - 30_000)])
+    assert.deepEqual(spans.map(span => [span.start, span.end]), [[T0, T0 + 15_000]])
   })
 })
 

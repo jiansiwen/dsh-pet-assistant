@@ -59,7 +59,7 @@ export interface MemoryRecord {
   id: string
   kind: MemoryKind
   scope: MemoryScope
-  /** 这条记忆说的是哪件事。冲突判定按 kind + scope + topic 三元组走。 */
+  /** 这条记忆的主题分类；同主题不代表互斥，替换关系须由用户点名。 */
   topic: string
   text: string
   sourceRefs: string[]
@@ -98,6 +98,8 @@ export type WriteRejection =
   | 'empty_text'
   | 'unknown_sensitivity'
   | 'sensitive_without_encryption'
+  | 'replacement_requires_user'
+  | 'invalid_replacement'
 
 /**
  * 模型给的字段先过一遍白名单。
@@ -129,6 +131,8 @@ export const WRITE_REJECTION_MESSAGES: Record<WriteRejection, string> = {
   unknown_sensitivity: '敏感级别不认识，只能用 normal 或 sensitive',
   sensitive_without_encryption:
     '这条被标成敏感内容，但本机还没有落地加密存储（数据密钥 + Windows DPAPI + 密钥恢复提示），所以拒绝写入。请改标 normal，或先在配置里启用加密。',
+  replacement_requires_user: '只有用户明确指定的替换才能让旧记忆失效，助理只能提交候选',
+  invalid_replacement: '替换目标必须存在、尚未失效，且与新记忆类型和范围一致；不能替换选中的记忆自身',
 }
 
 /**
@@ -167,7 +171,6 @@ export function memoryWeight(record: MemoryRecord): number {
  * 而它早就该失效了。所以每次读都按当前时间重算，status 列只作为可提前失效的标记。
  */
 export function effectiveStatus(record: MemoryRecord, now: number): MemoryStatus {
-  if (record.status === 'expired' || record.status === 'conflicting') return record.status
   if (record.expiresAt !== null && record.expiresAt <= now) return 'expired'
   return record.status
 }
@@ -187,7 +190,7 @@ export function visibleScopes(context: MemoryContext): MemoryScope[] {
   return scopes
 }
 
-/** topic 归一化：冲突判定不能因为多一个空格就漏判。 */
+/** 主题归一化用于分类与同文去重，不用来推断规则互斥。 */
 export function normalizeTopic(topic: string): string {
   return topic.trim().replace(/\s+/g, ' ').toLowerCase()
 }
@@ -201,6 +204,8 @@ export interface MemoryInput {
   sourceRefs?: string[] | null
   sensitivity?: string | null
   expiresAt?: number | null
+  /** 用户明确要替换的旧记忆 id；省略即追加兼容规则，不按主题推断矛盾。 */
+  replaceIds?: string[]
   actor: MemoryActor
 }
 
@@ -211,8 +216,10 @@ export type PutResult =
 export interface DeletionOutcome {
   /** 真正从库里删掉的（含被传播掉的派生记忆）。 */
   deleted: MemoryRecord[]
-  /** 只断了来源、本体还活着的。它们没被删，但依据少了一块。 */
+  /** 来源减少或间接失效、本体仍保留但不再注入的记忆。 */
   weakened: MemoryRecord[]
+  /** 历史冲突解除的剩余项；有确认记录才恢复 confirmed，否则退回 candidate。 */
+  restored: MemoryRecord[]
   ledgerEntries: number
 }
 
@@ -247,9 +254,11 @@ export function deletionReport(outcome: DeletionOutcome, external: ExternalCopie
     record => `${labelOf(record)}（${record.id}）已从记忆库删除`,
   )
   const invalidated = outcome.weakened.map(
-    record => `${labelOf(record)}（${record.id}）仍在库里，但支撑它的来源少了一条，已不再作为已确认事实注入`,
+    record => `${labelOf(record)}（${record.id}）仍在库里，但支撑它的来源减少或失效，已不再作为已确认事实注入`,
   )
-  const retained: string[] = []
+  const retained = outcome.restored.map(record =>
+    `${labelOf(record)}（${record.id}）仍保留，历史冲突已解除，${record.status === 'confirmed' ? '已恢复为已确认并参与注入' : '待用户确认，暂不注入'}`,
+  )
   if (external.legacyDomain) {
     retained.push('旧 personal_assistant 存储域里的同一条偏好仍在（迁移默认只读导入、不删旧数据）')
   }
@@ -365,78 +374,56 @@ export class MemoryStore {
     const sourceRefs = [...new Set((input.sourceRefs ?? []).filter(item => typeof item === 'string' && item.trim()))]
     const status: MemoryStatus = input.actor.isUser ? 'confirmed' : 'candidate'
 
-    // topic 为空表示"不知道这条说的是哪件事"。这种前提下判定两条记忆互相矛盾，
-    // 就是 design.md §9.3 说的凭空补证据——迁移进来的旧偏好全都没有 topic，
-    // 照判会把它们打成一大组冲突，一条都注入不了。
-    const rivals = topic
-      ? this.findByTopic(kind, scope, topic).filter(record => effectiveStatus(record, now) !== 'expired')
-      : []
-
-    // 同一句话重复记不新增行：用户把一条偏好说两遍很常见，堆两条一模一样的进提示词
-    // 只是挤占预算，还让"这条到底记了几次"变得说不清。
-    const duplicate = rivals.find(rival => normalizeTopic(rival.text) === normalizeTopic(text))
-    if (duplicate) {
-      return { ok: true, record: duplicate, conflicts: [], superseded: [] }
-    }
-
-    const conflicts: MemoryRecord[] = []
-    const superseded: MemoryRecord[] = []
-    for (const rival of rivals) {
-      if (status === 'confirmed') {
-        if (rival.status === 'confirmed') {
-          // 用户自己前后说了两句相反的话：两边都停下，等用户挑一个。
-          // 不能按"后说的算"自动覆盖——那句可能只是口误。
-          conflicts.push(rival)
-        } else {
-          superseded.push(rival)
-        }
-      } else if (rival.status === 'confirmed') {
-        // 候选撞上已确认：候选被标冲突并展示给用户，已确认那条不动。
-        // 反过来的话，任何专家都能靠提交一条矛盾候选把用户偏好挤出提示词。
-        conflicts.push(rival)
-      }
-    }
-
-    const id = makeMemoryId(kind.slice(0, 4), now)
-    // 有冲突就谁都不生效。用户前后矛盾时把新那条直接落成 confirmed 再翻回来，
-    // 中间态会被别的读取看到，所以这里一次算准。
-    const finalStatus: MemoryStatus = conflicts.length > 0 ? 'conflicting' : status
-
     return inTransaction(this.db, () => {
-      this.write(id, {
-        kind,
-        scope,
-        topic,
-        text,
-        sourceRefs,
-        status: finalStatus,
-        sensitivity,
-        createdBy: input.actor.id,
-        confirmedBy: finalStatus === 'confirmed' ? input.actor.id : null,
-        revision: 1,
-        createdAt: now,
-        updatedAt: now,
-        expiresAt: input.expiresAt ?? null,
-        importBatch: null,
-      })
-      // 用户拍板了，之前的候选就没必要再挂着：标 expired 而不是删掉，
-      // 保留"曾经提过这个说法"的痕迹，方便回头查为什么改口。
-      for (const record of superseded) this.setStatus(record.id, 'expired', now, null)
-      // 用户前后矛盾：旧的那条也停在 conflicting，注入时被 isInjectable 一起挡掉。
-      // 只在本次写入本身就是 confirmed（即用户写的）时才这么做——助理提交的矛盾候选
-      // 只能让它自己停在 conflicting，已确认的用户偏好不能被一条候选挤下去。
-      if (finalStatus === 'conflicting' && status === 'confirmed') {
-        for (const record of conflicts) {
-          if (record.status === 'confirmed') this.setStatus(record.id, 'conflicting', now, null)
-        }
+      // 同主题只是分类，不是互斥声明；只有用户明确给出的 id 才能被替换。
+      const replaceIds = input.replaceIds ?? []
+      if (replaceIds.length > 0 && !input.actor.isUser) {
+        return { ok: false, rejection: 'replacement_requires_user', message: WRITE_REJECTION_MESSAGES.replacement_requires_user }
       }
-      const stored = this.projectRaw(id)
-      if (!stored) throw new Error(`memory ${id} vanished inside its own write transaction`)
+      const superseded = this.replacementTargets(replaceIds, kind, scope, now)
+      if (!superseded) {
+        return { ok: false, rejection: 'invalid_replacement', message: WRITE_REJECTION_MESSAGES.invalid_replacement }
+      }
+      // 空主题也只按同文去重，不把无关的旧偏好视作冲突。
+      const duplicate = this.findByTopic(kind, scope, topic).find(record =>
+        effectiveStatus(record, now) !== 'expired'
+        && !replaceIds.includes(record.id)
+        && normalizeTopic(record.text) === normalizeTopic(text),
+      )
+      if (duplicate && replaceIds.length === 0) {
+        return { ok: true, record: duplicate, conflicts: [], superseded: [] }
+      }
+
+      const id = duplicate?.id ?? makeMemoryId(kind.slice(0, 4), now)
+      if (duplicate) {
+        this.setStatus(id, 'confirmed', now, input.actor.id)
+      } else {
+        this.write(id, {
+          kind,
+          scope,
+          topic,
+          text,
+          sourceRefs,
+          status,
+          sensitivity,
+          createdBy: input.actor.id,
+          confirmedBy: status === 'confirmed' ? input.actor.id : null,
+          revision: 1,
+          createdAt: now,
+          updatedAt: now,
+          expiresAt: input.expiresAt ?? null,
+          importBatch: null,
+        })
+      }
+      // 明确替换保留旧行供追溯；没有点名的兼容规则和历史冲突均不受影响。
+      for (const record of superseded) this.setStatus(record.id, 'expired', now, null)
+      const stored = this.get(id, now)
+      if (!stored) throw new Error(`记忆 ${id} 在写入事务中消失`)
       return {
-        ok: true as const,
-        record: { ...stored, status: effectiveStatus(stored, now) },
-        conflicts: conflicts.map(rival => this.get(rival.id, now) ?? rival),
-        superseded: superseded.map(rival => this.get(rival.id, now) ?? rival),
+        ok: true,
+        record: stored,
+        conflicts: [],
+        superseded: superseded.map(record => this.get(record.id, now)!),
       }
     })
   }
@@ -474,12 +461,14 @@ export class MemoryStore {
     })
   }
 
-  /** 迁移专用：id 由调用方给（旧 id 派生），重复导入靠主键冲突自然幂等。 */
+  /** 迁移与恢复入口：主键保证幂等，删除账本阻止同内容换 id 或跨批次复活。 */
   importRecord(record: MemoryRecord): boolean {
-    const exists = this.db.prepare('SELECT 1 FROM memories WHERE memory_id = ?').get(record.id)
-    if (exists) return false
-    this.write(record.id, record)
-    return true
+    return inTransaction(this.db, () => {
+      const exists = this.db.prepare('SELECT 1 FROM memories WHERE memory_id = ?').get(record.id)
+      if (exists || this.filterRestored([record]).blocked.length > 0) return false
+      this.write(record.id, record)
+      return true
+    })
   }
 
   get(id: string, now: number): MemoryRecord | null {
@@ -487,12 +476,6 @@ export class MemoryStore {
     if (!row) return null
     const record = rowToMemory(row, this.sourcesOf(id))
     return { ...record, status: effectiveStatus(record, now) }
-  }
-
-  /** 不做过期折算的原始投影，只在 put 内部刚写完时用。 */
-  private projectRaw(id: string): MemoryRecord | null {
-    const row = this.db.prepare('SELECT * FROM memories WHERE memory_id = ?').get(id) as Row | undefined
-    return row ? rowToMemory(row, this.sourcesOf(id)) : null
   }
 
   private sourcesOf(id: string): string[] {
@@ -530,24 +513,33 @@ export class MemoryStore {
   }
 
   /**
-   * 把候选抬成已确认，或把一条记忆改判。只有可信交互主体（用户）能调。
-   *
-   * 传 actor.isUser 为假直接拒绝——否则"专家自己确认自己的候选"这条通路就开着，
-   * §2.6 的那句话等于没写。
+   * 用户确认候选或选择历史冲突中的一条；只失效 replaceIds 点名的旧记忆。
+   * 省略 replaceIds 时其余同主题规则不变，可逐条确认多条兼容的历史冲突。
+   * 非用户、已过期的选择或无效替换目标返回 null，且整次不写入。
    */
-  confirm(id: string, actor: MemoryActor, now: number): MemoryRecord | null {
+  confirm(id: string, actor: MemoryActor, now: number, replaceIds: string[] = []): MemoryRecord | null {
     if (!actor.isUser) return null
     return inTransaction(this.db, () => {
       const current = this.get(id, now)
-      if (!current) return null
+      if (!current || current.status === 'expired' || replaceIds.includes(id)) return null
+      const superseded = this.replacementTargets(replaceIds, current.kind, current.scope, now)
+      if (!superseded) return null
       this.setStatus(id, 'confirmed', now, actor.id)
-      // 同一 topic 上别的说法一并失效：用户挑定了这一条，剩下的不该继续并列。
-      const rivals = this.findByTopic(current.kind, current.scope, current.topic).filter(
-        rival => rival.id !== id && effectiveStatus(rival, now) !== 'expired',
-      )
-      for (const rival of rivals) this.setStatus(rival.id, 'expired', now, null)
+      for (const record of superseded) this.setStatus(record.id, 'expired', now, null)
       return this.get(id, now)
     })
+  }
+
+  /** 只校验身份已明确指定的目标，不根据文本或主题猜测替换关系。 */
+  private replacementTargets(ids: string[], kind: MemoryKind, scope: MemoryScope, now: number): MemoryRecord[] | null {
+    const records: MemoryRecord[] = []
+    for (const id of new Set(ids)) {
+      const record = this.get(id, now)
+      if (!record || record.status === 'expired' || record.kind !== kind
+        || record.scope.kind !== scope.kind || record.scope.id !== scope.id) return null
+      records.push(record)
+    }
+    return records
   }
 
   private setStatus(id: string, status: MemoryStatus, now: number, confirmedBy: string | null): void {
@@ -563,36 +555,58 @@ export class MemoryStore {
   /**
    * 删除一条记忆，并沿来源引用传播。
    *
-   * 传播规则：派生记忆只有在**全部**来源都没了之后才被删掉。
-   * 一条"评审会上定了 A 方案"可能同时由会议转写和用户口述支撑，删掉转写不该让
-   * 口述那半边跟着消失；但两边都删了，它就没有任何依据继续以已确认的身份出现在
-   * 提示词里，这时候留着比删掉更危险。
-   *
-   * 只断了一条来源、本体还活着的，进 weakened 而不是 deleted——报告里要分开说。
+   * 全部来源消失的派生记忆一起删除；仍有来源的保留，但它及下游结论都退回候选，
+   * 不能把来源变少前的确认继续当成有效确认。已过期的记忆不会重新激活。
+   * 历史冲突只剩一项时，有确认记录才恢复已确认，否则仍需用户确认。
    */
   delete(id: string, reason: string, now: number): DeletionOutcome {
     return inTransaction(this.db, () => {
       const deleted: MemoryRecord[] = []
       const weakened: MemoryRecord[] = []
+      const restored: MemoryRecord[] = []
       const target = this.get(id, now)
-      if (!target) return { deleted, weakened, ledgerEntries: 0 }
+      if (!target) return { deleted, weakened, restored, ledgerEntries: 0 }
 
-      const cascade = this.dependentsOf(id)
+      const ledgerBefore = this.ledgerSize()
+      const remaining = new Set(this.dependentsOf(id))
       this.removeRow(target, reason, now)
       deleted.push(target)
 
-      for (const derivedId of cascade) {
-        const remaining = this.sourcesOf(derivedId)
-        const record = this.get(derivedId, now)
-        if (!record) continue
-        if (remaining.length > 0) {
-          weakened.push(record)
-          continue
+      // ponytail: 小规模记忆图反复扫描至稳定，最坏 O(n²)；规模增大再换入度队列。
+      // 不能只遍历一次：多路径引用中，后处理的父项可能删掉先处理子项的最后一个来源。
+      let changed: boolean
+      do {
+        changed = false
+        for (const derivedId of remaining) {
+          const record = this.get(derivedId, now)
+          if (!record) {
+            remaining.delete(derivedId)
+          } else if (record.sourceRefs.length === 0) {
+            this.removeRow(record, `来源记忆 ${id} 被删除`, now)
+            deleted.push(record)
+            remaining.delete(derivedId)
+            changed = true
+          }
         }
-        this.removeRow(record, `来源记忆 ${id} 被删除`, now)
-        deleted.push(record)
+      } while (changed)
+
+      for (const derivedId of remaining) {
+        const record = this.get(derivedId, now)!
+        this.setStatus(derivedId, record.status === 'expired' ? 'expired' : 'candidate', now, null)
+        weakened.push(this.get(derivedId, now)!)
       }
-      return { deleted, weakened, ledgerEntries: deleted.length }
+
+      for (const record of deleted) {
+        if (!record.topic) continue
+        // 仅检查旧版本标记过的冲突；后来追加的同主题兼容规则不算冲突对手。
+        const survivors = this.findByTopic(record.kind, record.scope, record.topic)
+          .filter(item => effectiveStatus(item, now) === 'conflicting')
+        if (survivors.length !== 1) continue
+        const survivor = survivors[0]
+        this.setStatus(survivor.id, survivor.confirmedBy ? 'confirmed' : 'candidate', now, null)
+        restored.push(this.get(survivor.id, now)!)
+      }
+      return { deleted, weakened, restored, ledgerEntries: this.ledgerSize() - ledgerBefore }
     })
   }
 

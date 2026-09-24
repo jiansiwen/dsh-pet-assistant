@@ -1,10 +1,12 @@
 /**
  * 个人助理工具注册与系统提示词编排。
  */
-import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import path from 'node:path'
 import type { SessionBridge } from './bridge.ts'
 import type { SemanticEvent } from './domain.ts'
+import { readProjectEvidence, type HelpContextStore } from './help-context.ts'
+import type { ObservationStore } from './observation.ts'
 import {
   deletionReport,
   describeConflict,
@@ -14,12 +16,10 @@ import {
   type MemoryStore,
 } from './memory.ts'
 import {
-  APPROVAL_REJECTION_MESSAGES,
   makeReportId,
-  publishRevisionFile,
   type ReportStore,
 } from './report.ts'
-import { localDateOf } from './time.ts'
+import { localDateOf, startOfLocalDate } from './time.ts'
 import type { ActivityTracker } from './tracker.ts'
 
 interface AssistantHost {
@@ -39,22 +39,25 @@ export interface ToolOptions {
   maxInjectedMemories: number
   /** 采集闸门：旧数据迁移没跑完时返回原因，开启助理模式的工具据此拒绝启动采集。 */
   captureBlockedReason(): string | null
+  /** 采集范围首次确认；未装配时沿用旧行为并在回执里明示范围。 */
+  captureScope?: {
+    acked(): boolean
+    ack(): void
+    describe(): Record<string, unknown>
+  }
   /** 旧存储域里是否还留着已导入的副本。删除偏好时必须如实告诉用户。 */
   legacyCopiesRetained: boolean
+  /** 主动帮助的工作上下文授权；未装配时相关工具明确拒绝，不降级读任意目录。 */
+  helpContexts?: HelpContextStore
+  /** 观察库；删除某时间段原始记录时需要，未装配时该工具明确拒绝。 */
+  observations?: ObservationStore
   /** 运行时挂载团队服务（团队模式开关的「开」）；已挂载时幂等。 */
   enableTeamMode(): { toolsRegistered: boolean }
   /** 运行时卸载团队服务（团队模式开关的「关」）；有运行中任务时拒绝。 */
   disableTeamMode(): Promise<{ ok: true } | { ok: false; error: string }>
 }
 
-/**
- * 偏好与日报确认都记成"用户本人"的动作。
- *
- * 这在纯聊天界面上是无法验证的：用户那句"确认"只能经模型转述成一次工具调用。
- * 所以真正拦住伪造确认的不是这个标记，而是确认必须绑定 revision + 内容摘要 +
- * 目标路径——模型没法凭空给出用户没看过的那一版的摘要。桌面壳的专用确认窗口
- * 是更强的形式，等日报确认接进去之后这里才该收紧。
- */
+/** 仅沿用偏好工具的现有身份语义；日报批准不接受模型自报的用户身份。 */
 const USER_ACTOR: MemoryActor = { id: 'user', isUser: true }
 
 /**
@@ -163,8 +166,126 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       const blocked = options.captureBlockedReason()
       if (blocked) return json({ status: 'refused', message: `未开启活动记录：${blocked}` })
       if (tracker.active) return json({ status: 'already_active', message: '个人助理模式已经在运行中' })
+      if (options.captureScope && !options.captureScope.acked()) {
+        return json({
+          status: 'scope-confirmation-required',
+          scope: options.captureScope.describe(),
+          message: '首次开启需要用户确认采集范围：请把 scope 原样展示给用户，用户明确同意后调用 personal_assistant_ack_capture_scope，再重新开启。',
+        })
+      }
       await tracker.start()
-      return json({ status: 'started', message: '个人助理模式已开启，开始记录电脑活动' })
+      return json({
+        status: 'started',
+        scope: options.captureScope?.describe() ?? null,
+        pet: options.bridge.teamEnabled ? 'desktop-shell-owned' : 'needs-summon',
+        message: '个人助理模式已开启，开始记录电脑活动；桌面角色需另调用 personal_assistant_summon_pet。',
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_ack_capture_scope',
+    description: '用户明确同意采集范围后调用一次，记录确认；之后开启助理模式不再重复询问。不能替用户确认，不能在用户未表态时调用。',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute() {
+      if (!options.captureScope) return json({ acked: false, message: '采集范围确认未装配' })
+      options.captureScope.ack()
+      return json({ acked: true, scope: options.captureScope.describe() })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_revoke_report',
+    description: '用户要求撤销某版已归档或已批准的日报状态时调用：只改状态标记，不删除已导出文件。删除导出文件必须另外取得用户明确同意并说明不可追回。',
+    parameters: {
+      revision: { type: 'integer', required: true, description: '要撤销的版本号（来自 personal_assistant_get_draft 的 history）' },
+      reason: { type: 'string', required: true, description: '用户给出的撤销原因' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { revision: number; reason: string }) {
+      const reportId = makeReportId('daily', localDateOf(Date.now()))
+      const record = options.reports.revision(reportId, args.revision)
+      if (!record) return json({ revoked: false, message: `找不到第 ${args.revision} 版日报` })
+      if (record.state !== 'archived' && record.state !== 'approved') {
+        return json({ revoked: false, message: `第 ${args.revision} 版当前状态是 ${record.state}，不需要撤销归档` })
+      }
+      options.reports.markRevoked(reportId, args.revision, args.reason)
+      return json({
+        revoked: true,
+        revision: args.revision,
+        note: '状态已标记为撤销；已导出的文件仍在磁盘上，删除它需要用户另外明确同意',
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_delete_activity',
+    description: '用户要求删除某段时间的原始活动记录时调用：停采样后删除该时段的采样原文、观察与自动解释事项，并沿来源失效派生记忆。用户笔记与导入记录不删；已发给模型的提示词与已导出文件追不回，必须如实说明。删除前先把影响范围告诉用户并取得明确同意。',
+    parameters: {
+      startMs: { type: 'number', required: true, description: '区间开始（epoch 毫秒）' },
+      endMs: { type: 'number', required: true, description: '区间结束（epoch 毫秒，不含）' },
+      reason: { type: 'string', description: '用户给出的删除原因' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { startMs: number; endMs: number; reason?: string }) {
+      const observations = options.observations
+      if (!observations) return json({ deleted: false, message: '观察库未装配，不能删除原始记录' })
+      const from = Number(args.startMs)
+      const to = Number(args.endMs)
+      if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) {
+        return json({ deleted: false, message: '删除区间无效：开始必须早于结束' })
+      }
+      const dates: string[] = []
+      for (let cursor = localDateOf(from); cursor <= localDateOf(to - 1); cursor = localDateOf(startOfLocalDate(cursor) + 86_400_000)) {
+        dates.push(cursor)
+      }
+      const retained = dates.map(date => {
+        const day = tracker.getDay(date)
+        return {
+          date,
+          userEvents: day.events.filter(event => event.source !== 'auto' && event.start < to && event.end > from).length,
+          notes: day.notes.length,
+        }
+      }).filter(item => item.userEvents > 0 || item.notes > 0)
+      const overlaps = observations.listOverlap('activity_span', from, to)
+      const outcome = await tracker.withCapturePaused(async () => {
+        let samples = 0
+        let autoEvents = 0
+        for (const date of dates) {
+          samples += tracker.deleteSampleRange(date, from, to)
+          autoEvents += await tracker.pruneAutoEvents(date, from, to)
+        }
+        const memoryOutcomes = overlaps.map(obs => options.memories.delete(obs.id, args.reason ?? '用户要求删除该时段原始记录', Date.now()))
+        const obsDeleted = observations.deleteOverlap('activity_span', from, to)
+        return { samples, autoEvents, obsDeleted, memoryOutcomes }
+      })
+      const deletedMemories = outcome.memoryOutcomes.reduce((total, item) => total + item.deleted.length, 0)
+      const invalidated = outcome.memoryOutcomes.reduce((total, item) => total + item.weakened.length, 0)
+      return json({
+        deleted: true,
+        deletedCounts: { samples: outcome.samples, observations: outcome.obsDeleted, autoEvents: outcome.autoEvents, derivedMemories: deletedMemories },
+        invalidated,
+        retained,
+        uncontrolled: ['删除前已注入模型提示词的内容无法撤回', '已导出的日报文件与任何外部副本不在本次删除范围'],
+        message: '已删除该时段的采样原文、观察与自动事项；用户笔记与导入记录保留。派生记忆按来源传播失效。',
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_set_capture_titles',
+    description: '用户单独交出或收回"窗口标题"采集授权。关闭后新的采样不再读取窗口标题，日报只能说到应用类别；开启后恢复。立即重启采样进程生效，跨重启保留。',
+    parameters: { enabled: { type: 'boolean', required: true, description: 'true=允许采集窗口标题，false=只采集应用与空闲指标' } },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { enabled: boolean }) {
+      await tracker.setCaptureTitles(args.enabled)
+      return json({
+        ok: true,
+        captureTitles: args.enabled,
+        mode: tracker.modeDescription(),
+        message: args.enabled ? '已恢复窗口标题采集' : '已停止窗口标题采集，之后的采样只记录应用与空闲指标',
+      })
     },
   }))
 
@@ -213,12 +334,14 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
     output: { schema: { type: 'string' }, render: textRender },
     async execute(args: { detail?: string }) {
       const day = tracker.getDay(localDateOf(Date.now()))
-      const uninterpreted = day.spans.filter(span => span.end > day.interpretedUpto && span.category !== 'idle')
+      const uninterpreted = day.spans.filter(span => span.end > day.interpretedUpto
+        && span.category !== 'idle' && span.category !== 'excluded')
       const result: Record<string, unknown> = {
         date: day.date,
         mode: tracker.modeDescription(),
         events: day.events,
         uninterpretedSpans: uninterpreted,
+        evidenceLimits: '窗口标题只证明使用线索，不证明聊天正文、对象身份或工作完成。no-input表示长时间无键鼠输入，可能在阅读，不自动计为工作成果；excluded表示隐私排除，禁止推断其内容。',
         notes: day.notes,
         categoryStats: categoryStats(day.spans),
         interpretedUpto: day.interpretedUpto,
@@ -315,7 +438,13 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
     async execute(args: { content: string }) {
       const date = localDateOf(Date.now())
       const reportId = makeReportId('daily', date)
-      const record = options.reports.saveDraftIfChanged(reportId, args.content, Date.now())
+      let record
+      try {
+        record = options.reports.saveDraftIfChanged(reportId, args.content, Date.now())
+      } catch (error) {
+        return json({ savedDraft: false, message: error instanceof Error ? error.message : String(error) })
+      }
+      options.bridge.notifyApprovalSnapshot()
       return json({
         savedDraft: true,
         date,
@@ -359,7 +488,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
 
   ctx.tools.register(defineTool({
     name: 'personal_assistant_submit_report',
-    description: '把当前草稿版本交给用户确认（草稿 → 待确认）。展示草稿请用户定稿之前调用，然后把返回的 revision、digest、targetPath 原样告诉用户——用户确认时这三样要带回来。',
+    description: '把当前草稿版本提交到桌面壳的可信审批待办，绑定版本、全文摘要、目标和有效期。只提交不发布；用户须在专用审批窗口阅读全文并批准，无桌面壳时保持待批，聊天中的确认不能发布。',
     parameters: {},
     output: { schema: { type: 'string' }, render: textRender },
     async execute() {
@@ -369,89 +498,62 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       if (!current) {
         return json({ submitted: false, message: '还没有草稿可提交，先调用 personal_assistant_save_draft' })
       }
-      const record = options.reports.submitForConfirmation(reportId, current.revision)
-      if (!record) {
+      try {
+        const proposal = options.bridge.submitReport(reportId)
         return json({
-          submitted: false,
-          message: `第 ${current.revision} 版现在不能提交（状态 ${current.state}），可能刚被新草稿取代，请重新读取草稿`,
+          submitted: true, date, reportId, proposalId: proposal.proposalId,
+          revision: proposal.revision, digest: proposal.digest, targetPath: proposal.target,
+          expiresAt: proposal.expiresAt, epoch: proposal.epoch,
+          message: '等待用户在桌面专用审批窗口阅读全文并批准；尚未发布，无壳时不会降级自批',
         })
+      } catch (error) {
+        return json({ submitted: false, message: error instanceof Error ? error.message : String(error) })
       }
-      return json({
-        submitted: true,
-        date,
-        reportId,
-        revision: record.revision,
-        digest: record.digest,
-        targetPath: path.join(options.reportDir, `${date}.md`),
-      })
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'personal_assistant_confirm_report',
-    description: '用户明确确认定稿后调用：校验版本号与内容摘要，把日报落盘为 Markdown，然后退出个人助理模式。revision 与 digest 必须原样取自 personal_assistant_submit_report 的返回值，不能自己编，也不能用旧版本的。',
+    description: '只读查询日报待批状态并引导用户打开桌面专用审批窗口。本工具不批准、不发布、不停止采集；即使用户在聊天中说确认，也必须由可信窗口批准。保留 revision/digest 参数仅兼容旧调用。',
     parameters: {
       revision: { type: 'integer', required: true, description: '用户确认的那一版的版本号' },
       digest: { type: 'string', required: true, description: '用户确认的那一版的内容摘要' },
     },
     output: { schema: { type: 'string' }, render: textRender },
-    async execute(args: { revision: number; digest: string }) {
-      const date = localDateOf(Date.now())
-      const reportId = makeReportId('daily', date)
-      const targetPath = path.join(options.reportDir, `${date}.md`)
-      const now = Date.now()
-
-      const approved = options.reports.approve(reportId, args.revision, args.digest, targetPath, USER_ACTOR, now)
-      if (!approved.ok) {
-        return json({
-          confirmed: false,
-          reason: approved.rejection,
-          message: APPROVAL_REJECTION_MESSAGES[approved.rejection],
-        })
-      }
-
-      const record = approved.record
-      const operationId = `publish-${reportId}-r${record.revision}-${now}`
-      if (!options.reports.beginPublish(operationId, record, now)) {
-        return json({ confirmed: false, message: '发布作业没能登记，日报未落盘；请重试' })
-      }
-      const outcome = await publishRevisionFile(targetPath, record.content, record.digest, record.revision)
-      if (!outcome.ok) {
-        options.reports.finishJob(operationId, 'failed', Date.now())
-        // 退回 approved 而不是留在 publishing：落盘失败是磁盘或路径的问题，
-        // 用户的确认（同一版、同一摘要）依然有效，该让用户能直接重试。
-        options.reports.setReportState(reportId, record.revision, 'approved')
-        return json({ confirmed: false, reason: outcome.reason, message: outcome.message })
-      }
-      options.reports.finishJob(operationId, 'succeeded', Date.now())
-      options.reports.setReportState(reportId, record.revision, 'archived')
-      await tracker.stop()
+    async execute(_args: { revision: number; digest: string }) {
+      const reportId = makeReportId('daily', localDateOf(Date.now()))
+      const record = options.reports.current(reportId)
+      const pending = options.bridge.pendingReportApprovals().find(item => item.reportId === reportId)
       return json({
-        confirmed: true,
-        date,
-        revision: record.revision,
-        savedPath: outcome.path,
-        digest: outcome.digest,
-        modeExited: true,
+        confirmed: false, reason: 'trusted_approval_required', reportId,
+        state: record?.state, revision: record?.revision,
+        proposalId: pending?.proposalId, expiresAt: pending?.expiresAt,
+        message: record?.state === 'archived'
+          ? '该版本已由可信通道发布，本工具不会重复发布；保存路径请读取日报草稿状态'
+          : pending
+            ? '日报仍在待批，请在桌面专用审批窗口阅读全文后批准；聊天确认不能发布'
+            : '没有可用的日报待批，请先提交当前草稿；没有桌面壳时不能发布',
       })
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'personal_assistant_remember_preference',
-    description: '记录用户明确说出的长期偏好（如"日报不要包含午休浏览网页的时间"）。用户对日报提出长期有效的修改意见或表达喜好时调用。必须给出 topic：同一 topic 下出现互相矛盾的说法时，两条都会停下并请用户挑一条。',
+    description: '记录用户明确说出的长期偏好。同主题可以有多条兼容规则，不自动互斥。只有用户明确要求替换旧规则时才填写 replaceIds；单次日报修改不自动成为长期偏好。',
     parameters: {
       text: { type: 'string', required: true, description: '偏好规则的完整描述，照用户的意思写，不要替他扩充' },
       topic: { type: 'string', required: true, description: '这条偏好管的是哪件事，如：日报口径 / 回复语言 / 提交规范' },
+      replaceIds: { type: 'array', items: { type: 'string' }, description: '用户明确要求替换的旧规则编号；未点名替换时省略' },
     },
     output: { schema: { type: 'string' }, render: textRender },
-    async execute(args: { text: string; topic: string }) {
+    async execute(args: { text: string; topic: string; replaceIds?: string[] }) {
       const result = options.memories.put({
         kind: 'user_preference',
         scopeKind: 'global',
         scopeId: '',
         topic: args.topic,
         text: args.text,
+        replaceIds: args.replaceIds,
         sensitivity: 'normal',
         sourceRefs: [],
         actor: USER_ACTOR,
@@ -470,6 +572,22 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
           ? '同一件事上出现了互相矛盾的说法，这几条都已停下、不再注入提示词，请让用户挑一条'
           : undefined,
       })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_resolve_preference',
+    description: '用户明确选择某条历史冲突或候选规则后，使该规则生效；仅将用户点名的 replaceIds 旧规则失效，其余同主题兼容规则不变。先展示规则并取得用户选择，不替用户裁决。',
+    parameters: {
+      id: { type: 'string', required: true, description: '用户选择生效的记忆编号' },
+      replaceIds: { type: 'array', items: { type: 'string' }, description: '用户明确要求被替换的旧规则编号' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { id: string; replaceIds?: string[] }) {
+      const record = options.memories.confirm(args.id, USER_ACTOR, Date.now(), args.replaceIds ?? [])
+      return record
+        ? json({ resolved: true, id: record.id, status: record.status, revision: record.revision })
+        : json({ resolved: false, message: '规则不存在、已失效或替换范围不匹配，请重新查看并让用户选择' })
     },
   }))
 
@@ -521,6 +639,69 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
     },
   }))
 
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_help_context',
+    description: '用户同意接受帮助并给出范围后调用：记录本次帮助授权的项目目录、当前文件和补充说明。未记录的目录之后不能读取证据。目录必须是用户明确说出的绝对路径。',
+    parameters: {
+      projectDir: { type: 'string', required: true, description: '用户授权查看的项目目录绝对路径' },
+      currentFile: { type: 'string', description: '用户当前关注的文件绝对路径，须位于项目目录内' },
+      note: { type: 'string', description: '用户描述的问题或目标原文' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { projectDir: string; currentFile?: string; note?: string }) {
+      const store = options.helpContexts
+      if (!store) return json({ recorded: false, message: '帮助上下文未装配，不能记录授权范围' })
+      const dir = path.resolve(args.projectDir)
+      if (!path.isAbsolute(args.projectDir)) return json({ recorded: false, message: '项目目录必须是绝对路径' })
+      const file = args.currentFile ? path.resolve(args.currentFile) : null
+      if (file !== null && !file.startsWith(dir + path.sep)) {
+        return json({ recorded: false, message: '当前文件不在授权项目目录内，请让用户确认范围' })
+      }
+      const record = store.add(makeId('help'), dir, file, args.note ?? null, Date.now())
+      return json({ recorded: true, id: record.id, projectDir: record.projectDir, currentFile: record.currentFile })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_list_help_contexts',
+    description: '列出用户已授权的帮助上下文范围，用于核对或提醒用户撤销。',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute() {
+      const store = options.helpContexts
+      if (!store) return json({ contexts: [] })
+      return json({ contexts: store.list() })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_forget_help_context',
+    description: '用户要求收回某个帮助范围时调用，删除对应授权记录。',
+    parameters: { id: { type: 'string', required: true, description: 'personal_assistant_list_help_contexts 返回的编号' } },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { id: string }) {
+      const store = options.helpContexts
+      if (!store) return json({ removed: false, message: '帮助上下文未装配' })
+      return json({ removed: store.remove(args.id) })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_read_project_evidence',
+    description: '只读读取已授权项目的工作证据：Git 分支、变更文件、差异统计、最近提交或非 Git 目录顶层条目。只能用于用户已授权且与当前帮助相关的目录；不得修改文件、不得运行构建或测试、不得联网。需要改代码时改用团队提案与用户审批。',
+    parameters: { projectDir: { type: 'string', required: true, description: '已授权的项目目录绝对路径' } },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { projectDir: string }) {
+      const store = options.helpContexts
+      if (!store) return json({ ok: false, error: '帮助上下文未装配，不能读取项目证据' })
+      if (!store.isAuthorized(args.projectDir)) {
+        return json({ ok: false, error: '该目录没有被用户授权为帮助上下文，请先确认范围' })
+      }
+      const evidence = await readProjectEvidence(args.projectDir)
+      return json({ ok: true, ...evidence, readOnly: true })
+    },
+  }))
+
   ctx.systemPrompt.section({
     name: 'personal-assistant',
     order: 150,
@@ -539,18 +720,21 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       '',
       '触发与流程规则：',
       '- 用户说"召唤宠物"、"打开桌面宠物"、"把宠物叫出来"，或在开启助理的同时想通过桌面宠物交流：调用 personal_assistant_summon_pet；宠物消息会直接进入当前会话。',
-      '- 用户说"开启个人助理模式"或类似表达：调用 personal_assistant_start。若返回 refused，把 message 原样告诉用户（通常是配置关掉了采集，或旧数据迁移没跑完），不要反复重试。',
+      '- 用户说"开启个人助理模式"或类似表达：调用 personal_assistant_start。若返回 scope-confirmation-required，把 scope 原样展示并询问用户是否同意该采集范围；用户明确同意后调用 personal_assistant_ack_capture_scope 再重新调用 personal_assistant_start。若返回 refused，把 message 原样告诉用户（通常是配置关掉了采集，或旧数据迁移没跑完），不要反复重试。返回 started 且 pet=needs-summon 时，询问用户是否要桌面角色，需要则调用 personal_assistant_summon_pet。',
       '- 用户说"关闭助理模式"：调用 personal_assistant_stop。',
+      '- 用户要求删除某段时间的原始记录：先说明将删除采样原文/观察/自动事项、保留用户笔记与导入、已发提示词追不回，取得明确同意后调用 personal_assistant_delete_activity，并把返回的四类结果如实转告。',
+      '- 用户要求停止或恢复窗口标题采集（如"别记窗口标题了"）：调用 personal_assistant_set_capture_titles；这只影响标题，不影响应用与空闲指标，也不删除已记录的历史。',
+      '- 用户点「好」或同意一起排查后：先询问遇到的问题、项目目录或文件范围；用户给出范围后调用 personal_assistant_help_context 记录授权，再调用 personal_assistant_read_project_evidence 只读分析。分析结论先给用户确认；任何修改、命令或外发都必须走团队提案与桌面审批，不能因为用户同意"看一下"就获得写权限。',
       '- 用户说"开启团队模式"或"关闭团队模式"：调用 personal_assistant_set_team_mode（enabled 分别为 true/false）。返回 ok=false 时把 error 原样告诉用户（最常见是有团队任务还在执行，等它结束再试）。',
       '- 用户问"我今天干了啥"或询问当天活动：调用 personal_assistant_today；对返回的未解释片段（uninterpretedSpans），结合时间顺序与相邻活动解释成工作事项，调用 personal_assistant_commit_events 保存，再以工作事项视角回答。',
-      '- 解释原则：只依据返回的数据。推断性结论（如根据聊天后打开的文档推断讨论内容）的 confidence 用 medium 并在回答中标注"（推断）"。不得编造聊天内容等无法获知的信息。',
+      '- 解释原则：只依据返回的数据。推断性结论（如根据聊天后打开的文档推断讨论内容）的 confidence 用 medium 并在回答中标注"（推断）"。不得编造聊天内容等无法获知的信息。窗口标题只是使用线索；截图、UI Automation、聊天正文读取当前未接入，用户要求时如实说明并改用粘贴/导出内容。',
       '- 用户粘贴聊天记录、导出内容，或说"记一下：…"：调用 personal_assistant_import_records。',
       '- 用户说"总结今日工作内容"或"生成日报"：按上方"已确认的记忆"撰写（记忆已在提示词中，不必再调用工具读取），调用 personal_assistant_today（detail 用 full），据此撰写中文日报草稿（按工作类别组织，标注时长与具体内容），调用 personal_assistant_save_draft 保存，再调用 personal_assistant_submit_report 提交确认，然后把草稿全文连同返回的 revision、digest、targetPath 一起展示给用户请求确认。',
-      '- 用户对日报提出修改：若当前对话没有草稿内容，先调用 personal_assistant_get_draft 取回最新版本；按用户要求调整后，再次调用 personal_assistant_save_draft（内容一改就是新版本，旧版本的确认自动作废），重新调用 personal_assistant_submit_report，并展示新草稿。若反馈属于长期偏好（含"以后"、"今后"、"都不要"等表述，或是对日报结构/内容/措辞/口径的通用性意见），同时调用 personal_assistant_remember_preference 记录，topic 填这条偏好管的是哪件事。',
-      '- 用户确认定稿（如"可以了"、"确认"、"就这样"）：调用 personal_assistant_confirm_report，revision 与 digest 必须原样取自 personal_assistant_submit_report 的返回值；成功后告知用户保存路径。返回 confirmed=false 时，把 message 原样转告用户并说明需要重新展示草稿，绝对不要自己编一组 revision/digest 再试。',
+      '- 用户对日报提出修改：若当前对话没有草稿内容，先调用 personal_assistant_get_draft 取回最新版本；按用户要求调整后，再次调用 personal_assistant_save_draft（内容一改就是新版本，旧版本的确认自动作废），重新调用 personal_assistant_submit_report，并展示新草稿。只有用户明确表示"以后"、"今后"或长期有效，才调用 personal_assistant_remember_preference 记录；单次修改只改当前草稿。用户明确替换旧规则时填写 replaceIds，不能因主题相同自动替换。',
+      '- 用户在聊天中确认定稿（如"可以了"、"确认"）：只能查询 personal_assistant_confirm_report 的待批状态，并引导用户在桌面专用审批窗口阅读全文、核对版本和目标后批准。模型工具不能发布，不能把聊天确认当作授权；未连接桌面壳时保持待批，不得降级。只有可信通道实际发布后才能说已保存，停止采集失败要如实转述。',
       '- 用户表达对日报或助理行为的长期喜好：主动调用 personal_assistant_remember_preference。',
       '- 用户要求删除某条记忆：调用 personal_assistant_forget_preference，然后把返回的四类结果（deleted / invalidated / retained / uncontrolled）如实转告用户，不能只说"已经忘了"。',
-      '- "需要用户裁决的矛盾记忆"非空时：在合适的时机把这几条互相矛盾的说法摆给用户，请他挑一条，然后用 personal_assistant_forget_preference 删掉不要的那些。',
+      '- "需要用户裁决的矛盾记忆"非空时：在合适的时机把这几条互相矛盾的说法摆给用户，请用户选择应生效的规则，再调用 personal_assistant_resolve_preference；只有用户明确点名不要的规则才填 replaceIds，兼容规则可逐条保留，不自动删除。',
       '',
       '当前状态：{{personal_assistant_mode}}',
     ].join('\n'),

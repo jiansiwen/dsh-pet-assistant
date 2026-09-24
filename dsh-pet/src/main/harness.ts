@@ -2,13 +2,14 @@
  * 会话桥接客户端：宠物通过本地 HTTP 长轮询与发起召唤的 dsh 主会话通信。
  *
  * 不再 spawn `dsh --profile headless` —— 宠物没有独立 API key、没有独立会话：
- * 每条消息经插件注入绑定的主会话（agent.followup），历史、模型、凭据全部复用主会话。
+ * 普通输入经 sessionCommand 走宿主原生 queue；chat 保留语音因果回复与团队委派。
+ * 历史、模型、凭据复用主会话，session/update 不构成可自动朗读的回复归属。
  * 连接参数来自插件写入的 <DSH_HOME>/personal-assistant/bridge.json。
  *
  * 两条凭据互不通用，这是刻意的：
  * - bridge.json 的 `token` 能发消息、读快照，但**签不出批准**；
- * - bridge-approval.json 的 `approvalToken` 只能批准/驳回提案，模型侧拿不到它。
- * 所以即使模型读到了 bridge.json（它有 read 工具），也无法自己批准自己的副作用计划。
+ * - bridge-approval.json 的审批令牌只由主进程读取，不经 IPC 或模型工具提供。
+ * 这不是操作系统沙箱：任意本地文件读取者仍可能获得它，不能据此宣称防住任意本地攻击。
  */
 import { readFileSync } from 'node:fs'
 import os from 'node:os'
@@ -20,6 +21,7 @@ import type {
   TeamSnapshot,
 } from '../renderer/types.js'
 import type { HealthBody } from './runtime-launch.ts'
+import type { SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
 
 export interface BridgeInfo {
   port: number
@@ -42,7 +44,8 @@ export interface BridgeInfo {
 
 /** 审批专用凭据。只有主进程读它，不经 IPC 暴露给渲染层。 */
 interface ApprovalCredential {
-  approvalToken: string
+  approvalToken?: string
+  reportApprovalToken?: string
   epoch?: string
   port?: number
 }
@@ -65,6 +68,13 @@ export interface BridgeCallbacks {
    * 正是为了让"重连即重新看到待办"，而不是依赖谁都没保证过的事件不丢。
    */
   onEvent: (event: BridgeEventPayload) => void
+  /**
+   * 会话流水：正文 / 思考过程 / 工具调用 / 用户输入，**按发生顺序**推来。
+   *
+   * 与 {@link BridgeCallbacks.onEvent} 不同，它不按 requestId 路由 —— 网页侧发起的轮次
+   * 没有 requestId，而宠物的对话框要和 DSH 会话完全绑定，那边的一切都得同步过来。
+   */
+  onChatDelta?: (item: BridgeEventPayload) => void
   /**
    * 主动提醒气泡（design.md §2.7）。固定文案、建议关闭与否都由插件侧决定，
    * 这里只负责送到界面。文案不是模型生成的，界面上也就没有可被注入的资料位。
@@ -103,19 +113,21 @@ export function readBridgeInfo(): BridgeInfo | null {
   return null
 }
 
-/** 读取审批凭据；团队模式没开（插件不写这个文件）时返回 null。 */
+/** 读取审批凭据；日报不依赖团队开关，文件缺失时不降级使用聊天令牌。 */
 export function readApprovalCredential(): ApprovalCredential | null {
   try {
     const raw = JSON.parse(readFileSync(approvalCredentialPath(), 'utf8')) as Partial<ApprovalCredential>
-    if (typeof raw.approvalToken === 'string' && raw.approvalToken.length > 0) {
+    const approvalToken = typeof raw.approvalToken === 'string' && raw.approvalToken ? raw.approvalToken : undefined
+    const reportApprovalToken = typeof raw.reportApprovalToken === 'string' && raw.reportApprovalToken ? raw.reportApprovalToken : undefined
+    if (approvalToken || reportApprovalToken) {
       return {
-        approvalToken: raw.approvalToken,
+        approvalToken, reportApprovalToken,
         epoch: typeof raw.epoch === 'string' && raw.epoch ? raw.epoch : undefined,
         port: typeof raw.port === 'number' && raw.port > 0 ? raw.port : undefined,
       }
     }
   } catch {
-    // 团队模式未开启
+    // 文件未写入或不可读：保持未授权。
   }
   return null
 }
@@ -153,8 +165,14 @@ export class BridgeClient {
   private info: BridgeInfo | null = null
   private seq = 0
   private stopped = false
-  private pending = new Map<string, (reply: ChatReply) => void>()
+  private pending = new Map<string, { resolve: (reply: ChatReply) => void; onDelta?: (text: string) => void }>()
   private callbacks: BridgeCallbacks | null = null
+  private sessionBinding: string | null = null
+  private sessionCursor = -1
+  private sessionGeneration = 0
+  private sessionNeedsBaseline = false
+  private readonly retiredBindings = new Set<string>()
+  private readonly lifetime = new AbortController()
 
   /**
    * 建立连接：先轮询等待桥接出现（宠物可能比召唤先启动），
@@ -168,9 +186,10 @@ export class BridgeClient {
         this.info = info
         this.seq = 0
         callbacks.onStatus('connected')
-        // 连上就拉一次快照：渲染层可能刚挂载就错过了此前所有事件。
+        // 会话基线先于日志回放；团队快照仍独立获取。
         void this.pushSnapshot()
-        void this.pollLoop()
+        await this.pushSessionSnapshot()
+        if (!this.stopped && this.info === info) void this.pollLoop()
         return
       }
       callbacks.onStatus('connecting')
@@ -181,47 +200,127 @@ export class BridgeClient {
   /**
    * 发送一条消息并等待主会话的回复（回复经事件流异步回传）。
    * 传 assistantId 即点名某个成员；名字对不上时服务端会明确报错，不会替你换人。
+   *
+   * `onDelta` 收到的是**显示用**增量文本：最终回复仍以返回值为准。宿主不吐增量时它一次都不会被调用，
+   * 调用方要能接受整段回复一次到达。
    */
-  async chat(text: string, assistantId?: string): Promise<ChatReply> {
-    if (!this.info) {
-      return { ok: false, error: '未连接到 dsh 会话：请先在 dsh 里说"召唤宠物"' }
-    }
+  async chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string): Promise<ChatReply> {
+    const info = this.info
+    if (!info) return { ok: false, error: '未连接到 dsh 会话：请先在 dsh 里说"召唤宠物"' }
+    const interrupted = (): ChatReply => ({ ok: false, error: signal?.aborted
+      ? '已停止等待回复；后台任务是否停止仍需核对，不会自动重发'
+      : '助理响应超时，请先核对后台任务状态，不会自动重发' })
+    if (signal?.aborted) return interrupted()
+    const controller = new AbortController()
+    const abortSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
     const id = `pet-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const replyPromise = new Promise<ChatReply>(resolve => {
-      this.pending.set(id, resolve)
-    })
+    const replyPromise = new Promise<ChatReply>(resolve => this.pending.set(id, { resolve, onDelta }))
+    const onAbort = (): void => { this.pending.get(id)?.resolve(interrupted()) }
+    abortSignal.addEventListener('abort', onAbort, { once: true })
+    const timer = setTimeout(() => controller.abort(), 320_000)
     try {
-      const response = await fetch(`http://127.0.0.1:${this.info.port}/chat?token=${this.info.token}`, {
+      const response = await fetch(`http://127.0.0.1:${info.port}/chat?token=${info.token}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          id,
-          text,
-          assistantId,
-          // 带上代次：会话已经换代了就该被拒，而不是把消息注入到一个陌生的会话里。
-          epoch: this.info.epoch,
-        }),
+        signal: abortSignal,
+        body: JSON.stringify({ id, text, assistantId, epoch: info.epoch, bindingId }),
       })
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}) as { error?: string }) as { error?: string }
-        this.pending.delete(id)
+        const body = await response.json().catch(() => ({})) as { error?: string }
+        if (body.error === 'stale binding') return { ok: false, error: '语音消息的会话绑定已变化，未发送到新会话' }
         if (response.status === 409) {
-          // 代次过期：桥接换代了，重连后让用户重发，别把这条消息静默丢掉。
           this.resetForNewEpoch()
           return { ok: false, error: '助理会话已重启，这条消息没有送达，请重发一次' }
         }
         return { ok: false, error: body.error ?? `桥接返回 ${response.status}` }
       }
+      return await replyPromise
     } catch (error) {
-      this.pending.delete(id)
+      if (abortSignal.aborted) return interrupted()
       return { ok: false, error: `桥接请求失败：${error instanceof Error ? error.message : String(error)}` }
-    }
-    const timeout = new Promise<ChatReply>(resolve => {
-      setTimeout(() => resolve({ ok: false, error: '助理响应超时（5 分钟），请重试' }), 320_000)
-    })
-    return Promise.race([replyPromise, timeout]).finally(() => {
+    } finally {
+      clearTimeout(timer)
+      abortSignal.removeEventListener('abort', onAbort)
       this.pending.delete(id)
-    })
+    }
+  }
+
+  /** 最近完整页或绑定内旧页。旧页仅供追加历史，不能替换当前状态。 */
+  async getSession(beforeSeq?: number, bindingId?: string): Promise<SessionResult> {
+    const info = this.info
+    const generation = this.sessionGeneration
+    if (!info || this.stopped) return { ok: false, error: '未连接到 dsh 会话' }
+    if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0 || !bindingId)) {
+      return { ok: false, error: '历史分页必须提供 beforeSeq 和 bindingId' }
+    }
+    try {
+      const query = new URLSearchParams({ token: info.token })
+      if (beforeSeq !== undefined) query.set('beforeSeq', String(beforeSeq))
+      if (bindingId !== undefined) query.set('bindingId', bindingId)
+      const response = await fetch(`http://127.0.0.1:${info.port}/session?${query}`, {
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]),
+      })
+      const result = await response.json() as SessionResult
+      if (this.stopped || this.info !== info || generation !== this.sessionGeneration) return this.staleSession()
+      if (!response.ok || !result.ok) return { ok: false, error: result.error ?? `会话读取失败（${response.status}）` }
+      const state = result.state
+      if (!state || typeof state.bindingId !== 'string' || !Number.isSafeInteger(state.cursor) || !Array.isArray(state.entries)) {
+        return { ok: false, error: '桥接未返回有效会话快照' }
+      }
+      if ((bindingId !== undefined && state.bindingId !== bindingId) || this.retiredBindings.has(state.bindingId)) return this.staleSession()
+      if (beforeSeq === undefined) {
+        if (state.bindingId === this.sessionBinding && state.cursor < this.sessionCursor) return this.staleSession()
+        this.acceptSession(state)
+      } else if (this.sessionBinding && state.bindingId !== this.sessionBinding) return this.staleSession()
+      return result
+    } catch (error) {
+      return { ok: false, error: `会话读取失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  /** 普通输入走原生 queue；语音仍使用 chat 的因果终稿，不能朗读无归属的 session/update。 */
+  async sessionCommand(command: SessionCommand): Promise<SessionResult> {
+    const info = this.info
+    const generation = this.sessionGeneration
+    if (!info || this.stopped) return { ok: false, error: '未连接到 dsh 会话' }
+    if (this.sessionBinding && command.bindingId !== this.sessionBinding) return this.staleSession()
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/session?token=${encodeURIComponent(info.token)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(command),
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(APPROVAL_TIMEOUT_MS)]),
+      })
+      const result = await response.json() as SessionResult
+      if (this.stopped || this.info !== info || generation !== this.sessionGeneration) return this.staleSession()
+      if (!response.ok || !result.ok) return { ok: false, error: result.error ?? `会话操作失败（${response.status}）` }
+      if (result.state) {
+        if (result.state.bindingId !== command.bindingId) return this.staleSession()
+        // 操作已成功，但它携带的旧状态不能覆盖更新的增量。
+        if (result.state.cursor < this.sessionCursor) return { ok: true }
+        this.acceptSession(result.state)
+      }
+      return result
+    } catch (error) {
+      return { ok: false, error: `会话操作结果待核对，不会自动重发：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  private staleSession(): SessionResult { return { ok: false, error: '会话绑定或快照已变化，旧结果已丢弃' } }
+
+  private acceptSession(state: SessionSnapshot): void {
+    if (state.bindingId !== this.sessionBinding) {
+      if (this.sessionBinding) this.retiredBindings.add(this.sessionBinding)
+      this.sessionBinding = state.bindingId
+      this.sessionGeneration += 1
+    }
+    this.sessionCursor = state.cursor
+  }
+
+  private async pushSessionSnapshot(): Promise<boolean> {
+    const result = await this.getSession()
+    if (!result.ok || !result.state || this.stopped) return false
+    this.callbacks?.onEvent({ type: 'session/update', epoch: this.info?.epoch, payload: { ...result.state, reset: true } })
+    this.sessionNeedsBaseline = false
+    return true
   }
 
   /** 拉一次团队快照。未连接、未开启团队模式或请求失败都返回 null，界面自己降级。 */
@@ -280,27 +379,32 @@ export class BridgeClient {
   /**
    * 批准或驳回一个提案。
    *
-   * 走的是独立凭据（bridge-approval.json），拿不到它就说明团队模式没开或插件是旧构建，
-   * 直接报错而不是拿聊天令牌去试 —— 服务端会 403，而且那种尝试本身就是错的。
+   * 走独立凭据（bridge-approval.json）；日报分路由使用日报令牌，团队保留原令牌。
+   * kind 和 expectedEpoch 来自主进程保存的卡片，不由舞台决定；缺凭据直接拒绝。
    */
   async decideApproval(
     proposalId: string,
     decision: ApprovalDecision,
     windowId?: number,
+    kind: 'team' | 'report' = 'team',
+    expectedEpoch?: string,
   ): Promise<DecideApprovalResult> {
     const info = this.info
     if (!info) return { ok: false, error: '未连接到 dsh 会话' }
     const credential = readApprovalCredential()
-    if (!credential) {
-      return { ok: false, error: '团队模式未开启，没有审批凭据' }
+    const token = kind === 'report' ? credential?.reportApprovalToken : credential?.approvalToken
+    if (!token) return { ok: false, error: '没有这类操作的审批凭据，请重新连接助理' }
+    if (!credential?.epoch || credential.epoch !== info.epoch
+      || (expectedEpoch !== undefined && expectedEpoch !== info.epoch)) {
+      return { ok: false, error: '审批所属会话已变化，请重新查看待办' }
     }
-    // 端口以 bridge.json 为准：审批文件里的 port 是同一次绑定写的，但 bridge.json 才是活的那份。
+    const route = kind === 'report' ? '/report-approval' : '/approval'
     try {
-      const response = await fetch(`http://127.0.0.1:${info.port}/approval`, {
+      const response = await fetch(`http://127.0.0.1:${info.port}${route}`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-dsh-approval-token': credential.approvalToken,
+          'x-dsh-approval-token': token,
         },
         signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
         body: JSON.stringify({
@@ -310,14 +414,13 @@ export class BridgeClient {
           windowId,
         }),
       })
-      const body = await response.json().catch(() => ({}) as Record<string, unknown>) as {
-        approvalId?: string
-        decision?: 'rejected'
-        error?: string
-        message?: string
-      }
-      if (response.ok) {
-        return { ok: true, approvalId: body.approvalId, decision: body.decision }
+      const body = await response.json().catch(() => ({})) as Partial<DecideApprovalResult>
+      if (response.ok && body.ok === true) {
+        return {
+          ok: true, approvalId: body.approvalId, decision: body.decision,
+          confirmed: body.confirmed, savedPath: body.savedPath, revision: body.revision,
+          digest: body.digest, modeExited: body.modeExited, message: body.message,
+        }
       }
       // 审批的 409 几乎都是业务态：提案不存在、已被消费、已过期。这些要原样告诉用户，
       // 不该拆连接。只有 EPOCH_MISMATCH 说明会话真的换代了，才需要重新发现桥接。
@@ -336,8 +439,10 @@ export class BridgeClient {
 
   dispose(): void {
     this.stopped = true
-    for (const resolve of this.pending.values()) {
-      resolve({ ok: false, error: '宠物正在退出' })
+    this.sessionGeneration += 1
+    this.lifetime.abort()
+    for (const entry of this.pending.values()) {
+      entry.resolve({ ok: false, error: '宠物正在退出' })
     }
     this.pending.clear()
   }
@@ -361,8 +466,9 @@ export class BridgeClient {
   private resetForNewEpoch(): void {
     this.info = null
     this.seq = 0
-    for (const resolve of this.pending.values()) {
-      resolve({ ok: false, error: '助理会话已重启，这条消息没有送达' })
+    this.sessionGeneration += 1
+    for (const entry of this.pending.values()) {
+      entry.resolve({ ok: false, error: '助理会话已重启，这条消息没有送达' })
     }
     this.pending.clear()
     this.callbacks?.onStatus('connecting')
@@ -377,7 +483,8 @@ export class BridgeClient {
         this.seq = 0
         this.callbacks?.onStatus('connected')
         void this.pushSnapshot()
-        void this.pollLoop()
+        await this.pushSessionSnapshot()
+        if (!this.stopped && this.info === info) void this.pollLoop()
         return
       }
       await sleep(2000)
@@ -388,34 +495,69 @@ export class BridgeClient {
   private async pollLoop(): Promise<void> {
     while (!this.stopped && this.info) {
       const info = this.info
-      let body: { events?: BridgeEventPayload[]; epoch?: string }
+      let body: { events?: BridgeEventPayload[]; epoch?: string; reset?: boolean }
       try {
         const response = await fetch(
           `http://127.0.0.1:${info.port}/events?token=${info.token}&since=${this.seq}`,
-          { signal: AbortSignal.timeout(LONG_POLL_TIMEOUT_MS + 5_000) },
+          { signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(LONG_POLL_TIMEOUT_MS + 5_000)]) },
         )
         if (!response.ok) throw new Error(`events ${response.status}`)
         body = await response.json() as typeof body
       } catch {
-        // 服务端关闭 / 会话销毁 / 进程退出：桥接不复存在，宠物随之退场
+        if (this.stopped || this.info !== info) return
+        // 网络失败不等于原生会话已结束；恢复后重新拉基线，不重发输入。
+        this.info = null
+        this.sessionGeneration += 1
         this.callbacks?.onStatus('disconnected')
-        this.callbacks?.onSessionEnded()
+        for (const entry of this.pending.values()) entry.resolve({ ok: false, error: '连接中断，后台任务结果待核对，不会自动重发' })
+        this.pending.clear()
+        void this.reconnect()
         return
       }
+      if (this.stopped || this.info !== info) return
       // 代次不符 = 桥接换了会话。旧游标对新代毫无意义，丢掉重来。
       if (typeof body.epoch === 'string' && info.epoch && body.epoch !== info.epoch) {
         this.resetForNewEpoch()
         return
       }
+      // ring 中可能还留着旧绑定的 reset：不相信其载荷，始终向当前服务取基线。
+      if (body.reset || (body.events ?? []).some(event => {
+        const update = event.payload as SessionUpdate | undefined
+        return event.type === 'session/update' && update && ((update.reset && update.cursor > this.sessionCursor) || update.bindingId !== this.sessionBinding)
+      })) {
+        this.sessionNeedsBaseline = true
+        // 发现换绑或缺口即使旧读失效，不等新快照到达才隔离在途请求。
+        this.sessionGeneration += 1
+      }
+      if (this.sessionNeedsBaseline) {
+        await this.pushSessionSnapshot()
+        if (this.stopped || this.info !== info) return
+      }
+      if (body.reset && !body.events?.length) this.seq = 0
       for (const event of body.events ?? []) {
         if (typeof event.seq === 'number' && event.seq > this.seq) this.seq = event.seq
+        if (event.type === 'session/update') {
+          const update = event.payload as SessionUpdate | undefined
+          if (this.sessionNeedsBaseline || !update || update.bindingId !== this.sessionBinding || update.reset || update.cursor <= this.sessionCursor) continue
+          this.sessionCursor = update.cursor
+          this.callbacks?.onEvent(event)
+          continue
+        }
         if (event.type === 'reply' && typeof event.id === 'string') {
-          this.pending.get(event.id)?.({
+          this.pending.get(event.id)?.resolve({
             ok: event.ok ?? false,
             reply: event.reply,
             error: event.error,
           })
           this.pending.delete(event.id)
+        } else if (event.type === 'delta' && typeof event.text === 'string') {
+          // 会话流水广播给界面：网页侧的轮次没有 requestId，不能按 id 路由，
+          // 而宠物要和 DSH 会话完全绑定 —— 那边的输入、思考、工具调用、正文都得按顺序显示。
+          this.callbacks?.onChatDelta?.(event)
+          // 正文按请求归属喂语音：只有宠物自己发起的那轮才有 pending。
+          if (typeof event.id === 'string' && (event.kind ?? 'text') === 'text') {
+            this.pending.get(event.id)?.onDelta?.(event.text)
+          }
         } else if (event.type === 'session-ended') {
           this.callbacks?.onStatus('disconnected')
           this.callbacks?.onSessionEnded()

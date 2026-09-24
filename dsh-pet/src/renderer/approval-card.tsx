@@ -129,7 +129,7 @@ export default function ApprovalCardPage() {
   return (
     <div className={`card risk-${view.risk}`}>
       <header className="card-head">
-        <h1 className="card-title">有个操作等你点头</h1>
+        <h1 className="card-title">{view.report ? '请确认这版日报' : '有个操作等你点头'}</h1>
         <span className={`card-risk risk-${view.risk}`}>{view.riskLabel}</span>
       </header>
 
@@ -151,6 +151,13 @@ export default function ApprovalCardPage() {
             <dt>说明</dt>
             <dd className="card-summary">{view.summary}</dd>
           </div>
+        )}
+        {view.report && (
+          <>
+            <div className="card-row"><dt>日报版本</dt><dd>{view.report.reportId} · 第 {view.report.revision} 版</dd></div>
+            <div className="card-row"><dt>内容摘要</dt><dd>{view.report.digest}</dd></div>
+            <div className="card-row"><dt>日报全文</dt><dd className="card-summary">{view.report.content}</dd></div>
+          </>
         )}
         {view.requester && (
           <div className="card-row">

@@ -12,10 +12,12 @@ import { Classifier } from './classifier.ts'
 import type { Config as ConfigType } from './config.ts'
 import { personalAssistantDomainSpec, type ActivitySpan, type PersonalAssistantDomainSpec } from './domain.ts'
 import { createLegacySource, purgeLegacyData, type LegacyTables } from './legacy.ts'
+import { HelpContextStore } from './help-context.ts'
 import { MemoryStore } from './memory.ts'
 import { MigrationStore, runMigration } from './migrate.ts'
 import { ObservationStore } from './observation.ts'
 import { reconcilePublishedFile, ReportStore } from './report.ts'
+import { ReportApprovalService } from './report-approval.ts'
 import { pruneSampleFiles, readLastSample, readSamples, sampleFileOf } from './sampler.ts'
 import { buildSpansFrom } from './spans.ts'
 import {
@@ -89,7 +91,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const classifier = new Classifier(config.customRules)
   // 迁移与跟踪器必须用同一套聚合口径，否则搬进来的历史和当天看到的对不上。
   const spansOf = (date: string): ActivitySpan[] =>
-    buildSpansFrom(readSamples(sampleFileOf(sampleDir, date)), classifier, config.minSpanMs)
+    buildSpansFrom(readSamples(sampleFileOf(sampleDir, date)), classifier, config.minSpanMs, config.sampleIntervalMs)
 
   // 上次进程崩在发布中途的日报作业先核对清楚：它可能其实已经写成功了，
   // 也可能留下一个和内容对不上的文件。这一步必须在任何新的发布之前。
@@ -136,10 +138,17 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     log(`legacy purge: ${JSON.stringify(outcome)}`)
   }
 
-  // 采集闸门。两个来源：用户关掉了采集，或者旧数据没搬完。
+  // 采集闸门。三个来源：用户关掉了采集、旧数据没搬完、或者这个平台上压根没有采集实现。
   // 迁移没跑完就继续采样，新旧两套记录会搅在一起，之后再也分不清哪条是哪来的。
+  //
+  // 平台这一条是**能力**而不是**授权**：采样脚本用 Win32 的 GetForegroundWindow +
+  // GetWindowText，只在 Windows 上存在。非 Windows 上如实拦住，而不是拉一个必然失败的
+  // 子进程 —— 后者每三秒重试一次，日志刷满而用户只看到"助理坏了"。
   const captureBlockedReason = (): string | null => {
     if (!config.captureActivity) return '配置里 captureActivity 已关闭，不采集前台活动'
+    if (process.platform !== 'win32') {
+      return `前台活动采集目前只在 Windows 上实现（当前系统 ${process.platform}），没有在记录活动`
+    }
     if (migration && !migration.complete) return `旧数据迁移未完成：${migration.failures.join('；')}`
     return null
   }
@@ -148,6 +157,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
     minSpanMs: config.minSpanMs,
     captureTitles: config.captureWindowTitles,
+    excludedProcesses: config.excludedProcesses,
+    excludedTitleKeywords: config.excludedTitleKeywords,
     captureBlockedReason,
   })
 
@@ -209,6 +220,11 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
           idleMs: typeof sample?.idleMs === 'number' ? sample.idleMs : null,
           focusMode: pet.focus,
           stageVisible: pet.visible,
+          captureActive: tracker.capturing,
+          sampleAt: sample?.ts ?? null,
+          sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
+          developmentApp: !sample?.idle && !sample?.excluded && classifier.classify(sample?.proc ?? '', sample?.title ?? '').category === 'dev',
+          taskRunning: (teamRuntime?.team.runningCount() ?? 0) > 0,
         },
         proactiveConfig,
       )
@@ -229,6 +245,13 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }
 
   const reportDir = config.reportDir || path.join(home, 'personal-assistant', 'reports')
+  bridge.attachReportApprovals(new ReportApprovalService(db, reports, {
+    epoch: bridge.epoch,
+    reportDir,
+    ttlMs: Math.max(10_000, config.approvalTtlMs),
+    stop: () => tracker.stop(),
+    active: () => tracker.active,
+  }))
   // 桌面专家助理团：默认关闭，由 desktop-team profile 显式打开；
   // 也允许用户在会话里说「开启团队模式」动态挂载（personal_assistant_set_team_mode），
   // 选择记在 user_flags，重启后不丢。团队委派与审批都挂在桥接的运行时代次上，
@@ -247,11 +270,22 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     if (running > 0) {
       return { ok: false, error: `还有 ${running} 个团队任务在执行，等它们结束再关闭团队模式` }
     }
+    if (runtime) {
+      bridge.detachTeam()
+      // 释放失败（子代理没能静止）时如实报错并保持团队开启：账目还没对清就把模式
+      // 标成已关、把库关掉，等于把结果不明的副作用弄丢。teamRuntime 留着供重试，
+      // dispose 内部只重试释放、不重发任务。
+      try {
+        await runtime.dispose()
+      } catch (error) {
+        return {
+          ok: false,
+          error: `关闭团队模式失败，团队保持开启以便重试：${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+    }
     teamRuntime = null
     setUserFlag(db, 'team_mode_enabled', 'false')
-    if (!runtime) return { ok: true }
-    bridge.detachTeam()
-    await runtime.dispose()
     return { ok: true }
   }
   if (config.teamEnabled || teamFlagOn()) {
@@ -259,8 +293,14 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     log(`team runtime mounted (profile: ${config.teamEnabled}, flag: ${teamFlagOn()})`)
   }
   // 清理顺序与注册顺序相反：先等自有子代理静止，再关库，最后才是桥接。
+  // 卸载钩子是同步的，等不了异步收尾；但释放失败必须出声且不关库——dispose 链路里
+  // 关库排在最后，前面抛错时团队库保持打开，结果不明的账目留给下次启动对账。
   ctx.effect(() => () => {
-    void teamRuntime?.dispose()
+    teamRuntime?.dispose().catch(error => {
+      const message = `团队释放失败，团队库保持打开待核查：${error instanceof Error ? error.message : String(error)}`
+      if (logger?.error) logger.error(message)
+      else log(`[error] ${message}`)
+    })
   }, 'personal-assistant:team')
 
   registerAssistantTools(ctx as never, tracker, {
@@ -268,6 +308,20 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     bridge,
     memories,
     reports,
+    observations,
+    helpContexts: new HelpContextStore(db),
+    captureScope: {
+      acked: () => getUserFlag(db, 'capture_scope_ack') === 'true',
+      ack: () => setUserFlag(db, 'capture_scope_ack', 'true'),
+      describe: () => ({
+        captureActivity: config.captureActivity,
+        captureWindowTitles: config.captureWindowTitles,
+        excludedProcesses: config.excludedProcesses,
+        excludedTitleKeywords: config.excludedTitleKeywords,
+        retentionActivityDays: config.retentionActivityDays,
+        note: '只记录前台应用、可选窗口标题与空闲指标；不截图、不读聊天正文、不记键鼠内容',
+      }),
+    },
     maxInjectedMemories: Math.max(0, Math.floor(config.maxInjectedMemories)),
     captureBlockedReason,
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
@@ -275,9 +329,9 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     disableTeamMode,
   })
 
-  // 会话桥接生命周期：agent 空闲时回传宠物消息的回复；会话销毁时通知宠物退场。
+  // 会话运行态全量转发；idle 同时驱动原有因果回复结算。
   ctx.on('agent/status', payload => {
-    if (payload.status === 'idle') bridge.onAgentIdle(payload.agent)
+    bridge.onAgentStatus(payload.agent, payload.status)
   })
   ctx.on('agent/disposed', payload => {
     bridge.onAgentDisposed(payload.agent)
@@ -302,7 +356,11 @@ interface RetentionDeps {
   now: number
 }
 
-/** 一次团队挂载的全部运行时所有物；dispose 按「先子代理静止、后关库」的顺序释放。 */
+/**
+ * 一次团队挂载的全部运行时所有物。
+ * dispose 按「先子代理静止 → 对账未完成态 → 关库」的顺序释放；前面任何一步失败
+ * 都会抛给调用方并且不关库，结果不明的账目留给下次启动对账。
+ */
 interface TeamRuntime {
   team: TeamService
   approvals: ApprovalService
@@ -356,11 +414,21 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     logger: teamLogger,
   })
   team.ensureRoster()
+  // 挂载后立即对账上次进程中断的任务：还挂着 running 的任务/运行/副作用一律记成
+  // unknown，只对账、不重发。对账失败就让挂载失败并释放刚开的库句柄——
+  // 带着没对过的账上岗，恢复流程就可能重发已经发生过的副作用。
+  try {
+    team.recoverInterruptedTasks()
+  } catch (error) {
+    store.close()
+    throw error
+  }
   // 装配完成后再注册工具，宿主可能不接受：尽力注册，失败时团队服务照常工作
   //（快照、审批卡片、宠物团队页），只是模型缺委派入口，重启后必然可用。
   let toolsRegistered = true
+  let unregisterTools: (() => void) | undefined
   try {
-    registerTeamTools(ctx as never, { team, approvals, bridge: deps.bridge })
+    unregisterTools = registerTeamTools(ctx as never, { team, approvals, bridge: deps.bridge })
   } catch (error) {
     toolsRegistered = false
     deps.log(`team tools registration failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -370,9 +438,16 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     team,
     approvals,
     toolsRegistered,
-    dispose: () => team.dispose().catch(() => undefined).then(() => {
+    dispose: async () => {
+      // 先等自有子代理全部静止；释放失败必须抛给调用方，并且不走到关库——
+      // 还有结果不明的运行就把库关掉，等于把副作用账目撕掉。
+      await team.dispose()
+      // 关库前把仍未完成的状态对账成 unknown：卸载或关闭团队模式都不丢账，
+      // 下次启动的恢复流程据此拒绝盲重试。
+      team.recoverInterruptedTasks()
+      unregisterTools?.()
       store.close()
-    }),
+    },
   }
 }
 
@@ -412,7 +487,7 @@ function applyRetention(deps: RetentionDeps): RetentionOutcome {
  * 上次崩在发布中途的日报作业，逐个核对目标文件。
  *
  * 核对而不是重发：内容对得上就说明那次其实成功了，补记已归档即可；文件不在就退回
- * 待发布让用户重试；文件在但内容对不上，说明有人或有别的进程动过它——这时候重发
+ * 草稿并要求重新可信审批；文件在但内容对不上，说明有人或有别的进程动过它——这时候重发
  * 会覆盖掉用户的东西，所以把该版本标成已撤销，让人来决定怎么办。
  */
 async function reconcilePublishJobs(reports: ReportStore, log: (message: string) => void): Promise<void> {
@@ -426,8 +501,8 @@ async function reconcilePublishJobs(reports: ReportStore, log: (message: string)
     }
     if (state === 'missing') {
       reports.finishJob(job.operationId, 'failed', Date.now())
-      reports.setReportState(job.reportId, job.revision, 'approved')
-      log(`publish job ${job.operationId}：${job.targetPath} 不存在，那次发布没写成，已退回待发布`)
+      reports.setReportState(job.reportId, job.revision, 'draft')
+      log(`publish job ${job.operationId}：${job.targetPath} 不存在，已退回草稿；需重新提交并由用户批准，不自动重发`)
       continue
     }
     reports.finishJob(job.operationId, 'unknown', Date.now())

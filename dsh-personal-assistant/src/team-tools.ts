@@ -13,6 +13,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ApprovalService } from './approval.ts'
 import { ApprovalError } from './approval.ts'
+import { gateDecision } from './gate.ts'
 import type { SessionBridge } from './bridge.ts'
 import type { TaskOutcome, TeamService } from './team.ts'
 
@@ -58,7 +59,31 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void {
+export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () => void {
+  const disposers: Array<() => void> = []
+  const dispose = () => {
+    while (disposers.length) {
+      disposers[disposers.length - 1]()
+      disposers.pop()
+    }
+  }
+  const own = (register: () => () => void): (() => void) => {
+    try {
+      const release = register()
+      disposers.push(release)
+      return release
+    } catch (error) {
+      dispose()
+      throw error
+    }
+  }
+  const ctx: TeamHost = {
+    tools: { register: definition => own(() => host.tools.register(definition)) },
+    systemPrompt: {
+      section: section => own(() => host.systemPrompt.section(section)),
+      variable: (name, provider) => own(() => host.systemPrompt.variable(name, provider)),
+    },
+  }
   const { team, approvals, bridge } = options
   const textOutput = {
     schema: { type: 'string' } as const,
@@ -100,9 +125,9 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
       member: { type: 'string', required: true, description: '承接成员的点名，如"孙悟空"' },
       goal: { type: 'string', required: true, description: '任务目标，一句话说清要解决什么' },
       evidence: { type: 'array', items: { type: 'string' }, description: '交给成员的已知材料（文件路径、报错原文、用户原话等）' },
-      acceptance: { type: 'array', items: { type: 'string' }, description: '验收条件；填了就要求成员拿出可核验产物，否则任务只会进复核' },
+      acceptance: { type: 'array', items: { type: 'string' }, description: '验收条件；当前自由文本产物需独立复核，模型自报不能标记任务完成' },
       dependsOn: { type: 'array', items: { type: 'string' }, description: '前置任务 id；前置未完成时本任务留在排队状态' },
-      budgetTokens: { type: 'integer', description: '本次委派的 token 预算上限' },
+      budgetTokens: { type: 'integer', description: '累计 token 预算。当前宿主不支持硬约束：非零预算会拒绝启动；0 明确表示不设累计预算' },
     },
     output: textOutput,
     async execute(
@@ -125,6 +150,7 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
         inputEvidence: args.evidence ?? [],
         acceptance: args.acceptance ?? [],
         ownerId: member.assistantId,
+        toolScope: 'read-only',
         dependsOn: args.dependsOn ?? [],
         budgetTokens: args.budgetTokens,
         originChannel: 'dsh-session',
@@ -213,7 +239,7 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
     name: 'desktop_team_propose_action',
     description:
       '为一个需要用户批准的副作用提交提案（写文件、删数据、发消息、改配置、执行命令等）。提案会推送到桌面宠物的审批卡；只有用户在可信交互面上点批准后才签发批准。提交提案本身不产生任何外部效果，也不代表已获授权。' +
-      '门禁是强制的：获批前真的调不动这些工具，会被直接拒绝，不要试图绕开。',
+      '批准只可交给已绑定任务身份、输入版本及完整参数的可信执行器；不要在普通主会话中直接执行来替代团队审批。',
     parameters: {
       taskId: { type: 'string', required: true, description: '关联任务 id' },
       summary: { type: 'string', required: true, description: '给用户看的一句话说明：要做什么、影响什么' },
@@ -221,24 +247,27 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
         type: 'string',
         required: true,
         description:
-          '将来真正要调用的宿主工具名，必须与实际调用完全一致：write / edit / bash / pwsh / str_replace_editor / skill / job_kill。门禁按这个名字匹配批准，写错就永远匹配不上。',
+          '实际宿主工具名：write / edit / bash / pwsh / str_replace_editor / job_kill。技能、再委派和未知工具不支持。',
       },
       target: {
         type: 'string',
         required: true,
         description:
-          '作用目标，必须与将来传给该工具的那个字段逐字相同：write/edit 用 file_path，str_replace_editor 用 path，bash/pwsh 用整条 command，skill 用技能名，job_kill 用 job_id。',
+          '作用目标必须与完整参数中的对应字段相同：write/edit 用 file_path，str_replace_editor 用 path，bash/pwsh 用整条 command，job_kill 用 job_id。',
       },
-      params: { type: 'object', additionalProperties: true, description: '具体参数；参与计划摘要哈希，改动会让已签发的批准失效' },
+      params: { type: 'object', additionalProperties: true, required: true, description: '将要调用工具的完整参数对象，包含目标字段；键序无关，任何值变动都使批准失效' },
       risk: { type: 'string', enum: ['low', 'medium', 'high'], required: true, description: '风险等级；high 会要求用户在独立审批窗口确认' },
-      assistantId: { type: 'string', description: '提案归属成员 id；缺省记为总助理' },
+      assistantId: { type: 'string', description: '必须与任务所属成员一致；缺省使用任务成员' },
     },
     output: textOutput,
     async execute(args: { taskId: string; summary: string; tool: string; target: string; params?: unknown; risk: 'low' | 'medium' | 'high'; assistantId?: string }) {
       const task = team.getTask(args.taskId)
       if (!task) return json({ ok: false, error: `任务 ${args.taskId} 不存在` })
-      const assistantId = args.assistantId ?? team.chief().assistantId
-      if (!team.member(assistantId)) return json({ ok: false, error: `成员 ${assistantId} 不存在` })
+      const assistantId = args.assistantId ?? task.ownerId
+      if (assistantId !== task.ownerId || !team.member(assistantId)?.enabled) return json({ ok: false, error: '提案成员与任务成员不符或已停用' })
+      if (['done', 'failed', 'cancelled', 'unknown'].includes(task.status)) return json({ ok: false, error: '任务已终止或结果不明，需先复核' })
+      const decision = gateDecision(args.tool, args.params)
+      if (decision.kind !== 'gated' || decision.target !== args.target) return json({ ok: false, error: '工具不支持审批或完整参数中的目标与提案不符' })
       const proposal = approvals.propose({
         taskId: task.taskId,
         assistantId,
@@ -254,7 +283,7 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
         proposalId: proposal.proposalId,
         state: proposal.state,
         expiresAt: proposal.expiresAt,
-        note: '等待用户在桌面审批卡上决定；用 desktop_team_status 查看结果。获批后直接调用该工具即可，门禁会在那一刻消费批准；执行完用 desktop_team_finish_operation 结账。未获批准前调用会被拒绝。',
+        note: '等待可信审批决定。当前只读团队不执行副作用；获批也不代表已执行。需任务专用可信执行器绑定最新版本后消费，不能在普通主会话直接调用工具代替。',
       })
     },
   }))
@@ -262,22 +291,22 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
   ctx.tools.register(defineTool({
     name: 'desktop_team_finish_operation',
     description:
-      '给一次已经发生的副作用结账。批准在真实调用那一刻就由门禁消费掉了，所以这里不需要、也不能再「首次登记」——直接凭 proposalId 找到那条执行记录写下结果即可。结果不明时写 unknown，由用户核查真实外部状态后再定。',
+      '查询一次副作用的可信执行记录。保留旧工具名，但不再接受模型自报成功来结账；真实工具结果或可信人工复核才可修改账目。',
     parameters: {
       proposalId: { type: 'string', required: true, description: '已批准且已执行的提案 id' },
-      state: { type: 'string', enum: ['succeeded', 'failed', 'unknown'], required: true, description: 'succeeded/failed=已确定结果；unknown=结果不明，需人工核查' },
-      operationId: { type: 'string', description: '已知操作记录 id 时直接传，省一次反查' },
-      resultDigest: { type: 'string', description: '结果摘要（不要放敏感原文）' },
+      state: { type: 'string', enum: ['succeeded', 'failed', 'unknown'], description: '旧参数，仅兼容接收，不会修改可信状态' },
+      operationId: { type: 'string', description: '可选执行记录 id，必须与提案对应' },
+      resultDigest: { type: 'string', description: '旧参数，不会写入可信账目' },
     },
     output: textOutput,
-    async execute(args: { proposalId: string; state: 'succeeded' | 'failed' | 'unknown'; operationId?: string; resultDigest?: string }) {
+    async execute(args: { proposalId: string; state?: 'succeeded' | 'failed' | 'unknown'; operationId?: string; resultDigest?: string }) {
       try {
-        if (args.operationId) {
-          approvals.settle(args.operationId, args.state, args.resultDigest ?? null)
-          return json({ ok: true, operationId: args.operationId, state: args.state })
+        const operation = approvals.operationByProposal(args.proposalId)
+        if (!operation || (args.operationId && args.operationId !== operation.operationId)) {
+          return json({ ok: false, error: '提案没有匹配的真实执行记录' })
         }
-        const operation = approvals.settleByProposal(args.proposalId, args.state, args.resultDigest ?? null)
-        return json({ ok: true, operationId: operation.operationId, kind: operation.kind, state: args.state })
+        return json({ ok: true, operationId: operation.operationId, kind: operation.kind, state: operation.state,
+          note: '返回可信账目，忽略模型自报状态和摘要；结果不明时须人工核查，禁止盲重试' })
       } catch (error) {
         return json({ ok: false, error: errorMessage(error), note: '查不到执行记录说明门禁从未放行过这次副作用；不要凭空报成功。' })
       }
@@ -300,7 +329,8 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
       '- 需要专业分析时调用 desktop_team_assign 点名委派，把已知材料写进 evidence、把可核验要求写进 acceptance。返回的 summary/artifacts/blockers 是子代理的真实运行结果，直接引用，不要改写成自己的判断。',
       '- 点名必须精确：名字不存在或席位未启用时工具会报错，此时如实告诉用户，不要自动换成别的成员。',
       '- 专家席位是只读的：write / edit / bash / pwsh / str_replace_editor / skill / job_kill 这些工具根本不在它们手里，也别指望它们替你动手。',
-      '- 副作用走三步，门禁是强制的、不是建议：①用 desktop_team_propose_action 提案，tool 填将来真正要调用的宿主工具名、target 填将来真正要传的那个字段值（write/edit 的 file_path、str_replace_editor 的 path、bash/pwsh 的整条 command）；②等用户在桌面审批卡上批准；③获批后直接调用该工具，门禁会在那一刻单次消费批准。执行完用 desktop_team_finish_operation 结账。',
+      '- 当前团队只运行只读 spawn 委派。副作用可提交提案，但需要独立可信执行器接入；批准不是执行结果，不得在普通主会话直接调用工具冒充已走团队门禁。desktop_team_finish_operation 只查询可信结果，不接受模型自报结账。',
+      '- 非零累计 token 预算当前无法硬约束，任务会拒绝启动；不得擅自改成 0 绕过预算。无可信成果核验器的任务保留 review，不能把 artifacts 非空当成完成。',
       '- 被门禁拒绝时按拒绝理由改正提案，不要换个工具、换个路径或拆成小步绕过去 —— 那只会让用户看到一堆被拦下的尝试。',
       '- 提案不等于授权。不要把"已提交提案"说成"已获批准"，不要把未核验的推断写进 artifacts。',
       '- 用户问团队进度或待批准事项：调用 desktop_team_status。',
@@ -315,4 +345,5 @@ export function registerTeamTools(ctx: TeamHost, options: TeamToolOptions): void
       .map(member => `- ${member.displayName}（${member.assistantId}）：${member.toolPolicy.mode}，${member.enabled ? '已启用' : '未启用'}`)
       .join('\n')
   })
+  return dispose
 }

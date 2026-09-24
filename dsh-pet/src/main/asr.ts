@@ -4,8 +4,12 @@
  * 1. **流式（首选）**：sherpa-onnx 流式 Zipformer 中英模型（`local-asr/streaming`），
  *    边喂音频边出部分文本——「说一个字出一个字」靠它。识别器每次听写时创建，
  *    听写期间由渲染层逐帧送 PCM（base64 Int16）。
- * 2. **整句（回退）**：本地 SenseVoice（`local-asr`）说完整句再转；流式模型没装时用。
- *    两条都不可用时最后回退 Windows 旧引擎（asr-wave.ps1）。
+ * 2. **整句（回退）**：本地 SenseVoice（`local-asr/model`）说完整句再转；流式模型没装时用。
+ *
+ * **两条路都在进程内解码**（`sherpa-onnx-node` 的 Node API），**不 spawn 任何外部程序**。
+ * 这一点是跨平台的关键：旧实现调 `sherpa-onnx-offline.exe`，而 Windows 的 `.exe` 在 macOS
+ * 上根本不存在 —— 于是"识别"这件事在 Mac 上被一个文件名挡死了，尽管模型本身是跨平台的。
+ * 换成 Node API 后，同一个模型目录在三个系统上都能用。
  *
  * 录音在渲染层完成（getUserMedia + 静音检测），PCM 经 base64 过 contextBridge 送上来。
  */
@@ -14,7 +18,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import sherpa from 'sherpa-onnx-node'
+import sherpa, { type OfflineRecognizerInstance } from 'sherpa-onnx-node'
 
 export interface AsrResult {
   ok: boolean
@@ -22,11 +26,8 @@ export interface AsrResult {
   error?: string
 }
 
-const TIMEOUT_MS = 60000
-
 const ERROR_MESSAGES: Record<string, string> = {
-  'init-failed': '无法初始化语音识别：请确认麦克风可用，并在 Windows 设置中安装中文语音包',
-  'grammar-failed': '当前语音识别器不支持听写，请安装完整的中文语音功能',
+  'init-failed': '无法初始化语音识别：本地模型可能没装好，或麦克风不可用',
   'timeout-empty': '没有听到说话内容',
   'recognize-failed': '语音识别失败',
 }
@@ -36,17 +37,23 @@ function mapError(code: string | undefined, fallback: string): string {
   return fallback
 }
 
-/** 本地模型安装根目录（setup-local-asr.ps1 的落点）。 */
+/** 本地模型安装根目录（`scripts/setup-local-asr.ps1` 或 macOS 版脚本的落点）。 */
 export function localAsrDir(userDataDir: string): string {
   return path.join(userDataDir, 'local-asr')
 }
 
+/**
+ * 整句 SenseVoice 模型是否可用。
+ *
+ * 只看**模型文件**，不看可执行文件：解码走进程内 API，不需要任何 `.exe`。
+ * 这是从 macOS 评估里改掉的一处 —— 旧判据要求 `bin/sherpa-onnx-offline.exe` 存在，
+ * 于是 Mac 上哪怕模型齐了也永远判"不可用"，一路掉到 Windows 专有的兜底引擎。
+ */
 export function localAsrAvailable(userDataDir: string): boolean {
-  const dir = localAsrDir(userDataDir)
+  const dir = path.join(localAsrDir(userDataDir), 'model')
   return (
-    existsSync(path.join(dir, 'bin', 'sherpa-onnx-offline.exe'))
-    && existsSync(path.join(dir, 'model', 'model.int8.onnx'))
-    && existsSync(path.join(dir, 'model', 'tokens.txt'))
+    existsSync(path.join(dir, 'model.int8.onnx'))
+    && existsSync(path.join(dir, 'tokens.txt'))
   )
 }
 
@@ -220,54 +227,103 @@ function spawnText(command: string, args: string[], timeoutMs: number): Promise<
   })
 }
 
-/** SenseVoice 的 stdout：v1.13+ 是一行 JSON（{"text":...}），旧版是 "Text: ..." 行。两种都认。 */
-export function parseSenseVoiceText(stdout: string): string | null {
-  for (const line of stdout.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed.startsWith('{')) continue
-    try {
-      const parsed = JSON.parse(trimmed) as { text?: unknown }
-      if (typeof parsed.text === 'string') {
-        const text = cleanSenseVoiceText(parsed.text)
-        if (text) return text
-      }
-    } catch {
-      // 非 JSON 行，走下面的正则
-    }
-  }
-  const match = /Text:\s*(.+)/.exec(stdout)
-  return match ? cleanSenseVoiceText(match[1]) : null
-}
-
-function cleanSenseVoiceText(raw: string): string | null {
+/** SenseVoice 的输出可能带时间戳标记，清掉它们并去空白。 */
+export function cleanSenseVoiceText(raw: string): string | null {
   // 时间戳标记形如 "| 1|" 或 "|1.00|"：成对竖线夹着空白与数字，替换成一个空格。
   const text = raw.replace(/\|[\s\d.]*\|/g, ' ').replace(/\|/g, ' ').trim()
   return text.length > 0 ? text : null
 }
 
-async function transcribeWithSenseVoice(wavPath: string, userDataDir: string): Promise<AsrResult> {
-  const dir = localAsrDir(userDataDir)
-  const { code, stdout } = await spawnText(
-    path.join(dir, 'bin', 'sherpa-onnx-offline.exe'),
-    [
-      '--tokens=' + path.join(dir, 'model', 'tokens.txt'),
-      '--sense-voice-model=' + path.join(dir, 'model', 'model.int8.onnx'),
-      wavPath,
-    ],
-    TIMEOUT_MS,
-  )
-  if (code !== 0) return { ok: false, error: '本地语音识别失败（SenseVoice 运行异常）' }
-  const text = parseSenseVoiceText(stdout)
-  if (text === null) return { ok: false, error: ERROR_MESSAGES['timeout-empty'] }
-  return { ok: true, text }
+/**
+ * 把 16bit PCM 重采样到 16kHz。
+ *
+ * SenseVoice 只吃 16kHz，而渲染层刻意**不指定**录音采样率（指定了与部分麦克风流组合时
+ * `onaudioprocess` 可能永远不来，见 `dictation.ts` 的注释），拿到的往往是 44.1k/48k。
+ * 用 sherpa 自带的线性重采样器，不自己写插值 —— 采样率换算写错只会让识别变差，
+ * 不会报错，是最难发现的一类 bug。
+ */
+function resampleTo16k(samples: Float32Array, sampleRate: number): Float32Array {
+  if (sampleRate === 16000) return samples
+  const resampler = new sherpa.LinearResampler(sampleRate, 16000)
+  return resampler.flush(samples)
 }
 
+/**
+ * 进程内 SenseVoice 解码。
+ *
+ * 旧实现 spawn `sherpa-onnx-offline.exe` 并把 stdout 当 JSON 解析 —— 那条路在 macOS 上
+ * 直接断掉（没有 `.exe`）。改成 Node API 后不再有任何外部进程，也不需要解析 stdout：
+ * 结果对象直接就有 `text`。
+ *
+ * 引擎只在第一次调用时创建并缓存：模型加载约 1–2 秒，而听写是高频操作。
+ * 缓存放在模块级而不是实例级 —— 转写链路是"一次一段"，没有自然的实例边界。
+ */
+let senseVoiceEngine: { recognizer: OfflineRecognizerInstance; dir: string } | null = null
+
+function senseVoiceRecognizer(userDataDir: string): OfflineRecognizerInstance {
+  const modelDir = path.join(localAsrDir(userDataDir), 'model')
+  if (senseVoiceEngine !== null && senseVoiceEngine.dir === modelDir) return senseVoiceEngine.recognizer
+  const recognizer = new sherpa.OfflineRecognizer({
+    modelConfig: {
+      senseVoice: {
+        model: path.join(modelDir, 'model.int8.onnx'),
+        language: 'auto',
+        useInverseTextNormalization: 1,
+      },
+      tokens: path.join(modelDir, 'tokens.txt'),
+      numThreads: 2,
+    },
+    decodingMethod: 'greedy_search',
+  })
+  senseVoiceEngine = { recognizer, dir: modelDir }
+  return recognizer
+}
+
+/** 测试之间清掉缓存：引擎持有原生句柄，跨测试复用会让"模型没装"这类用例假通过。 */
+export function resetSenseVoiceEngine(): void {
+  senseVoiceEngine = null
+}
+
+function transcribeWithSenseVoice(wav: Buffer, userDataDir: string): AsrResult {
+  const parsed = wavChunk(wav)
+  if (parsed === null) return { ok: false, error: '录音格式无法识别' }
+  if (parsed.bitsPerSample !== 16) return { ok: false, error: '录音位深不是 16bit，无法识别' }
+  // wav 的 data 段是 16bit LE；转成 Float32（-1..1）再喂识别器。
+  const sampleCount = Math.floor(parsed.data.length / 2)
+  const samples = new Float32Array(sampleCount)
+  for (let i = 0; i < sampleCount; i++) samples[i] = parsed.data.readInt16LE(i * 2) / 32768
+
+  let recognizer: OfflineRecognizerInstance
+  try {
+    recognizer = senseVoiceRecognizer(userDataDir)
+  } catch (error) {
+    return { ok: false, error: `本地识别模型加载失败：${error instanceof Error ? error.message : String(error)}` }
+  }
+  try {
+    const stream = recognizer.createStream()
+    stream.acceptWaveform({ sampleRate: 16000, samples: resampleTo16k(samples, parsed.sampleRate) })
+    recognizer.decode(stream)
+    const result = recognizer.getResult(stream)
+    const text = typeof result.text === 'string' ? cleanSenseVoiceText(result.text) : null
+    if (text === null) return { ok: false, error: ERROR_MESSAGES['timeout-empty'] }
+    return { ok: true, text }
+  } catch (error) {
+    return { ok: false, error: `本地语音识别失败：${error instanceof Error ? error.message : String(error)}` }
+  }
+}
+
+/**
+ * Windows 旧引擎兜底（`System.Speech`）。
+ *
+ * 只在**没装本地模型**时才走到这里，而且只在 Windows 上可用 —— 它是最后一道网，
+ * 不是主路径。macOS 上没装模型就直接报"识别模型没装"，不假装有兜底。
+ */
 async function transcribeWithLegacyEngine(wavPath: string): Promise<AsrResult> {
   const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'asr-wave.ps1')
   const { code, stdout } = await spawnText(
     'powershell',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-Path', wavPath],
-    TIMEOUT_MS,
+    60000,
   )
   if (code !== 0 && stdout.trim() === '') return { ok: false, error: '语音识别进程异常退出' }
   const lines = stdout.trim().split('\n')
@@ -285,17 +341,28 @@ async function transcribeWithLegacyEngine(wavPath: string): Promise<AsrResult> {
   return { ok: false, error: '语音识别无输出' }
 }
 
+/** Windows 旧引擎能否用。非 Windows 上没有它 —— 兜底那条路必须如实关闭。 */
+export function legacyEngineAvailable(platform: string = process.platform): boolean {
+  return platform === 'win32'
+}
+
 /**
  * 转写一段渲染层录好的 wav。识别期间不占麦克风：录音已结束，唤醒监听可以照常收音。
  */
 export async function transcribeWav(wav: ArrayBuffer, userDataDir: string): Promise<AsrResult> {
   const buffer = Buffer.from(wav)
   const trimmed = trimSilence(buffer)
+  const effective = trimmed.length > 0 ? trimmed : buffer
+  // 本地模型那条路全程在内存里，不落临时文件 —— 少一次写盘、少一处清理。
+  if (localAsrAvailable(userDataDir)) return transcribeWithSenseVoice(effective, userDataDir)
+  // 没装模型时：Windows 还有系统自带的旧引擎，别的系统上就只能如实说没装。
+  if (!legacyEngineAvailable()) {
+    return { ok: false, error: '本机还没装语音识别模型，听写用不了（装好模型后即可离线识别）' }
+  }
   const tmp = mkdtempSync(path.join(tmpdir(), 'dsh-asr-'))
   const wavPath = path.join(tmp, 'dictation.wav')
   try {
-    writeFileSync(wavPath, trimmed.length > 0 ? trimmed : buffer)
-    if (localAsrAvailable(userDataDir)) return await transcribeWithSenseVoice(wavPath, userDataDir)
+    writeFileSync(wavPath, effective)
     return await transcribeWithLegacyEngine(wavPath)
   } finally {
     try { rmSync(tmp, { recursive: true, force: true }) } catch { /* 临时目录 */ }

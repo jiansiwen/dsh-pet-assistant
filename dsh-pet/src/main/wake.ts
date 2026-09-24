@@ -1,9 +1,14 @@
 /**
- * 常驻唤醒词监听：拉起 wake.ps1（Windows System.Speech 离线识别）持续听"小潘"。
+ * 常驻唤醒词监听：拉起 wake.ps1（Windows System.Speech 离线识别）持续听"小潘小潘"。
+ * 词本身在 `wake-grammar.ps1` 里构造 —— 那份构造器同时被离线探针复用，改词只需改一处。
  * 进程意外退出时延迟自动重启；每次识别到唤醒词调用 onWake 回调。
  *
  * 起停由麦克风仲裁器（`audio.ts`）说了算，这个模块只管把进程跑起来。初始化失败会经 onLost
  * 报上去 —— 设备空出来了、而且短时间内不会自己好，这件事只有上层能决定怎么处置。
+ *
+ * **只在 Windows 上有实现**（`platform.ts` 的 `supportsWakeWord`）：System.Speech 的离线
+ * 识别器是 Windows 专有的。别的系统上由调用方（`index.ts` 的 `applyAudio`）直接拦住，
+ * 根本不会调到这里 —— 那里拦是因为在这里报"失败"会造成同步重入。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'

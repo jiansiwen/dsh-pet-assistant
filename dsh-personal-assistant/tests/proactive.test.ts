@@ -31,7 +31,11 @@ import { getUserFlag, openAssistantStore, setUserFlag } from '../src/store.ts'
 const config: ProactiveConfig = { enabled: true, idleMs: 480_000, cooldownMs: 3_600_000 }
 
 function input(overrides: Partial<ProactiveInput> = {}): ProactiveInput {
-  return { now: 1_000_000, idleMs: 600_000, focusMode: false, stageVisible: true, ...overrides }
+  return {
+    now: 1_000_000, idleMs: 600_000, focusMode: false, stageVisible: true,
+    captureActive: true, sampleAt: overrides.now ?? 1_000_000, sampleIntervalMs: 5000,
+    developmentApp: true, taskRunning: false, ...overrides,
+  }
 }
 
 test('够空闲的第一次：提醒，文案是设计原文的固定句', () => {
@@ -53,6 +57,24 @@ test('不够空闲不提醒；拿不到空闲数据也不提醒 —— 缺数据
   if (missing.decision.kind === 'none') assert.equal(missing.decision.reason, 'no-idle-data')
   // 拿不到数据的这一拍不能把空闲期记上：下一拍有数据时它还是"第一次"。
   assert.equal(missing.state.idlePeriodStart, null)
+})
+
+test('停采样、过期样本、非开发应用和正在执行任务都不能触发提醒', () => {
+  const cases: [Partial<ProactiveInput>, string][] = [
+    [{ captureActive: false }, 'capture-inactive'],
+    [{ sampleAt: null }, 'stale-sample'],
+    [{ sampleAt: 984_999 }, 'stale-sample'],
+    [{ sampleAt: 1_000_001 }, 'stale-sample'],
+    [{ developmentApp: false }, 'not-development-app'],
+    [{ taskRunning: true }, 'task-running'],
+    [{ idleMs: NaN }, 'no-idle-data'],
+    [{ idleMs: -1 }, 'no-idle-data'],
+  ]
+  for (const [overrides, reason] of cases) {
+    const result = evaluateProactive(INITIAL_PROACTIVE_STATE, input(overrides), config)
+    assert.deepEqual(result.decision, { kind: 'none', reason })
+    assert.equal(result.state.lastNotifiedAt, null)
+  }
 })
 
 test('同一个空闲期最多提醒一次', () => {

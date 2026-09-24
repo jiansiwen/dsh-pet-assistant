@@ -15,6 +15,9 @@ import { formatDate, formatSize, progressLabel, sectionLabel, shortenDir } from 
 import type { DocRoots, DocState } from './types.js'
 import './doc.css'
 
+/** 主进程投影会带 PDF 物理页码；types.d.ts 的简报类型尚未含该字段时按可选读取。 */
+type SectionWithPage = { pageNumber?: number }
+
 interface DocPanelProps {
   readonly state: DocState
   readonly roots: DocRoots
@@ -132,7 +135,12 @@ export default function DocPanel({
                   onClick={() => setSelected(section.index)}
                 >
                   <span className="doc-row-index">{section.index + 1}</span>
-                  <span className="doc-row-label">{sectionLabel(section.heading, section.index)}</span>
+                  <span className="doc-row-label">
+                    {(section as SectionWithPage).pageNumber !== undefined && (
+                      <span className="doc-tag">第 {(section as SectionWithPage).pageNumber} 页</span>
+                    )}
+                    {sectionLabel(section.heading, section.index)}
+                  </span>
                   {/* 状态用文字而不是只用颜色：已讲/含代码都是要读出来的信息。 */}
                   {section.hasCode && <span className="doc-tag">含代码</span>}
                   {section.spoken && <span className="doc-tag done">已讲</span>}
@@ -184,7 +192,7 @@ export default function DocPanel({
                 问
               </button>
             </div>
-            <p className="doc-ask-hint">回答会带上这一段的原文，答案铺在对话页。</p>
+            <p className="doc-ask-hint">回答会带上这一段的原文，答案显示在上方最近结果中。</p>
           </div>
         </section>
       )}

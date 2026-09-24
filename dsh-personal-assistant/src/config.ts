@@ -47,6 +47,8 @@ export interface Config {
    * 代价是活动只剩进程名，日报只能说到"用了 Word"而说不出"在写哪份文档"。
    */
   captureWindowTitles: boolean
+  excludedProcesses: string[]
+  excludedTitleKeywords: string[]
   /** 原始活动（采样片段与观察记录）保留天数，超期由保留期清理删除；最小 1。 */
   retentionActivityDays: number
   /**
@@ -102,6 +104,8 @@ export const Config: Schema<Config> = Schema.object({
   storePath: Schema.string().default(''),
   captureActivity: Schema.boolean().default(true),
   captureWindowTitles: Schema.boolean().default(true),
+  excludedProcesses: Schema.array(Schema.string()).default(['KeePass', 'KeePassXC', '1Password', 'Bitwarden']),
+  excludedTitleKeywords: Schema.array(Schema.string()).default(['密码管理', '支付密码', '银行卡', '网上银行', 'password manager']),
   retentionActivityDays: Schema.number().default(7),
   maxInjectedMemories: Schema.number().default(40),
   migrateLegacy: Schema.boolean().default(true),

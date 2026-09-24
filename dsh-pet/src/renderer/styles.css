@@ -60,6 +60,20 @@ body,
   padding: 2px 8px;
 }
 
+/*
+ * 构建标识：半透明、低对比，不抢注意力但一眼能找到。
+ * 它的存在本身就是诊断信息 —— 看不到它就说明宠物跑的是旧构建。
+ */
+.build-tag {
+  font-size: 9.5px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  padding: 1px 6px;
+  opacity: 0.75;
+}
+
 .panel-actions {
   display: flex;
   gap: 4px;
@@ -137,6 +151,48 @@ body,
   word-break: break-word;
 }
 
+/*
+ * 会话流水里的非正文形态：思考过程与工具调用。
+ *
+ * 不做气泡 —— 它们是「过程」不是「对话内容」，视觉上要弱一档，别和正文抢注意力。
+ * 单行省略 + title 看全文：DSH 那边也是这么显示的，一屏能塞下十来条过程。
+ * 不折行是刻意的：思考常常很长，折行会把正文顶出屏幕，那正好是用户抱怨过的问题。
+ */
+.feed-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 1px 6px;
+  min-width: 0;
+  overflow: hidden;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.feed-think {
+  color: var(--runtime-detail, #5a6070);
+  font-style: italic;
+}
+
+.feed-tool {
+  color: #2f3a86;
+}
+
+.feed-name {
+  flex: none;
+  font-weight: 700;
+}
+
+.feed-arg {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .bubble.user {
   align-self: flex-end;
   background: #6a8fe7;
@@ -187,6 +243,15 @@ body,
 .chip:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.voice-conversation-option {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 12px 0;
+  color: #5a6070;
+  font-size: 12px;
 }
 
 .input-row {
@@ -384,4 +449,325 @@ body,
 
 @media (prefers-reduced-motion: reduce) {
   .proactive-bubble { animation: none; }
+}
+
+/* ===== 会议页（P6）：追加于此，不动上面的既有样式 ===== */
+
+.meeting-page {
+  /*
+    与 .team-page / .doc-page 同一套滚动契约 —— 会议页先前漏了这三行，
+    结果内容一长就被 .panel 的 max-height 500 + overflow: hidden 直接裁掉，
+    而且裁掉的部分没有任何滚动条能到达（用户只能看到"最近的会议"标题就断了）。
+
+    min-height 180 的算法同 .team-page：500 - header 40 - tabs 34
+    - runtime-row 66（摊开说明的最坏情况）- input-row 70 = 290，180 不会挤掉别的区域。
+    再小的话三块区域连标题都摆不下，滚动条会一直动。
+  */
+  flex: 1 1 auto;
+  min-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  color: #22263a;
+  font-size: 13px;
+}
+
+.meeting-section {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(30, 40, 90, 0.12);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.meeting-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.meeting-revision {
+  font-size: 11px;
+  font-weight: 400;
+  color: #6a7190;
+}
+
+.meeting-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+.meeting-field input[type='text'],
+.meeting-field input[type='number'],
+.meeting-edit-row input[type='text'],
+.meeting-rename input[type='text'] {
+  border: 1px solid rgba(30, 40, 90, 0.25);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+  background: #fff;
+  color: #22263a;
+}
+
+.meeting-radio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.meeting-consent {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  line-height: 1.5;
+}
+
+.meeting-hint {
+  margin: 0;
+  color: #6a7190;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.meeting-error {
+  margin: 0;
+  color: #b3261e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.meeting-notice {
+  margin: 0;
+  color: #1d5c2f;
+  font-size: 12px;
+}
+
+.meeting-btn {
+  border: 1px solid rgba(30, 40, 90, 0.25);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #22263a;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.meeting-btn:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+
+.meeting-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.meeting-btn.primary {
+  background: #3557d6;
+  border-color: #3557d6;
+  color: #fff;
+}
+
+.meeting-btn.danger {
+  background: #c62828;
+  border-color: #c62828;
+  color: #fff;
+  font-weight: 700;
+}
+
+/* 录音中红色常显标识：录着就一直挂着，任何一节都盖不住它。 */
+.meeting-rec-banner {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #b71c1c;
+  color: #fff;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-weight: 700;
+  box-shadow: 0 2px 10px rgba(183, 28, 28, 0.4);
+}
+
+.meeting-rec-banner.stopping {
+  background: #8d3b0f;
+  box-shadow: 0 2px 10px rgba(141, 59, 15, 0.4);
+}
+
+.meeting-rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #fff;
+  animation: meeting-blink 1.2s steps(2, start) infinite;
+}
+
+.meeting-rec-text {
+  flex: 1;
+}
+
+@keyframes meeting-blink {
+  50% { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meeting-rec-dot { animation: none; }
+}
+
+.meeting-recent {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.meeting-recent-btn {
+  border: 1px solid rgba(30, 40, 90, 0.2);
+  border-radius: 8px;
+  background: #fff;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.meeting-recent-btn.active {
+  border-color: #3557d6;
+  color: #3557d6;
+  font-weight: 700;
+}
+
+.meeting-recent-state {
+  color: #6a7190;
+  font-size: 11px;
+}
+
+.meeting-transcribe-state {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #444a63;
+}
+
+.meeting-speakers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meeting-speaker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.meeting-count {
+  color: #6a7190;
+  font-size: 11px;
+}
+
+.meeting-rename {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.meeting-segments {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meeting-segment {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  border-bottom: 1px dashed rgba(30, 40, 90, 0.12);
+  padding-bottom: 6px;
+}
+
+.meeting-pick {
+  margin-top: 2px;
+}
+
+.meeting-seg-label {
+  min-width: 72px;
+  font-weight: 700;
+  display: flex;
+  flex-direction: column;
+}
+
+.meeting-uncertain {
+  font-style: normal;
+  font-weight: 400;
+  font-size: 10px;
+  color: #9a6b00;
+}
+
+.meeting-seg-text {
+  flex: 1;
+  line-height: 1.5;
+}
+
+.meeting-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.meeting-edit-row select {
+  border: 1px solid rgba(30, 40, 90, 0.25);
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+  background: #fff;
+}
+
+.meeting-minutes {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(30, 40, 90, 0.05);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.meeting-minutes-meta {
+  margin: 0;
+  color: #6a7190;
+  font-size: 11px;
+}
+
+.meeting-close {
+  align-self: flex-end;
 }

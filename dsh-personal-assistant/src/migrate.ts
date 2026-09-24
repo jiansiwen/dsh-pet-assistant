@@ -225,7 +225,8 @@ function digestOf(batchId: string, source: LegacySource, options: MigrationOptio
   }
   switch (batchId) {
     case 'legacy-preferences':
-      return sha256(JSON.stringify({ ...payload, rows: source.preferences() }))
+      // 偏好全量导入，不受活动日期范围或时区影响；跨日启动不能让旧偏好重跑。
+      return sha256(JSON.stringify({ batchId, rows: source.preferences() }))
     case 'legacy-days':
       return sha256(JSON.stringify({ ...payload, rows: source.days() }))
     case 'legacy-reports':
@@ -279,7 +280,7 @@ function importPreferences(deps: MigrationDeps): BatchBodyResult {
     if (deps.memories.importRecord(record)) imported += 1
     else skipped += 1
   }
-  return { imported, skipped, detail: `旧偏好 ${rows.length} 条，新导入 ${imported} 条，已存在或无效 ${skipped} 条` }
+  return { imported, skipped, detail: `旧偏好 ${rows.length} 条，新导入 ${imported} 条，已存在、已删除或无效 ${skipped} 条` }
 }
 
 /** 旧语义事项与用户笔记 → 观察记录，保留旧 id、时间和来源。 */

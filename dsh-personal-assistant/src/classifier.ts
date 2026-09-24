@@ -94,7 +94,7 @@ const DEFAULT_RULES: Rule[] = [
     category: 'dev',
     extract: t => trimTitle(t),
   },
-  { process: /^Code$/i, category: 'dev', extract: t => trimTitle(stripSuffix(t, ['Visual Studio Code', 'VS Code'])) },
+  { process: /^(Code|Qoder|Cursor|Windsurf)$/i, category: 'dev', extract: t => trimTitle(stripSuffix(t, ['Visual Studio Code', 'VS Code', 'Qoder', 'Cursor', 'Windsurf'])) },
   { process: /^(devenv|Code - Insiders)$/i, category: 'dev', extract: t => trimTitle(t) },
   { process: /^(eclipse|studio64)$/i, category: 'dev', extract: t => trimTitle(t) },
 

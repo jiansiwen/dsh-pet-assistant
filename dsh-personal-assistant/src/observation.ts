@@ -158,6 +158,22 @@ export class ObservationStore {
     return Number(result.changes)
   }
 
+  /** 删除与 [from, to) 重叠的观察，返回删掉的行数。用户删除某时间段原始记录用。 */
+  deleteOverlap(source: ObservationSource, from: number, to: number): number {
+    const result = this.db
+      .prepare('DELETE FROM observations WHERE source = ? AND start_at < ? AND end_at > ?')
+      .run(source, to, from)
+    return Number(result.changes)
+  }
+
+  /** 列出与 [from, to) 重叠的观察。删除前先取 id，才能沿来源传播失效派生记忆。 */
+  listOverlap(source: ObservationSource, from: number, to: number): Observation[] {
+    const rows = this.db
+      .prepare('SELECT * FROM observations WHERE source = ? AND start_at < ? AND end_at > ? ORDER BY start_at')
+      .all(source, to, from) as Row[]
+    return rows.map(rowToObservation)
+  }
+
   count(): number {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM observations').get() as Row
     return Number(row.n)

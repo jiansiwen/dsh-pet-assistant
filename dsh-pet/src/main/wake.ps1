@@ -30,22 +30,19 @@ try {
 }
 
 try {
-    # Wake word "Xiao Pan" (U+5C0F U+6F58) plus homophone variants to raise recall:
-    $xiao = [char]0x5C0F   # xiao3 (small)
-    $pan  = [char]0x6F58   # Pan (surname)
-    $variants = @(
-        "$xiao$pan",                 # primary
-        ($xiao + [char]0x76FC),      # homophone variant 1 (U+76FC)
-        ($xiao + [char]0x76D8),      # homophone variant 2 (U+76D8)
-        ($xiao + [char]0x78D0),      # homophone variant 3 (U+78D0)
-        ($xiao + [char]0x7554),      # homophone variant 4 (U+7554)
-        ($xiao + [char]0x87E0),      # homophone variant 5 (U+87E0)
-        ([char]0x6653 + $pan),       # different first syllable (U+6653)
-        ($pan + [char]0x554A)        # trailing particle variant (U+554A)
-    )
-    $choices = New-Object System.Speech.Recognition.Choices($variants)
-    $grammar = New-Object System.Speech.Recognition.Grammar($choices)
-    $engine.LoadGrammar($grammar)
+    # Wake word "Xiao Pan Xiao Pan" (U+5C0F U+6F58 U+5C0F U+6F58).
+    #
+    # Doubled on purpose: a single "Xiao Pan" is only two syllables and gets fired by
+    # ambient conversation ("...small...plate..."). Four syllables is long enough that
+    # ordinary speech rarely produces it, while still being quick to say.
+    #
+    # The grammar itself lives in wake-grammar.ps1 so the offline probe
+    # (_verify/wake-grammar-probe.ps1) exercises the exact same builder -- otherwise a
+    # probe result would only be evidence about a copy that may have drifted.
+    . (Join-Path $PSScriptRoot 'wake-grammar.ps1')
+    $wakeCodepoints = @(0x5C0F, 0x6F58, 0x5C0F, 0x6F58)
+    $built = New-WakeGrammar -WakeCodepoints $wakeCodepoints -WithVariants
+    $engine.LoadGrammar($built.Grammar)
 } catch {
     Write-Output '{"ok":false,"error":"grammar-failed"}'
     exit 0

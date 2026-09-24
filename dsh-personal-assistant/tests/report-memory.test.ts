@@ -64,6 +64,29 @@ function put(over: Partial<Parameters<MemoryStore['put']>[0]> = {}, actor: Memor
   )
 }
 
+/** 还原旧版本留下的记录，不用新版 put 凭空制造冲突。 */
+function importMemory(over: Partial<MemoryRecord> & Pick<MemoryRecord, 'id'>): MemoryRecord {
+  const record: MemoryRecord = {
+    kind: 'user_preference',
+    scope: { kind: 'global', id: '' },
+    topic: '日报口径',
+    text: over.id,
+    sourceRefs: [],
+    status: 'conflicting',
+    sensitivity: 'normal',
+    createdBy: USER.id,
+    confirmedBy: USER.id,
+    revision: 1,
+    createdAt: NOW,
+    updatedAt: NOW,
+    expiresAt: null,
+    importBatch: '旧版本备份',
+    ...over,
+  }
+  assert.equal(memories.importRecord(record), true)
+  return record
+}
+
 describe('写入校验：认不出来就拒绝，不猜一个最接近的', () => {
   test('六类之外的 kind 一律拒', () => {
     assert.equal(validateMemoryInput({ kind: 'preference', scopeKind: 'global', text: 'x' }), 'unknown_kind')
@@ -123,31 +146,37 @@ describe('确认权限：专家只能提交候选', () => {
     assert.equal(memories.get(created.record.id, NOW)?.status, 'candidate')
   })
 
-  test('用户确认候选后同 topic 的其他说法一并失效', () => {
-    const candidate = put({ text: '构建要先跑 typecheck' }, EXPERT)
-    assert.ok(candidate.ok)
+  test('确认同主题候选不影响其他规则，后续候选不能挤掉已确认项', () => {
+    const first = put({ text: '日报不要包含午休' })
+    const candidate = put({ text: '日报按工作类别组织' }, EXPERT)
+    assert.ok(first.ok && candidate.ok)
+    assert.equal(candidate.record.status, 'candidate')
     const confirmed = memories.confirm(candidate.record.id, USER, NOW)
     assert.equal(confirmed?.status, 'confirmed')
+    assert.deepEqual(memories.get(first.record.id, NOW), first.record)
 
-    const other = put({ text: '构建直接跑 build 就行' }, EXPERT)
+    const other = put({ text: '日报使用列表' }, EXPERT)
     assert.ok(other.ok)
-    assert.equal(other.record.status, 'conflicting', '候选撞上已确认要被标冲突，而不是并列进提示词')
-    // 已确认那条不能被一条候选挤掉
-    assert.equal(memories.get(candidate.record.id, NOW)?.status, 'confirmed')
-    assert.equal(memories.injectable({}, NOW).length, 1)
+    assert.equal(other.record.status, 'candidate')
+    assert.equal(memories.injectable({}, NOW).length, 2)
+    assert.equal(memories.confirm(other.record.id, USER, NOW)?.status, 'confirmed')
+    assert.equal(memories.injectable({}, NOW).length, 3)
   })
 })
 
-describe('冲突：保留两边让用户挑，不自动裁决', () => {
-  test('用户前后矛盾时两条都停在 conflicting，谁都不注入', () => {
-    const first = put({ text: '日报按工作类别组织' })
-    assert.ok(first.ok)
-    const second = put({ text: '日报按时间顺序流水账' })
-    assert.ok(second.ok)
-    assert.equal(second.record.status, 'conflicting')
-    assert.equal(second.conflicts.length, 1)
-    assert.equal(memories.get(first.record.id, NOW)?.status, 'conflicting')
-    assert.deepEqual(memories.injectable({}, NOW), [])
+describe('同主题不代表矛盾，只有用户点名才替换', () => {
+  test('同主题的兼容规则同时注入，不自动制造冲突或失效', () => {
+    const first = put({ text: '日报不要包含午休' })
+    const second = put({ text: '日报按工作类别组织' })
+    const third = put({ text: '日报不要包含无关聊天' })
+    assert.ok(first.ok && second.ok && third.ok)
+    for (const result of [first, second, third]) {
+      assert.equal(result.record.status, 'confirmed')
+      assert.deepEqual(result.conflicts, [])
+      assert.deepEqual(result.superseded, [])
+      assert.deepEqual(memories.get(result.record.id, NOW), result.record)
+    }
+    assert.equal(memories.injectable({}, NOW).length, 3)
   })
 
   test('同一句话说两遍不算冲突，也不重复入库', () => {
@@ -169,13 +198,77 @@ describe('冲突：保留两边让用户挑，不自动裁决', () => {
     assert.equal(memories.injectable({}, NOW).length, 2)
   })
 
-  test('topic 归一化：大小写与多余空白不造成漏判', () => {
+  test('主题归一化用于同文去重，不推断正文是否互斥', () => {
     assert.equal(normalizeTopic('  Report   Tone '), 'report tone')
     const first = put({ topic: 'Report Tone', text: '正式一点' })
-    assert.ok(first.ok)
+    const duplicate = put({ topic: ' report   tone ', text: ' 正式一点 ' })
     const second = put({ topic: 'report tone', text: '随意一点' })
-    assert.ok(second.ok)
-    assert.equal(second.record.status, 'conflicting')
+    assert.ok(first.ok && duplicate.ok && second.ok)
+    assert.equal(duplicate.record.id, first.record.id)
+    assert.equal(second.record.status, 'confirmed')
+    assert.equal(memories.injectable({}, NOW).length, 2)
+  })
+
+  test('新规则只替换明确指定的旧项，同主题兼容项保持原样', () => {
+    const old = put({ text: '日报按时间组织' })
+    const compatible = put({ text: '日报不要包含午休' })
+    assert.ok(old.ok && compatible.ok)
+    const result = put({ text: '日报按工作类别组织', replaceIds: [old.record.id, old.record.id] })
+    assert.ok(result.ok)
+    assert.deepEqual(result.superseded.map(item => [item.id, item.status]), [[old.record.id, 'expired']])
+    assert.equal(result.superseded[0].revision, old.record.revision + 1)
+    assert.deepEqual(memories.get(compatible.record.id, NOW), compatible.record)
+    assert.deepEqual(new Set(memories.injectable({}, NOW).map(item => item.id)),
+      new Set([compatible.record.id, result.record.id]))
+  })
+
+  test('替换为已有候选时复用并确认该行，不丢其来源', () => {
+    const old = put({ text: '旧规则' })
+    const candidate = put({ text: '新规则', sourceRefs: ['会议记录'] }, EXPERT)
+    assert.ok(old.ok && candidate.ok)
+    const result = put({ text: '新规则', replaceIds: [old.record.id] })
+    assert.ok(result.ok)
+    assert.equal(result.record.id, candidate.record.id)
+    assert.equal(result.record.status, 'confirmed')
+    assert.equal(result.record.confirmedBy, USER.id)
+    assert.deepEqual(result.record.sourceRefs, ['会议记录'])
+    assert.equal(memories.count(), 2)
+  })
+
+  test('非用户替换、目标缺失、范围或类型不符都整次拒绝', () => {
+    const old = put({ text: '旧规则' })
+    const scoped = put({ scopeKind: 'project', scopeId: 'dsh', text: '项目规则' })
+    const otherKind = put({ kind: 'project_fact', text: '项目事实' })
+    const expired = put({ text: '到期规则', expiresAt: NOW })
+    assert.ok(old.ok && scoped.ok && otherKind.ok && expired.ok)
+    const before = memories.list({ projectId: 'dsh' }, NOW)
+    const denied = put({ text: '新规则', replaceIds: [old.record.id] }, EXPERT)
+    assert.ok(!denied.ok)
+    assert.equal(denied.rejection, 'replacement_requires_user')
+    for (const id of ['不存在', scoped.record.id, otherKind.record.id, expired.record.id]) {
+      const result = put({ text: '新规则', replaceIds: [old.record.id, id] })
+      assert.ok(!result.ok)
+      assert.equal(result.rejection, 'invalid_replacement')
+    }
+    assert.deepEqual(memories.list({ projectId: 'dsh' }, NOW), before)
+  })
+
+  test('用户裁决历史冲突只失效点名对手，未点名项不变', () => {
+    const chosen = importMemory({ id: 'chosen', confirmedBy: null })
+    const rival = importMemory({ id: 'rival' })
+    const untouched = importMemory({ id: 'untouched' })
+    assert.equal(memories.confirm(chosen.id, EXPERT, NOW, [rival.id]), null)
+    assert.equal(memories.confirm(chosen.id, USER, NOW, [chosen.id]), null)
+    assert.equal(memories.confirm(chosen.id, USER, NOW, [rival.id, '不存在']), null)
+    assert.deepEqual(memories.get(chosen.id, NOW), chosen)
+    assert.deepEqual(memories.get(rival.id, NOW), rival)
+    const confirmed = memories.confirm(chosen.id, USER, NOW + 1, [rival.id])
+    assert.equal(confirmed?.status, 'confirmed')
+    assert.equal(confirmed?.confirmedBy, USER.id)
+    assert.equal(memories.get(rival.id, NOW + 1)?.status, 'expired')
+    assert.deepEqual(memories.get(untouched.id, NOW + 1), untouched)
+    assert.equal(memories.confirm(untouched.id, USER, NOW + 2)?.status, 'confirmed')
+    assert.equal(memories.injectable({}, NOW + 2).length, 2)
   })
 })
 
@@ -269,18 +362,61 @@ describe('删除传播：没有依据的结论不能继续当事实', () => {
     assert.equal(outcome.ledgerEntries, 2)
   })
 
-  test('还剩一条来源时只断边，本体留着但进 weakened', () => {
+  test('多源删除保留本体但降级全部下游，返回、报告与实际注入一致', () => {
     const transcript = put({ kind: 'team_experience', topic: '评审会转写', text: '转写片段' })
     const dictated = put({ kind: 'user_preference', topic: '评审会口述', text: '用户口述的结论' })
     assert.ok(transcript.ok && dictated.ok)
-    const child = derived(`${transcript.record.id}`, { sourceRefs: [transcript.record.id, dictated.record.id] })
+    const child = derived(transcript.record.id, { sourceRefs: [transcript.record.id, dictated.record.id] })
+    const grandchild = derived(child.id, { topic: '后续安排', text: '下一步实施 A 方案' })
 
-    const outcome = memories.delete(transcript.record.id, '转写到保留期', NOW)
+    const outcome = memories.delete(transcript.record.id, '转写到保留期', NOW + 1)
     assert.deepEqual(outcome.deleted.map(item => item.id), [transcript.record.id])
-    assert.deepEqual(outcome.weakened.map(item => item.id), [child.id])
-    const survivor = memories.get(child.id, NOW)
-    assert.ok(survivor)
-    assert.deepEqual(survivor.sourceRefs, [dictated.record.id])
+    assert.deepEqual(outcome.weakened.map(item => item.id), [child.id, grandchild.id])
+    for (const record of outcome.weakened) {
+      assert.equal(record.status, 'candidate')
+      assert.equal(record.revision, 3)
+      assert.equal(record.updatedAt, NOW + 1)
+      assert.deepEqual(record, memories.get(record.id, NOW + 1))
+      assert.equal(isInjectable(record, NOW + 1), false)
+    }
+    assert.deepEqual(outcome.weakened[0].sourceRefs, [dictated.record.id])
+    assert.deepEqual(outcome.weakened[1].sourceRefs, [child.id])
+    assert.deepEqual(memories.injectable({ projectId: 'dsh' }, NOW + 1).map(item => item.id), [dictated.record.id])
+    const report = deletionReport(outcome, {
+      legacyDomain: false, sampleFiles: [], exportedFiles: [], sentToProvider: false,
+    })
+    assert.equal(report.invalidated.length, 2)
+    assert.ok(report.invalidated.every(line => line.includes('已不再作为已确认事实注入')))
+    assert.deepEqual(outcome.restored, [])
+
+    const final = memories.delete(dictated.record.id, '删除最后来源', NOW + 2)
+    assert.deepEqual(final.deleted.map(item => item.id), [dictated.record.id, child.id, grandchild.id])
+    assert.deepEqual(final.weakened, [])
+    assert.equal(memories.count(), 0)
+  })
+
+  test('多路径中先访问子项再删除父项，也会删掉最终无来源的子项', () => {
+    const root = importMemory({ id: 'root', status: 'confirmed' })
+    const child = importMemory({ id: 'a-child', status: 'confirmed', sourceRefs: [root.id, 'z-parent'] })
+    const parent = importMemory({ id: 'z-parent', status: 'confirmed', sourceRefs: [root.id] })
+    const leaf = importMemory({ id: 'leaf', status: 'confirmed', sourceRefs: [child.id] })
+    const outcome = memories.delete(root.id, '删除原始记录', NOW)
+    assert.deepEqual(new Set(outcome.deleted.map(item => item.id)), new Set([root.id, parent.id, child.id, leaf.id]))
+    assert.deepEqual(outcome.weakened, [])
+    assert.equal(outcome.ledgerEntries, 4)
+    assert.equal(memories.count(), 0)
+  })
+
+  test('来源减少不会复活已过期的派生记忆', () => {
+    const source = put({ text: '来源' })
+    assert.ok(source.ok)
+    const expired = importMemory({
+      id: 'expired-derived', status: 'confirmed', sourceRefs: [source.record.id, '外部来源'], expiresAt: NOW,
+    })
+    const outcome = memories.delete(source.record.id, '删除来源', NOW)
+    assert.equal(outcome.weakened[0].id, expired.id)
+    assert.equal(outcome.weakened[0].status, 'expired')
+    assert.deepEqual(memories.injectable({}, NOW), [])
   })
 
   test('传播是传递的：孙子辈一起走', () => {
@@ -295,8 +431,78 @@ describe('删除传播：没有依据的结论不能继续当事实', () => {
 
   test('删不存在的 id 是空操作，不写账本', () => {
     const outcome = memories.delete('nope', '手滑', NOW)
-    assert.deepEqual(outcome.deleted, [])
-    assert.equal(outcome.ledgerEntries, 0)
+    assert.deepEqual(outcome, { deleted: [], weakened: [], restored: [], ledgerEntries: 0 })
+  })
+})
+
+describe('删除历史冲突后恢复剩余项，不补造用户确认', () => {
+  for (const confirmedBy of [USER.id, null]) {
+    test(`只剩一项时${confirmedBy ? '恢复历史确认' : '退回候选'}，报告与注入一致`, () => {
+      const removed = importMemory({ id: 'removed' })
+      const survivor = importMemory({ id: 'survivor', confirmedBy })
+      const unrelated = importMemory({ id: 'other-project', scope: { kind: 'project', id: 'other' } })
+      const outcome = memories.delete(removed.id, '用户删除另一说法', NOW + 1)
+      const expectedStatus = confirmedBy ? 'confirmed' : 'candidate'
+      assert.equal(outcome.restored.length, 1)
+      assert.equal(outcome.restored[0].id, survivor.id)
+      assert.equal(outcome.restored[0].status, expectedStatus)
+      assert.equal(outcome.restored[0].revision, survivor.revision + 1)
+      assert.equal(outcome.restored[0].confirmedBy, confirmedBy)
+      assert.deepEqual(outcome.restored[0], memories.get(survivor.id, NOW + 1))
+      assert.deepEqual(memories.get(unrelated.id, NOW + 1), unrelated)
+      assert.deepEqual(memories.injectable({}, NOW + 1).map(item => item.id), confirmedBy ? [survivor.id] : [])
+      const report = deletionReport(outcome, {
+        legacyDomain: false, sampleFiles: [], exportedFiles: [], sentToProvider: false,
+      })
+      assert.equal(report.retained.length, 1)
+      assert.match(report.retained[0], confirmedBy ? /已恢复为已确认并参与注入/ : /待用户确认，暂不注入/)
+    })
+  }
+
+  test('还剩多个冲突项不自动裁决，删至一个才恢复', () => {
+    const first = importMemory({ id: 'first' })
+    const second = importMemory({ id: 'second' })
+    const third = importMemory({ id: 'third' })
+    assert.deepEqual(memories.delete(first.id, '删除', NOW).restored, [])
+    assert.equal(memories.get(second.id, NOW)?.status, 'conflicting')
+    assert.equal(memories.get(third.id, NOW)?.status, 'conflicting')
+    assert.deepEqual(memories.injectable({}, NOW), [])
+    assert.deepEqual(memories.delete(second.id, '删除', NOW).restored.map(item => item.id), [third.id])
+  })
+
+  test('新追加的同主题兼容规则不阻止旧冲突剩余项恢复', () => {
+    const removed = importMemory({ id: 'removed' })
+    const survivor = importMemory({ id: 'survivor' })
+    const compatible = put({ text: '日报不要包含午休' })
+    assert.ok(compatible.ok)
+    const outcome = memories.delete(removed.id, '删除冲突对手', NOW)
+    assert.deepEqual(outcome.restored.map(item => item.id), [survivor.id])
+    assert.deepEqual(memories.get(compatible.record.id, NOW), compatible.record)
+    assert.deepEqual(new Set(memories.injectable({}, NOW).map(item => item.id)),
+      new Set([survivor.id, compatible.record.id]))
+  })
+
+  test('已过期的冲突不能确认、替换或自动恢复', () => {
+    const expired = importMemory({ id: 'expired-conflict', expiresAt: NOW })
+    const rival = importMemory({ id: 'rival' })
+    assert.equal(effectiveStatus(expired, NOW), 'expired')
+    assert.equal(memories.confirm(expired.id, USER, NOW, [rival.id]), null)
+    const replacement = put({ text: '新规则', replaceIds: [expired.id] })
+    assert.ok(!replacement.ok)
+    assert.equal(replacement.rejection, 'invalid_replacement')
+    assert.deepEqual(memories.delete(rival.id, '删除', NOW).restored, [])
+    assert.equal(memories.get(expired.id, NOW)?.status, 'expired')
+    assert.deepEqual(memories.injectable({}, NOW), [])
+  })
+
+  test('冲突剩余项同时丢失来源时只能降级，不能恢复旧确认', () => {
+    const source = importMemory({ id: 'source' })
+    const survivor = importMemory({ id: 'survivor', sourceRefs: [source.id, '外部来源'] })
+    const outcome = memories.delete(source.id, '删除来源兼冲突对手', NOW)
+    assert.deepEqual(outcome.restored, [])
+    assert.equal(outcome.weakened[0].id, survivor.id)
+    assert.equal(outcome.weakened[0].status, 'candidate')
+    assert.deepEqual(memories.injectable({}, NOW), [])
   })
 })
 
@@ -348,6 +554,20 @@ describe('删除账本：备份恢复不能复活已删记忆', () => {
     const { accepted, blocked } = memories.filterRestored([resurrected])
     assert.deepEqual(accepted, [])
     assert.deepEqual(blocked.map(item => item.id), ['restored-1'])
+    assert.equal(memories.importRecord(original), false, '导入入口本身必须拒绝，不能依赖调用方先过滤')
+    assert.equal(memories.importRecord({ ...resurrected, importBatch: '另一次导入' }), false)
+    assert.equal(memories.count(), 0)
+    assert.equal(memories.ledgerSize(), 1)
+  })
+
+  test('未删除的内容可导入且主键幂等，不因别的范围删过同文就拒绝', () => {
+    const original = put()
+    assert.ok(original.ok)
+    memories.delete(original.record.id, '删除全局规则', NOW)
+    const scoped = { ...original.record, id: 'project-copy', scope: { kind: 'project' as const, id: 'dsh' } }
+    assert.equal(memories.importRecord(scoped), true)
+    assert.equal(memories.importRecord(scoped), false)
+    assert.deepEqual(memories.injectable({ projectId: 'dsh' }, NOW), [scoped])
   })
 
   test('没删过的内容正常放行', () => {
@@ -365,6 +585,10 @@ describe('删除账本：备份恢复不能复活已删记忆', () => {
     const again = put({ text: '日报不要包含午休' })
     assert.ok(again.ok, '删过又要重新记，必须让记')
     assert.equal(again.record.status, 'confirmed')
+    const deletedAgain = memories.delete(again.record.id, '再次删除', NOW)
+    assert.equal(deletedAgain.deleted.length, 1)
+    assert.equal(deletedAgain.ledgerEntries, 0, '相同内容账本去重，不能把删除数当新增账目数')
+    assert.equal(memories.ledgerSize(), 1)
   })
 })
 

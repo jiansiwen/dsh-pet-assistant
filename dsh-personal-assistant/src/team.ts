@@ -10,7 +10,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentRun, SubagentResult } from '@deepseek-ai/dsh-subagent'
-import { READ_ONLY_DENY_CANDIDATES, installApprovalGate } from './gate.ts'
+import { READ_ONLY_ALLOW_TOOLS, installReadOnlyGate, installDelegationReadOnlyGate } from './gate.ts'
 import type { ApprovalService } from './approval.ts'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
@@ -173,7 +173,7 @@ export interface ExpertReport {
   readonly needsApproval: readonly string[]
 }
 
-/** 扁平对象 schema，落在 dsh-tools 强制子集内；结构化产物是验收依据。 */
+/** 结构化输出仅是待核验材料，不代表验收通过。 */
 const REPORT_SCHEMA: ObjectJsonSchema = {
   type: 'object',
   additionalProperties: false,
@@ -206,15 +206,77 @@ export interface TaskOutcome {
   readonly diagnostic: string | null
 }
 
+/** reply/delta 的采样拍：与主会话扫描同频，避免两个来源的出字节奏不一致。 */
+const REPLY_DELTA_TICK_MS = 120
+
+/** 子代理会话事件里扫描增量所需的最小形状，避免与宿主的 SessionEvent 类型耦合。 */
+interface ChunkEventLike {
+  type: string
+  data: Record<string, unknown>
+}
+
+/**
+ * 把子代理会话里**新增的可见文本**按拍交给 onText。
+ *
+ * 团队委派走 `SubagentRun`，只在结束时才拿得到 `result`：不接这一层，用户在宠物气泡里
+ * 看到的就是「整段一次性弹出」——而同一时间 DSH 网页早已打完字。这里复用与主会话相同的
+ * 判据（`assistant/chunk` 且 `chunk.type === 'text-delta'`）边跑边推：
+ * reasoning-delta 是思考草稿，不进气泡；block-start/end、usage、finish 也不进。
+ *
+ * 按拍批量推出而非逐 token 推：一次 run 常有上千个 token，逐个写发件箱等于上千次库写入，
+ * 而用户看不出「一段推 1 次」与「一段推 100 次」的差别。
+ *
+ * 会话事件日志是**只增**的，因此按下标记录游标是安全的；每拍重读是为了看见新增的事件。
+ */
+export function watchReplyDeltas(
+  events: () => readonly ChunkEventLike[] | undefined,
+  onText: (text: string) => void,
+  tickMs = REPLY_DELTA_TICK_MS,
+): () => void {
+  let cursor = 0
+  let stopped = false
+  const timer = setInterval(() => {
+    if (stopped) return
+    let list: readonly ChunkEventLike[]
+    try {
+      list = events() ?? []
+    } catch {
+      // 读会话失败不该打断任务本身：停掉增量，结果仍会照常结算。
+      stopped = true
+      return
+    }
+    let buffer = ''
+    for (let i = cursor; i < list.length; i += 1) {
+      const event = list[i]
+      if (event?.type !== 'assistant/chunk') continue
+      const chunk = event.data.chunk as { type?: unknown; text?: unknown } | undefined
+      if (chunk?.type !== 'text-delta') continue
+      const text = chunk.text
+      if (typeof text === 'string' && text.length > 0) buffer += text
+    }
+    cursor = list.length
+    if (buffer.length > 0) onText(buffer)
+  }, tickMs)
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
 interface LiveRun {
-  readonly run: SubagentRun
+  run?: SubagentRun
+  releaseGuard?: () => void
   readonly taskId: string
   readonly assistantId: string
-  readonly sideEffect: boolean
+  readonly controller: AbortController
+  readonly finished: Promise<void>
 }
 
 export class TeamService {
   private readonly liveRuns = new Map<string, LiveRun>()
+  private recovered = false
+  private disposed = false
   private readonly ctx: Context
   private readonly store: TeamStore
   private readonly options: TeamOptions
@@ -295,9 +357,14 @@ export class TeamService {
   }
 
   submitTask(input: TaskInput): Task {
-    const owner = input.ownerId ? this.store.getMember(input.ownerId) : null
-    if (input.ownerId && !owner) throw new Error(`unknown assistant ${input.ownerId}`)
-    const ownerId = owner?.assistantId ?? this.chief().assistantId
+    if (this.disposed) throw new Error('团队服务已经停止')
+    const budget = input.budgetTokens ?? this.options.defaultBudgetTokens
+    if (!Number.isSafeInteger(budget) || budget < 0) throw new Error('预算必须是非负安全整数；0 表示未设置累计预算')
+    if (input.deadlineAt != null && (!Number.isSafeInteger(input.deadlineAt) || input.deadlineAt < 0)) throw new Error('截止时间必须是有效毫秒时间戳')
+    if (!input.goal.trim()) throw new Error('任务目标不能为空')
+    const owner = input.ownerId ? this.store.getMember(input.ownerId) : this.chief()
+    if (!owner?.enabled) throw new Error(`成员不存在或未启用：${input.ownerId ?? ''}`)
+    const ownerId = owner.assistantId
     const dependsOn = input.dependsOn ?? []
     const now = Date.now()
     const taskId = randomUUID()
@@ -312,8 +379,8 @@ export class TeamService {
       goal: input.goal,
       inputEvidence: input.inputEvidence ?? [],
       acceptance: input.acceptance ?? [],
-      toolScope: input.toolScope ?? owner?.toolPolicy.mode ?? 'read-only',
-      budgetTokens: input.budgetTokens ?? this.options.defaultBudgetTokens,
+      toolScope: input.toolScope ?? 'read-only',
+      budgetTokens: budget,
       deadlineAt: input.deadlineAt ?? null,
       dependsOn,
       status: 'created',
@@ -351,12 +418,6 @@ export class TeamService {
     return this.liveRuns.size
   }
 
-  private sideEffectCount(): number {
-    let count = 0
-    for (const live of this.liveRuns.values()) if (live.sideEffect) count += 1
-    return count
-  }
-
   /** 依赖是否全部完成；未完成的依赖让任务留在排队状态。 */
   private dependenciesSatisfied(task: Task): boolean {
     return task.dependsOn.every((dep) => this.store.getTask(dep)?.status === 'done')
@@ -378,77 +439,110 @@ export class TeamService {
    * @returns 任务终态与专家报告；额度不足或依赖未就绪时返回排队中的任务。
    */
   async runTask(taskId: string, parentAgent: Agent, signal: AbortSignal): Promise<TaskOutcome | null> {
+    if (this.disposed) throw new Error('团队服务已经停止')
+    if (!this.recovered) this.recoverInterruptedTasks()
     const task = this.store.getTask(taskId)
     if (!task) return null
-    if (TERMINAL_TASK_STATUSES.includes(task.status)) {
-      return { task, report: null, stopReason: task.status, diagnostic: null }
+    // 待批、复核、未知及运行中均不能重新领取，避免重发已发生的副作用。
+    if (!['created', 'queued'].includes(task.status)) {
+      return { task, report: null, stopReason: task.status, diagnostic: '只领取新建或排队任务；其余状态需人工复核' }
     }
-    if (!this.dependenciesSatisfied(task)) {
-      const queued = this.setStatus(task, 'queued')
-      return queued ? { task: queued, report: null, stopReason: 'queued', diagnostic: 'dependencies not done' } : null
-    }
-    if (this.liveRuns.size >= this.options.maxConcurrentInference) {
-      const queued = this.setStatus(task, 'queued')
-      return queued ? { task: queued, report: null, stopReason: 'queued', diagnostic: 'inference slots full' } : null
-    }
-    const sideEffect = task.toolScope === 'side-effect'
-    if (sideEffect && this.sideEffectCount() >= this.options.maxConcurrentSideEffect) {
-      const queued = this.setStatus(task, 'queued')
-      return queued ? { task: queued, report: null, stopReason: 'queued', diagnostic: 'side-effect slot full' } : null
-    }
-
-    const member = this.store.getMember(task.ownerId) ?? this.chief()
-    const claimed = this.setStatus(task, 'running')
-    if (!claimed) return null
+    const refuse = (status: TaskStatus, stopReason: string, diagnostic: string): TaskOutcome => this.store.transaction(() => {
+      const updated = this.setStatus(task, status) ?? task
+      const member = this.store.getMember(task.ownerId)
+      // 桥接调用方不读取返回值；未启动也必须生成可见回复，不能静默留在等待中。
+      this.store.appendEvent('reply/done', { requestId: task.originRequestId, taskId, assistantId: task.ownerId,
+        displayName: member?.displayName, skinId: member?.skinId, status: updated.status,
+        text: diagnostic, diagnostic, stopReason, artifacts: [], blockers: [], needsApproval: [] }, { taskId, assistantId: task.ownerId })
+      return { task: updated, report: null, stopReason, diagnostic }
+    })
+    if (signal.aborted) return refuse('cancelled', 'aborted', '任务开始前已取消')
+    if (task.deadlineAt !== null && task.deadlineAt <= Date.now()) return refuse('failed', 'deadline-exceeded', '任务已超过截止时间，未启动')
+    const member = this.store.getMember(task.ownerId)
+    if (!member?.enabled) return refuse('failed', 'owner-unavailable', '任务成员不存在或已停用，不会替换成员')
+    if (task.budgetTokens !== 0) return refuse('review', 'budget-unsupported', '宿主仅支持单次输出 maxTokens，无法保证累计任务预算；未启动。需明确采用无累计预算或接入硬预算执行器')
+    const sideEffect = task.toolScope === 'side-effect' && member.toolPolicy.mode === 'side-effect'
+    if (sideEffect) return refuse('review', 'side-effect-unsupported', '副作用委派尚未接入启动前审批门禁，拒绝启动；请使用可信任务专用执行器')
+    if (this.options.provider !== 'spawn') return refuse('review', 'provider-unsupported', '只读隔离目前仅核实 spawn 的独立描述符；未启动其他 provider')
+    if (!this.dependenciesSatisfied(task)) return refuse('queued', 'queued', '前置任务尚未通过验收')
+    if (this.liveRuns.size >= this.options.maxConcurrentInference) return refuse('queued', 'queued', '推理额度已满')
 
     const runId = randomUUID()
-    this.store.insertRun({
-      runId,
-      taskId,
-      assistantId: member.assistantId,
-      childSessionId: null,
-      messageId: null,
-      state: 'running',
-      stopReason: null,
-      outputDigest: null,
-      startedAt: Date.now(),
-      endedAt: null,
+    const claimed = this.store.transaction(() => {
+      const updated = this.setStatus(task, 'running')
+      if (!updated) return null
+      this.store.insertRun({
+        runId, taskId, assistantId: member.assistantId, childSessionId: null, messageId: null,
+        state: 'running', stopReason: null, outputDigest: null, startedAt: Date.now(), endedAt: null,
+      })
+      this.store.appendEvent('run/started', { runId, taskId, assistantId: member.assistantId, displayName: member.displayName },
+        { taskId, assistantId: member.assistantId })
+      return updated
     })
-    this.store.appendEvent(
-      'run/started',
-      { runId, taskId, assistantId: member.assistantId, displayName: member.displayName },
-      { taskId, assistantId: member.assistantId },
-    )
-
-    let run: SubagentRun
+    if (!claimed) return null
+    const controller = new AbortController()
+    const runSignal = AbortSignal.any([signal, controller.signal])
+    let finished!: () => void
+    const live: LiveRun = { taskId, assistantId: member.assistantId, controller,
+      finished: new Promise<void>(resolve => { finished = resolve }) }
+    // 启动期间即占用额度，取消和退出也能找到尚未返回的运行。
+    this.liveRuns.set(runId, live)
+    const remaining = task.deadlineAt === null ? this.options.taskTimeoutMs : task.deadlineAt - Date.now()
+    const timeoutMs = Math.max(1, Math.min(this.options.taskTimeoutMs, remaining, 2_147_483_647))
+    const timeoutReason = remaining <= this.options.taskTimeoutMs && task.deadlineAt !== null ? 'deadline-exceeded' : 'timeout'
+    const timer = setTimeout(() => controller.abort(timeoutReason), timeoutMs)
+    let outcome: TaskOutcome
+    // 边跑边推可见文本：不接这一层，宠物气泡会等到 reply/done 才一次性弹出。
+    let stopDelta: () => void = () => undefined
     try {
-      run = await this.startChild(member, claimed, parentAgent, signal, runId)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      this.store.finishRun(runId, 'failed', 'start-rejected', null)
-      const failed = this.setStatus(claimed, 'failed')
-      this.store.appendEvent(
-        'run/ended',
-        { runId, taskId, state: 'failed', diagnostic: message },
-        { taskId, assistantId: member.assistantId },
+      const denied = [...this.options.denyExpertTools, ...member.toolPolicy.denyTools]
+      live.releaseGuard = installDelegationReadOnlyGate(this.ctx, String(parentAgent.id), runId, denied)
+      live.run = await this.startChild(member, claimed, parentAgent, runSignal, runId)
+      if (!live.run.localAgent) throw new Error('只读团队必须使用已核实的进程内 spawn，不能接受远程运行')
+      installReadOnlyGate(live.run.localAgent.ctx, denied)
+      this.store.attachChildSession(runId, String(live.run.id))
+      stopDelta = watchReplyDeltas(
+        () => live.run?.localAgent?.session?.events as readonly ChunkEventLike[] | undefined,
+        (text) => this.store.appendEvent('reply/delta', {
+          requestId: claimed.originRequestId, taskId, assistantId: member.assistantId,
+          displayName: member.displayName, skinId: member.skinId, text,
+        }, { taskId, assistantId: member.assistantId }),
       )
-      this.options.logger.error('team delegation rejected', { taskId, message })
-      return { task: failed ?? claimed, report: null, stopReason: 'start-rejected', diagnostic: message }
-    }
-
-    this.liveRuns.set(runId, { run, taskId, assistantId: member.assistantId, sideEffect })
-    try {
-      const result = await this.awaitResult(run, runId, signal)
-      return this.settle(taskId, runId, member, claimed, result)
+      const result = await this.awaitResult(live.run, runSignal)
+      runSignal.throwIfAborted()
+      // 先停增量再结算：否则最后一拍可能落到 reply/done 之后，气泡先定稿、又冒出半个尾巴。
+      stopDelta()
+      outcome = this.settle(taskId, runId, member, claimed, result)
+    } catch (error) {
+      const stopReason = runSignal.aborted ? (controller.signal.aborted ? String(controller.signal.reason) : 'aborted')
+        : live.run ? 'infrastructure-error' : 'start-rejected'
+      outcome = this.stopRun(taskId, runId, stopReason, error instanceof Error ? error.message : String(error))
     } finally {
-      this.liveRuns.delete(runId)
+      clearTimeout(timer)
+      // 异常/取消路径也要收掉增量定时器（正常路径已在结算前停过一次，重复调用是幂等的）。
+      stopDelta()
+      // 即使门禁装配抛错，也观察已发布句柄的结果，避免未处理的拒绝。
+      void live.run?.result.catch(() => undefined)
+      let quiescent = false
       try {
-        await run.dispose()
+        await live.run?.dispose()
+        quiescent = true
       } catch (error) {
-        // 释放失败不能盖掉已经结算好的结果，否则用户看不到真实产出
-        this.options.logger.warn('team run disposed with error', { runId, error: String(error) })
+        controller.abort('aborted')
+        this.options.logger.warn('团队子代理未能释放，必须人工核查', { runId, error: String(error) })
+        this.store.transaction(() => {
+          const current = this.store.getTask(taskId)
+          if (current) this.setStatus(current, 'unknown')
+          this.markUncertainOperations(taskId)
+        })
+      } finally {
+        // 未能确认静止时保留门禁与额度；退出时只重试释放，不重发任务。
+        if (quiescent) { live.releaseGuard?.(); this.liveRuns.delete(runId) }
+        finished()
       }
     }
+    const current = this.store.getTask(taskId) ?? outcome.task
+    return { ...outcome, task: current, diagnostic: current.status === 'unknown' ? '运行或释放结果不明，禁止自动重试' : outcome.diagnostic }
   }
 
   private async startChild(
@@ -458,69 +552,14 @@ export class TeamService {
     signal: AbortSignal,
     runId: string,
   ): Promise<SubagentRun> {
-    const readOnly = member.toolPolicy.mode === 'read-only'
-    const deny = readOnly ? this.resolveDenyTools(member) : []
-    const request = {
-      label: `${member.displayName}·${task.goal.slice(0, 40)}`,
-      prompt: this.buildPrompt(member, task),
-      parent: parentAgent,
-      signal,
-      persona: member.persona,
-      outputSchema: REPORT_SCHEMA,
-      ...(deny.length > 0 ? { toolFilter: { deny } } : {}),
-    }
-    const run = await this.ctx.subagents.start(this.options.provider, request)
-    if (!readOnly) this.armGate(run, member, task)
-    this.store.attachChildSession(runId, String(run.id))
-    return run
-  }
-
-  /**
-   * 给副作用席位装执行点门禁：没有批准就调不动 write/bash 这类工具。
-   *
-   * 门禁只能装在子代理自己的 agent-scoped ctx 上 —— 宿主的语义是「plain-context guard
-   * applies globally; one registered through agent.ctx applies only to that agent」，
-   * 而且 agent ctx 的贡献会在 agent 销毁时自动回卷。装在全局 ctx 上会连用户自己的
-   * 主会话一起拦掉，那是灾难。
-   *
-   * 远程 provider 返回 `localAgent: undefined`，拿不到 agent ctx 就装不上门禁。
-   * 这时必须失败关闭：一个不受门禁约束的副作用代理，比一个跑不起来的任务危险得多。
-   */
-  private armGate(run: SubagentRun, member: MemberConfig, task: Task): void {
-    const child = run.localAgent
-    if (!child) {
-      void run
-        .dispose()
-        .catch((error: unknown) => this.options.logger.warn('team run disposed with error', { taskId: task.taskId, error: String(error) }))
-      throw new Error(
-        `无法为 ${member.displayName} 安装执行点门禁：provider "${this.options.provider}" 返回的是远程运行（localAgent 缺失）。` +
-          '副作用席位必须跑在进程内 provider（spawn / fork）上，否则批准制度拦不住任何真实调用。',
-      )
-    }
-    installApprovalGate(child.ctx, {
-      taskId: task.taskId,
-      assistantId: member.assistantId,
-      approvals: this.options.approvals,
-      label: member.displayName,
+    const denied = [...this.options.denyExpertTools, ...member.toolPolicy.denyTools]
+    // 读取父代理实际工具视图，不用全局 get；report 在子代理自身层注册，不能传给 restrict。
+    const allow = READ_ONLY_ALLOW_TOOLS.filter(name => name !== 'report' && !denied.includes(name) && this.ctx.tools.get(name, parentAgent))
+    return this.ctx.subagents.start(this.options.provider, {
+      label: runId,
+      prompt: this.buildPrompt(member, task), parent: parentAgent, signal,
+      persona: member.persona, outputSchema: REPORT_SCHEMA, toolFilter: { allow },
     })
-  }
-
-  /**
-   * 只禁用运行时确实存在的工具名；deny 列表里的未知名字会被宿主大声拒绝。
-   *
-   * 这里用 `ctx.tools.get` 判存在性，与宿主真正的判据并不完全等价：`tools.restrict()` 校验的
-   * 是 `restrictableNames`，而它只含从全局层与祖先层**继承来**的工具，不含子代理自己那层注册的。
-   * 当前候选名单全是宿主全局注册的通用工具（write / bash / subagent 这些），落在交集里，所以
-   * 安全。但要往名单里加子代理专属工具（`report` 就是）时得记住这条：`get` 能命中，`restrict`
-   * 会抛错，整个委派起不来。
-   */
-  private resolveDenyTools(member: MemberConfig): string[] {
-    const candidates = new Set([...READ_ONLY_DENY_CANDIDATES, ...this.options.denyExpertTools, ...member.toolPolicy.denyTools])
-    const resolved: string[] = []
-    for (const name of candidates) {
-      if (this.ctx.tools.get(name)) resolved.push(name)
-    }
-    return resolved
   }
 
   private buildPrompt(member: MemberConfig, task: Task): ContentBlock[] {
@@ -532,65 +571,104 @@ export class TeamService {
       task.acceptance.length > 0
         ? `【验收条件】\n${task.acceptance.map((item) => `- ${item}`).join('\n')}`
         : '',
-      task.toolScope === 'read-only'
-        ? '【权限】本次只读：分析并给出结论与证据，不要修改文件、不要执行有副作用的命令。需要外部副作用时写进 needsApproval，由总助理走用户审批后执行。'
-        : '【权限】本次允许副作用，但每一步都要先写进 needsApproval，等批准后再执行；不得自行扩大范围。',
+      '【权限】本次只读：分析并给出结论与证据，不得修改文件、执行有副作用的命令或再委派。需要副作用时写进 needsApproval，由总助理转交可信审批执行流程。',
       '【产出】按结构化输出返回：summary 给结论；artifacts 逐条写清可核验的产物或证据及其来源；blockers 写阻碍；needsApproval 写需要批准的副作用计划。没有证据支撑的判断只能进 blockers，不能写进 artifacts。',
     ]
     return [{ type: 'text', text: sections.filter((section) => section.length > 0).join('\n\n') }]
   }
 
-  private async awaitResult(run: SubagentRun, runId: string, signal: AbortSignal): Promise<SubagentResult> {
-    let timer: NodeJS.Timeout | undefined
-    let onAbort: (() => void) | undefined
-    const timeout = new Promise<SubagentResult>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`task run ${runId} exceeded ${this.options.taskTimeoutMs}ms`)), this.options.taskTimeoutMs)
-      onAbort = () => reject(new Error(`task run ${runId} cancelled`))
+  private async awaitResult(run: SubagentRun, signal: AbortSignal): Promise<SubagentResult> {
+    let onAbort!: () => void
+    const aborted = new Promise<SubagentResult>((_, reject) => {
+      onAbort = () => reject(signal.reason)
       signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
     })
     try {
-      return await Promise.race([run.result, timeout])
+      return await Promise.race([run.result, aborted])
     } finally {
-      // 结果先到时必须收掉定时器与监听器，否则进程会被这个空定时器吊住整个超时时长
-      clearTimeout(timer)
-      if (onAbort) signal.removeEventListener('abort', onAbort)
+      signal.removeEventListener('abort', onAbort)
     }
+  }
+
+  /** 调用方持有事务；不确定的副作用只能记 unknown，绝不重发。 */
+  private markUncertainOperations(taskId: string): void {
+    for (const operation of this.store.listOperations(taskId)) {
+      if (!['planned', 'running'].includes(operation.state)) continue
+      this.store.setOperationState(operation.operationId, 'unknown', operation.resultDigest)
+      this.store.appendEvent('operation/updated', { operationId: operation.operationId, state: 'unknown', kind: operation.kind }, { taskId })
+    }
+  }
+
+  private stopRun(taskId: string, runId: string, stopReason: string, diagnostic: string): TaskOutcome {
+    return this.store.transaction(() => {
+      const task = this.store.getTask(taskId)!
+      const cancelled = stopReason === 'aborted'
+      if (!this.store.finishRun(runId, cancelled ? 'cancelled' : 'failed', stopReason, null)) {
+        return { task, report: null, stopReason: task.status, diagnostic }
+      }
+      this.markUncertainOperations(taskId)
+      const updated = task.status === 'running' ? this.setStatus(task, cancelled ? 'cancelled' : 'failed') ?? task : task
+      this.store.appendEvent('run/ended', { runId, taskId, state: updated.status, stopReason, diagnostic }, { taskId, assistantId: task.ownerId })
+      const member = this.store.getMember(task.ownerId)
+      this.store.appendEvent('reply/done', { requestId: task.originRequestId, taskId, assistantId: task.ownerId,
+        displayName: member?.displayName, skinId: member?.skinId, status: updated.status,
+        text: `任务未完成：${diagnostic}`, diagnostic, artifacts: task.artifacts }, { taskId, assistantId: task.ownerId })
+      return { task: updated, report: null, stopReason, diagnostic }
+    })
+  }
+
+  /** 启动装配时调用；首次执行也会兜底调用。仅对账，不恢复或重发外部副作用。 */
+  recoverInterruptedTasks(): void {
+    for (const task of this.store.listTasks({ teamId: this.options.teamId })) {
+      if ([...this.liveRuns.values()].some(live => live.taskId === task.taskId)) continue
+      this.store.transaction(() => {
+        const runs = this.store.listRuns(task.taskId).filter(run => run.state === 'running')
+        const uncertain = this.store.listOperations(task.taskId).some(operation => ['planned', 'running', 'unknown'].includes(operation.state))
+        for (const run of runs) {
+          this.store.finishRun(run.runId, 'unknown', 'runtime-interrupted', null)
+          this.store.appendEvent('run/ended', { runId: run.runId, taskId: task.taskId, state: 'unknown', stopReason: 'runtime-interrupted' },
+            { taskId: task.taskId, assistantId: run.assistantId })
+        }
+        this.markUncertainOperations(task.taskId)
+        if ((task.status === 'running' || runs.length > 0 || uncertain) && !['unknown', 'cancelled', 'failed'].includes(task.status)) this.setStatus(task, 'unknown')
+      })
+    }
+    this.recovered = true
   }
 
   /** 只有产物可核验才算完成；跑完但拿不出证据的进复核，不伪装成功。 */
   private settle(taskId: string, runId: string, member: MemberConfig, task: Task, result: SubagentResult): TaskOutcome {
     const report = this.parseReport(result.structured)
-    const artifacts = report?.artifacts ?? []
-    const accepted = result.stopReason === 'completed' && report !== null && (task.acceptance.length === 0 || artifacts.length > 0)
-    const status: TaskStatus = accepted ? 'done' : result.stopReason === 'completed' ? 'review' : 'failed'
-
-    this.store.finishRun(runId, accepted ? 'succeeded' : status === 'review' ? 'succeeded' : 'failed', result.stopReason, report ? `artifacts:${artifacts.length}` : null)
-    const updated = this.setStatus(task, status, { artifacts }) ?? task
-    this.store.appendEvent(
-      'run/ended',
-      { runId, taskId, state: status, stopReason: result.stopReason, summary: report?.summary ?? null },
-      { taskId, assistantId: member.assistantId },
-    )
-    for (const artifact of artifacts) {
-      this.store.appendEvent('task/artifact', { taskId, artifact }, { taskId, assistantId: member.assistantId })
-    }
-    this.store.appendEvent(
-      'reply/done',
-      {
-        requestId: updated.originRequestId,
-        taskId,
-        assistantId: member.assistantId,
-        displayName: member.displayName,
-        skinId: member.skinId,
-        status,
-        text: report?.summary ?? this.fallbackText(result),
-        artifacts,
-        blockers: report?.blockers ?? [],
-        needsApproval: report?.needsApproval ?? [],
-      },
-      { taskId, assistantId: member.assistantId },
-    )
-    return { task: updated, report, stopReason: result.stopReason, diagnostic: result.diagnostic ?? null }
+    if (result.stopReason !== 'completed') return { ...this.stopRun(taskId, runId, result.stopReason, result.diagnostic ?? '子代理未正常完成'), report }
+    return this.store.transaction(() => {
+      const current = this.store.getTask(taskId)!
+      if (current.revision !== task.revision || current.status !== 'running') {
+        if (this.store.finishRun(runId, 'unknown', 'task-changed', null)) {
+          this.markUncertainOperations(taskId)
+          this.store.appendEvent('run/ended', { runId, taskId, state: 'unknown', stopReason: 'task-changed' }, { taskId })
+        }
+        const updated = current.status === 'running' ? this.setStatus(current, 'unknown') ?? current : current
+        return { task: updated, report: null, stopReason: 'task-changed', diagnostic: '任务已变化，迟到报告不能覆盖当前状态' }
+      }
+      const artifacts = report?.artifacts ?? []
+      // 自由文本产物及验收条件没有可信核验器，模型自报非空不能作为验收通过。
+      const status: TaskStatus = report && report.needsApproval.length > 0 ? 'awaiting-approval' : 'review'
+      const diagnostic = !report ? '结构化报告无效，需要复核' : report.needsApproval.length > 0 ? '存在待批准事项'
+        : report.blockers.length > 0 ? '存在阻碍，需要复核' : '产物及验收条件尚未独立核验，不能标记完成'
+      this.markUncertainOperations(taskId)
+      this.store.finishRun(runId, 'succeeded', result.stopReason, report ? `artifacts:${artifacts.length}` : null)
+      const updated = this.setStatus(current, status, { artifacts })!
+      this.store.appendEvent('run/ended', { runId, taskId, state: status, stopReason: result.stopReason, diagnostic, summary: report?.summary ?? null },
+        { taskId, assistantId: member.assistantId })
+      for (const artifact of artifacts) this.store.appendEvent('task/artifact', { taskId, artifact }, { taskId, assistantId: member.assistantId })
+      this.store.appendEvent('reply/done', {
+        requestId: updated.originRequestId, taskId, assistantId: member.assistantId, displayName: member.displayName,
+        skinId: member.skinId, status, text: report?.summary ?? this.fallbackText(result), diagnostic,
+        artifacts, blockers: report?.blockers ?? [], needsApproval: report?.needsApproval ?? [],
+      }, { taskId, assistantId: member.assistantId })
+      return { task: updated, report, stopReason: result.stopReason, diagnostic }
+    })
   }
 
   private fallbackText(result: SubagentResult): string {
@@ -606,23 +684,20 @@ export class TeamService {
   private parseReport(structured: unknown): ExpertReport | null {
     if (typeof structured !== 'object' || structured === null) return null
     const raw = structured as Record<string, unknown>
-    const strings = (value: unknown): string[] =>
-      Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
-    if (typeof raw.summary !== 'string') return null
-    return {
-      summary: raw.summary,
-      artifacts: strings(raw.artifacts),
-      blockers: strings(raw.blockers),
-      needsApproval: strings(raw.needsApproval),
-    }
+    const strings = (value: unknown): value is string[] =>
+      Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim().length > 0)
+    if (typeof raw.summary !== 'string' || !raw.summary.trim() ||
+        !strings(raw.artifacts) || !strings(raw.blockers) || !strings(raw.needsApproval)) return null
+    return { summary: raw.summary, artifacts: raw.artifacts, blockers: raw.blockers, needsApproval: raw.needsApproval }
   }
 
   /** 扫描可执行任务并按并发上限推进；返回本轮真正跑过的任务结果。 */
   async runReady(parentAgent: Agent, signal: AbortSignal): Promise<TaskOutcome[]> {
     const outcomes: TaskOutcome[] = []
+    if (!this.recovered) this.recoverInterruptedTasks()
     const candidates = this.store
       .listTasks({ teamId: this.options.teamId })
-      .filter((task) => !TERMINAL_TASK_STATUSES.includes(task.status) && task.status !== 'running')
+      .filter((task) => task.status === 'created' || task.status === 'queued')
       .sort((a, b) => a.createdAt - b.createdAt)
     for (const task of candidates) {
       if (this.liveRuns.size >= this.options.maxConcurrentInference) break
@@ -636,28 +711,29 @@ export class TeamService {
   async cancelTask(taskId: string): Promise<Task | null> {
     const task = this.store.getTask(taskId)
     if (!task) return null
+    const waits: Promise<void>[] = []
     for (const [runId, live] of this.liveRuns) {
       if (live.taskId !== taskId) continue
-      try {
-        await live.run.dispose()
-      } catch (error) {
-        this.options.logger.warn('cancel could not dispose child run', { runId, error: String(error) })
-      }
-      this.store.finishRun(runId, 'cancelled', 'aborted', null)
+      // 先落终态再发取消；同步到达的正常结果不得把取消覆盖成成功。
+      this.stopRun(taskId, runId, 'aborted', '用户取消任务；已发生副作用不会撤回')
+      live.controller.abort('aborted')
+      waits.push(live.finished)
     }
-    if (TERMINAL_TASK_STATUSES.includes(task.status)) return task
-    return this.setStatus(task, 'cancelled')
+    if (waits.length === 0 && !TERMINAL_TASK_STATUSES.includes(task.status)) {
+      this.store.transaction(() => { this.markUncertainOperations(taskId); this.setStatus(task, 'cancelled') })
+    }
+    await Promise.all(waits)
+    return this.store.getTask(taskId)
   }
 
-  /** 退出前等待自有子代理静止；不终止用户独立启动的 dsh 服务。 */
+  /** 等待自有启动、运行及释放全部结束后，调用方才可关闭业务库。 */
   async dispose(): Promise<void> {
+    this.disposed = true
+    await Promise.all([...new Set([...this.liveRuns.values()].map(live => live.taskId))].map(taskId => this.cancelTask(taskId)))
     for (const [runId, live] of this.liveRuns) {
-      try {
-        await live.run.dispose()
-      } catch (error) {
-        this.options.logger.warn('team dispose could not release child run', { runId, error: String(error) })
-      }
+      await live.run?.dispose()
+      live.releaseGuard?.()
+      this.liveRuns.delete(runId)
     }
-    this.liveRuns.clear()
   }
 }

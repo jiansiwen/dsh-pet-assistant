@@ -10,14 +10,25 @@
     "start": "node scripts/build.mjs && electron .",
     "dev": "node scripts/build.mjs --watch",
     "test": "node --test --experimental-test-module-mocks \"tests/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit"
+    "verify:pet": "node scripts/verify-pet-renderer.mjs",
+    "typecheck": "tsc --noEmit",
+    "pack:mac": "electron-builder --mac --config build/electron-builder.yml",
+    "pack:win": "electron-builder --win --config build/electron-builder.yml"
   },
   "dependencies": {
     "@deepseek-ai/dsh": "0.1.1-rc.2",
     "@deepseek-ai/dsh-sdk-client": "0.1.1-rc.2",
+    "pdfjs-dist": "6.3.289",
     "sherpa-onnx-node": "^1.13.7",
-    "sherpa-onnx-win-x64": "^1.13.7",
     "ws": "^8.21.3"
+  },
+  "optionalDependencies": {
+    "sherpa-onnx-darwin-arm64": "^1.13.7",
+    "sherpa-onnx-darwin-x64": "^1.13.7",
+    "sherpa-onnx-linux-arm64": "^1.13.7",
+    "sherpa-onnx-linux-x64": "^1.13.7",
+    "sherpa-onnx-win-ia32": "^1.13.7",
+    "sherpa-onnx-win-x64": "^1.13.7"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

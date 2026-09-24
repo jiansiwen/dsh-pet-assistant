@@ -12,6 +12,7 @@ import { Classifier } from './classifier.ts'
 import {
   killSampler,
   launchSampler,
+  pruneSampleRange,
   readSamples,
   sampleFileOf,
   type SamplerProcess,
@@ -27,6 +28,8 @@ export interface TrackerConfig {
    * 标题压根不进采样文件——这是采集侧的授权开关，不是事后的过滤器。
    */
   captureTitles: boolean
+  excludedProcesses?: readonly string[]
+  excludedTitleKeywords?: readonly string[]
   /**
    * 采集被拦住的原因，null 表示允许采集。
    * 装配时由入口给出（配置关掉了采集，或旧数据迁移没跑完）。
@@ -36,6 +39,11 @@ export interface TrackerConfig {
 
 export function emptyDay(date: string): DayRecord {
   return { date, events: [], notes: [], interpretedUpto: 0 }
+}
+
+/** 标题采集实际取值：运行时覆盖优先于插件配置，两者都缺时才默认开启。 */
+export function effectiveCaptureTitles(state: { captureTitles?: boolean }, configTitles: boolean): boolean {
+  return state.captureTitles ?? configTitles
 }
 
 export class ActivityTracker {
@@ -68,19 +76,81 @@ export class ActivityTracker {
     return this.domain.global.get().active
   }
 
+  get capturing(): boolean {
+    return this.active && this.sampler?.alive === true && this.config.captureBlockedReason() === null
+  }
+
   async start(): Promise<void> {
     const blocked = this.config.captureBlockedReason()
     if (blocked) throw new Error(`采集被拦住，未启动采样进程：${blocked}`)
     if (this.sampler?.alive) return
+    const state = this.domain.global.get()
     this.sampler = launchSampler(this.scriptPath, this.sampleDir, this.config.sampleIntervalMs, {
-      captureTitles: this.config.captureTitles,
+      captureTitles: effectiveCaptureTitles(state, this.config.captureTitles),
+      excludedProcesses: this.config.excludedProcesses,
+      excludedTitleKeywords: this.config.excludedTitleKeywords,
     })
-    await this.domain.global.set({ active: true, startedAt: Date.now(), pid: this.sampler.pid })
+    await this.domain.global.set({ ...state, active: true, startedAt: Date.now(), pid: this.sampler.pid })
+  }
+
+  /**
+   * 单独交出或收回标题授权：持久化覆盖并重启采样进程。
+   * 分级授权必须落在采集侧 —— 关掉之后新的采样不再调用 GetWindowText。
+   */
+  async setCaptureTitles(enabled: boolean): Promise<void> {
+    const state = this.domain.global.get()
+    await this.domain.global.set({ ...state, captureTitles: enabled })
+    if (!this.sampler?.alive) return
+    this.killSamplerNow()
+    this.sampler = launchSampler(this.scriptPath, this.sampleDir, this.config.sampleIntervalMs, {
+      captureTitles: enabled,
+      excludedProcesses: this.config.excludedProcesses,
+      excludedTitleKeywords: this.config.excludedTitleKeywords,
+    })
+    await this.domain.global.set({ ...this.domain.global.get(), pid: this.sampler.pid })
   }
 
   async stop(): Promise<void> {
     this.killSamplerNow()
     await this.domain.global.set({ active: false, startedAt: 0 })
+  }
+
+  /** 删除某一天采样原文中落在区间内的样本；调用方须已在 withCapturePaused 内。 */
+  deleteSampleRange(date: string, from: number, to: number): number {
+    return pruneSampleRange(sampleFileOf(this.sampleDir, date), from, to)
+  }
+
+  /** 删除某一天里来源为 auto 且与区间重叠的语义事项，返回删除条数。 */
+  async pruneAutoEvents(date: string, from: number, to: number): Promise<number> {
+    let removed = 0
+    await this.enqueueDayUpdate(date, day => {
+      const kept = day.events.filter(event => !(event.source === 'auto' && event.start < to && event.end > from))
+      removed = day.events.length - kept.length
+      return { ...day, events: kept }
+    })
+    return removed
+  }
+
+  /**
+   * 暂停采样进程执行一段必须独占采样文件的操作（如删除某时间段原文），结束后按原状态恢复。
+   * 边重写 JSONL 边追加会丢样本或留半行，所以删除类操作必须走这里。
+   */
+  async withCapturePaused<T>(fn: () => Promise<T>): Promise<T> {
+    const wasCapturing = this.sampler?.alive === true
+    if (wasCapturing) this.killSamplerNow()
+    try {
+      return await fn()
+    } finally {
+      if (wasCapturing && this.domain.global.get().active && this.config.captureBlockedReason() === null) {
+        const state = this.domain.global.get()
+        this.sampler = launchSampler(this.scriptPath, this.sampleDir, this.config.sampleIntervalMs, {
+          captureTitles: effectiveCaptureTitles(state, this.config.captureTitles),
+          excludedProcesses: this.config.excludedProcesses,
+          excludedTitleKeywords: this.config.excludedTitleKeywords,
+        })
+        await this.domain.global.set({ ...state, pid: this.sampler.pid })
+      }
+    }
   }
 
   /**
@@ -100,7 +170,9 @@ export class ActivityTracker {
     // 用户看到的解释由 modeDescription 给出。
     if (this.config.captureBlockedReason() !== null) return
     this.sampler = launchSampler(this.scriptPath, this.sampleDir, this.config.sampleIntervalMs, {
-      captureTitles: this.config.captureTitles,
+      captureTitles: effectiveCaptureTitles(state, this.config.captureTitles),
+      excludedProcesses: this.config.excludedProcesses,
+      excludedTitleKeywords: this.config.excludedTitleKeywords,
     })
     await this.domain.global.set({ ...state, pid: this.sampler.pid })
   }
@@ -129,7 +201,7 @@ export class ActivityTracker {
   /** 从采样日志聚合指定日期的活动片段。 */
   buildSpans(date: string): ActivitySpan[] {
     const samples = readSamples(sampleFileOf(this.sampleDir, date))
-    return buildSpansFrom(samples, this.classifier, this.config.minSpanMs)
+    return buildSpansFrom(samples, this.classifier, this.config.minSpanMs, this.config.sampleIntervalMs)
   }
 
   /** 一天的完整视图：文件聚合的活动片段 + 持久化的事项/笔记/游标。 */

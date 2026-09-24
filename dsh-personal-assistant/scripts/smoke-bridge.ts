@@ -11,8 +11,11 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { ApprovalError, ApprovalService } from '../src/approval.ts'
+import { ApprovalError, ApprovalService, type GateCall } from '../src/approval.ts'
 import { SessionBridge, type BridgeAgent, type BridgeEvent } from '../src/bridge.ts'
+import { ReportStore } from '../src/report.ts'
+import { ReportApprovalService } from '../src/report-approval.ts'
+import { openAssistantStore } from '../src/store.ts'
 import { TeamService, type TeamOptions } from '../src/team.ts'
 import { TeamStore } from '../src/team-domain.ts'
 
@@ -28,13 +31,21 @@ let expertResult: { output: Array<{ type: string; text?: string }>; structured?:
   stopReason: 'completed',
 }
 
+/** 进程内子代理的最小假形状：installReadOnlyGate 要求 ctx.agent.ctx 指回 ctx 本身。 */
+function fakeLocalAgent(id: string) {
+  const ctx: any = { tools: { guard: () => () => undefined } }
+  ctx.agent = { id, ctx }
+  return { id, ctx }
+}
+
 const fakeCtx = {
   subagents: {
     start: async (_provider: string, request: Record<string, any>) => {
       delegations.push(request)
       return {
         id: `child-${delegations.length}`,
-        localAgent: undefined,
+        // 只读团队只接受进程内 spawn：拿不到 localAgent 的运行会被失败关闭。
+        localAgent: fakeLocalAgent(`child-agent-${delegations.length}`),
         result: Promise.resolve(expertResult),
         async dispose() {},
       }
@@ -42,6 +53,8 @@ const fakeCtx = {
   },
   tools: {
     get: (name: string) => (existingTools.has(name) ? {} : undefined),
+    // installDelegationReadOnlyGate 装在宿主 ctx 上；桥接套件不验守卫行为（那是套件一的事）。
+    guard: () => () => undefined,
   },
 }
 
@@ -51,7 +64,8 @@ const teamOptions: Omit<TeamOptions, 'approvals'> = {
   maxConcurrentInference: 2,
   maxConcurrentSideEffect: 1,
   taskTimeoutMs: 60_000,
-  defaultBudgetTokens: 1000,
+  // 宿主无法硬约束累计预算：非零预算的任务会在启动前被拒，点名委派就永远跑不起来。
+  defaultBudgetTokens: 0,
   seats: [],
   denyExpertTools: ['web_fetch'],
   logger: { info() {}, warn() {}, error() {} },
@@ -93,6 +107,7 @@ let draining = false
 const seen: BridgeEvent[] = []
 let activeBridge: SessionBridge | null = null
 let activeStore: TeamStore | null = null
+let activeReportDb: ReturnType<typeof openAssistantStore> | null = null
 
 interface HttpResult {
   status: number
@@ -159,24 +174,76 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 8000
   throw new Error(`等待超时：${label}；已收到 [${received}]`)
 }
 
-/** 让主会话「说一句话」，模拟宿主在轮次里追加的 assistant 事件。 */
+const activeAgentEvents: Array<{ type: string; data: Record<string, unknown> }> = []
+const injected: Array<{ role: string; sourceKind: string; text: string; id: string }> = []
+/** 当前轮次号与步号：followup 开一个新轮次，assistantSays 在其中自增步号。 */
+let activeTurn = 0
+let activeStep = 0
+
+/** 让主会话在当前轮次「说一句话」：追加一条带 turn/step 的 assistant/message（因果折叠按它取回复）。 */
 function assistantSays(text: string): void {
-  activeAgentEvents.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
+  activeStep += 1
+  activeAgentEvents.push({
+    type: 'assistant/message',
+    data: {
+      turn: activeTurn,
+      step: activeStep,
+      message: {
+        id: `assistant-${activeTurn}-${activeStep}`,
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        source: { kind: 'model', provider: 'fake', model: 'fake' },
+      },
+    },
+  })
 }
 
-const activeAgentEvents: Array<{ type: string; data: Record<string, unknown> }> = []
-const injected: Array<{ role: string; sourceKind: string; text: string }> = []
+/** 关闭当前轮次；reason.kind 默认 completed，也可造 interrupted 等非正常结束。 */
+function endActiveTurn(kind = 'completed'): void {
+  activeAgentEvents.push({ type: 'turn/end', data: { turn: activeTurn, reason: { kind } } })
+}
+
+/** 往当前轮次再塞一条 user/message，模拟共享会话里网页端也插了一句。 */
+function injectExtraUser(id: string, sourceKind: unknown = 'user'): void {
+  activeAgentEvents.push({
+    type: 'user/message',
+    data: { id, role: 'user', content: [{ type: 'text', text: '插话' }], source: { kind: sourceKind } },
+  })
+}
+
+/** 注入之前造一个「别人已问完并答完」的完整轮次，验证因果折叠只认自己那条消息的轮次。 */
+function pushHistoryTurn(question: string, answer: string): void {
+  activeTurn += 1
+  activeStep = 0
+  activeAgentEvents.push({ type: 'turn/start', data: { turn: activeTurn } })
+  activeAgentEvents.push({
+    type: 'user/message',
+    data: { id: `history-${activeTurn}`, role: 'user', content: [{ type: 'text', text: question }], source: { kind: 'user' } },
+  })
+  assistantSays(answer)
+  endActiveTurn('completed')
+}
+
 const agent: BridgeAgent = {
   session: { events: activeAgentEvents },
   followup(message: unknown) {
-    const raw = message as { role?: string; source?: { kind?: string }; content?: Array<{ type: string; text?: string }> }
+    const raw = message as { id?: string; role?: string; source?: { kind?: string }; content?: Array<{ type: string; text?: string }> }
     injected.push({
       role: String(raw.role),
       sourceKind: String(raw.source?.kind),
+      id: String(raw.id),
       text: (raw.content ?? [])
         .filter((block) => block.type === 'text')
         .map((block) => block.text ?? '')
         .join(''),
+    })
+    // 宿主领取这条消息：开一个新轮次，把消息本体（含真实 id）写进日志，供因果折叠定位。
+    activeTurn += 1
+    activeStep = 0
+    activeAgentEvents.push({ type: 'turn/start', data: { turn: activeTurn } })
+    activeAgentEvents.push({
+      type: 'user/message',
+      data: { id: raw.id, role: raw.role, content: raw.content ?? [], source: raw.source ?? { kind: 'user' } },
     })
   },
 }
@@ -221,7 +288,76 @@ async function main(): Promise<void> {
     assert.equal(injected.length, 0, '查询类端点不得触碰主会话')
   })
 
-  console.log('\n== 主会话注入与区间归属')
+  console.log('\n== 非团队日报审批')
+  const reportDb = openAssistantStore(path.join(dir, 'personal-assistant', 'assistant.sqlite'))
+  activeReportDb = reportDb
+  const reports = new ReportStore(reportDb)
+  let reportModeActive = true
+  let reportStops = 0
+  const reportApprovals = new ReportApprovalService(reportDb, reports, {
+    epoch: bridge.epoch,
+    reportDir: path.join(dir, 'reports'),
+    ttlMs: 60_000,
+    active: () => reportModeActive,
+    stop: async () => { reportStops += 1; reportModeActive = false },
+  })
+  const reportId = 'daily:2026-09-18'
+  const reportContent = '# 日报审批冒烟\n\n只允许可信 HTTP 批准后发布。\n'
+  let reportProposalId = ''
+  let reportTarget = ''
+  await checkAsync('团队关闭也能提交日报：独立凭据落盘，全文通过事件和重连快照可见', async () => {
+    bridge.attachReportApprovals(reportApprovals)
+    reports.saveDraft(reportId, reportContent, Date.now())
+    const proposal = bridge.submitReport(reportId)
+    reportProposalId = proposal.proposalId
+    reportTarget = proposal.target
+    assert.equal(existsSync(reportTarget), false, '提交不能发布')
+    assert.equal(reportStops, 0)
+    const credential = JSON.parse(readFileSync(approvalFile, 'utf8'))
+    assert.equal(credential.reportApprovalToken, reportApprovals.approvalCapabilityToken)
+    assert.equal(credential.approvalToken, undefined, '日报凭据不能依赖团队启用')
+    assert.equal(credential.token, undefined)
+    assert.notEqual(credential.reportApprovalToken, token)
+    assert.equal(readFileSync(infoFile, 'utf8').includes(credential.reportApprovalToken), false)
+    const snapshot = await request('GET', '/team')
+    assert.equal(snapshot.body.team, false)
+    assert.deepEqual(snapshot.body.members, [])
+    assert.deepEqual(snapshot.body.proposals, [proposal])
+    assert.equal(snapshot.body.proposals[0].content, reportContent)
+    assert.equal(JSON.stringify(snapshot.body).includes(credential.reportApprovalToken), false)
+    assert.deepEqual((await request('GET', '/team')).body, snapshot.body)
+    await waitFor('日报快照事件', () => eventsOf('team/snapshot').some(event =>
+      (event.payload as { proposals?: Array<{ proposalId: string }> })?.proposals?.some(item => item.proposalId === reportProposalId) === true))
+  })
+
+  await checkAsync('聊天令牌不能批准日报；可信 HTTP 无需聊天令牌，发布一次并拒绝重放', async () => {
+    const body = { proposalId: reportProposalId, decision: 'approve', epoch: bridge.epoch }
+    const headers = { 'x-dsh-approval-token': reportApprovals.approvalCapabilityToken }
+    assert.equal((await request('POST', '/report-approval', { body, token: false })).status, 403)
+    assert.equal((await request('POST', '/report-approval', { body })).status, 403)
+    assert.equal((await request('POST', '/report-approval', { body, headers: { 'x-dsh-approval-token': token } })).status, 403)
+    assert.equal((await request('GET', '/health', { token: reportApprovals.approvalCapabilityToken })).status, 401)
+    const stale = await request('POST', '/report-approval', { body: { ...body, epoch: '旧运行时代次' }, headers, token: false })
+    assert.equal(stale.status, 409)
+    assert.equal(stale.body.error, 'EPOCH_MISMATCH')
+    assert.equal(existsSync(reportTarget), false)
+    assert.equal(reportStops, 0)
+    const approved = await request('POST', '/report-approval', { body, headers, token: false })
+    assert.equal(approved.status, 200)
+    assert.equal(approved.body.confirmed, true)
+    assert.equal(approved.body.modeExited, true)
+    assert.equal(readFileSync(reportTarget, 'utf8'), reportContent)
+    assert.equal(reports.current(reportId)?.state, 'archived')
+    assert.equal(reportStops, 1)
+    assert.deepEqual((await request('GET', '/team')).body.proposals, [])
+    const replay = await request('POST', '/report-approval', { body, headers, token: false })
+    assert.equal(replay.status, 409)
+    assert.equal(replay.body.error, 'ALREADY_CONSUMED')
+    assert.equal(reportStops, 1)
+    assert.equal(injected.length, 0, '日报审批不能注入主会话或调用模型')
+  })
+
+  console.log('\n== 主会话注入与因果归属')
   await checkAsync('/chat 挡住旧代次、空文本与畸形请求体', async () => {
     const stale = await request('POST', '/chat', { body: { text: '来自已死进程的消息', epoch: 'epoch-of-a-dead-process' } })
     assert.equal(stale.status, 409)
@@ -233,24 +369,47 @@ async function main(): Promise<void> {
     assert.equal(eventsOf('reply').length, 0)
   })
 
-  await checkAsync('区间起点排除注入前的历史消息，回复标记 interval', async () => {
-    assistantSays('这是别人问出来的回答')
-    const accepted = await request('POST', '/chat', { body: { requestId: 'req-interval', text: '今天做了什么' } })
-    assert.deepEqual(accepted.body, { accepted: true, requestId: 'req-interval', epoch: bridge.epoch })
-    // 宠物消息必须是 user 来源：plugin 来源会被 dsh web 折叠成「上下文注入」，用户看不到原话。
-    assert.deepEqual(injected.at(-1), { role: 'user', sourceKind: 'user', text: '今天做了什么' })
+  await checkAsync('因果折叠：只认本消息进入的轮次，历史轮次不冒充，回复标记 causal', async () => {
+    // 注入之前先有一个别人问完答完的完整轮次；因果折叠必须按消息 id 跳过它。
+    pushHistoryTurn('别人的问题', '这是别人问出来的回答')
+    const accepted = await request('POST', '/chat', { body: { requestId: 'req-causal', text: '今天做了什么' } })
+    assert.deepEqual(accepted.body, { accepted: true, requestId: 'req-causal', epoch: bridge.epoch })
+    // 宠物消息必须是 user 来源，且桥接要记住它的 id —— 因果折叠全靠这个 id 定位轮次。
+    const lastInjected = injected.at(-1)!
+    assert.equal(lastInjected.role, 'user')
+    assert.equal(lastInjected.sourceKind, 'user', 'plugin 来源会被 dsh web 折叠成「上下文注入」，用户看不到原话')
+    assert.equal(lastInjected.text, '今天做了什么')
+    assert.ok(lastInjected.id.length > 0, '必须记住注入消息的稳定 id')
 
+    // 本轮次还没结束（无 turn/end）：idle 必须保持 pending，绝不拿历史轮次的回答冒充。
     bridge.onAgentIdle(agent)
     await settle()
-    assert.equal(eventsOf('reply', 'req-interval').length, 0, '区间内没有新事件时不得拿历史消息冒充回复')
+    assert.equal(eventsOf('reply', 'req-causal').length, 0, '轮次未结束不得结算，更不得拿历史消息冒充回复')
 
+    // 补完本轮次：assistant 文本 + turn/end completed，才结算。
     assistantSays('今天写了桥接冒烟')
+    endActiveTurn('completed')
     bridge.onAgentIdle(agent)
-    await waitFor('区间回复', () => eventsOf('reply', 'req-interval').length === 1)
-    const reply = eventsOf('reply', 'req-interval')[0]
+    await waitFor('causal 回复', () => eventsOf('reply', 'req-causal').length === 1)
+    const reply = eventsOf('reply', 'req-causal')[0]
     assert.equal(reply.ok, true)
-    assert.equal(reply.reply, '今天写了桥接冒烟')
-    assert.equal(reply.attribution, 'interval')
+    assert.equal(reply.reply, '今天写了桥接冒烟', '只取本轮次文本，不取历史轮次的「这是别人问出来的回答」')
+    assert.equal(reply.attribution, 'causal')
+    assert.equal(reply.turn, activeTurn, '结算要落在本消息所属的那个轮次上')
+  })
+
+  await checkAsync('共享会话混入其他用户输入：拒绝猜测，标记 mixed', async () => {
+    assert.equal((await request('POST', '/chat', { body: { requestId: 'req-mixed', text: '我在宠物上问的' } })).status, 200)
+    // 网页端在同一轮次里也插了一句（source.kind 同为 user）——无法分辨回复归属。
+    injectExtraUser('web-user-msg', 'user')
+    assistantSays('把两个人的问题一起答了')
+    endActiveTurn('completed')
+    bridge.onAgentIdle(agent)
+    await waitFor('mixed 失败', () => eventsOf('reply', 'req-mixed').length === 1)
+    const reply = eventsOf('reply', 'req-mixed')[0]
+    assert.equal(reply.ok, false)
+    assert.equal(reply.attribution, 'mixed')
+    assert.match(reply.error ?? '', /分开|混入/)
   })
 
   await checkAsync('串行队列：上一条没结算时下一条只排队，结算后才注入', async () => {
@@ -262,10 +421,11 @@ async function main(): Promise<void> {
     ] as Array<[string, string]>) {
       assert.equal((await request('POST', '/chat', { body: { requestId: id, text } })).status, 200)
     }
-    assert.equal(injected.length, before + 1, '同一时刻只能有一个区间在飞')
+    assert.equal(injected.length, before + 1, '同一时刻只能有一条在飞')
     assert.equal(injected.at(-1)?.text, '第一条')
 
     assistantSays('第一条的回答')
+    endActiveTurn('completed')
     bridge.onAgentIdle(agent)
     await waitFor('req-a 回复', () => eventsOf('reply', 'req-a').length === 1)
     assert.equal(injected.length, before + 2)
@@ -273,18 +433,20 @@ async function main(): Promise<void> {
     assert.equal(eventsOf('reply', 'req-a')[0].reply, '第一条的回答')
 
     assistantSays('第二条的回答')
+    endActiveTurn('completed')
     bridge.onAgentIdle(agent)
     await waitFor('req-b 回复', () => eventsOf('reply', 'req-b').length === 1)
     assert.equal(injected.at(-1)?.text, '第三条')
 
     assistantSays('第三条的回答')
+    endActiveTurn('completed')
     bridge.onAgentIdle(agent)
     await waitFor('req-c 回复', () => eventsOf('reply', 'req-c').length === 1)
     assert.equal(injected.length, before + 3, '队列最终要排空')
     assert.deepEqual(
-      seen.filter((event) => event.type === 'reply' && event.attribution === 'interval').map((event) => event.id),
-      ['req-interval', 'req-a', 'req-b', 'req-c'],
-      '每条回复都要落到发起它的那个 requestId 上',
+      seen.filter((event) => event.type === 'reply' && event.attribution === 'causal').map((event) => event.id),
+      ['req-causal', 'req-a', 'req-b', 'req-c'],
+      '每条成功回复都要落到发起它的那个 requestId 上',
     )
   })
 
@@ -300,8 +462,8 @@ async function main(): Promise<void> {
 
   await checkAsync('排队到上限后直接 429，不再往没人读的空洞里塞消息', async () => {
     const before = injected.length
-    assert.equal((await request('POST', '/chat', { body: { requestId: 'req-hold', text: '占住区间' } })).status, 200)
-    assert.equal(injected.at(-1)?.text, '占住区间')
+    assert.equal((await request('POST', '/chat', { body: { requestId: 'req-hold', text: '占住轮次' } })).status, 200)
+    assert.equal(injected.at(-1)?.text, '占住轮次')
     for (let index = 0; index < 32; index += 1) {
       const queued = await request('POST', '/chat', { body: { requestId: `req-fill-${index}`, text: `排队 ${index}` } })
       assert.equal(queued.status, 200, `第 ${index} 条应当被受理`)
@@ -346,7 +508,7 @@ async function main(): Promise<void> {
     bridge.attachTeam(team, approvals)
     bridge.writeApprovalCredential(approvals)
     assert.equal(bridge.teamEnabled, true)
-    await waitFor('团队快照事件', () => eventsOf('team/snapshot').length === 1)
+    await waitFor('团队快照事件', () => eventsOf('team/snapshot').some(event => (event.payload as { team?: boolean })?.team === true))
     assert.equal((await request('GET', '/health')).body.team, true)
 
     const snapshot = await request('GET', '/team')
@@ -358,6 +520,8 @@ async function main(): Promise<void> {
 
     const credential = JSON.parse(readFileSync(approvalFile, 'utf8')) as Record<string, unknown>
     assert.equal(credential.approvalToken, approvals.approvalCapabilityToken)
+    assert.equal(credential.reportApprovalToken, reportApprovals.approvalCapabilityToken)
+    assert.notEqual(credential.reportApprovalToken, credential.approvalToken)
     assert.equal(credential.epoch, bridge.epoch)
     assert.equal(credential.port, port)
     assert.equal(credential.token, undefined, '审批凭据文件不得混进聊天令牌')
@@ -437,20 +601,21 @@ async function main(): Promise<void> {
     const reply = eventsOf('reply', 'req-wukong')[0]
     assert.equal(reply.attribution, 'task')
     assert.equal(reply.ok, true)
-    assert.equal(reply.status, 'done')
+    assert.equal(reply.status, 'awaiting-approval', '有 needsApproval 的任务停在待批，不伪装完成')
     assert.equal(reply.reply, '找到两处空指针')
     assert.deepEqual(reply.artifacts, ['src/a.ts:12 未判空', 'src/b.ts:40 未判空'], '专家的证据必须传到宠物气泡')
     assert.deepEqual(reply.needsApproval, ['需要写入修复补丁'])
     assert.equal(delegations.length, 1)
-    const deny = delegations[0].toolFilter.deny as string[]
-    assert.ok(deny.includes('subagent') && deny.includes('subagent_fork'), '专家不得再委派')
-    for (const name of ['bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'skill', 'job_kill']) {
-      assert.ok(deny.includes(name), `${name} 有副作用，「只读」专家必须默认禁掉`)
+    // 工具面是白名单：只有已核实的观测工具进得来；report 留在子代理自身层，不进 restrict。
+    const allow = delegations[0].toolFilter.allow as string[]
+    for (const name of ['read', 'glob', 'grep']) {
+      assert.ok(allow.includes(name), `${name} 是观测工具，禁掉专家就废了`)
     }
-    for (const name of ['read', 'glob', 'grep', 'report']) {
-      assert.equal(deny.includes(name), false, `${name} 是观测/交回结论用的，禁掉专家就废了`)
+    assert.equal(allow.includes('report'), false, 'report 在子代理自身层注册，不能进 restrict 名单')
+    assert.equal(allow.includes('web_fetch'), false, 'denyExpertTools 配置追加要生效')
+    for (const name of ['bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'skill', 'job_kill', 'subagent', 'subagent_fork', 'workflow', 'send_message', 'interrupt_agent']) {
+      assert.equal(allow.includes(name), false, `${name} 绝不能进 allow 名单：副作用与再委派都不得交给专家`)
     }
-    assert.ok(deny.includes('web_fetch'), 'denyExpertTools 配置追加要生效')
     assert.ok((await request('GET', '/team')).body.tasks.length >= 1)
   })
 
@@ -464,16 +629,19 @@ async function main(): Promise<void> {
   })
 
   let proposalId = ''
+  let approvedCall: GateCall
   await checkAsync('审批端点只认独立凭据：匿名与聊天令牌都换不来批准', async () => {
-    const task = team.submitTask({ goal: '需要副作用的任务', ownerId: 'member-tangseng' })
+    const created = team.submitTask({ goal: '需要副作用的任务', ownerId: 'member-tangseng', toolScope: 'side-effect' })
+    // 模拟已领取的调用，不启动真实子代理；批准必须绑定运行中的同一成员、参数与修订。
+    const task = store.updateTask(created.taskId, created.revision, { status: 'running' })
+    assert.ok(task)
+    approvedCall = {
+      taskId: task.taskId, assistantId: task.ownerId, tool: 'write', target: 'D:/tmp/report.md',
+      params: { mode: 'append' }, inputRevision: task.revision,
+    }
     proposalId = approvals.propose({
-      taskId: task.taskId,
-      assistantId: 'member-wukong',
+      ...approvedCall,
       summary: '把结论写进 report.md',
-      tool: 'write',
-      target: 'D:/tmp/report.md',
-      params: { mode: 'append' },
-      inputRevision: task.revision,
       risk: 'medium',
     }).proposalId
     await waitFor('提案事件转发给宠物', () => eventsOf('proposal/created').length >= 1)
@@ -504,14 +672,14 @@ async function main(): Promise<void> {
     assert.ok(approved.body.expiresAt > Date.now())
     assert.equal(store.getProposal(proposalId)?.state, 'approved')
 
-    // kind 用提案里那个真实宿主工具名：门禁走的是 consumeByProposal(proposalId, call.tool)，
-    // 而这个字段会被 finish_operation 与桌面卡片直接展示，不能是自造的分类词。
-    const operation = approvals.consumeByProposal(proposalId, 'write')
+    // 仅验证执行点记账，不实际调用写入工具。
+    const operation = approvals.consumeByProposal(proposalId, 'write', approvedCall)
     assert.equal(operation.state, 'planned')
     assert.equal(operation.kind, 'write')
-    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, 'write'))), 'ALREADY_CONSUMED')
+    assert.equal(approvalCode(thrownBy(() => approvals.consumeByProposal(proposalId, 'write', approvedCall))), 'ALREADY_CONSUMED')
     approvals.settle(operation.operationId, 'succeeded', 'digest-bridge')
     assert.equal(store.getOperation(operation.operationId)?.state, 'succeeded')
+    assert.ok(store.updateTask(approvedCall.taskId, approvedCall.inputRevision, { status: 'done' }))
     await waitFor('副作用账目转发给宠物', () => eventsOf('operation/updated').length >= 1)
   })
 
@@ -567,6 +735,36 @@ async function main(): Promise<void> {
     assert.deepEqual(bridge.getPetState(), { focus: true, visible: false }, '部分更新不覆盖另一字段')
   })
 
+  await checkAsync('团队凭据与日报凭据互不通用；关闭团队不丢日报待批，仍能可信拒绝回草稿', async () => {
+    reports.saveDraft(reportId, `${reportContent}\n- 补充第二版。`, Date.now())
+    const pending = bridge.submitReport(reportId)
+    const body = { proposalId: pending.proposalId, decision: 'reject', epoch: bridge.epoch }
+    assert.equal((await request('POST', '/report-approval', {
+      body, token: false, headers: { 'x-dsh-approval-token': approvals.approvalCapabilityToken },
+    })).status, 403)
+    assert.equal((await request('POST', '/approval', {
+      body: { proposalId, decision: 'approve', epoch: bridge.epoch }, token: false,
+      headers: { 'x-dsh-approval-token': reportApprovals.approvalCapabilityToken },
+    })).status, 403)
+    bridge.detachTeam()
+    const snapshot = await request('GET', '/team')
+    assert.equal(snapshot.body.team, false)
+    assert.deepEqual(snapshot.body.members, [])
+    assert.deepEqual(snapshot.body.proposals, [pending])
+    const credential = JSON.parse(readFileSync(approvalFile, 'utf8'))
+    assert.equal(credential.approvalToken, undefined)
+    assert.equal(credential.reportApprovalToken, reportApprovals.approvalCapabilityToken)
+    const rejected = await request('POST', '/report-approval', {
+      body, token: false, headers: { 'x-dsh-approval-token': credential.reportApprovalToken },
+    })
+    assert.equal(rejected.status, 200)
+    assert.equal(rejected.body.decision, 'rejected')
+    assert.equal(reports.current(reportId)?.state, 'draft')
+    assert.deepEqual((await request('GET', '/team')).body.proposals, [])
+    assert.equal(readFileSync(reportTarget, 'utf8'), reportContent, '拒绝新版本不能改动已发布文件')
+    assert.equal(reportStops, 1)
+  })
+
   console.log('\n== 退场')
   await checkAsync('dispose 关服务、删两个发现文件，且幂等', async () => {
     draining = false
@@ -605,6 +803,8 @@ export async function run(): Promise<void> {
     } catch {
       // 已经关过了
     }
+    activeReportDb?.close()
+    activeReportDb = null
     activeBridge = null
     activeStore = null
     rmSync(dir, { recursive: true, force: true })
