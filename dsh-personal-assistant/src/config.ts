@@ -80,9 +80,16 @@ export interface Config {
   maxConcurrentInference: number
   /** 同时进行的副作用委派上限，必须小于推理上限。 */
   maxConcurrentSideEffect: number
-  /** 单个任务的执行超时（毫秒）。 */
+  /** 单个任务的执行超时（毫秒），即墙钟超时；到点取消子代理，不重发。 */
   taskTimeoutMs: number
-  /** 未显式指定时任务的 token 预算。 */
+  /**
+   * 未显式指定时任务的累计 token 预算。
+   *
+   * 默认 0 = 用户选择「无累计预算」（2026-10-17 决定）。宿主只有单次输出上限（子代理沿用父会话每次请求的
+   * maxTokens），没有累计硬上限，所以团队任务的总费用不封顶；仍然生效的只有单次输出上限、墙钟超时
+   * （taskTimeoutMs）与并发上限（maxConcurrentInference / maxConcurrentSideEffect）。
+   * 填非零值不会被假装执行：宿主守不住累计预算，这样的任务一律如实拒启（budget-unsupported）。
+   */
   defaultBudgetTokens: number
   /** 批准有效期（毫秒）；运行时代次变化会让旧批准立即失效。 */
   approvalTtlMs: number
@@ -94,6 +101,16 @@ export interface Config {
   proactiveIdleMs: number
   /** 两次主动提醒之间的最小间隔（毫秒）；设计原文建议 60 分钟。 */
   proactiveCooldownMs: number
+  /**
+   * 日报与长期记忆的写入方式：
+   * - manual（默认）：提交到桌面专用审批窗口，用户逐条批准后生效；模型不能自批。
+   * - auto：用户已在设置里明确选择"自动记录"——日报草稿直接写进目标文件，
+   *   长期偏好直接落库。模型仍然调同一个工具、仍然拿不到凭据，
+   *   签发者是用户在配置里打开的开关，不是模型自己。
+   *
+   * 注意这个值来自配置文件（用户自己改的），模型无法在会话中修改它。
+   */
+  approvalMode: 'manual' | 'auto'
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -123,10 +140,12 @@ export const Config: Schema<Config> = Schema.object({
   maxConcurrentInference: Schema.number().default(2),
   maxConcurrentSideEffect: Schema.number().default(1),
   taskTimeoutMs: Schema.number().default(600000),
-  defaultBudgetTokens: Schema.number().default(200000),
+  // 0 = 用户选择无累计预算（费用不封顶）；非零值的任务会因宿主没有累计硬上限而如实拒启。
+  defaultBudgetTokens: Schema.number().default(0),
   approvalTtlMs: Schema.number().default(300000),
   denyExpertTools: Schema.array(Schema.string()).default([]),
   proactiveEnabled: Schema.boolean().default(true),
   proactiveIdleMs: Schema.number().default(480000),
   proactiveCooldownMs: Schema.number().default(3600000),
+  approvalMode: Schema.union(['manual', 'auto']).default('manual'),
 })

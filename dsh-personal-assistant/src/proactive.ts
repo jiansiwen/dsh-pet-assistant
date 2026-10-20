@@ -43,6 +43,10 @@ export interface ProactiveInput {
   sampleIntervalMs: number
   developmentApp: boolean
   taskRunning: boolean
+  /** 会议进行中（录音 / 会议面板开着）。缺省按没有会议处理，与旧装配兼容。 */
+  meetingActive?: boolean
+  /** 已经在一起看（主动帮助 episode 进行中）：不再重复打扰。 */
+  engaged?: boolean
 }
 
 export type ProactiveDecision =
@@ -57,7 +61,9 @@ export type ProactiveSkipReason =
   | 'not-development-app'
   | 'task-running'
   | 'focus-mode'
+  | 'meeting'
   | 'stage-hidden'
+  | 'help-in-progress'
   | 'no-idle-data'
   | 'not-idle-enough'
   | 'cooldown'
@@ -124,7 +130,9 @@ export function evaluateProactive(
 
   if (state.disabled || !config.enabled) return skip('disabled')
   if (input.focusMode) return skip('focus-mode')
+  if (input.meetingActive === true) return skip('meeting')
   if (!input.stageVisible) return skip('stage-hidden')
+  if (input.engaged === true) return skip('help-in-progress')
   if (!input.captureActive) return skip('capture-inactive')
   const maxAgeMs = Math.max(15_000, input.sampleIntervalMs * 3)
   if (input.sampleAt === null || !Number.isFinite(input.sampleAt)
@@ -169,4 +177,107 @@ export function recordDisable(state: ProactiveState): ProactiveState {
 /** 用户重新打开提醒。 */
 export function recordEnable(state: ProactiveState): ProactiveState {
   return { ...state, disabled: false, declineStreak: 0, notifiedInPeriod: false }
+}
+
+// ───────────────────────────── 持久化（插件现有的 user_flags） ─────────────────────────────
+
+/** user_flags 的读写口；装配侧用 getUserFlag / setUserFlag 包一层传进来，本模块不直接碰库。 */
+export interface FlagStore {
+  get(key: string): string | null
+  set(key: string, value: string): void
+}
+
+/** 旧装配就在用的关闭标记：仍是「关没关」的权威来源，重启后关闭照旧成立。 */
+export const PROACTIVE_DISABLED_FLAG = 'proactive_disabled'
+/** 冷却与连续拒绝计数：重启后不该让刚提醒过的用户马上又被打扰一次。 */
+export const PROACTIVE_STATE_FLAG = 'proactive_state'
+
+/** 从 user_flags 恢复。空闲段是瞬时信息，不持久（重启后由第一拍采样重新判定）。 */
+export function restoreProactiveState(flags: FlagStore): ProactiveState {
+  let saved: Partial<ProactiveState> = {}
+  try {
+    const raw = flags.get(PROACTIVE_STATE_FLAG)
+    if (raw) saved = JSON.parse(raw) as Partial<ProactiveState>
+  } catch { /* 写坏的状态当成没有：最坏多一次冷却外的提醒判定，不会误开已关闭的提醒。 */ }
+  const number = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+  return {
+    ...INITIAL_PROACTIVE_STATE,
+    lastNotifiedAt: number(saved.lastNotifiedAt),
+    declineStreak: Math.max(0, Math.floor(number(saved.declineStreak) ?? 0)),
+    disabled: flags.get(PROACTIVE_DISABLED_FLAG) === 'true',
+  }
+}
+
+export function persistProactiveState(flags: FlagStore, state: ProactiveState): void {
+  flags.set(PROACTIVE_DISABLED_FLAG, state.disabled ? 'true' : 'false')
+  flags.set(PROACTIVE_STATE_FLAG, JSON.stringify({ lastNotifiedAt: state.lastNotifiedAt, declineStreak: state.declineStreak }))
+}
+
+// ───────────────────────────── 提醒 → 帮助 episode 的装配 ─────────────────────────────
+
+/** HelpEpisodeStore 满足这个形状（help-context.ts）。 */
+export interface ProactiveEpisodes {
+  offer(now: number, idlePeriodStart: number | null): unknown
+  accept(now: number, facts: () => unknown): unknown
+  decline(now: number): unknown
+  active(now: number): unknown
+}
+
+export type ProactiveFeedback = 'accept' | 'decline' | 'disable' | 'enable'
+
+/**
+ * 主动提醒的一站式装配：评估 → 弹气泡时记 episode → 用户点选时推进状态机与 episode → 落 user_flags。
+ *
+ * 结构性的「不做」都在这里：拒绝、关闭、不回应三条路上 facts 根本不会被调用（不生成候选、不读任何东西）；
+ * 已经在一起看的时候不再提醒；关闭写进 user_flags，重启后仍然关闭。
+ * 本类不设定时器、不碰文件：装配侧负责周期调用 evaluate 与转发点选。
+ */
+export class ProactiveHelpFlow {
+  private current: ProactiveState
+  private readonly flags: FlagStore
+  private readonly episodes: ProactiveEpisodes | undefined
+  private readonly config: ProactiveConfig
+  private readonly facts: () => unknown
+
+  constructor(options: { flags: FlagStore; config: ProactiveConfig; episodes?: ProactiveEpisodes; facts: () => unknown }) {
+    this.flags = options.flags
+    this.episodes = options.episodes
+    this.config = options.config
+    this.facts = options.facts
+    this.current = restoreProactiveState(options.flags)
+  }
+
+  get state(): ProactiveState {
+    return { ...this.current }
+  }
+
+  /** 评估一拍；真的要提醒时先记一条 offered episode，再把决定交给装配侧推气泡。 */
+  evaluate(input: ProactiveInput): ProactiveDecision {
+    const engaged = input.engaged === true || (this.episodes?.active(input.now) ?? null) !== null
+    const before = this.current
+    const { state, decision } = evaluateProactive(before, { ...input, engaged }, this.config)
+    this.current = state
+    if (decision.kind !== 'none') {
+      this.episodes?.offer(input.now, state.idlePeriodStart)
+      persistProactiveState(this.flags, state)
+    }
+    return decision
+  }
+
+  /** 用户在气泡上的点选。只有「好」会生成候选；其余几条路什么都不读。 */
+  feedback(kind: ProactiveFeedback, now: number): void {
+    if (kind === 'accept') {
+      this.current = recordAccept(this.current)
+      this.episodes?.accept(now, this.facts)
+    } else if (kind === 'decline') {
+      this.current = recordDecline(this.current)
+      this.episodes?.decline(now)
+    } else if (kind === 'disable') {
+      this.current = recordDisable(this.current)
+      this.episodes?.decline(now)
+    } else {
+      this.current = recordEnable(this.current)
+    }
+    persistProactiveState(this.flags, this.current)
+  }
 }

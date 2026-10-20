@@ -30,17 +30,20 @@ try {
 }
 
 try {
-    # Wake word "Xiao Pan Xiao Pan" (U+5C0F U+6F58 U+5C0F U+6F58).
+    # Wake word "Xiao Pan Tong Xue" (U+5C0F U+6F58 U+540C U+5B66).
     #
-    # Doubled on purpose: a single "Xiao Pan" is only two syllables and gets fired by
-    # ambient conversation ("...small...plate..."). Four syllables is long enough that
-    # ordinary speech rarely produces it, while still being quick to say.
+    # Four syllables, and unlike the old "Xiao Pan Xiao Pan" the tail ("tong xue") is a
+    # distinct word pair rather than a repeat: the recognizer matches whole phrases, so a
+    # repeated two-syllable word is far more likely to be produced by ambient speech than
+    # this one. It also reads like a name people actually say out loud.
     #
     # The grammar itself lives in wake-grammar.ps1 so the offline probe
     # (_verify/wake-grammar-probe.ps1) exercises the exact same builder -- otherwise a
     # probe result would only be evidence about a copy that may have drifted.
     . (Join-Path $PSScriptRoot 'wake-grammar.ps1')
-    $wakeCodepoints = @(0x5C0F, 0x6F58, 0x5C0F, 0x6F58)
+    # U+5C0F U+6F58 U+540C U+5B66 (Xiao Pan Tong Xue) -- keep this line ASCII-only:
+    # PowerShell 5.1 parses BOM-less UTF-8 as GBK, so a literal here would corrupt the script.
+    $wakeCodepoints = @(0x5C0F, 0x6F58, 0x540C, 0x5B66)
     $built = New-WakeGrammar -WakeCodepoints $wakeCodepoints -WithVariants
     $engine.LoadGrammar($built.Grammar)
 } catch {
@@ -51,12 +54,29 @@ try {
 Write-Output '{"ready":true}'
 [Console]::Out.Flush()
 
+# Transient recognize errors must not end the listener.
+#
+# The old loop broke out on the first exception, which killed the process; the supervisor
+# restarts it three seconds later, so short glitches were survivable -- but a persistent
+# error turned into a restart storm while the user heard nothing. A single failed
+# Recognize() almost always means "no speech in this window" or a device hiccup, so retry
+# instead: give up only after a long run of consecutive failures, which is when the
+# process really is wedged and the supervisor should take over.
+$consecutiveFailures = 0
+$maxConsecutiveFailures = 30
+
 while ($true) {
     try {
         $reco = $engine.Recognize([TimeSpan]::FromSeconds(3))
+        $consecutiveFailures = 0
     } catch {
-        Write-Output '{"ok":false,"error":"recognize-failed"}'
-        break
+        $consecutiveFailures++
+        if ($consecutiveFailures -ge $maxConsecutiveFailures) {
+            Write-Output '{"ok":false,"error":"recognize-failed"}'
+            break
+        }
+        Start-Sleep -Milliseconds 200
+        continue
     }
 
     if ($reco -and $reco.Text) {

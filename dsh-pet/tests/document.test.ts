@@ -707,3 +707,45 @@ describe('mentionsDocs（意图识别的前置筛子）', () => {
     assert.equal(mentionsDocs('解释一下这段代码'), true)
   })
 })
+
+describe('阅读视图快照（不走缓存，每次重查授权与指纹）', () => {
+  class BytesFs extends FakeFs {
+    override async readBytes(target: string): Promise<Uint8Array> {
+      const real = norm(await this.realpath(target))
+      this.readCount++
+      return new Uint8Array(Buffer.from(this.tree.get(real) ?? ''))
+    }
+  }
+
+  test('授权内且指纹一致才给字节；撤销、越界、符号链接换指向、改内容、超限都拒', async () => {
+    const fs = new BytesFs().seed('D:/docs/a.pdf', 'v1').seed('D:/other/b.pdf', 'evil')
+    let roots = ['D:/docs']
+    const library = new DocumentLibrary(fs, () => roots)
+    const first = await library.snapshot('D:/docs/a.pdf')
+    assert.equal(first.kind, 'snapshot')
+    assert.ok(first.kind === 'snapshot')
+    const fingerprint = first.fingerprint
+    assert.equal((await library.snapshot('D:/docs/a.pdf', fingerprint)).kind, 'snapshot')
+
+    fs.seed('D:/docs/a.pdf', 'v2')
+    const changed = await library.snapshot('D:/docs/a.pdf', fingerprint)
+    assert.equal(changed.kind, 'changed')
+
+    assert.equal((await library.snapshot('D:/other/b.pdf')).kind, 'denied')
+    fs.link('D:/docs/a.pdf', 'D:/docs/c.pdf').seed('D:/docs/c.pdf', 'v1')
+    assert.equal((await library.snapshot('D:/docs/a.pdf', fingerprint)).kind, 'changed', '链接换了指向不跟着走')
+    fs.links.clear()
+
+    fs.sizes.set('D:/docs/a.pdf', MAX_DOC_BYTES + 1)
+    assert.equal((await library.snapshot('D:/docs/a.pdf')).kind, 'too-big')
+    fs.sizes.clear()
+
+    const reads = fs.readCount
+    roots = []
+    assert.equal((await library.snapshot('D:/docs/a.pdf')).kind, 'denied')
+    assert.equal(fs.readCount, reads, '越权时不读取')
+    roots = ['D:/docs']
+    fs.tree.delete('D:/docs/a.pdf')
+    assert.equal((await library.snapshot('D:/docs/a.pdf')).kind, 'missing')
+  })
+})

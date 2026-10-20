@@ -81,6 +81,8 @@ const quitCalls: number[] = []
 const registeredShortcuts: string[] = []
 let shortcutsCleared = 0
 let dockHideCalls = 0
+/** 注册过几次桌面采集授权回调。装配时必须正好一次 —— 不注册，会议就永远只有麦克风一轨。 */
+let displayMediaHandlers = 0
 const windows: FakeBrowserWindow[] = []
 const trays: FakeTray[] = []
 
@@ -222,6 +224,23 @@ const fakeElectron = {
     openPath: () => Promise.resolve(''),
     openExternal: () => Promise.resolve(),
   },
+  // 会议回环声的桌面采集授权（M4-03）。装配时会注册一次 handler；
+  // 测试里没有任何会议在录，所以它永远不该被调用 —— 被调就炸出来。
+  session: {
+    defaultSession: {
+      setDisplayMediaRequestHandler: () => {
+        displayMediaHandlers += 1
+      },
+    },
+  },
+  desktopCapturer: {
+    getSources: async () => [],
+  },
+  // 模型下载走 Electron 的 net.fetch（走系统代理），主进程装配时会引用它。
+  // 这份测试不下载任何东西：给了就报错，避免"测试里偷偷联网"。
+  net: {
+    fetch: () => { throw new Error('装配测试不得发起网络请求') },
+  },
   nativeImage: {
     // resize 返回的对象要能接 setTemplateImage —— macOS 分支会调它把图标标成
     // 跟随菜单栏主题反色的单色蒙版。
@@ -254,18 +273,36 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
 
 test('通道清单：舞台侧注册的每一条都该在，一条不多', () => {
   const expectedOn = [
-    'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'stage-set-visible', 'stage-set-focus',
+    'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'speech-local', 'stage-set-visible', 'stage-set-focus',
+    // 演示隐私模式（M5-05）：与专注、隐藏各自独立，只改"渲染哪些历史与预览"。
+    'presentation-mode',
     'proactive-respond', 'overlay-state',
+    // 阅读视图窗口的回报通道：在 doc-view-window 里注册并核对发送方是阅读视图本身。
+    'doc-view-report',
+    // 共享采集 / KWS 唤醒 / 渲染层播放 / 插话（M1-02、M1-03、M1-05）：全部核对来源是舞台窗口。
+    'kws-feed', 'audio-consumer-lost', 'tts-playback-receipt', 'barge-in-detected', 'barge-in-metrics',
   ]
   const expectedHandle = [
-    'get-state', 'save-settings', 'chat-send', 'session-get', 'session-command',
+    'get-state', 'save-settings', 'chat-send', 'session-get', 'session-command', 'session-start',
     'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir', 'doc-open', 'doc-explain', 'doc-ask',
+    'doc-view-session', 'doc-view-bytes', 'doc-view-page', 'doc-view-resource',
+    // 日报工作台窗口的通道在 report-workbench-window 里注册并核对发送方；舞台侧只有打开入口。
+    'report-workbench-open', 'report-workbench:load', 'report-workbench:edit', 'report-workbench:request-publish',
+    'report-workbench:deletion-preview', 'report-workbench:request-deletion', 'report-workbench:import-material',
+    'report-workbench:request-share',
     'team-get', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
     'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select',
+    // 环境检查（M5-06）：只查、只按用户确认执行，不主动下载、不主动改系统设置。
+    'first-run-report', 'first-run-download', 'first-run-open-settings',
+    // 会议系统音频能力查询（M4-03）：渲染层开会前问一次，拿不到就不去反复试。
+    'meeting-loopback-capability',
+    // 外部证据收件（M3-03 / M4-06 后续）：主进程弹原生确认框，用户同意后才上报。
+    'evidence-intake-minutes', 'evidence-intake-window',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
     'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
+    'audio-sync', 'residency-state', 'residency-set',
   ]
   assert.deepEqual([...ipcListeners.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedOn].sort())
   assert.deepEqual([...ipcHandlers.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedHandle].sort())
@@ -288,8 +325,8 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
   // preload 里 expose 的 invoke/send 清单。暴露了没人接 = 渲染层调一下 promise 永远悬着，
   // 界面看起来"点了没反应"，而日志上一切正常 —— 这类断裂只有对清单才看得出来。
   const exposed = [
-    'get-state', 'save-settings', 'mouse-state', 'context-menu', 'chat-send', 'speech-stop',
-    'session-get', 'session-command', 'overlay-state',
+    'get-state', 'save-settings', 'mouse-state', 'context-menu', 'chat-send', 'speech-stop', 'speech-local',
+    'session-get', 'session-command', 'session-start', 'overlay-state', 'report-workbench-open',
     'team-get', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
     'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'runtime-start', 'runtime-stop',
@@ -299,6 +336,8 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
     'exit-done',
+    'audio-sync', 'kws-feed', 'audio-consumer-lost', 'tts-playback-receipt', 'barge-in-detected', 'barge-in-metrics',
+    'residency-state', 'residency-set',
   ]
   for (const channel of exposed) {
     assert.ok(ipcHandlers.has(channel) || ipcListeners.has(channel), `preload 暴露了 ${channel}，主进程没接`)
@@ -325,6 +364,32 @@ test('stage-set-focus：专注模式掐掉唤醒监听，退出专注再恢复 �
   setFocus({} as object, false)
   assert.equal(wakeStarts.length, startsBefore + 1, '专注结束：唤醒监听恢复')
   assert.ok(lastSent('companion-state') !== undefined, '状态变化投影到了界面')
+})
+
+test('会议回环声：装配时注册了桌面采集授权，否则永远只有麦克风一轨', () => {
+  // Electron 17+ 起，渲染层的 getDisplayMedia 不再自己弹框，而是问主进程的 handler。
+  // 少这一次注册，"对方的声音"在每场会议里都是缺失，而用户看不出是没实现。
+  assert.equal(displayMediaHandlers, 1)
+})
+
+test('presentation-mode：只藏历史与提醒，不动麦克风、不动专注模式', () => {
+  const setPresentation = ipcListeners.get('presentation-mode')
+  assert.ok(setPresentation)
+  const wakesBefore = wakeStarts.length
+  const stopsBefore = wakeStops
+  const focusBefore = (lastSent('companion-state') as { focusMode?: boolean } | undefined)?.focusMode
+
+  setPresentation({} as object, true)
+  const after = lastSent('companion-state') as { presentationMode?: boolean; focusMode?: boolean; stageVisible?: boolean } | undefined
+  assert.equal(after?.presentationMode, true, '状态投影到界面：渲染层据此隐藏历史与预览')
+  assert.equal(after?.focusMode, focusBefore ?? false, '演示不该顺带打开/关闭专注模式')
+  assert.equal(after?.stageVisible, true, '角色不该被隐藏：演示时用户还要看它讲解')
+  assert.equal(wakeStarts.length, wakesBefore, '不重启唤醒监听')
+  assert.equal(wakeStops, stopsBefore, '麦克风不受影响：演示时还要插话')
+
+  setPresentation({} as object, false)
+  const off = lastSent('companion-state') as { presentationMode?: boolean } | undefined
+  assert.equal(off?.presentationMode, false, '关掉即恢复显示')
 })
 
 test('speech-stop：不管说没说话都先停链条，说过话才记"实际念出的部分"', () => {

@@ -101,6 +101,20 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
   useEffect(() => {
     if (!behavior.protected && projected) force(projected)
   }, [projected, force, behavior.protected])
+  /**
+   * 任务/会话结束后必须**主动收回**工作姿态。
+   *
+   * `actionForStatus` 在"没有状态"时返回 null 表示"不投影"，但 force 是一次性赋值：
+   * 上一拍设成 write/read 之后，没有任何代码把它改回去 —— 于是回复结束了，角色还在
+   * 对着电脑敲个不停。这里盯住"从有动作变回没有动作"这个沿，把它收回 idle。
+   */
+  const previousProjected = useRef<PetAction | null>(null)
+  useEffect(() => {
+    const wasWorking = previousProjected.current !== null
+    previousProjected.current = projected
+    if (behavior.protected || projected !== null || !wasWorking) return
+    force('idle')
+  }, [projected, force, behavior.protected])
 
   const markForegroundColor = useMemo(() => markForeground(manifest.markColor), [manifest.markColor])
   const attention = needsAttention(status)

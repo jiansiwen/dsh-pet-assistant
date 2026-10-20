@@ -9,13 +9,16 @@
  * - 专家只读，副作用一律先提案、经可信主体签发批准后才能消费执行；
  * - 批准 id 不进入模型上下文，模型只持有自己提交的 proposalId。
  */
+import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ApprovalService } from './approval.ts'
 import { ApprovalError } from './approval.ts'
-import { gateDecision } from './gate.ts'
+import { PATH_TARGET_TOOLS, canonicalPath, canonicalRoot, fileVersion, gateDecision, isWithinRoot } from './gate.ts'
+import { HelpTaskError } from './help-task.ts'
 import type { SessionBridge } from './bridge.ts'
 import type { TaskOutcome, TeamService } from './team.ts'
+import { REVIEW_RESOLUTIONS, type OperationRecord } from './team-domain.ts'
 
 interface TeamHost {
   tools: { register(definition: unknown): () => void }
@@ -59,6 +62,48 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** 帮助任务工具的统一失败回执：带上可编程判断的错误码。 */
+function failure(error: unknown): string {
+  return json({ ok: false, error: errorMessage(error), ...(error instanceof HelpTaskError ? { code: error.code } : {}) })
+}
+
+function tail(text: unknown, max: number): string | null {
+  return typeof text === 'string' ? (text.length <= max ? text : `…${text.slice(-max)}`) : null
+}
+
+/** 验收证据的紧凑投影：退出码、结论、文件结果与输出结尾；完整输出留在账本里。 */
+function evidenceView(evidence: unknown): unknown {
+  if (typeof evidence !== 'object' || evidence === null) return null
+  const record = evidence as Record<string, unknown>
+  if (record.kind === 'run_verification') {
+    return {
+      kind: record.kind, outcome: record.outcome ?? null, verdict: record.verdict ?? null, exitCode: record.exitCode ?? null,
+      signal: record.signal ?? null, timedOut: record.timedOut ?? false, durationMs: record.durationMs ?? null,
+      stdoutTail: tail(record.stdout, 800), stderrTail: tail(record.stderr, 800),
+      stdoutTruncated: record.stdoutTruncated ?? false, stderrTruncated: record.stderrTruncated ?? false,
+      fileResults: record.fileResults ?? null,
+    }
+  }
+  return evidence
+}
+
+/** 可信账目的对外投影：只给摘要与时间，不含参数或结果正文。 */
+function operationView(item: OperationRecord) {
+  return {
+    operationId: item.operationId,
+    taskId: item.taskId,
+    kind: item.kind,
+    target: item.target ?? null,
+    state: item.state,
+    startedAt: item.startedAt,
+    executedAt: item.executedAt ?? null,
+    endedAt: item.endedAt,
+    resultDetail: item.resultDetail ?? null,
+    evidence: evidenceView(item.evidence),
+    review: item.review ?? null,
+  }
+}
+
 export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () => void {
   const disposers: Array<() => void> = []
   const dispose = () => {
@@ -92,7 +137,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
 
   ctx.tools.register(defineTool({
     name: 'desktop_team_start',
-    description: '开启桌面专家助理团：把当前会话登记为总助理（唐僧）的宿主会话，写入团队成员编制，并让桌面宠物可以显示多角色舞台与任务面板。用户说"开启团队模式"、"叫上专家"、"启动助理团"时调用。',
+    description: '开启桌面专家助理团：把当前会话登记为总助理的宿主会话，写入团队成员编制，并让桌面宠物可以显示多角色舞台与任务面板。用户说"开启团队模式"、"叫上专家"、"启动助理团"时调用。',
     parameters: {},
     output: textOutput,
     async execute(_args: unknown, exec: unknown) {
@@ -120,14 +165,14 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
 
   ctx.tools.register(defineTool({
     name: 'desktop_team_assign',
-    description: '把一项任务派给指定成员并等待其真实运行结果。member 用点名（唐僧/孙悟空/悟空/猪八戒/八戒等）；名字不存在或席位未启用会直接报错，不会替你换人。专家默认只读，需要外部副作用时它们会在 needsApproval 里提出，由你用 desktop_team_propose_action 走用户审批。',
+    description: '把一项任务派给指定成员并等待其真实运行结果。member 用点名（总助理/助理1/助理2等）；名字不存在或席位未启用会直接报错，不会替你换人。专家默认只读，需要外部副作用时它们会在 needsApproval 里提出，由你用 desktop_team_propose_action 走用户审批。',
     parameters: {
-      member: { type: 'string', required: true, description: '承接成员的点名，如"孙悟空"' },
+      member: { type: 'string', required: true, description: '承接成员的点名，如"总助理"' },
       goal: { type: 'string', required: true, description: '任务目标，一句话说清要解决什么' },
       evidence: { type: 'array', items: { type: 'string' }, description: '交给成员的已知材料（文件路径、报错原文、用户原话等）' },
       acceptance: { type: 'array', items: { type: 'string' }, description: '验收条件；当前自由文本产物需独立复核，模型自报不能标记任务完成' },
       dependsOn: { type: 'array', items: { type: 'string' }, description: '前置任务 id；前置未完成时本任务留在排队状态' },
-      budgetTokens: { type: 'integer', description: '累计 token 预算。当前宿主不支持硬约束：非零预算会拒绝启动；0 明确表示不设累计预算' },
+      budgetTokens: { type: 'integer', description: '累计 token 预算。默认 0 = 用户选择不设累计预算（费用不封顶，只受单次输出上限、墙钟超时与并发上限约束）；宿主没有累计硬上限，非零预算会如实拒绝启动' },
     },
     output: textOutput,
     async execute(
@@ -205,32 +250,34 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
           risk: item.risk,
           expiresAt: item.expiresAt,
         })),
-        operations: approvals.operations(args.taskId).slice(0, 20).map(item => ({
-          operationId: item.operationId,
-          taskId: item.taskId,
-          kind: item.kind,
-          state: item.state,
-        })),
+        operations: approvals.operations(args.taskId).slice(0, 20).map(operationView),
+        // 帮助任务：episode / 授权范围 / 每版改动 / 每次验证 / 由账本推出的结论（mayClaimFixed 只看真实退出码）。
+        ...(args.taskId && team.help.helpTask(args.taskId) ? { help: team.help.status(args.taskId) } : {}),
       })
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'desktop_team_cancel',
-    description: '取消一个任务：停掉它正在运行的子代理并把状态置为 cancelled。已经发生的外部副作用不会被撤回，返回里会列出，必须如实告知用户。',
+    description: '取消一个任务：停掉它正在运行的子代理并把状态置为 cancelled。返回结构化回执 state（not-executed 未执行 / cancelling 取消中 / terminated 已终止 / partially-executed 已部分执行 / unknown 结果未知）与终止证据；已经发生的外部副作用不会被撤回，返回里会列出，必须如实告知用户，不得把「取消中」说成已停止。',
     parameters: {
       taskId: { type: 'string', required: true, description: '要取消的任务 id' },
     },
     output: textOutput,
     async execute(args: { taskId: string }) {
-      const task = await team.cancelTask(args.taskId)
-      if (!task) return json({ ok: false, error: `任务 ${args.taskId} 不存在` })
+      // 回执只认真实终止证据（运行结束记录 + 子代理释放完成）；等不到就如实报「取消中」。
+      const receipt = await team.cancelWithReceipt(args.taskId)
+      if (!receipt) return json({ ok: false, error: `任务 ${args.taskId} 不存在` })
+      const task = team.getTask(args.taskId)
       return json({
         ok: true,
-        taskId: task.taskId,
-        status: task.status,
-        operationsAlreadyPerformed: approvals.operations(task.taskId).map(item => ({ kind: item.kind, state: item.state })),
-        note: '取消只停止后续工作，已执行的副作用不会自动回滚',
+        taskId: args.taskId,
+        status: task?.status ?? receipt.evidence.taskStatus ?? null,
+        state: receipt.state,
+        evidence: receipt.evidence,
+        message: receipt.message,
+        operationsAlreadyPerformed: approvals.operations(args.taskId).map(item => ({ kind: item.kind, target: item.target ?? null, state: item.state })),
+        note: '取消只停止后续工作，已执行的副作用不会自动回滚；结果不明的副作用不会自动重发',
       })
     },
   }))
@@ -260,7 +307,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       assistantId: { type: 'string', description: '必须与任务所属成员一致；缺省使用任务成员' },
     },
     output: textOutput,
-    async execute(args: { taskId: string; summary: string; tool: string; target: string; params?: unknown; risk: 'low' | 'medium' | 'high'; assistantId?: string }) {
+    async execute(args: { taskId: string; summary: string; tool: string; target: string; params?: unknown; risk: 'low' | 'medium' | 'high'; assistantId?: string }, exec: unknown) {
       const task = team.getTask(args.taskId)
       if (!task) return json({ ok: false, error: `任务 ${args.taskId} 不存在` })
       const assistantId = args.assistantId ?? task.ownerId
@@ -268,22 +315,45 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       if (['done', 'failed', 'cancelled', 'unknown'].includes(task.status)) return json({ ok: false, error: '任务已终止或结果不明，需先复核' })
       const decision = gateDecision(args.tool, args.params)
       if (decision.kind !== 'gated' || decision.target !== args.target) return json({ ok: false, error: '工具不支持审批或完整参数中的目标与提案不符' })
+      // 写类目标按执行器同一口径规范化成真实路径：批准绑定的必须是执行时真正会写到的位置。
+      let target = args.target
+      let baseHash: string | null = null
+      const cwd = (exec as ExecContext | undefined)?.agent?.session?.header?.cwd
+      const root = canonicalRoot(cwd)
+      if (PATH_TARGET_TOOLS.includes(args.tool) && root !== undefined && cwd !== undefined) {
+        if (args.tool === 'str_replace_editor' && !path.isAbsolute(args.target)) return json({ ok: false, error: 'str_replace_editor 的 path 必须是绝对路径' })
+        try {
+          target = canonicalPath(args.target, cwd)
+        } catch (error) {
+          return json({ ok: false, error: `无法确认目标的实际位置：${errorMessage(error)}` })
+        }
+        if (!isWithinRoot(root, target)) {
+          return json({ ok: false, error: `目标实际位置 ${target} 不在会话工作区 ${root} 内（符号链接与相似前缀按真实路径判断），执行器会拒绝` })
+        }
+        // 同时绑定目标此刻的内容版本：用户在批准后改了这个文件，这条批准就不能再用。
+        baseHash = fileVersion(target)
+      }
       const proposal = approvals.propose({
         taskId: task.taskId,
         assistantId,
         summary: args.summary,
         tool: args.tool,
-        target: args.target,
+        target,
         params: args.params ?? null,
         inputRevision: task.revision,
         risk: args.risk,
+        baseHash,
       })
       return json({
         ok: true,
         proposalId: proposal.proposalId,
         state: proposal.state,
+        target: proposal.target,
+        baseHash,
         expiresAt: proposal.expiresAt,
-        note: '等待可信审批决定。当前只读团队不执行副作用；获批也不代表已执行。需任务专用可信执行器绑定最新版本后消费，不能在普通主会话直接调用工具代替。',
+        note: '等待可信审批决定。提交提案本身不执行副作用；获批也不代表已执行——只有该任务运行中的可信执行器以完全相同的参数调用时才会消费这一次批准，'
+          + '执行结果以执行账本为准。不能在普通主会话直接调用工具代替。'
+          + (baseHash !== null ? '批准还绑定了目标文件此刻的内容版本，文件在批准后被改动就需要重新提案。' : ''),
       })
     },
   }))
@@ -305,7 +375,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
         if (!operation || (args.operationId && args.operationId !== operation.operationId)) {
           return json({ ok: false, error: '提案没有匹配的真实执行记录' })
         }
-        return json({ ok: true, operationId: operation.operationId, kind: operation.kind, state: operation.state,
+        return json({ ok: true, ...operationView(operation),
           note: '返回可信账目，忽略模型自报状态和摘要；结果不明时须人工核查，禁止盲重试' })
       } catch (error) {
         return json({ ok: false, error: errorMessage(error), note: '查不到执行记录说明门禁从未放行过这次副作用；不要凭空报成功。' })
@@ -313,13 +383,162 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     },
   }))
 
+  ctx.tools.register(defineTool({
+    name: 'desktop_team_review_unknown',
+    description:
+      '为执行账本里一条结果不明（unknown）的操作申请人工复核。先请用户核对真实外部状态，再按用户的结论提交：'
+      + 'verified-succeeded（已核实成功）/ verified-failed（已核实失败）/ abandoned（放弃核查）。'
+      + '调用本身不改账本，只在桌面审批窗口生成一张复核卡；用户批准后结论才写进账本。模型自报的结论无效，不要对用户说已核实。',
+    parameters: {
+      operationId: { type: 'string', required: true, description: '执行账本里状态为 unknown 的 operationId（desktop_team_status 可查）' },
+      resolution: { type: 'string', enum: [...REVIEW_RESOLUTIONS], required: true, description: '用户给出的结论' },
+      note: { type: 'string', description: '用户核对的依据，原样写进复核卡与账本（不超过 500 字）' },
+    },
+    output: textOutput,
+    async execute(args: { operationId: string; resolution: string; note?: string }) {
+      try {
+        return json(team.help.proposeReview(args))
+      } catch (error) {
+        return failure(error)
+      }
+    },
+  }))
+
+  // 帮助任务（M2-06）：只有装配了帮助授权来源才注册 —— 没有授权边界就不该有读取与改动入口。
+  if (team.help.available) {
+    ctx.tools.register(defineTool({
+      name: 'desktop_team_open_help_task',
+      description:
+        '在用户已经经桌面审批窗口授权的帮助范围上开一个帮助任务（记在总助理名下，账本里可追溯）。之后的读取、改动提案、验证命令都挂在这个任务上。'
+        + '没有有效授权（未授权、已撤销、实际路径已改指）会直接拒绝。',
+      parameters: {
+        projectDir: { type: 'string', required: true, description: '已授权帮助范围的项目目录（绝对路径，与授权记录一致）' },
+        goal: { type: 'string', required: true, description: '这次帮助要做什么，一句话' },
+        episodeId: { type: 'string', description: '从主动提醒进入时，personal_assistant_help_candidates 给出的 episodeId，用来把这次帮助串进账本' },
+        helpContextId: { type: 'string', description: '可选：指定哪一条授权记录（同一目录既有目录级又有文件级授权时）' },
+      },
+      output: textOutput,
+      async execute(args: { projectDir: string; goal: string; episodeId?: string; helpContextId?: string }) {
+        try {
+          const { task, link } = team.help.openTask(args)
+          return json({ ok: true, taskId: task.taskId, status: task.status, projectRoot: link.projectRoot, currentFile: link.currentFile,
+            episodeId: link.episodeId, helpContextId: link.helpContextId,
+            note: '只能读取这个范围；改动用 desktop_team_propose_change，验证用 desktop_team_propose_verification，每一步都要用户单独批准。' })
+        } catch (error) {
+          return failure(error)
+        }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'desktop_team_read_file',
+      description:
+        '只读帮助任务授权范围内的一个文件或目录（路径按真实位置判断，越界、授权撤销、二进制文件都会拒绝）。'
+        + '文件返回全文内容哈希 hash —— 提交改动提案时它就是该文件的 baseHash；目录返回条目清单。',
+      parameters: {
+        taskId: { type: 'string', required: true, description: '帮助任务 id' },
+        path: { type: 'string', description: '相对授权根目录或绝对路径；缺省读授权范围本身' },
+        startLine: { type: 'integer', description: '从第几行开始（1 起），缺省 1' },
+        maxLines: { type: 'integer', description: '最多返回多少行，缺省 2000，上限 4000' },
+      },
+      output: textOutput,
+      async execute(args: { taskId: string; path?: string; startLine?: number; maxLines?: number }) {
+        try {
+          return json(team.help.read(args))
+        } catch (error) {
+          return failure(error)
+        }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'desktop_team_propose_change',
+      description:
+        '为帮助任务提交一版改动提案（不写任何文件）。每个文件给出：path、读取时拿到的 baseHash（新建文件写 absent），'
+        + '以及 content（整文件替换内容）或 diff（该文件的统一 diff）二选一。插件重算差异后推到桌面审批卡；'
+        + '用户批准后由可信执行器应用：应用前重读哈希，文件在此期间被改过就冲突暂停、一个文件都不写；写入用临时文件加改名，前后哈希进账本。'
+        + '同一任务的新提案会取代还没执行的旧提案。不要用 write/edit/bash 直接改用户的项目。',
+      parameters: {
+        taskId: { type: 'string', required: true, description: '帮助任务 id' },
+        summary: { type: 'string', required: true, description: '一句话说明这版改动要解决什么（会显示在审批卡上）' },
+        files: {
+          type: 'array',
+          required: true,
+          description: '要改的文件，最多 20 个',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              path: { type: 'string', required: true, description: '相对授权根目录或绝对路径' },
+              baseHash: { type: 'string', required: true, description: 'desktop_team_read_file 返回的 hash；新建文件写 absent' },
+              content: { type: 'string', description: '整文件替换内容（与 diff 二选一）' },
+              diff: { type: 'string', description: '针对这一个文件的统一 diff（@@ 段，上下文必须与读取到的内容逐字一致；与 content 二选一）' },
+            },
+          },
+        },
+      },
+      output: textOutput,
+      async execute(args: { taskId: string; summary: string; files: Array<{ path: string; baseHash: string; content?: string; diff?: string }> }) {
+        try {
+          return json(team.help.proposeChange(args))
+        } catch (error) {
+          return failure(error)
+        }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'desktop_team_propose_verification',
+      description:
+        '为帮助任务提交一条验证命令（不运行）：程序 + 参数数组（不经 shell，不要把命令拼成一个字符串），cwd 必须在授权范围内，'
+        + '必须给超时与预期副作用说明。程序会解析成绝对路径（不搜索工作目录）；shell、脚本宿主与 Windows 的 .cmd/.bat 不支持，'
+        + '例如 npm 脚本请改成 node node_modules/<包>/bin/<入口>.js。批准后由可信执行器运行一次，真实退出码与截断输出写进账本。',
+      parameters: {
+        taskId: { type: 'string', required: true, description: '帮助任务 id' },
+        program: { type: 'string', required: true, description: '程序名（如 node、python）或可执行文件路径' },
+        args: { type: 'array', items: { type: 'string' }, required: true, description: '参数数组，每个参数单独一项' },
+        cwd: { type: 'string', description: '工作目录（相对授权根目录或绝对路径），缺省为授权根目录' },
+        timeoutSeconds: { type: 'integer', required: true, description: '超时秒数（1-1800），到点结束整个进程树' },
+        expectedEffects: { type: 'string', required: true, description: '预期副作用说明，例如「只运行测试，不修改源文件」' },
+      },
+      output: textOutput,
+      async execute(args: { taskId: string; program: string; args: string[]; cwd?: string; timeoutSeconds: number; expectedEffects: string }) {
+        try {
+          return json(team.help.proposeVerification(args))
+        } catch (error) {
+          return failure(error)
+        }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'desktop_team_wait',
+      description:
+        '等待用户对改动 / 验证 / 复核审批卡的决定；批准后再等可信执行器跑完，返回账本结果与 verdict。'
+        + '超时只表示还没等到，不会作废审批卡。只有 verdict.mayClaimFixed 为 true 才能说修复完成。',
+      parameters: {
+        proposalId: { type: 'string', required: true, description: 'propose 工具返回的 proposalId' },
+        timeoutSeconds: { type: 'integer', description: '最多等多少秒，缺省 120，上限 600' },
+      },
+      output: textOutput,
+      async execute(args: { proposalId: string; timeoutSeconds?: number }, exec: unknown) {
+        const seconds = Math.min(600, Math.max(1, Math.floor(args.timeoutSeconds ?? 120)))
+        try {
+          return json({ ok: true, ...await team.help.wait(args.proposalId, (exec as ExecContext | undefined)?.signal ?? new AbortController().signal, seconds * 1000) })
+        } catch (error) {
+          return failure(error)
+        }
+      },
+    }))
+  }
+
   ctx.systemPrompt.section({
     name: 'desktop-team',
     order: 160,
     text: [
       '## 桌面专家助理团',
       '',
-      '本环境装有 desktop_team_* 工具。你（当前会话）就是总助理唐僧：负责理解用户目标、拆分任务、点名委派、转交审批、汇总结论。',
+      '本环境装有 desktop_team_* 工具。你（当前会话）就是总助理总助理：负责理解用户目标、拆分任务、点名委派、转交审批、汇总结论。',
       '',
       '成员编制（只有 enabled 的席位能接单）：',
       '{{desktop_team_roster}}',
@@ -329,12 +548,24 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       '- 需要专业分析时调用 desktop_team_assign 点名委派，把已知材料写进 evidence、把可核验要求写进 acceptance。返回的 summary/artifacts/blockers 是子代理的真实运行结果，直接引用，不要改写成自己的判断。',
       '- 点名必须精确：名字不存在或席位未启用时工具会报错，此时如实告诉用户，不要自动换成别的成员。',
       '- 专家席位是只读的：write / edit / bash / pwsh / str_replace_editor / skill / job_kill 这些工具根本不在它们手里，也别指望它们替你动手。',
-      '- 当前团队只运行只读 spawn 委派。副作用可提交提案，但需要独立可信执行器接入；批准不是执行结果，不得在普通主会话直接调用工具冒充已走团队门禁。desktop_team_finish_operation 只查询可信结果，不接受模型自报结账。',
-      '- 非零累计 token 预算当前无法硬约束，任务会拒绝启动；不得擅自改成 0 绕过预算。无可信成果核验器的任务保留 review，不能把 artifacts 非空当成完成。',
+      '- 副作用任务（总助理席位 × side-effect 范围，目前由桌面点名发起）在可信执行器里运行：每次副作用调用都会先在桌面审批窗口生成审批卡，用户批准后才执行且只执行一次；改参数、目标变化、过期、重放、转委派一律拒绝。批准不是执行结果，结果以执行账本为准（desktop_team_status / desktop_team_finish_operation 只读可信记录，不接受模型自报结账）；不得在普通主会话直接调用工具冒充已走团队门禁。',
+      '- 团队任务默认不设累计 token 预算（用户的选择，费用不封顶），只受单次输出上限、墙钟超时与并发上限约束。宿主没有累计硬上限：用户要求累计预算时任务会如实拒启，不得替用户改成 0 绕过。无可信成果核验器的任务保留 review，不能把 artifacts 非空当成完成。',
       '- 被门禁拒绝时按拒绝理由改正提案，不要换个工具、换个路径或拆成小步绕过去 —— 那只会让用户看到一堆被拦下的尝试。',
       '- 提案不等于授权。不要把"已提交提案"说成"已获批准"，不要把未核验的推断写进 artifacts。',
       '- 用户问团队进度或待批准事项：调用 desktop_team_status。',
       '- 用户要求停止某项工作：调用 desktop_team_cancel，并如实说明已发生的副作用不会被撤回。',
+      '- 执行账本里结果不明（unknown）的操作：先请用户核对真实情况，再按用户的结论调用 desktop_team_review_unknown（已核实成功 / 已核实失败 / 放弃）。只有用户在桌面审批窗口批准后结论才写进账本，不要自己宣布结果。',
+      ...(team.help.available
+        ? [
+            '',
+            '帮助任务（用户已经在桌面审批窗口确认了读取范围之后）：',
+            '- 用 desktop_team_open_help_task 在该范围上开任务（从主动提醒进来的带上 episodeId）；读文件只用 desktop_team_read_file，它只读授权范围内的内容并给出内容哈希。',
+            '- 改代码只能用 desktop_team_propose_change 提交改动提案（文件 + 统一 diff 或整文件内容 + 读取时的 baseHash），不要用 write/edit/bash 直接改用户的项目。用户在审批窗口核对差异并批准后由可信执行器应用；返回冲突暂停时说明文件已被改过、没有写入，重新读取后再提交新一版。',
+            '- 验证用 desktop_team_propose_verification（程序 + 参数数组 + 授权范围内的 cwd + 超时 + 预期副作用说明），批准后只运行一次。',
+            '- 用 desktop_team_wait 等决定与执行结果。只有 verdict.mayClaimFixed 为 true（验证命令真实退出码为 0）才能说「修好了」或「验证通过」；已应用未验证、验证失败、冲突暂停、结果不明都要照实说。',
+            '- 用户同意一起看，只代表愿意开始；读取范围、每一处改动、每一条命令都要各自经桌面审批，不能拿前一次同意顶替。用户只是一段时间没有输入，不要说成用户遇到了困难。',
+          ]
+        : []),
     ].join('\n'),
   })
 

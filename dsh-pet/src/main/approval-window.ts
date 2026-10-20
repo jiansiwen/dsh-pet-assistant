@@ -214,7 +214,7 @@ export class ApprovalWindow {
       const currentView = cardView(proposal, this.currentRequester, Date.now())
       if (!currentView.canDecide) return { ok: false, error: currentView.blockedReason ?? '提案已失效' }
       const result = await this.bridge.decideApproval(proposal.proposalId, decision as ApprovalDecision,
-        event.sender.id, proposal.kind === 'report' ? 'report' : 'team', proposal.epoch)
+        event.sender.id, proposal.kind ?? 'team', proposal.epoch)
       if (result.ok) this.retire(proposal.proposalId)
       return result
     } catch (error) {

@@ -11,6 +11,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import {
+  loopbackCapability,
   playAudioSpec,
   platformOf,
   recordAudioSpec,
@@ -161,5 +162,45 @@ describe('platform：路径拼接不依赖运行平台', () => {
     const spec = playAudioSpec('win32', '/app/dist/main/', '/tmp/a.mp3')
     assert.ok(spec)
     assert.ok(spec.args.includes('/app/dist/main/play.ps1'), `实际：${spec.args.join(' ')}`)
+  })
+})
+
+describe('platform：会议系统音频（M4-03）', () => {
+  test('Linux 没有实现，如实说不录对方的声音', () => {
+    const result = loopbackCapability('linux', 'unknown')
+    assert.equal(result.available, false)
+    assert.match(result.reason, /Linux/)
+  })
+
+  test('macOS 缺「屏幕与系统录音」权限时明确指向那个设置页', () => {
+    // 关键点：这不是麦克风权限。说错页面等于让用户在一个无关的开关上反复折腾。
+    const result = loopbackCapability('darwin', 'denied')
+    assert.equal(result.available, false)
+    assert.match(result.reason, /屏幕与系统录音/)
+    assert.equal(/麦克风/.test(result.reason) && !/只录本机麦克风/.test(result.reason), false)
+  })
+
+  test('macOS 被系统策略限制时同样不尝试', () => {
+    const result = loopbackCapability('darwin', 'restricted')
+    assert.equal(result.available, false)
+    assert.match(result.reason, /策略/)
+  })
+
+  test('macOS 还没问过：放行去试，并预告会弹权限框', () => {
+    const result = loopbackCapability('darwin', 'not-determined')
+    assert.equal(result.available, true)
+    assert.match(result.reason ?? '', /询问/)
+  })
+
+  test('macOS 已授权：放行，不需要提示', () => {
+    const result = loopbackCapability('darwin', 'granted')
+    assert.equal(result.available, true)
+    assert.equal(result.reason, null)
+  })
+
+  test('Windows 不需要单独授权', () => {
+    const result = loopbackCapability('win32', 'unknown')
+    assert.equal(result.available, true)
+    assert.equal(result.reason, null)
   })
 })

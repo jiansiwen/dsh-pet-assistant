@@ -91,7 +91,45 @@ export class ObservationStore {
 
       CREATE INDEX IF NOT EXISTS idx_observations_range ON observations (start_at, end_at);
       CREATE INDEX IF NOT EXISTS idx_observations_source ON observations (source, start_at);
+
+      CREATE TABLE IF NOT EXISTS deleted_activity_ranges (
+        from_ms INTEGER NOT NULL,
+        to_ms INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        deleted_at INTEGER NOT NULL,
+        PRIMARY KEY (from_ms, to_ms)
+      );
     `)
+  }
+
+  /**
+   * 记下一段已被用户删除的活动区间。
+   *
+   * 采样原文被备份软件还原、或当时某个原文文件没删掉，下次读当天活动时那段样本会重新聚合出来。
+   * 区间账本让读取侧把它们挡掉：删过的时段不会悄悄回到观察库、日报材料或工作台里。
+   * 结束时间截到删除时刻——删除之后新采到的活动不属于这次删除。
+   */
+  recordDeletedRange(from: number, to: number, reason: string, now: number): { from: number; to: number } {
+    const end = Math.min(to, now)
+    this.db.prepare(`INSERT OR REPLACE INTO deleted_activity_ranges (from_ms, to_ms, reason, deleted_at) VALUES (?, ?, ?, ?)`)
+      .run(from, end, reason, now)
+    return { from, to: end }
+  }
+
+  deletedRanges(): Array<{ from: number; to: number; reason: string; deletedAt: number }> {
+    return (this.db.prepare('SELECT * FROM deleted_activity_ranges ORDER BY from_ms').all() as Row[]).map(row => ({
+      from: Number(row.from_ms), to: Number(row.to_ms), reason: String(row.reason), deletedAt: Number(row.deleted_at),
+    }))
+  }
+
+  /** [start, end) 是否与任一已删除区间重叠。 */
+  overlapsDeleted(start: number, end: number, ranges = this.deletedRanges()): boolean {
+    return ranges.some(range => start < range.to && end > range.from)
+  }
+
+  /** 按 id 删一条观察（迁移进来的旧笔记等）；返回是否真的删掉了。 */
+  deleteById(id: string): boolean {
+    return Number(this.db.prepare('DELETE FROM observations WHERE observation_id = ?').run(id).changes) > 0
   }
 
   /**
@@ -174,10 +212,41 @@ export class ObservationStore {
     return rows.map(rowToObservation)
   }
 
+  /** 按 id 取一条观察；工作事项提交时据此确认来源引用在本地真实存在。 */
+  get(id: string): Observation | null {
+    const row = this.db.prepare('SELECT * FROM observations WHERE observation_id = ?').get(id) as Row | undefined
+    return row ? rowToObservation(row) : null
+  }
+
   count(): number {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM observations').get() as Row
     return Number(row.n)
   }
+}
+
+/**
+ * 活动片段 → 观察。摘要口径与迁移（migrate.ts importSpans）一致：
+ * 有标题时「进程｜分类｜标题」，无标题时只有分类。
+ */
+export function activitySpanObservation(
+  id: string,
+  span: { start: number; end: number; app: string; category: string; title: string },
+  timezone: string,
+  payloadRef: string | null,
+): Observation {
+  return {
+    id, source: 'activity_span', scopeKind: 'global', scopeId: '',
+    startAt: span.start, endAt: span.end, timezone,
+    summary: span.title ? `${span.app}｜${span.category}｜${span.title}` : `${span.category}`,
+    payloadRef, sensitivity: 'normal', legacyId: null, importBatch: null,
+  }
+}
+
+/** 活动观察只能证明"用过"：有标题算窗口标题证据，否则算进程停留。 */
+export function activityEvidenceType(observation: Observation): 'window_title' | 'process_dwell' | 'legacy_event' | 'user_note' {
+  if (observation.source === 'legacy_day_event') return 'legacy_event'
+  if (observation.source === 'user_note') return 'user_note'
+  return observation.summary.split('｜').length >= 3 ? 'window_title' : 'process_dwell'
 }
 
 function rowToObservation(row: Row): Observation {

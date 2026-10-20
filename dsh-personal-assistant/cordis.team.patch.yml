@@ -2,8 +2,8 @@
 #
 # 用法：挂在任意一个已经能正常启动的 profile 上，不需要新建 profile：
 #
-#   dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
-#   dsh --profile headless --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml "让悟空看看这个仓库"
+#   dsh --profile web --patch <插件目录>/cordis.team.patch.yml
+#   dsh --profile headless --patch <插件目录>/cordis.team.patch.yml "让悟空看看这个仓库"
 #
 # 想常开，就把下面这一条抄进该 profile 的 cordis.patch.yml（它本来就排在所有 bundle 层之后）。
 #
@@ -13,16 +13,23 @@
 # `duplicate loader entry id: personal-assistant`，整个 dsh 起不来。
 # 按 id 覆盖走的是另一条分支：找不到该 id 只 warn 跳过，找到就逐字段赋值。
 #
-# ── 为什么 petDir 必须重复写一遍 ───────────────────────────────────────────
-# 字段级覆盖是**整体替换**，不是深合并（`target[key] = value`）。这里只写 teamEnabled
-# 的话，bundle 层给的 petDir 会被整个 config 顶掉，召唤宠物时就再也不会自动拉起 dsh-pet。
+# ── petDir 为什么是注释掉的 ────────────────────────────────────────────────
+# petDir（桌面宠物工程目录）是每台机器自己的设置，插件不能替别人写死作者本机路径。
+# 这里的 config 是**整体替换**（`target[key] = value`，不深合并）：一旦在这里写了
+# config，插件默认配置就会被整体顶掉。想保留「召唤宠物时自动拉起 dsh-pet」，就把
+# 下面那行 petDir 改成你自己本机的 dsh-pet 目录并取消注释；不写则留空（默认），
+# 召唤只会绑定会话，桌宠需要你自行启动。
 #
 # 其余团队参数（并发上限、超时、预算、批准有效期、额外禁用工具）都在 src/config.ts 里
 # 带了默认值：spawn 不继承父上下文、推理并发 2、副作用并发 1、任务超时 10 分钟、
 # 批准有效期 5 分钟。要调再往这个 config 里加字段，同样注意整体替换语义。
 #
+# 累计预算 defaultBudgetTokens 默认 0 = 用户 2026-10-17 选择「不设累计预算」：团队任务的
+# 模型费用不封顶，只受单次输出上限、墙钟超时与并发上限约束。宿主没有累计硬上限，
+# 在这里填非零值不会让预算生效，只会让未指定预算的任务一律拒启（budget-unsupported）。
+#
 # ── 桌面上站几个人 ────────────────────────────────────────────────────────
-# 默认只有总助理 + 两名专家上台，沙僧与白龙马是未启用席位（design.md §2.11：其余角色
+# 默认只有总助理 + 两名专家上台，助理3与助理4是未启用席位（design.md §2.11：其余角色
 # 可作为未启用席位，不播放假工作）。直接后果是群体场景里只有「闲聊」开得起来 ——
 # 四人麻将、五人开黑都凑不齐人。想五人全部首发，把下面这行的注释去掉：
 #
@@ -33,5 +40,5 @@
 # 名单里写错的名字会被忽略，并在日志里留一条 warn。
 - id: personal-assistant
   config:
-    petDir: 'D:/work/dsh-pet'
+    # petDir: '/path/to/dsh-pet'   # 换成你自己本机的 dsh-pet 目录才会自动拉起桌宠
     teamEnabled: true

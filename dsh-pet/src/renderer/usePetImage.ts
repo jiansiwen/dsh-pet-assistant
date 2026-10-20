@@ -139,7 +139,7 @@ const framesCache = new Map<string, Promise<SkinFrames>>()
 /**
  * 共享素材缓存：按皮肤缓存 **Promise**，不是缓存结果。
  *
- * 占位期唐僧、沙僧、白龙马的 skinId 都是 panda，而多角色舞台是一起挂载的。只缓存结果的
+ * 占位期总助理、助理3、助理4的 skinId 都是 panda，而多角色舞台是一起挂载的。只缓存结果的
  * 话三个 effect 会在同一轮里同时 miss，照样读三遍盘、跑三遍漫水填充抠图；缓存 Promise
  * 才能让后两个直接挂到第一个的在途请求上。
  *

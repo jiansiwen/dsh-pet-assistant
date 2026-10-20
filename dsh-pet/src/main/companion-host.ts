@@ -12,10 +12,9 @@
  * 3. **所有权**：只终止自己 spawn 的那个进程（手里有 ChildProcess 句柄），从不按 pid 杀。
  *    附着到用户自己起的运行时时，退出只断连接。
  *
- * 有一件事这个壳做不到，也刻意没有假装能做到：**它不能替用户"召唤"助理**。
- * bridge.json 是插件在某个会话调用召唤工具时才写的（`bridge.bind(agent)`），
- * 壳启动的只是一个 dsh 运行时；运行时起来之后，需要有一个会话去召唤，桥接才存在。
- * 所以 `await-bridge` 超时不是失败，而是一条明确的待办：去 dsh 会话里说「召唤宠物」。
+ * 会话绑定与运行时是两件事：插件一加载就写出 bridge.json（未绑定，`/health` 回 bound:false），
+ * 桌面可以经 `/session/start` 开启或恢复会话，网页里「召唤宠物」也照旧接管绑定。所以 `await-bridge`
+ * 超时说明插件没加载或是改造前的旧版，而不是"还没人召唤"。
  *
  * 状态里刻意不含"活动记录是否开启""会议录音是否开启"：这两件事由 dsh 侧的插件控制，
  * 壳现在拿不到证据。等阶段C/D 把它们接进来时必须各自单列一项，不能并进"在线"里 ——
@@ -29,6 +28,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, write
 import path from 'node:path'
 import { probeHealth, readBridgeInfo } from './harness.ts'
 import { platformOf } from './platform.ts'
+import { resolveAppLayout, type AppLayout } from './runtime-launch.ts'
 import {
   decideStartAction,
   listLaunchableProfiles,
@@ -64,6 +64,20 @@ export interface CompanionState {
    * 不落盘。会议总会结束，重启后还闷着不说话只会被当成坏了；宁可让用户再点一下。
    */
   focusMode: boolean
+  /**
+   * 演示隐私模式（M5-05）：隐藏本应用的历史与预览、压制主动提醒与娱乐，但**保留**文档讲解、
+   * 外放插话与暂停/停止这些"你正在用它做的事"。
+   *
+   * 与上面两件是**三件不同的事**，可以任意组合：
+   * - `stageVisible=false`：角色从桌面上消失（截图里什么都不剩）。
+   * - `focusMode=true`：角色还在，但不闲聊、不开牌局、不听唤醒词。
+   * - `presentationMode=true`：角色和任务状态照常，但**过去的内容不再露出来** ——
+   *   聊天历史、主动提醒、会议/日报预览都收起；新产生的内容照常显示（用户正在演示它）。
+   *
+   * 不落盘，理由与 focusMode 相同：演示结束后还藏着历史只会被当成"坏了"。
+   * 关闭即恢复 —— 这里从不删除任何数据，只是不渲染。
+   */
+  presentationMode: boolean
   /** 关闭舞台后是否仍保留壳（唤醒监听 + 启动入口）。用户明确启用才为 true。 */
   trayResident: boolean
   profile: string
@@ -103,7 +117,7 @@ export interface CompanionHostCallbacks {
 const LINK_LABEL: Record<RuntimeLink, string> = {
   none: '未连接运行时',
   starting: '正在启动…',
-  booted: '运行时已启动，等待会话召唤',
+  booted: '运行时已启动，等待助理插件就绪',
   'attached-external': '已连接（用户启动的运行时）',
   'attached-own': '已连接（本壳启动的运行时）',
 }
@@ -128,6 +142,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/** 运行时在线但还没有会话：告诉用户下一步，而不是让"已就绪"暗示可以对话。 */
+function unboundHint(health: HealthBody | null): string {
+  return health?.bound === false ? '；助理会话尚未开启：在宠物会话框发消息或说“开启个人助理模式”即可开启' : ''
+}
+
 export class CompanionHost {
   private tray: Tray | null = null
   private child: ChildProcess | null = null
@@ -137,14 +156,14 @@ export class CompanionHost {
   private disposed = false
   private state: CompanionState
   private readonly callbacks: CompanionHostCallbacks
-  private readonly options: { mainDir: string; dshHome: string; instanceId: string }
+  private readonly options: { mainDir: string; dshHome: string; instanceId: string; layout?: AppLayout }
 
   // 显式字段 + 构造函数体内赋值，不用参数属性（constructor(private readonly …)）：
   // Node 的 strip-only TypeScript 只擦类型、不改写语法，参数属性会让本文件无法被
   // node --test 直接导入，而 index.ts 传递导入了它，整条主进程装配就都测不了。
   constructor(
     callbacks: CompanionHostCallbacks,
-    options: { mainDir: string; dshHome: string; instanceId: string },
+    options: { mainDir: string; dshHome: string; instanceId: string; layout?: AppLayout },
   ) {
     this.callbacks = callbacks
     this.options = options
@@ -153,6 +172,7 @@ export class CompanionHost {
       link: 'none',
       stageVisible: true,
       focusMode: false,
+      presentationMode: false,
       trayResident: settings.trayResident === true,
       profile: settings.runtimeProfile || 'web',
       lastStage: null,
@@ -160,6 +180,23 @@ export class CompanionHost {
       lastFailed: false,
       ownPid: null,
     }
+  }
+
+  /**
+   * 桌面壳的目录布局。优先用 `index.ts` 算好的那一份。
+   *
+   * 两处各算一次的风险很具体：打包态下 `mainDir` 在 asar 里，独立算出来会把随包 dsh CLI
+   * 指到 `app.asar/node_modules/...` —— 子进程读不了，启动必然失败。共用一份就不会分裂。
+   */
+  private appLayout(): AppLayout {
+    if (this.options.layout) return this.options.layout
+    const packaged = app.isPackaged === true
+    return resolveAppLayout({
+      mainDir: this.options.mainDir,
+      isPackaged: packaged,
+      appPath: packaged && typeof app.getAppPath === 'function' ? app.getAppPath() : undefined,
+      resourcesPath: packaged ? process.resourcesPath : undefined,
+    })
   }
 
   /** 建托盘、恢复上一次的所有权记录、开始周期性刷新。 */
@@ -207,6 +244,19 @@ export class CompanionHost {
     this.emit()
   }
 
+  /**
+   * 切演示隐私模式。
+   *
+   * 只改状态：渲染层读到 `presentationMode` 之后决定隐藏哪些历史与预览。
+   * **不动**麦克风、不动窗口、不动专注模式 —— 演示时用户往往还要讲解、还要插话，
+   * 把它们一起掐掉就成了"关掉宠物"，不是"别把我的历史露出来"。
+   */
+  setPresentationMode(value: boolean): void {
+    if (this.state.presentationMode === value) return
+    this.state = { ...this.state, presentationMode: value }
+    this.emit()
+  }
+
   setTrayResident(value: boolean): void {
     this.callbacks.saveSettings({ trayResident: value })
     this.state = { ...this.state, trayResident: value }
@@ -235,10 +285,14 @@ export class CompanionHost {
     this.state = { ...this.state, link: 'starting', profile: target }
     this.emit()
     try {
+      const layout = this.appLayout()
       const plan = planRuntimeLaunch({
         dshHome: this.options.dshHome,
         profile: target,
-        appDir: path.resolve(this.options.mainDir, '../..'),
+        // 打包后随包 CLI 在 app.asar.unpacked：以子进程跑的东西读不了 asar 内的路径。
+        appDir: layout.realAppDir,
+        // 只影响失败时给用户的下一步：安装版里没有"去 dsh-pet 目录装依赖"这回事。
+        packaged: layout.packaged,
       })
       if (!plan.ok) {
         this.report(plan.stage, plan.message, true)
@@ -375,15 +429,15 @@ export class CompanionHost {
         return
       }
       this.state = { ...this.state, link: 'attached-own' }
-      this.report('ready', `团队模式已就绪（profile ${this.state.profile}，运行时 pid=${bridge.pid}）`)
+      this.report('ready', `团队模式已就绪（profile ${this.state.profile}，运行时 pid=${bridge.pid}）${unboundHint(health)}`)
       return
     }
     if (this.disposed) return
-    // 运行时起来了，但还没有会话去召唤助理 —— 这是待办，不是故障。
+    // 旧版插件只在召唤时才写 bridge.json；新版一加载就写。等满时限还没出现，多半是插件没加载起来。
     this.state = { ...this.state, link: child.exitCode === null && child.signalCode === null ? 'booted' : 'none' }
     this.report(
       'await-bridge',
-      `运行时已启动（pid ${String(child.pid)}），但还没有会话召唤助理：在 dsh 会话里说「召唤宠物」即可接入${logFile ? `；运行时输出在 ${logFile}` : ''}`,
+      `运行时已启动（pid ${String(child.pid)}），但助理插件的桥接没有出现：插件可能没有加载，或是旧版（旧版需要在 dsh 会话里说「召唤宠物」）${logFile ? `；运行时输出在 ${logFile}` : ''}`,
     )
   }
 
@@ -394,7 +448,7 @@ export class CompanionHost {
       return
     }
     this.state = { ...this.state, link }
-    this.report('ready', `已连接到正在运行的助理团队（profile ${this.state.profile}）`)
+    this.report('ready', `已连接到正在运行的助理团队（profile ${this.state.profile}）${unboundHint(health)}`)
   }
 
   private async refresh(): Promise<void> {
@@ -500,9 +554,18 @@ export class CompanionHost {
           click: item => this.setFocusMode(item.checked),
         },
         {
+          // 第三种：演示隐私模式。与上面两项的区别是"藏什么"——
+          // 隐藏藏的是角色本身，专注压的是闲聊与唤醒，这里藏的是**过去的内容**（历史、提醒、预览）。
+          // 讲解、插话、暂停照旧可用：演示时用户正是要用它们。
+          label: '演示隐私模式（隐藏历史与提醒，讲解与插话照常）',
+          type: 'checkbox',
+          checked: this.state.presentationMode,
+          click: item => this.setPresentationMode(item.checked),
+        },
+        {
           // 唤醒监听初始化失败后会粘住、不自动重试（否则每三秒刷一条错误日志，用户看到的
           // 是一只一直在报错的宠物）。所以修好麦克风、装好中文语音包之后得有地方能把它叫回来。
-          label: '重新监听唤醒词（"小潘小潘"）',
+          label: '重新监听唤醒词（"小潘同学"）',
           click: () => this.callbacks.onRetryWake(),
         },
         {
@@ -604,3 +667,4 @@ export class CompanionHost {
     }
   }
 }
+

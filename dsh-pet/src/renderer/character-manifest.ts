@@ -7,10 +7,10 @@
  *    `usePetSkinImages` 会去探测 `assets/pets/<任意字符串>.png`，全部 404，角色变成空白。
  *    所以任何不认识的皮肤都落到 `panda`。
  *
- * 2. **身份色标**。占位期唐僧、沙僧、白龙马的 skinId 都是 panda —— 三个角色渲染出三只
+ * 2. **身份色标**。占位期总助理、助理3、助理4的 skinId 都是 panda —— 三个角色渲染出三只
  *    一模一样的熊猫，光看形象分不出谁是谁。色标是这阶段的唯一区分手段。
  *    色相不是随手挑的：三个 panda 角色两两相距 89°/97°/174°，且都避开了任务状态用的
- *    语义色（红=失败、绿=完成、琥珀=待批准、蓝=进行中）和三套皮肤主色。唐僧原本用金色，
+ *    语义色（红=失败、绿=完成、琥珀=待批准、蓝=进行中）和三套皮肤主色。总助理原本用金色，
  *    但金色与"待批准"的琥珀只差 5° 色相，审批卡和名牌会互相污染，所以换成了深青碧。
  *
  * 3. **动作降级**。素材是按皮肤逐动作抽帧的，缺哪个动作无法预知（当前只有 panda 有
@@ -56,14 +56,14 @@ export interface CharacterManifest {
 /**
  * 五个角色的编制与色标。assistantId 与插件 `ensureRoster()` 写库的值一一对应。
  *
- * 台词按各自的性格写：唐僧稳重简洁（不用一堆话替代结论）、孙悟空干脆机敏、
- * 猪八戒幽默生活化、沙僧细致踏实、白龙马简洁及时。
- * 猪八戒那几组沿用改造前单宠物的原词 —— 它本来就是那个皮肤的性格，换了编制不该换脾气。
+ * 台词按各自的性格写：总助理稳重简洁（不用一堆话替代结论）、助理1干脆机敏、
+ * 助理2幽默生活化、助理3细致踏实、助理4简洁及时。
+ * 助理2那几组沿用改造前单宠物的原词 —— 它本来就是那个皮肤的性格，换了编制不该换脾气。
  */
 const ROSTER: readonly CharacterManifest[] = [
   {
     assistantId: 'member-tangseng',
-    displayName: '唐僧',
+    displayName: '总助理',
     roleId: 'tangseng',
     skin: 'panda',
     markColor: '#0F766E',
@@ -77,7 +77,7 @@ const ROSTER: readonly CharacterManifest[] = [
   },
   {
     assistantId: 'member-wukong',
-    displayName: '孙悟空',
+    displayName: '助理1',
     roleId: 'wukong',
     skin: 'boy-glasses',
     markColor: '#C026D3',
@@ -91,7 +91,7 @@ const ROSTER: readonly CharacterManifest[] = [
   },
   {
     assistantId: 'member-bajie',
-    displayName: '猪八戒',
+    displayName: '助理2',
     roleId: 'bajie',
     skin: 'girl-glasses',
     markColor: '#DB2777',
@@ -105,7 +105,7 @@ const ROSTER: readonly CharacterManifest[] = [
   },
   {
     assistantId: 'member-shaseng',
-    displayName: '沙僧',
+    displayName: '助理3',
     roleId: 'shaseng',
     skin: 'panda',
     markColor: '#4D7C0F',
@@ -119,7 +119,7 @@ const ROSTER: readonly CharacterManifest[] = [
   },
   {
     assistantId: 'member-bailongma',
-    displayName: '白龙马',
+    displayName: '助理4',
     roleId: 'bailongma',
     skin: 'panda',
     markColor: '#7E22CE',
@@ -232,7 +232,7 @@ function synthesize(assistantId: string, displayName: string, roleId: string, sk
  * 又在桌面上改了一次，桌面上那次才是他最后的意思。反过来会让右键菜单看着能用、其实被远端覆盖。
  *
  * 覆盖的只有 `skin` 一个字段。名字、roleId、色标、台词全部跟着 assistantId 走 —— 这是
- * design.md §2.2 的"换形象不换身份和记忆"：唐僧换成眼镜女生的样子，说话还是唐僧的说话，
+ * design.md §2.2 的"换形象不换身份和记忆"：总助理换成眼镜女生的样子，说话还是总助理的说话，
  * 记忆与任务归属一点不动。
  */
 export function manifestFor(
@@ -260,7 +260,7 @@ export function manifestFor(
  * 改造前"单宠物 + 选皮肤"的老设置映射到编制内角色。
  *
  * 三套皮肤各自对应一个本来就用它的角色，所以老用户升级后宠物的脾气不变 ——
- * 选了 girl-glasses 的人一直养的是那个会说"哎呀，别戳我～"的猪八戒，不该因为多了个团队
+ * 选了 girl-glasses 的人一直养的是那个会说"哎呀，别戳我～"的助理2，不该因为多了个团队
  * 编制就换成一套中性台词。settings.ts 迁移旧 pet-settings.json 时也走这条映射。
  */
 const LEGACY_SKIN_ROLE: Record<PetSkin, string> = {

@@ -4,6 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SubagentRun, SubagentStartRequest, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import type { ToolGuard } from '@deepseek-ai/dsh-tools'
 import { ApprovalService } from '../src/approval.ts'
+import { Config } from '../src/config.ts'
 import { TeamStore } from '../src/team-domain.ts'
 import { TeamService, type TeamOptions } from '../src/team.ts'
 
@@ -269,4 +270,38 @@ test('释放失败保留门禁和额度并记 unknown，退出仅重试释放', 
   assert.equal(f.team.runningCount(), 0)
   assert.equal(f.startupGuards.length, 0)
   assert.equal(f.requests.length, 1)
+})
+
+test('默认配置不设累计预算：未指定预算的任务直接启动；显式非零预算如实拒启，原因写明宿主没有累计硬上限', async t => {
+  const defaults = Config({} as never)
+  assert.equal(defaults.defaultBudgetTokens, 0, '用户 2026-10-17 选择不设累计预算')
+  // 仍然生效的只有单次输出上限（宿主沿用父会话）、墙钟超时与并发上限。
+  assert.equal(defaults.taskTimeoutMs, 600_000)
+  assert.equal(defaults.maxConcurrentInference, 2)
+  assert.equal(defaults.maxConcurrentSideEffect, 1)
+  const f = fixture(t, { defaultBudgetTokens: defaults.defaultBudgetTokens })
+  const started = await f.team.runTask(f.team.submitTask({ goal: '默认预算' }).taskId, f.parent, signal())
+  assert.equal(f.requests.length, 1)
+  assert.equal(started?.task.budgetTokens, 0)
+  assert.equal(started?.task.status, 'review')
+  assert.equal(f.requests[0]?.agentOptions, undefined, '不覆盖子代理的单次输出上限，沿用父会话')
+  const refused = await f.team.runTask(f.team.submitTask({ goal: '显式预算', budgetTokens: 5000 }).taskId, f.parent, signal())
+  assert.equal(refused?.task.status, 'review')
+  assert.equal(refused?.stopReason, 'budget-unsupported')
+  assert.match(refused?.diagnostic ?? '', /宿主没有累计硬上限/)
+  assert.equal(f.requests.length, 1, '非零预算的任务没有启动')
+})
+
+test('只读子代理能用宿主自身层的 structured_output 交回报告，restrict 名单里不出现子代理本地工具', async t => {
+  const f = fixture(t)
+  f.setStart(async request => {
+    const execution = (name: string) => ({ name, agent: { session: {
+      header: { parentSession: 'parent' }, events: [{ type: 'subagent/descriptor', data: { label: request.label } }],
+    } } })
+    assert.equal(f.startupGuards[0]!(execution('structured_output') as never), undefined)
+    return f.run
+  })
+  await f.team.runTask(f.team.submitTask({ goal: '交回结构化结论' }).taskId, f.parent, signal())
+  assert.equal(f.childGuards[0]!({ agent: f.child, name: 'structured_output', signal: signal() } as never), undefined)
+  for (const name of ['report', 'structured_output']) assert.equal(f.requests[0]?.toolFilter?.allow?.includes(name), false, name)
 })

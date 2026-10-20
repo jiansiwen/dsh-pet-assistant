@@ -1,6 +1,8 @@
 /** 本地 PDF 解析的线程边界；主线程不加载 PDF.js，也不向解析线程传文件路径。 */
 import { Worker } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
 import { MAX_DOC_BYTES, MAX_DOC_CHARS } from './document.ts'
+import { toUnpackedPath } from './runtime-launch.ts'
 
 export const MAX_PDF_PAGES = 500
 export const MAX_PDF_PAGE_CHARS = 100_000
@@ -92,7 +94,10 @@ export async function parsePdf(data: Uint8Array, options: PdfParseOptions = {}):
   const bytes = new Uint8Array(data)
   let worker: Worker
   try {
-    worker = new Worker(new URL(import.meta.url.endsWith('.ts') ? './doc-pdf-worker.ts' : './doc-pdf-worker.js', import.meta.url), {
+    // worker 线程从真实路径启动：打包后它在 app.asar.unpacked（见 asarUnpack 的第 ② 项）。
+    // 开发态 `.ts` 分支保持原样 —— 那时跑的是 node --test 的 TypeScript 直通，没有 asar。
+    const workerUrl = new URL(import.meta.url.endsWith('.ts') ? './doc-pdf-worker.ts' : './doc-pdf-worker.js', import.meta.url)
+    worker = new Worker(import.meta.url.endsWith('.ts') ? workerUrl : toUnpackedPath(fileURLToPath(workerUrl)), {
       workerData: { bytes, limits },
       transferList: [bytes.buffer],
       execArgv: [],

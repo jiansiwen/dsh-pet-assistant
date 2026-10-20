@@ -186,10 +186,10 @@ describe('录音 → 停止 → 结算：先停流落盘，再转写', () => {
     if (!started.ok) return
     const meetingId = started.meetingId
 
-    // 渲染层收到"开始流"的通知才会采音。
+    // 渲染层收到"开始流"的通知才会采音。startedAt 是两路时间轴共同的零点。
     const startEvent = h.events.find(event => event.channel === 'meeting-started')
     assert.ok(startEvent !== undefined, '应通知渲染层开始流')
-    assert.deepEqual(startEvent.payload, { meetingId, sources: 'mic', name: '产品评审会', sampleRate: 16000 })
+    assert.deepEqual(startEvent.payload, { meetingId, sources: 'mic', name: '产品评审会', sampleRate: 16000, startedAt: 1_700_000_000_000 })
 
     fakeRendererPush(h, meetingId, 3)
     assert.equal(h.store.chunkFileCount(meetingId), 3, '每块都即时加密落盘')
@@ -224,13 +224,16 @@ describe('录音 → 停止 → 结算：先停流落盘，再转写', () => {
       assert.equal(Buffer.from(wav.slice(8, 12)).toString('ascii'), 'WAVE')
     }
 
-    // 段：全部 uncertain=true、单一默认标签，不按时间瞎合并。
+    // 段：全部 uncertain=true。测试目录里没装分人模型 → 退回逐块转写，整条麦克风音轨
+    // 归一组并如实标"未分人"（带音源前缀的 id），不按时间瞎合并。
     const segments = h.store.getSegments(meetingId)
     assert.equal(segments.length, 4)
-    assert.equal(segments.every(segment => segment.uncertain && segment.label === '发言人1' && segment.speaker === 's1'), true)
+    assert.equal(segments.every(segment => segment.uncertain && segment.label === '本机麦克风·未分人' && segment.speaker === 'mic-s1'), true)
+    assert.equal(segments.every(segment => segment.track === 'mic'), true)
     assert.equal(segments[0].startMs, 4000, 'startMs 是相对会议开始的毫秒数')
     assert.ok((segments[0].endMs ?? 0) > (segments[0].startMs ?? 0))
     assert.equal(segments[0].text, '识别文本1')
+    assert.ok(h.recorder.getState().transcribeNote?.includes('未自动分人'), '模型缺失要如实写明未自动分人')
 
     // 纪要草稿已生成（本地模板）。
     const minutes = h.store.getMinutes(meetingId)
@@ -382,6 +385,23 @@ describe('narrator TTS 区间：助理播报不算真人发言', () => {
     h.store.close()
   })
 
+  test('纪要写出音轨缺失的原因，能把"为什么只有一半声音"说清楚', () => {
+    // 只说"缺了一轨"回答不了"我该改哪个开关"：麦克风权限与屏幕录制权限是两个页面。
+    const content = buildMinutesContent({
+      name: 'x', startedAt: 0, endedAt: 1000, sources: 'mic+loopback', consentText: '同意', retentionDays: 7,
+      segments: [], assistantSpeech: [], missingTracks: ['loopback'],
+      missingTrackReasons: { loopback: '缺少「屏幕与系统录音」权限' },
+    })
+    assert.ok(content.includes('缺失原因'))
+    assert.ok(content.includes('屏幕与系统录音'))
+    // 没有原因时不能编一行空的"- 缺失原因："出来。
+    const noReason = buildMinutesContent({
+      name: 'y', startedAt: 0, endedAt: 1000, sources: 'mic+loopback', consentText: '同意', retentionDays: 7,
+      segments: [], assistantSpeech: [], missingTracks: ['loopback'],
+    })
+    assert.equal(noReason.includes('缺失原因'), false)
+  })
+
   test('buildMinutesContent 列出缺失音轨，不假装录到了', () => {
     const content = buildMinutesContent({
       name: 'x',
@@ -415,14 +435,16 @@ describe('说话人修订与纪要确认（经 recorder 门面）', () => {
     const { h, meetingId } = await transcribedHarness()
     const before = h.store.getMeeting(meetingId)?.segmentsRevision ?? 0
 
-    const renamed = h.recorder.renameSpeaker(meetingId, 's1', '张三')
+    const renamed = h.recorder.renameSpeaker(meetingId, 'mic-s1', '张三')
     assert.equal(renamed.ok, true)
     if (renamed.ok) assert.equal(renamed.revision, before + 1)
 
+    // 拆出来的新人编号避开 mic-s1 的编号：s2。
     const split = h.recorder.splitSegments(meetingId, [1], '李四')
     assert.equal(split.ok, true)
+    assert.ok(h.store.getSegments(meetingId).some(segment => segment.speaker === 's2' && segment.label === '李四'))
 
-    const merged = h.recorder.mergeSpeakers(meetingId, 's2', 's1')
+    const merged = h.recorder.mergeSpeakers(meetingId, 's2', 'mic-s1')
     assert.equal(merged.ok, true)
 
     const minutes = h.store.getMinutes(meetingId)
@@ -440,7 +462,7 @@ describe('说话人修订与纪要确认（经 recorder 门面）', () => {
     assert.equal(h.store.getMinutes(meetingId)?.state, 'confirmed')
 
     // 确认之后再修订：纪要退回草稿，旧确认作废。
-    h.recorder.renameSpeaker(meetingId, 's1', '王五')
+    h.recorder.renameSpeaker(meetingId, 'mic-s1', '王五')
     assert.equal(h.store.getMinutes(meetingId)?.state, 'draft')
     h.store.close()
   })
@@ -450,8 +472,10 @@ describe('说话人修订与纪要确认（经 recorder 门面）', () => {
     const result = h.recorder.getSpeakers(meetingId)
     assert.equal(result.ok, true)
     if (!result.ok) return
-    assert.deepEqual(result.speakers, [{ speaker: 's1', label: '发言人1', count: 2 }])
+    assert.deepEqual(result.speakers, [{ speaker: 'mic-s1', label: '本机麦克风·未分人', count: 2 }])
     assert.equal(result.segments.length, 2)
+    assert.equal(result.transcript?.mode, 'undiarized')
+    assert.equal(result.transcript?.userEdited, false)
     h.store.close()
   })
 })

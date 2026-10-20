@@ -24,7 +24,8 @@ export function isSessionCommand(value: unknown): value is SessionCommand {
     (command[key] as string).length <= max
   switch (command.kind) {
     case 'prompt': return text('text', 60_000) && (command.spoken === undefined || typeof command.spoken === 'boolean')
-    case 'cancel': return true
+    case 'cancel': return (command.scope === undefined || ['run', 'mute', 'pause', 'resume'].includes(command.scope as string))
+      && (command.taskId === undefined || text('taskId', 256)) && (command.requestId === undefined || text('requestId', 256))
     case 'model': return text('provider', 256) && text('model', 512) &&
       (command.reasoningEffort === undefined || text('reasoningEffort', 128))
     case 'permission': return text('value', 128) && /^[a-zA-Z0-9_-]+$/.test(command.value as string)

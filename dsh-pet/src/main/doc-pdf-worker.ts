@@ -6,6 +6,7 @@ import { parentPort, workerData } from 'node:worker_threads'
 import { getDocument, GlobalWorkerOptions, PasswordException } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import type { PDFPageProxy, TextContent, TextItem } from 'pdfjs-dist/types/src/display/api.js'
 import { pdfFailure, type PdfLimits, type PdfPage, type PdfParseResult } from './doc-pdf.ts'
+import { PdfTextJoiner } from './doc-presenter.ts'
 
 // PDF.js 在 Node 中使用内部回环 worker；整套回环运行于外层可终止线程，而不是 Electron 主线程。
 // external 保留原包结构，API 和 worker 必须从同一个安装版本解析。
@@ -31,8 +32,8 @@ async function pageText(page: PDFPageProxy, limits: PdfLimits, previousChars: nu
   const reader = (page.streamTextContent({ includeMarkedContent: false }) as ReadableStream<TextContent>).getReader()
   const parts: string[] = []
   let length = 0
-  let previous: TextItem | undefined
-  let lineEnded = false
+  // 拼接规则与阅读视图共用（doc-presenter.ts）：提纲正文与高亮区间必须出自同一个字符串。
+  const joiner = new PdfTextJoiner()
   let complete = false
   try {
     for (;;) {
@@ -40,23 +41,16 @@ async function pageText(page: PDFPageProxy, limits: PdfLimits, previousChars: nu
       if (chunk.done) { complete = true; break }
       for (const item of chunk.value.items) {
         if (!('str' in item)) continue
-        if (item.str === '') { lineEnded ||= item.hasEOL; continue }
-        let separator = ''
-        if (previous) {
-          const differentLine = Math.abs(item.transform[5] - previous.transform[5]) > Math.max(1, previous.height / 2)
-          const gap = item.transform[4] - (previous.transform[4] + previous.width)
-          separator = lineEnded || differentLine ? '\n' : gap > Math.max(1, previous.height * 0.15) ? ' ' : ''
-        }
-        length += separator.length + item.str.length
+        const piece = joiner.piece(item as TextItem)
+        if (piece === null) continue
+        length += piece.separator.length + piece.str.length
         if (length > limits.maxPageChars || previousChars + length > limits.maxChars) {
           return pdfFailure('char-limit', {
             pageNumber: page.pageNumber,
             limit: length > limits.maxPageChars ? limits.maxPageChars : limits.maxChars,
           })
         }
-        parts.push(separator, item.str)
-        previous = item
-        lineEnded = item.hasEOL
+        parts.push(piece.separator, piece.str)
       }
     }
     const text = parts.join('').trim()

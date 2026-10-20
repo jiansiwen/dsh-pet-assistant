@@ -35,7 +35,7 @@ function proposal(patch: Partial<TeamProposalSnapshot> = {}): TeamProposalSnapsh
 }
 
 const names = (assistantId: string): string | null =>
-  ({ 'tang-seng': '唐僧', 'sun-wukong': '孙悟空' })[assistantId] ?? null
+  ({ 'tang-seng': '总助理', 'sun-wukong': '助理1' })[assistantId] ?? null
 
 describe('TASK_STATUS_LABEL：十个状态一个都不能漏', () => {
   it('插件侧的每个状态都有中文措辞，且互不相同', () => {
@@ -221,7 +221,7 @@ describe('deadlineNote：只提示已经逾期和今天到期', () => {
 })
 
 describe('memberRow：能不能改用户的文件，必须写出来', () => {
-  const sunWukong = { assistantId: 'sun-wukong', displayName: '孙悟空', roleId: 'expert', toolScope: 'side-effect' }
+  const sunWukong = { assistantId: 'sun-wukong', displayName: '助理1', roleId: 'expert', toolScope: 'side-effect' }
 
   it('只读成员标成只读', () => {
     const row = memberRow({ ...sunWukong, toolScope: 'read-only' }, [], [])
@@ -279,7 +279,7 @@ describe('memberRow：能不能改用户的文件，必须写出来', () => {
   })
 
   it('state 缺失按 pending 算', () => {
-    // 装置默认不带 assistantId，这里必须点名归到孙悟空名下，否则测的是"数不到别人"而不是这一条。
+    // 装置默认不带 assistantId，这里必须点名归到助理1名下，否则测的是"数不到别人"而不是这一条。
     assert.equal(
       memberRow(sunWukong, [], [proposal({ assistantId: 'sun-wukong', state: undefined })]).pendingApprovals,
       1,
@@ -402,7 +402,7 @@ describe('teamPanelView：整份快照的投影', () => {
       ],
     }
     const view = teamPanelView(snapshot, names, NOW)
-    assert.equal(view.tasks.find(item => item.taskId === 'a')?.owner, '孙悟空')
+    assert.equal(view.tasks.find(item => item.taskId === 'a')?.owner, '助理1')
     assert.equal(view.tasks.find(item => item.taskId === 'b')?.owner, 'sha-seng')
     assert.equal(view.tasks.find(item => item.taskId === 'c')?.owner, null)
   })
@@ -444,8 +444,8 @@ describe('teamPanelView：整份快照的投影', () => {
     const snapshot: TeamSnapshot = {
       team: true,
       members: [
-        { assistantId: 'tang-seng', displayName: '唐僧', toolScope: 'read-only' },
-        { assistantId: 'sun-wukong', displayName: '孙悟空', toolScope: 'side-effect' },
+        { assistantId: 'tang-seng', displayName: '总助理', toolScope: 'read-only' },
+        { assistantId: 'sun-wukong', displayName: '助理1', toolScope: 'side-effect' },
       ],
       tasks: [task({ taskId: 'a', ownerId: 'sun-wukong', status: 'running' })],
       proposals: [proposal({ proposalId: 'p', assistantId: 'sun-wukong' })],

@@ -1,35 +1,28 @@
 /**
  * dsh-personal-assistant 插件入口。
  */
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { ApprovalService } from './approval.ts'
-import { SessionBridge } from './bridge.ts'
+import { AssistantApprovalService, snapshotDigest } from './assistant-approval.ts'
+import { SessionBridge, type HostAgents, type SessionHost } from './bridge.ts'
 import { Classifier } from './classifier.ts'
 import type { Config as ConfigType } from './config.ts'
 import { personalAssistantDomainSpec, type ActivitySpan, type PersonalAssistantDomainSpec } from './domain.ts'
 import { createLegacySource, purgeLegacyData, type LegacyTables } from './legacy.ts'
-import { HelpContextStore } from './help-context.ts'
+import { HelpContextStore, HelpEpisodeStore, registerHelpEpisodeTools } from './help-context.ts'
 import { MemoryStore } from './memory.ts'
 import { MigrationStore, runMigration } from './migrate.ts'
 import { ObservationStore } from './observation.ts'
+import { resolvePetDir } from './pet-dir.ts'
 import { reconcilePublishedFile, ReportStore } from './report.ts'
 import { ReportApprovalService } from './report-approval.ts'
-import { pruneSampleFiles, readLastSample, readSamples, sampleFileOf } from './sampler.ts'
+import { platformCaptureBlockedReason, pruneSampleFiles, readLastSample, readSamples, sampleFileOf, samplerScriptName } from './sampler.ts'
 import { buildSpansFrom } from './spans.ts'
-import {
-  evaluateProactive,
-  INITIAL_PROACTIVE_STATE,
-  recordAccept,
-  recordDecline,
-  recordDisable,
-  recordEnable,
-  type ProactiveConfig,
-  type ProactiveState,
-} from './proactive.ts'
+import { ProactiveHelpFlow, type ProactiveConfig } from './proactive.ts'
 import { ASSISTANT_SCHEMA_VERSION, getUserFlag, openAssistantStore, setUserFlag } from './store.ts'
 import { TeamService, type TeamLogger } from './team.ts'
 import { TeamStore } from './team-domain.ts'
@@ -37,11 +30,24 @@ import { registerTeamTools } from './team-tools.ts'
 import { localDateOf, retentionStartDate, startOfLocalDate } from './time.ts'
 import { registerAssistantTools } from './tools.ts'
 import { ActivityTracker } from './tracker.ts'
+import { WorkItemStore } from './work-items.ts'
+import { MaterialStore } from './materials.ts'
+import { intakeEvidence, type IntakeResult } from './evidence-intake.ts'
+import { mountReportWorkbench } from './workbench.ts'
 
 export { Config } from './config.ts'
 
 export const name = 'personal-assistant'
+/**
+ * 只声明必需服务。cordis 4 里 inject 的每一项都是**必需**依赖（对象形式的值是拦截配置，不表示可选；
+ * cordis 3 的 `{ required, optional }` 写法在这里会被当成两个叫 required / optional 的服务，插件永远起不来）。
+ * agents 若写进来，没有它的宿主里整个插件会停在 pending。所以 agents 不声明，用到时经 ctx.get 现取，
+ * 见 {@link hostAgents}。
+ */
 export const inject = ['tools', 'storageDomain', 'systemPrompt']
+
+/** 插件上次经 /session/start 自建的会话 id；桌面再开始会话时据此恢复。 */
+const OWNED_SESSION_FLAG = 'bridge_owned_session_id'
 
 function dshHome(): string {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
@@ -61,6 +67,20 @@ interface PluginContext {
   effect(execute: () => () => void, label?: string): unknown
   on(event: 'agent/status' | 'agent/disposed', listener: (payload: { agent: unknown; status?: string }) => void): unknown
   logger?(name: string): PluginLogger
+  /** cordis 的「不经 inject 读服务」：没有提供时返回 undefined。假宿主可能连这个方法都没有。 */
+  get?(name: string): unknown
+}
+
+/**
+ * 可选读取宿主的会话服务 ctx.agents。每次调用现取：宿主可能根本没有它、晚于本插件装上或中途卸载。
+ * 经 ctx.get 拿到的服务按调用方追踪，create/resume 的所有权因此落在本插件的 fiber 上——
+ * 插件卸载时宿主也会把它们一并回收（桥接仍会先按所有权主动释放）。
+ */
+function hostAgents(ctx: PluginContext): HostAgents | undefined {
+  if (typeof ctx.get !== 'function') return undefined
+  const value = ctx.get('agents') as Partial<HostAgents> | undefined
+  if (!value || typeof value.create !== 'function' || typeof value.resume !== 'function') return undefined
+  return value as HostAgents
 }
 
 export async function apply(ctx: PluginContext, config: ConfigType): Promise<void> {
@@ -73,7 +93,9 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const domain = await ctx.storageDomain.open(personalAssistantDomainSpec)
   ctx.effect(() => () => void domain.close(), 'personal-assistant:domain')
 
-  const scriptPath = fileURLToPath(new URL('../assets/sampler.ps1', import.meta.url))
+  // 每个平台一份采样脚本（Windows: sampler.ps1，macOS: sampler-macos.js）；没有实现的平台
+  // 由下面的采集闸门如实拦住，路径只是占位，永远不会被拉起。
+  const scriptPath = fileURLToPath(new URL(`../assets/${samplerScriptName(process.platform) ?? 'sampler.ps1'}`, import.meta.url))
   const sampleDir = path.join(home, 'personal-assistant', 'samples')
   mkdirSync(sampleDir, { recursive: true })
 
@@ -141,18 +163,27 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   // 采集闸门。三个来源：用户关掉了采集、旧数据没搬完、或者这个平台上压根没有采集实现。
   // 迁移没跑完就继续采样，新旧两套记录会搅在一起，之后再也分不清哪条是哪来的。
   //
-  // 平台这一条是**能力**而不是**授权**：采样脚本用 Win32 的 GetForegroundWindow +
-  // GetWindowText，只在 Windows 上存在。非 Windows 上如实拦住，而不是拉一个必然失败的
-  // 子进程 —— 后者每三秒重试一次，日志刷满而用户只看到"助理坏了"。
+  // 平台这一条是**能力**而不是**授权**：采样实现只有 Windows（PowerShell + user32）与
+  // macOS（osascript JXA）两份。其余平台（如 Linux）如实拦住，而不是拉一个必然失败的子进程 ——
+  // 后者每三秒重试一次，日志刷满而用户只看到"助理坏了"。
   const captureBlockedReason = (): string | null => {
     if (!config.captureActivity) return '配置里 captureActivity 已关闭，不采集前台活动'
-    if (process.platform !== 'win32') {
-      return `前台活动采集目前只在 Windows 上实现（当前系统 ${process.platform}），没有在记录活动`
-    }
+    const unsupported = platformCaptureBlockedReason(process.platform)
+    if (unsupported) return unsupported
     if (migration && !migration.complete) return `旧数据迁移未完成：${migration.failures.join('；')}`
     return null
   }
 
+  const describeCaptureScope = (titles: boolean): Record<string, unknown> => ({
+    captureActivity: config.captureActivity, captureWindowTitles: titles,
+    sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
+    excludedProcesses: config.excludedProcesses, excludedTitleKeywords: config.excludedTitleKeywords,
+    retentionActivityDays: config.retentionActivityDays,
+    destination: '本机采样文件；活动证据会按需发送当前会话模型服务商用于解释及日报',
+    note: '仅前台应用、可选标题与空闲指标；不截图、不读聊天正文、不记键鼠内容',
+  })
+  const captureScopeAuthorized = (titles: boolean): boolean =>
+    getUserFlag(db, 'capture_scope_digest') === snapshotDigest(describeCaptureScope(titles))
   const tracker = new ActivityTracker(domain, classifier, scriptPath, sampleDir, {
     sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
     minSpanMs: config.minSpanMs,
@@ -160,6 +191,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     excludedProcesses: config.excludedProcesses,
     excludedTitleKeywords: config.excludedTitleKeywords,
     captureBlockedReason,
+    captureScopeAuthorized,
   })
 
   // 保留期清理排在迁移之后：先搬再删，反过来会把还没搬进新库的原文直接删掉。
@@ -179,56 +211,88 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
 
   // 会话桥接：宠物消息经 agent.followup 注入召唤它的那个会话，
   // 历史与模型与主会话一致，凭据直接复用，宠物端无需配置 API key。
+  // 桌面也可以经 POST /session/start 自己开始会话：恢复或新建的会话归本插件所有，id 记在 user_flags。
+  const sessionHost: SessionHost = {
+    agents: () => hostAgents(ctx),
+    readOwnedSessionId: () => getUserFlag(db, OWNED_SESSION_FLAG),
+    writeOwnedSessionId: sessionId => setUserFlag(db, OWNED_SESSION_FLAG, sessionId),
+    cwd: () => process.cwd(),
+  }
+  /**
+   * 证据收件的处理器。资料库要等下面的装配段才建好，而桥接在这里就要构造 ——
+   * 所以先留一个转发器，资料库建好后立刻补上。请求只会在插件装载完成后到达，
+   * 那时这个变量一定已经有值；万一没有，如实回"还没准备好"，不假装收下。
+   */
+  let evidenceIntakeHandler: ((request: unknown) => IntakeResult) | null = null
+  // 桌面宠物目录：显式配置 > DSH_PET_DIR > 插件同级的 dsh-pet（从同一仓库克隆的人天然满足）。
+  // 解析不到时召唤只绑定会话，工具会提示用户手动启动，不把作者本机路径写死。
+  const pluginDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
+  const petDirResolution = resolvePetDir({
+    configured: config.petDir,
+    env: process.env.DSH_PET_DIR,
+    pluginDir,
+    exists: dir => {
+      try { return statSync(dir).isDirectory() } catch { return false }
+    },
+  })
   const bridge = new SessionBridge({
     dshHome: home,
-    petDir: config.petDir || undefined,
+    petDir: petDirResolution.dir ?? undefined,
+    activityState: () => ({ active: tracker.active, capturing: tracker.capturing, titles: tracker.captureTitles }),
     logger,
+    sessionHost,
+    evidenceIntake: request => evidenceIntakeHandler?.(request)
+      ?? { ok: false, error: '证据库还在初始化，请稍后重试' },
   })
 
+  // 帮助授权与主动帮助 episode 各只有一份：工具、团队执行器与主动提醒共用，授权与追溯落在同一处。
+  const helpContexts = new HelpContextStore(db)
+  const helpEpisodes = new HelpEpisodeStore(db)
+
   // 主动提醒（design.md §2.7）：策略在 proactive.ts，这里只做三件事 ——
-  // 周期性评估、把候选推给宠物、把用户的点选记回状态机。
-  // 「关闭提醒」是用户意愿，落进 user_flags 表：重启不能把它悄悄复活。
+  // 周期性评估、把候选推给宠物、把用户的点选记回状态机（ProactiveHelpFlow 负责落 user_flags 与 episode）。
+  // 「关闭提醒」是用户意愿：重启不能把它悄悄复活。拒绝与不回应两条路上不生成候选、不读任何东西。
   if (config.proactiveEnabled) {
     const proactiveConfig: ProactiveConfig = {
       enabled: true,
       idleMs: Math.max(60_000, config.proactiveIdleMs),
       cooldownMs: Math.max(60_000, config.proactiveCooldownMs),
     }
-    let proactiveState: ProactiveState = {
-      ...INITIAL_PROACTIVE_STATE,
-      disabled: getUserFlag(db, 'proactive_disabled') === 'true',
-    }
+    const proactive = new ProactiveHelpFlow({
+      flags: { get: key => getUserFlag(db, key), set: (key, value) => setUserFlag(db, key, value) },
+      config: proactiveConfig,
+      episodes: helpEpisodes,
+      // 只在用户点「好」之后调用：候选取自已采集的数据，不额外读取。标题只在授权采集标题时才给。
+      facts: () => {
+        const sample = readLastSample(sampleFileOf(sampleDir, localDateOf(Date.now())))
+        return {
+          sessionCwd: bridge.boundSessionCwd(),
+          foreground: sample && !sample.idle && !sample.excluded
+            ? { process: sample.proc ?? '', title: tracker.captureTitles ? (sample.title ?? null) : null }
+            : null,
+          authorized: helpContexts.list(),
+        }
+      },
+    })
     bridge.onProactiveFeedback(kind => {
-      if (kind === 'accept') proactiveState = recordAccept(proactiveState)
-      else if (kind === 'decline') proactiveState = recordDecline(proactiveState)
-      else if (kind === 'disable') {
-        proactiveState = recordDisable(proactiveState)
-        setUserFlag(db, 'proactive_disabled', 'true')
-        log('proactive：用户关闭了主动提醒，重启后也不会再弹')
-      } else {
-        proactiveState = recordEnable(proactiveState)
-        setUserFlag(db, 'proactive_disabled', 'false')
-      }
+      proactive.feedback(kind, Date.now())
+      if (kind === 'disable') log('proactive：用户关闭了主动提醒，重启后也不会再弹')
     })
     const evaluateProactiveOnce = (): void => {
       const sample = readLastSample(sampleFileOf(sampleDir, localDateOf(Date.now())))
       const pet = bridge.getPetState()
-      const { state, decision } = evaluateProactive(
-        proactiveState,
-        {
-          now: Date.now(),
-          idleMs: typeof sample?.idleMs === 'number' ? sample.idleMs : null,
-          focusMode: pet.focus,
-          stageVisible: pet.visible,
-          captureActive: tracker.capturing,
-          sampleAt: sample?.ts ?? null,
-          sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
-          developmentApp: !sample?.idle && !sample?.excluded && classifier.classify(sample?.proc ?? '', sample?.title ?? '').category === 'dev',
-          taskRunning: (teamRuntime?.team.runningCount() ?? 0) > 0,
-        },
-        proactiveConfig,
-      )
-      proactiveState = state
+      const decision = proactive.evaluate({
+        now: Date.now(),
+        idleMs: typeof sample?.idleMs === 'number' ? sample.idleMs : null,
+        focusMode: pet.focus,
+        stageVisible: pet.visible,
+        meetingActive: pet.meeting,
+        captureActive: tracker.capturing,
+        sampleAt: sample?.ts ?? null,
+        sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
+        developmentApp: !sample?.idle && !sample?.excluded && classifier.classify(sample?.proc ?? '', sample?.title ?? '').category === 'dev',
+        taskRunning: (teamRuntime?.team.runningCount() ?? 0) > 0,
+      })
       if (decision.kind !== 'none') {
         bridge.pushProactive(decision.message, decision.kind === 'suggest-disable')
         log(`proactive：${decision.kind}（idle ${Math.round((sample?.idleMs ?? 0) / 1000)}s）`)
@@ -244,6 +308,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ctx.effect(() => () => clearInterval(proactiveTimer), 'personal-assistant:proactive')
   }
 
+  bridge.attachAssistantApprovals(new AssistantApprovalService({ epoch: bridge.epoch, ttlMs: Math.max(10_000, config.approvalTtlMs) }))
   const reportDir = config.reportDir || path.join(home, 'personal-assistant', 'reports')
   bridge.attachReportApprovals(new ReportApprovalService(db, reports, {
     epoch: bridge.epoch,
@@ -251,7 +316,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ttlMs: Math.max(10_000, config.approvalTtlMs),
     stop: () => tracker.stop(),
     active: () => tracker.active,
-  }))
+  }), config.approvalMode)
   // 桌面专家助理团：默认关闭，由 desktop-team profile 显式打开；
   // 也允许用户在会话里说「开启团队模式」动态挂载（personal_assistant_set_team_mode），
   // 选择记在 user_flags，重启后不丢。团队委派与审批都挂在桥接的运行时代次上，
@@ -260,7 +325,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const teamFlagOn = (): boolean => getUserFlag(db, 'team_mode_enabled') === 'true'
   const enableTeamMode = (): { toolsRegistered: boolean } => {
     if (teamRuntime) return { toolsRegistered: teamRuntime.toolsRegistered }
-    teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log })
+    teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log, helpContexts, helpEpisodes })
     setUserFlag(db, 'team_mode_enabled', 'true')
     return { toolsRegistered: teamRuntime.toolsRegistered }
   }
@@ -303,31 +368,48 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     })
   }, 'personal-assistant:team')
 
+  // 工作事项与导入材料各一份：对话工具、日报工作台和删除传播读写同一处，不各自建一份副本。
+  const workItems = new WorkItemStore(db)
+  const materials = new MaterialStore(db)
+  // 外部证据收件（会议纪要 / 窗口文本）：桌面壳经 POST /evidence/intake 送进来。
+  // 校验与入库都在 `intakeEvidence` 里，这里只把资料库与时钟接上。
+  evidenceIntakeHandler = request => intakeEvidence(request, { materials, now: () => Date.now() })
   registerAssistantTools(ctx as never, tracker, {
     reportDir,
     bridge,
     memories,
+    memoryApprovalSnapshot: () => ({
+      records: db.prepare('SELECT * FROM memories ORDER BY memory_id').all(),
+      sources: db.prepare('SELECT * FROM memory_sources ORDER BY source_id, derived_id').all(),
+    }),
     reports,
     observations,
-    helpContexts: new HelpContextStore(db),
+    workItems,
+    materials,
+    helpContexts,
     captureScope: {
-      acked: () => getUserFlag(db, 'capture_scope_ack') === 'true',
-      ack: () => setUserFlag(db, 'capture_scope_ack', 'true'),
-      describe: () => ({
-        captureActivity: config.captureActivity,
-        captureWindowTitles: config.captureWindowTitles,
-        excludedProcesses: config.excludedProcesses,
-        excludedTitleKeywords: config.excludedTitleKeywords,
-        retentionActivityDays: config.retentionActivityDays,
-        note: '只记录前台应用、可选窗口标题与空闲指标；不截图、不读聊天正文、不记键鼠内容',
-      }),
+      acked: () => captureScopeAuthorized(tracker.captureTitles),
+      ack: scope => setUserFlag(db, 'capture_scope_digest', snapshotDigest(scope ?? describeCaptureScope(tracker.captureTitles))),
+      describe: titles => describeCaptureScope(titles ?? tracker.captureTitles),
     },
     maxInjectedMemories: Math.max(0, Math.floor(config.maxInjectedMemories)),
     captureBlockedReason,
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
     enableTeamMode,
     disableTeamMode,
+    approvalMode: () => config.approvalMode,
   })
+  // 日报工作台：桌面逐条修订、按看到的那一版请求发布、分类删除。发布与删除只经桌面可信审批生效。
+  mountReportWorkbench(bridge, {
+    db, tracker, reports, memories, observations, workItems, materials, helpContexts, reportDir,
+    legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
+  })
+  // 主动帮助的候选与选定：选定的读取范围只经桌面可信审批生效，模型自报的范围无效。
+  ctx.effect(() => registerHelpEpisodeTools(ctx as never, {
+    episodes: helpEpisodes,
+    helpContexts,
+    submit: submission => bridge.submitAssistant(submission),
+  }), 'personal-assistant:help-episodes')
 
   // 会话运行态全量转发；idle 同时驱动原有因果回复结算。
   ctx.on('agent/status', payload => {
@@ -336,12 +418,25 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   ctx.on('agent/disposed', payload => {
     bridge.onAgentDisposed(payload.agent)
   })
-  // 插件卸载：通知宠物退场并关闭桥接服务。
+  // 插件卸载：通知宠物退场、关闭桥接服务，并按所有权释放桥接自建的会话（返回的 Promise 交给宿主等）。
   ctx.effect(() => () => bridge.dispose(), 'personal-assistant:bridge')
 
   // 采样器是插件的托管子进程：插件卸载时（web 服务停止 / profile 卸载）必须回收，
   // 否则会遗留孤儿进程。清理钩子早于任何可能抛错的初始化注册，保证一定生效。
   ctx.effect(() => () => tracker.dispose(), 'personal-assistant:sampler')
+
+  // 插件加载即监听（未绑定）：桌面壳不必等网页召唤就能找到运行时并经 /session/start 开始会话；
+  // 未绑定时对话与审批如实拒绝。起不来不拖垮插件——召唤宠物时 bind 会再试一次。
+  try {
+    const listening = await bridge.listen()
+    log(listening.advertised
+      ? `bridge listening (unbound) on 127.0.0.1:${listening.port}`
+      : `bridge listening on 127.0.0.1:${listening.port}; bridge.json is still served by runtime pid ${listening.incumbentPid ?? '?'}`)
+  } catch (error) {
+    const message = `bridge failed to listen at load (a summon will retry): ${error instanceof Error ? error.message : String(error)}`
+    if (logger?.warn) logger.warn(message)
+    else log(`[warn] ${message}`)
+  }
 
   // 模式开启但采样进程已死（插件重载/进程崩溃）时重新拉起；采集被拦住时不拉。
   await tracker.ensureSamplerAlive()
@@ -374,6 +469,9 @@ interface MountTeamDeps {
   bridge: SessionBridge
   logger?: PluginLogger
   log(message: string): void
+  /** 帮助任务的读取授权与主动帮助 episode：与工具、主动提醒共用同一份。 */
+  helpContexts: HelpContextStore
+  helpEpisodes: HelpEpisodeStore
 }
 
 /**
@@ -412,6 +510,8 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     denyExpertTools: config.denyExpertTools,
     approvals,
     logger: teamLogger,
+    helpScopes: deps.helpContexts,
+    episodes: deps.helpEpisodes,
   })
   team.ensureRoster()
   // 挂载后立即对账上次进程中断的任务：还挂着 running 的任务/运行/副作用一律记成

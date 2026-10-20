@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { isSessionCommand, shouldDismissOverlay, validBoxes } from '../src/main/overlay-state.ts'
-import { mergeEntries, mergeSession, overlayPosition } from '../src/renderer/session-view.ts'
+import { entriesForPresentation, mergeEntries, mergeSession, overlayPosition, presentationCutoffOf } from '../src/renderer/session-view.ts'
 import type { SessionEntry, SessionSnapshot } from '../src/session-types.js'
 
 const box = { x1: 100, y1: 100, x2: 200, y2: 200 }
@@ -55,4 +55,37 @@ test('增量保留历史页边界，过期游标不覆盖新内容，换绑清�
   assert.equal(mergeSession(merged, first), merged)
   assert.deepEqual(mergeSession(merged, { ...update, reset: true }).entries, update.entries)
   assert.equal(mergeSession(merged, snapshot('b', 1, [])).entries.length, 0)
+})
+
+// ===== 演示隐私模式（M5-05）：只决定渲染哪些，不删数据 =====
+
+test('演示模式：分界之前的一律不可见，之后新产生的照常显示', () => {
+  const before = [entry('a', 1, '私人对话'), entry('b', 2, '更私人的内容')]
+  const cutoff = presentationCutoffOf(before)
+  assert.equal(cutoff, 2, '分界应是当前最大 seq')
+
+  const { visible, hidden } = entriesForPresentation([...before, entry('c', 3, '演示中的新内容')], cutoff)
+  assert.deepEqual(visible.map(item => item.id), ['c'], '只有分界之后的可见')
+  assert.equal(hidden, 2, '被藏起来的条数要对得上，界面要显示它')
+
+  // 关掉演示模式（cutoff = null）：同一批数据原样全部回来 —— 证明这里只过滤、没删除。
+  const restored = entriesForPresentation([...before, entry('c', 3, '演示中的新内容')], null)
+  assert.equal(restored.visible.length, 3)
+  assert.equal(restored.hidden, 0)
+})
+
+test('演示模式：往上翻历史插入更早的条目时，分界不跟着漂移', () => {
+  const cutoff = presentationCutoffOf([entry('b', 5, '开启时的最新一条')])
+  // 翻历史把 seq 更小的条目插到数组**前面**：按下标分界会错位，按 seq 不会。
+  const afterPaging = [entry('z', 1, '更早的历史'), entry('b', 5, '开启时的最新一条'), entry('c', 6, '新消息')]
+  const { visible, hidden } = entriesForPresentation(afterPaging, cutoff)
+  assert.deepEqual(visible.map(item => item.id), ['c'], '翻出来的旧历史不能被露出来')
+  assert.equal(hidden, 2)
+})
+
+test('演示模式：空历史没有可分界的对象，返回 null 表示不隐藏', () => {
+  assert.equal(presentationCutoffOf([]), null)
+  const { visible, hidden } = entriesForPresentation([entry('a', 1, '第一条')], null)
+  assert.equal(visible.length, 1)
+  assert.equal(hidden, 0)
 })

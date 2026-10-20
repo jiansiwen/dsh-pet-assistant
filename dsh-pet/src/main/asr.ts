@@ -19,6 +19,7 @@ import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import sherpa, { type OfflineRecognizerInstance } from 'sherpa-onnx-node'
+import { toUnpackedPath } from './runtime-launch.ts'
 
 export interface AsrResult {
   ok: boolean
@@ -319,7 +320,8 @@ function transcribeWithSenseVoice(wav: Buffer, userDataDir: string): AsrResult {
  * 不是主路径。macOS 上没装模型就直接报"识别模型没装"，不假装有兜底。
  */
 async function transcribeWithLegacyEngine(wavPath: string): Promise<AsrResult> {
-  const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'asr-wave.ps1')
+  // PowerShell 读不了 asar：打包后必须走 app.asar.unpacked 里的真实文件（见 asarUnpack）。
+  const scriptPath = toUnpackedPath(path.join(path.dirname(fileURLToPath(import.meta.url)), 'asr-wave.ps1'))
   const { code, stdout } = await spawnText(
     'powershell',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-Path', wavPath],

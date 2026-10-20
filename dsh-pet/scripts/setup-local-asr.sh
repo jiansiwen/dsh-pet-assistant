@@ -31,20 +31,35 @@ MIRROR="${MIRROR:-}"
 SHERPA_VER="v1.13.7"
 MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
 STREAM_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16.tar.bz2"
+# 会议按音色分人：pyannote 分段（MIT）+ 3D-Speaker 声纹嵌入（上游 Apache-2.0），本地推理，不上传音频。
+SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+# 本地唤醒（M1-02，macOS 唯一的本地唤醒方案）：sherpa-onnx 官方 kws-models 发布里的 WenetSpeech 中文 KWS 小模型
+#（zipformer，约 3.3M 参数，建模单元为拼音声母 + 带调韵母），许可证 Apache-2.0（见模型 README）。
+# 包大小 15,292,881 字节；sha256 取自该发布的 checksum.txt，解压前校验。
+KWS_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01-mobile.tar.bz2"
+KWS_SHA256="b812a043aef628a6915f89cb9a94e55f8e87e89ff904b516f822d7e0a3e6de2b"
 
 if [ -n "$MIRROR" ]; then
   MODEL_URL="${MIRROR%/}/$MODEL_URL"
   STREAM_URL="${MIRROR%/}/$STREAM_URL"
+  SEG_URL="${MIRROR%/}/$SEG_URL"
+  EMB_URL="${MIRROR%/}/$EMB_URL"
+  KWS_URL="${MIRROR%/}/$KWS_URL"
 fi
 
 MODEL_DIR="$DEST/model"
 STREAM_DIR="$DEST/streaming"
+DIAR_DIR="$DEST/diarization"
+KWS_DIR="$DEST/kws"
 
 echo "安装位置：$DEST"
 
-# 两个模型齐了就直接退出（与 Windows 版同样的幂等语义）。
+# 三组模型齐了就直接退出（与 Windows 版同样的幂等语义）。
 if [ -f "$MODEL_DIR/model.int8.onnx" ] && [ -f "$MODEL_DIR/tokens.txt" ] \
-   && [ -f "$STREAM_DIR/encoder.int8.onnx" ] && [ -f "$STREAM_DIR/joiner.int8.onnx" ]; then
+   && [ -f "$STREAM_DIR/encoder.int8.onnx" ] && [ -f "$STREAM_DIR/decoder.int8.onnx" ] \
+   && [ -f "$STREAM_DIR/joiner.int8.onnx" ] && [ -f "$STREAM_DIR/tokens.txt" ] \
+   && [ -f "$DIAR_DIR/segmentation.onnx" ] && [ -f "$DIAR_DIR/embedding.onnx" ]    && [ -f "$KWS_DIR/encoder.int8.onnx" ] && [ -f "$KWS_DIR/decoder.onnx" ]    && [ -f "$KWS_DIR/joiner.int8.onnx" ] && [ -f "$KWS_DIR/tokens.txt" ]; then
   echo "已经装好了，无需重复下载。"
   exit 0
 fi
@@ -53,7 +68,7 @@ for tool in curl tar; do
   command -v "$tool" >/dev/null 2>&1 || { echo "缺少 $tool，请先安装它" >&2; exit 1; }
 done
 
-mkdir -p "$MODEL_DIR" "$STREAM_DIR"
+mkdir -p "$MODEL_DIR" "$STREAM_DIR" "$DIAR_DIR"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/dsh-asr-setup-XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
@@ -105,6 +120,44 @@ if [ ! -f "$STREAM_DIR/encoder.int8.onnx" ] || [ ! -f "$STREAM_DIR/decoder.int8.
   [ -n "$STREAM_TOKENS" ] || STREAM_TOKENS="$(find "$TMP" -name 'tokens.txt' -type f | head -1)"
   [ -n "$STREAM_TOKENS" ] || { echo "压缩包里没找到流式 tokens.txt" >&2; exit 1; }
   cp "$STREAM_TOKENS" "$STREAM_DIR/tokens.txt"
+fi
+
+# ── 说话人分离（会议按音色分人）──
+if [ ! -f "$DIAR_DIR/segmentation.onnx" ]; then
+  PACK="$TMP/segmentation.tar.bz2"
+  fetch "$SEG_URL" "$PACK"
+  tar -xjf "$PACK" -C "$TMP"
+  SEG="$(find "$TMP" -path '*pyannote-segmentation*' -name 'model.onnx' -type f | head -1)"
+  [ -n "$SEG" ] || { echo "压缩包里没找到分段模型 model.onnx" >&2; exit 1; }
+  LICENSE_FILE="$(find "$(dirname "$SEG")" -maxdepth 1 -name 'LICENSE*' -type f | head -1)"
+  [ -z "$LICENSE_FILE" ] || cp "$LICENSE_FILE" "$DIAR_DIR/LICENSE.segmentation.txt"
+  cp "$SEG" "$DIAR_DIR/segmentation.onnx"
+fi
+if [ ! -f "$DIAR_DIR/embedding.onnx" ]; then
+  fetch "$EMB_URL" "$TMP/embedding.onnx"
+  [ "$(wc -c < "$TMP/embedding.onnx")" -gt 1048576 ] || { echo "声纹嵌入模型大小异常，可能下载不完整" >&2; exit 1; }
+  cp "$TMP/embedding.onnx" "$DIAR_DIR/embedding.onnx"
+fi
+
+# ── 本地唤醒词模型（KWS）：只装模型文件，keywords 文件由应用按唤醒词常量生成 ──
+if [ ! -f "$KWS_DIR/encoder.int8.onnx" ] || [ ! -f "$KWS_DIR/decoder.onnx" ]    || [ ! -f "$KWS_DIR/joiner.int8.onnx" ] || [ ! -f "$KWS_DIR/tokens.txt" ]; then
+  PACK="$TMP/kws.tar.bz2"
+  fetch "$KWS_URL" "$PACK"
+  if command -v shasum >/dev/null 2>&1; then ACTUAL="$(shasum -a 256 "$PACK" | cut -d' ' -f1)"; else ACTUAL="$(sha256sum "$PACK" | cut -d' ' -f1)"; fi
+  [ "$ACTUAL" = "$KWS_SHA256" ] || { echo "唤醒模型 sha256 不符：期望 $KWS_SHA256，实际 $ACTUAL" >&2; exit 1; }
+  echo "解压唤醒词模型..."
+  tar -xjf "$PACK" -C "$TMP"
+  mkdir -p "$KWS_DIR"
+  for pair in "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx:encoder.int8.onnx"               "decoder-epoch-12-avg-2-chunk-16-left-64.onnx:decoder.onnx"               "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx:joiner.int8.onnx"; do
+    SRC="$(find "$TMP" -name "${pair%%:*}" -type f | head -1)"
+    [ -n "$SRC" ] || { echo "压缩包里没找到 ${pair%%:*}" >&2; exit 1; }
+    cp "$SRC" "$KWS_DIR/${pair##*:}"
+  done
+  KWS_TOKENS="$(find "$TMP" -path '*kws*' -name 'tokens.txt' -type f | head -1)"
+  [ -n "$KWS_TOKENS" ] || { echo "压缩包里没找到唤醒模型 tokens.txt" >&2; exit 1; }
+  cp "$KWS_TOKENS" "$KWS_DIR/tokens.txt"
+  KWS_README="$(dirname "$KWS_TOKENS")/README.md"
+  [ ! -f "$KWS_README" ] || cp "$KWS_README" "$KWS_DIR/README.model.md"
 fi
 
 # ── 收尾核对：报告实际落盘的文件，而不是只说"完成" ──

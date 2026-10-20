@@ -21,7 +21,9 @@ const targets = [
     platform: 'node',
     format: 'esm',
     // sherpa-onnx 系列是 N-API 原生模块，必须 external（bundle 内联会丢 .node 二进制）。
-    external: ['electron', '@deepseek-ai/*', 'sherpa-onnx-node', 'sherpa-onnx-win-x64', 'pdfjs-dist'],
+    // ws 同理必须 external：它是 CJS 包，被 ESM bundle 内联后其内部的动态 require("events")
+    // 会在运行时炸掉（Error: Dynamic require of "events" is not supported）。
+    external: ['electron', '@deepseek-ai/*', 'sherpa-onnx-node', 'sherpa-onnx-win-x64', 'pdfjs-dist', 'ws'],
   },
   {
     // PDF.js 与其 worker/CMap/标准字体保留在同一外部依赖包内，不拷贝素材或加载远端 CDN。
@@ -62,6 +64,15 @@ const targets = [
     external: ['electron'],
   },
   {
+    // 阅读视图窗口的 preload：只暴露凭令牌取会话/字节/页许可/随包字体与回报用户动作，没有任何路径接口。
+    name: 'doc-view-preload',
+    entryPoints: [path.join(root, 'src/preload/doc-view.ts')],
+    outfile: path.join(root, 'dist/preload/doc-view.cjs'),
+    platform: 'node',
+    format: 'cjs',
+    external: ['electron'],
+  },
+  {
     name: 'renderer',
     entryPoints: [path.join(root, 'src/renderer/main.tsx')],
     outfile: path.join(root, 'dist/renderer/main.js'),
@@ -80,11 +91,41 @@ const targets = [
     format: 'iife',
     define: { 'process.env.NODE_ENV': '"production"' },
   },
+  {
+    // 阅读视图页面单独打包，pdf.js 及其解析端一并内联、在页面线程内运行：
+    // 不拷贝 worker 脚本、不从 CDN 取任何东西，CSP 只需 'self'。产物附带 dist/renderer/doc-view.css。
+    name: 'doc-view-renderer',
+    entryPoints: [path.join(root, 'src/renderer/doc-view-main.tsx')],
+    outfile: path.join(root, 'dist/renderer/doc-view.js'),
+    platform: 'browser',
+    format: 'iife',
+    define: { 'process.env.NODE_ENV': '"production"' },
+  },
+  {
+    // 日报工作台的 preload：只有读视图、逐条修订、请求发布/删除、导入文件与请求发送授权，没有任何批准接口。
+    name: 'report-workbench-preload',
+    entryPoints: [path.join(root, 'src/preload/report-workbench.ts')],
+    outfile: path.join(root, 'dist/preload/report-workbench.cjs'),
+    platform: 'node',
+    format: 'cjs',
+    external: ['electron'],
+  },
+  {
+    // 日报工作台页面单独打包；产物附带 dist/renderer/report-workbench.css，正是 report-workbench.html 链接的文件名。
+    name: 'report-workbench-renderer',
+    entryPoints: [path.join(root, 'src/renderer/report-workbench-main.tsx')],
+    outfile: path.join(root, 'dist/renderer/report-workbench.js'),
+    platform: 'browser',
+    format: 'iife',
+    define: { 'process.env.NODE_ENV': '"production"' },
+  },
 ]
 
 function copyStatic() {
   cpSync(path.join(root, 'src/renderer/index.html'), path.join(root, 'dist/renderer/index.html'))
   cpSync(path.join(root, 'src/renderer/approval.html'), path.join(root, 'dist/renderer/approval.html'))
+  cpSync(path.join(root, 'src/renderer/doc-view.html'), path.join(root, 'dist/renderer/doc-view.html'))
+  cpSync(path.join(root, 'src/renderer/report-workbench.html'), path.join(root, 'dist/renderer/report-workbench.html'))
   cpSync(path.join(root, 'src/renderer/styles.css'), path.join(root, 'dist/renderer/styles.css'))
   // ⚠️ 这里只做「覆盖拷贝」，**不删除**目标里多余的文件。
   //
@@ -105,6 +146,8 @@ function copyStatic() {
   cpSync(path.join(root, 'src/main/play.ps1'), path.join(root, 'dist/main/play.ps1'))
   cpSync(path.join(root, 'src/main/speak-once.ps1'), path.join(root, 'dist/main/speak-once.ps1'))
   cpSync(path.join(root, 'src/main/asr-wave.ps1'), path.join(root, 'dist/main/asr-wave.ps1'))
+  // 桌面动作（窗口识别 / WPS 翻页）的 UI Automation 辅助脚本，由 win-actions.ts 常驻启动。
+  cpSync(path.join(root, 'src/main/win-uia.ps1'), path.join(root, 'dist/main/win-uia.ps1'))
 }
 
 function esbuildOptions(target) {

@@ -16,6 +16,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { cardView, formatCountdown } from '../main/approval-policy.js'
 import { teamPanelView } from './team-panel.js'
 import type { TeamSnapshot } from './types.js'
+import type { CancelReceipt } from '../session-types.js'
+
+/** 还能被取消的任务状态：终态与结果不明的任务没有可停的东西，不给按钮。 */
+const CANCELLABLE = new Set(['created', 'queued', 'running', 'awaiting-approval', 'awaiting-user', 'review'])
+const RECEIPT_LABEL: Record<CancelReceipt['state'], string> = {
+  'not-executed': '未执行', cancelling: '取消中', terminated: '已终止', 'partially-executed': '已部分执行', unknown: '结果未知',
+}
 
 interface TeamPanelProps {
   /** 整份团队快照。null 表示桥接还没给过数据。 */
@@ -24,12 +31,42 @@ interface TeamPanelProps {
   memberNames: (assistantId: string) => string | null
   /** 请主进程打开专用审批窗口。开不成的那句报错由调用方显示（toast 归 App 管）。 */
   onOpenApproval: (proposalId: string) => void | Promise<void>
+  /** 当前会话绑定；任务取消与暂停经会话命令通道送到主进程，没有绑定时不显示这些按钮。 */
+  bindingId?: string
 }
 
-export default function TeamPanel({ snapshot, memberNames, onOpenApproval }: TeamPanelProps) {
+export default function TeamPanel({ snapshot, memberNames, onOpenApproval, bindingId }: TeamPanelProps) {
   const [now, setNow] = useState(() => Date.now())
   /** 正在开窗的那条提案 id。同一时刻只允许一次请求，见下面 openApproval。 */
   const [opening, setOpening] = useState<string | null>(null)
+  /** 正在取消的任务 id，以及每个任务最近一次的取消回执（如实显示 state，不把取消中说成已停止）。 */
+  const [cancelling, setCancelling] = useState<string | null>(null)
+  const [receipts, setReceipts] = useState<Record<string, { state: CancelReceipt['state'] | null; text: string }>>({})
+  const [pauseNote, setPauseNote] = useState<string | null>(null)
+  const paused = (snapshot as (TeamSnapshot & { paused?: boolean }) | null)?.paused === true
+
+  /** 定向取消一个团队任务：只作用于插件持有的子代理，回执带运行结束 / 释放证据。 */
+  const cancelTask = useCallback(async (taskId: string) => {
+    if (!bindingId || cancelling !== null) return
+    setCancelling(taskId)
+    try {
+      const result = await window.petApi.sessionCommand({ kind: 'cancel', bindingId, taskId })
+      const text = result.receipt?.message ?? result.notice ?? result.error ?? '取消没有回执，后台状态未知'
+      setReceipts(previous => ({ ...previous, [taskId]: { state: result.receipt?.state ?? null, text } }))
+    } catch (reason) {
+      setReceipts(previous => ({ ...previous, [taskId]: { state: 'unknown', text: `取消没有送达，后台状态未知：${String(reason)}` } }))
+    } finally {
+      setCancelling(null)
+    }
+  }, [bindingId, cancelling])
+
+  /** 暂停 / 恢复后续步骤：只挡新的领取，不中止在跑的任务。 */
+  const togglePause = useCallback(async () => {
+    if (!bindingId) return
+    const result = await window.petApi.sessionCommand({ kind: 'cancel', bindingId, scope: paused ? 'resume' : 'pause' })
+      .catch(reason => ({ ok: false, error: String(reason), notice: undefined }))
+    setPauseNote(result.notice ?? result.error ?? null)
+  }, [bindingId, paused])
 
   const view = useMemo(() => teamPanelView(snapshot, memberNames, now), [snapshot, memberNames, now])
 
@@ -165,7 +202,14 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval }: Tea
             <h3 className="team-section-title">
               任务
               {view.runningCount > 0 && <span className="team-count quiet">{view.runningCount} 个在跑</span>}
+              {bindingId && view.teamEnabled && (
+                <button type="button" className="team-go" onClick={() => void togglePause()}
+                  title="暂停后续步骤：排队中的任务不会开始，在跑的任务照常结束（要停下它请点任务上的「取消」）">
+                  {paused ? '恢复后续步骤' : '暂停后续步骤'}
+                </button>
+              )}
             </h3>
+            {pauseNote && <p className="team-note" role="status">{pauseNote}</p>}
             {view.tasks.length === 0 ? (
               <p className="team-none">还没有任务。跟总助理说一句要做什么，它就会分派下去。</p>
             ) : (
@@ -187,6 +231,21 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval }: Tea
                     {task.note && (
                       <p className="team-note" role="status">
                         {task.note}
+                      </p>
+                    )}
+                    {bindingId && CANCELLABLE.has(task.status) && (
+                      <div className="team-proposal-foot">
+                        <button type="button" className="team-go" disabled={cancelling !== null}
+                          title="定向取消这个任务：只停插件持有的子代理，不影响主会话；已发生的副作用不会撤回"
+                          onClick={() => void cancelTask(task.taskId)}>
+                          {cancelling === task.taskId ? '正在取消…' : '取消'}
+                        </button>
+                      </div>
+                    )}
+                    {receipts[task.taskId] && (
+                      <p className={`team-note${receipts[task.taskId].state ? ` cancel-${receipts[task.taskId].state}` : ''}`} role="status">
+                        {receipts[task.taskId].state ? `${RECEIPT_LABEL[receipts[task.taskId].state!]}：` : ''}
+                        {receipts[task.taskId].text}
                       </p>
                     )}
                   </li>

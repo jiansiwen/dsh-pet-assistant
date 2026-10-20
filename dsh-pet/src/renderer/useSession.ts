@@ -18,7 +18,7 @@ export function useSession() {
     const result = await window.petApi.getSession()
     if (request !== generation.current) return
     if (!result.ok || !result.state) {
-      setError(result.error ?? '还未连接原生会话，请在 dsh 中召唤宠物')
+      setError(result.error ?? '助理会话尚未开启：发一条消息或说“开启个人助理模式”即可开启')
       return
     }
     const state = result.state
@@ -66,6 +66,14 @@ export function useSession() {
     }
   }, [])
 
+  /** 主进程刚开启或恢复了会话：同步写入新绑定，紧接着的命令才不会被当成"绑定已改变"。 */
+  const adopt = useCallback((state: SessionSnapshot) => {
+    eventVersion.current += 1
+    current.current = state
+    setSession(previous => mergeSession(previous, state))
+    setError('')
+  }, [])
+
   const loadOlder = useCallback(async () => {
     const state = current.current
     if (!state?.hasMore || state.beforeSeq == null || olderLock.current) return
@@ -87,5 +95,5 @@ export function useSession() {
     } finally { olderLock.current = false; setLoadingOlder(false) }
   }, [])
 
-  return { session, error, command, refresh, loadOlder, loadingOlder }
+  return { session, error, command, refresh, loadOlder, loadingOlder, adopt }
 }

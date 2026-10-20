@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!--
+    工作台渲染的是模型写的日报、事项与资料文字：脚本、样式只认本目录，图片只认本目录与内联数据，
+    connect-src 禁掉——页面的一切数据都经 IPC 从主进程拿，它没有理由自己发任何网络请求。
+    这个窗口不是批准方：页面上的任何按钮最多只能请求主进程打开专用审批窗口。
+  -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+  />
+  <title>日报工作台</title>
+  <link rel="stylesheet" href="./report-workbench.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script src="./report-workbench.js"></script>
+</body>
+</html>

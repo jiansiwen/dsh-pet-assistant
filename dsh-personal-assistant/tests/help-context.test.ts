@@ -8,6 +8,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { HelpContextStore, readProjectEvidence } from '../src/help-context.ts'
 import { registerAssistantTools } from '../src/tools.ts'
+import { AssistantApprovalService } from '../src/assistant-approval.ts'
+import { SessionBridge } from '../src/bridge.ts'
 
 interface ToolDef { name: string; execute(args: unknown): Promise<string> }
 
@@ -15,6 +17,9 @@ function harness() {
   const dir = mkdtempSync(path.join(tmpdir(), 'dsh-help-'))
   const db = new DatabaseSync(path.join(dir, 'assistant.sqlite'))
   const helpContexts = new HelpContextStore(db)
+  const bridge = new SessionBridge({ dshHome: dir })
+  const approvals = new AssistantApprovalService({ epoch: bridge.epoch, ttlMs: 60_000 })
+  bridge.attachAssistantApprovals(approvals)
   const tools = new Map<string, ToolDef>()
   const ctx = {
     tools: { register: (def: ToolDef) => tools.set(def.name, def) },
@@ -23,8 +28,8 @@ function harness() {
   const boom = (): never => { throw new Error('不应调用') }
   registerAssistantTools(ctx as never, { getDay: boom } as never, {
     reportDir: dir,
-    bridge: { teamEnabled: false, submitReport: boom, pendingReportApprovals: () => [], notifyApprovalSnapshot: () => undefined } as never,
-    memories: { put: boom, list: boom, delete: boom, injectable: boom } as never,
+    bridge,
+    memories: { put: boom, list: boom, delete: boom, injectable: boom, listProject: () => [] } as never,
     reports: { current: boom, saveDraftIfChanged: boom, submitForConfirmation: boom, approve: boom, history: boom } as never,
     maxInjectedMemories: 10,
     captureBlockedReason: () => null,
@@ -35,24 +40,37 @@ function harness() {
   })
   const call = async (name: string, args: unknown = {}): Promise<Record<string, unknown>> =>
     JSON.parse(await tools.get(name)!.execute(args)) as Record<string, unknown>
-  return { dir, db, helpContexts, tools, call, cleanup: () => { db.close(); rmSync(dir, { recursive: true, force: true }) } }
+  const approve = async (pending: Record<string, unknown>) => {
+    assert.equal(pending.pending, true)
+    assert.equal(pending.recorded, undefined)
+    const result = await approvals.decide(String(pending.proposalId), 'approve', bridge.epoch, approvals.approvalCapabilityToken)
+    assert.equal(result.ok, true)
+    return result.result as { id: string; currentFile: string }
+  }
+  return { dir, db, helpContexts, tools, call, approve, cleanup: () => { bridge.dispose(); db.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 test('帮助范围必须绝对路径，文件必须落在授权目录内', async () => {
   const h = harness()
   try {
-    assert.equal((await h.call('personal_assistant_help_context', { projectDir: 'relative/dir' })).recorded, false)
+    assert.equal((await h.call('personal_assistant_help_context', { projectDir: 'relative/dir' })).pending, false)
     const outside = mkdtempSync(path.join(tmpdir(), 'dsh-help-out-'))
     const bad = await h.call('personal_assistant_help_context', {
       projectDir: h.dir, currentFile: path.join(outside, 'a.ts'),
     })
-    assert.equal(bad.recorded, false)
+    assert.equal(bad.pending, false)
     rmSync(outside, { recursive: true, force: true })
-    const ok = await h.call('personal_assistant_help_context', {
+    writeFileSync(path.join(h.dir, 'a.ts'), '测试文件')
+    const pending = await h.call('personal_assistant_help_context', {
       projectDir: h.dir, currentFile: path.join(h.dir, 'a.ts'), note: '构建失败',
     })
-    assert.equal(ok.recorded, true)
+    assert.equal(h.helpContexts.list().length, 0)
+    const ok = await h.approve(pending)
+    assert.equal(h.helpContexts.list().length, 1)
     assert.equal(ok.currentFile, path.join(h.dir, 'a.ts'))
+    const evidence = await h.call('personal_assistant_read_project_evidence', { projectDir: h.dir })
+    assert.deepEqual(evidence.entries, ['a.ts'])
+    assert.deepEqual(evidence.recentCommits, [])
   } finally { h.cleanup() }
 })
 
@@ -63,7 +81,9 @@ test('未授权目录读不到证据；授权后只读返回顶层条目', async
     const denied = await h.call('personal_assistant_read_project_evidence', { projectDir: h.dir })
     assert.equal(denied.ok, false)
     const added = await h.call('personal_assistant_help_context', { projectDir: h.dir })
-    assert.equal(added.recorded, true)
+    assert.equal(h.helpContexts.list().length, 0)
+    await h.approve(added)
+    assert.equal(h.helpContexts.list().length, 1)
     const evidence = await h.call('personal_assistant_read_project_evidence', { projectDir: h.dir })
     assert.equal(evidence.ok, true)
     assert.equal(evidence.readOnly, true)
@@ -75,7 +95,7 @@ test('未授权目录读不到证据；授权后只读返回顶层条目', async
 test('撤销授权后证据读取立即拒绝', async () => {
   const h = harness()
   try {
-    const added = await h.call('personal_assistant_help_context', { projectDir: h.dir })
+    const added = await h.approve(await h.call('personal_assistant_help_context', { projectDir: h.dir }))
     const listed = await h.call('personal_assistant_list_help_contexts')
     assert.equal((listed.contexts as unknown[]).length, 1)
     const removed = await h.call('personal_assistant_forget_help_context', { id: String(added.id) })

@@ -1,63 +1,151 @@
-# macOS 打包配置：权限声明与签名能力。
+# dsh 桌面助理团的打包配置（electron-builder 26.x；字段按 26.17.0 的 schema 核对过）。
 #
-# 这个文件**不是可选的**。macOS 10.14+ 起：
+# electron-builder 尚未安装（package.json 的 devDependencies 里没有它）：安装依赖需要用户授权，
+# 所以这份配置当前**只是备好**，没有跑过真实打包。授权后的产包与验证步骤见
+# petsBak/dsh-pet/packaging-checklist.md。
 #
-#   应用访问麦克风必须在 Info.plist 里声明 `NSMicrophoneUsageDescription`，
-#   否则调用 `getUserMedia` 时系统会**直接终止进程** —— 不是返回错误、不是弹窗拒绝，
-#   是进程消失。用户看到的是"宠物点一下说话就没了"，而日志里什么都留不下。
+# 用法（在 dsh-pet 目录，构建前先清空 dist，免得把旧产物和 *.stale 帧带进包里）：
+#   npx electron-builder --win --config build/electron-builder.yml --publish never
+#   npx electron-builder --mac --config build/electron-builder.yml --publish never
+# 只想看目录结构、不出安装包时加 --dir。
 #
-# 用法（在 dsh-pet 目录）：
-#   npx electron-builder --mac --config build/electron-builder.yml
+# ── 签名与发布：本配置只产出本地测试包 ──
+# - 不配置任何签名证书（mac.identity: null、forceCodeSigning: false、Windows 不给 CSC_LINK），
+#   也不公证（mac.notarize: false）、不配置发布目标（publish: null，命令行再加 --publish never）。
+# - 产物文件名带 unsigned-local，不能当作已签名 / 已公证的发行版对外分发或宣称。
+# - 系统保护照常生效：Windows 会出 SmartScreen 提示，macOS 首次打开要用户在
+#   「系统设置 → 隐私与安全性」里自己点"仍要打开"。不要关 Gatekeeper、不要批量去掉隔离属性。
+# - 签名证书、Apple 开发者账号公证都要另行授权后再改这里。
 #
-# 注意：**开发态直接 `pnpm start` 不走这里**。那时进程是 `Electron.app`，
-# 麦克风权限取决于 Electron 自己的 Info.plist（它已声明了麦克风用途），
-# 所以开发时能说话。只有打包成独立 .app 之后才必须有这份配置。
+# ── 安装包携带什么 ──
+# 运行时：
+#   - Electron 37（electron-builder 按 node_modules/electron 的版本取对应发行包）。
+#   - 随包 dsh CLI（@deepseek-ai/dsh，生产依赖）与 @deepseek-ai/dsh-sdk-client。
+#     团队运行时用壳自己的可执行文件带 ELECTRON_RUN_AS_NODE=1 来跑，不依赖用户 PATH 上的 node；
+#     CLI 从 app.asar.unpacked 的真实路径启动（runtime-launch.ts 的 resolveAppLayout().realAppDir）。
+#     因此**不能**用 electronFuses 关掉 runAsNode，TTS 合成 worker 也靠它。
+# 原生模块（N-API 预编译包，不需要按 Electron 重编译，见 npmRebuild: false）：
+#   - sherpa-onnx-node + 当前平台子包（sherpa-onnx-win-x64 / -darwin-arm64 / -darwin-x64），
+#     .node 与同目录的 onnxruntime 动态库必须一起解包，系统加载器才找得到依赖库。
+#   - dsh 运行时依赖里的 node-pty、koffi、sharp、@napi-rs/canvas、node-addon-require-builtin。
+# 资源：
+#   - dist/main（主进程、PDF 解析 worker、TTS worker、7 个 .ps1）、dist/preload、dist/renderer。
+#   - dist/assets：形象帧、托盘图标、pointer-watch.ps1（渲染层用相对 URL 读、托盘用 nativeImage 读，
+#     两者都支持 asar；只有 .ps1 要解包给 PowerShell）。
+#   - pdfjs-dist：legacy build、pdf.worker、cmaps、standard_fonts，由 PDF 解析 worker 按文件读取。
+# 不随包：
+#   - 本地语音模型：放在 userData/local-asr（%APPDATA%\dsh-pet\local-asr、
+#     ~/Library/Application Support/dsh-pet/local-asr），首次使用时经确认下载（model-resources.ts），
+#     或用 scripts/setup-local-asr 脚本安装。几百 MB 的模型不进安装包，升级应用也不必重下。
+#   - 个人助理插件 dsh-personal-assistant：它是 dsh profile 的一层，装进 ~/.dsh/profiles/<名字> 并在那里
+#     解析 peer 依赖。装插件 = 改动用户的 profile（package.json 与图层列表），桌面壳不能自动做；
+#     dsh plugin add 还要求本机有 pnpm。若把插件放进安装包再 link/file 进 profile，升级或卸载应用会让
+#     profile 里的依赖悬空。所以插件包（pnpm pack 产出的 .tgz）随安装包一起单独提供，
+#     首次检查给出完整的安装命令，由用户确认后自己执行。
+#   - 用户数据：~/.dsh 与 userData 都不进包，安装、卸载都不动它们。
 
 appId: com.dsh.pet
 productName: dsh 桌面助理团
+# 注意：不要在 extraMetadata 里写 productName。Electron 用打包后 package.json 的 productName（没有时用 name）
+# 决定 userData 目录名：现在是 dsh-pet，与开发态、setup 脚本的落点相同；写了就会换成"dsh 桌面助理团"，
+# 已装的模型、设置、会议库在用户看来就全"丢"了。
+artifactName: dsh-pet-${version}-${os}-${arch}-unsigned-local.${ext}
 
 directories:
   output: release
   buildResources: build
 
+asar: true
+
 files:
   - dist/**/*
   - package.json
-  # 语音脚本与模型目录：.ps1 在 macOS 上用不到，但 wake.ps1 / play.ps1 等
-  # 是 build.mjs 的拷贝目标，少一个不会崩（运行时会走平台分支），留着也不碍事。
   - '!**/*.map'
+  # tools/matting/sync-frames.py 把多余的旧帧改名成 *.stale：引擎探测不到，也不该占安装包。
+  - '!**/*.stale'
+  # 生产依赖（dependencies + 已装的 optionalDependencies）由 electron-builder 自动带上；
+  # devDependencies（electron、esbuild、react 等）不进包 —— 渲染层的 react 已被 esbuild 打进 bundle。
 
-extraResources:
-  # 素材走 resources 而不是 asar：逐帧探测要按真实路径读文件，
-  # 打进 asar 之后 fs 读不到（Electron 的 asar 补丁能读，但路径语义会变）。
-  - from: assets
-    to: assets
+# 素材不再走 extraResources：旧配置把 assets 整份拷到 resources/assets，但没有任何代码读那里
+# （渲染层与托盘都读 dist/assets），等于在安装包里多放一份 130MB 的重复拷贝。
+
+asarUnpack:
+  # ① PowerShell 读不了 asar 里的文件：主进程的 7 个脚本与 pointer-watch.ps1 必须是真实文件。
+  - dist/main/*.ps1
+  - dist/assets/*.ps1
+  # ② 线程与子进程入口：从 app.asar.unpacked 的真实路径启动（runtime-launch.ts 的 toUnpackedPath），
+  #    不依赖 worker 线程 / ELECTRON_RUN_AS_NODE 子进程里的 asar 补丁。
+  - dist/main/doc-pdf-worker.js
+  - dist/main/tts-edge-worker.js
+  # ③ sherpa-onnx 原生模块与平台子包：.node 与同目录的 dll/dylib 一起解包。
+  - node_modules/sherpa-onnx-node/**
+  - node_modules/sherpa-onnx-*/**
+  # ④ PDF.js 按文件读取的资源（legacy build、worker、cmaps、standard_fonts）。
+  - node_modules/pdfjs-dist/**
+  # ⑤ 团队运行时（dsh CLI）及其全部依赖：以子进程从真实路径运行。它的依赖里有 node-pty、koffi 等
+  #    原生模块，还会按自身目录拼路径交给外部程序（pnpm、PowerShell、spawn-helper），放在 asar 里
+  #    这些路径都不成立。所以生产依赖整体解包，asar 里只留本应用自己的 dist。
+  - node_modules/**
+
+# 原生模块全是 N-API 预编译包（ABI 与 Electron 版本无关），不需要按 Electron 头文件重编译；
+# 开着它会尝试从源码重编 node-pty，在没有 VS/Xcode 构建工具的机器上直接失败。
+npmRebuild: false
+
+# 不配置签名证书：无证书时出未签名的本地测试包，而不是因为没签名就失败。
+forceCodeSigning: false
+
+# 不配置发布目标。命令行同时加 --publish never。
+publish: null
 
 mac:
   category: public.app-category.productivity
+  # 不写 arch：默认按构建机的架构出包。pnpm 只装当前架构的 sherpa-onnx-darwin-* 子包，
+  # 在 arm64 机器上硬出 x64 包会缺原生模块；跨架构出包要先另行授权安装对应子包。
   target:
     - target: dmg
-      arch: [arm64, x64]
   # 宠物要常驻桌面，不需要 Dock 图标（代码里也会调 app.dock.hide()，
   # LSUIElement 让它在 Dock 里从启动那一刻就不出现，避免闪一下）。
+  #
+  # 权限用途说明（这几条与 entitlements 保持原样，未改动）：
+  # - NSMicrophoneUsageDescription：麦克风（唤醒、听写、会议录音）。缺了它，getUserMedia 时系统直接终止进程。
+  # - NSCameraUsageDescription：不使用摄像头，仅满足媒体权限的完整性检查。
+  # - NSAppleEventsUsageDescription：自动化（Apple Events）。除活动记录外，mac-actions.ts 经
+  #   System Events 识别 WPS 窗口、读页码、翻页也用到这项授权；文案若要补上"文档讲解"需产品确认后再改。
+  # - 辅助功能（Accessibility）与屏幕录制（Screen Recording）没有 Info.plist 用途键：它们由用户在
+  #   「系统设置 → 隐私与安全性」里授权。对应能力是 mac-actions.ts 的 WPS 窗口识别 / 读页码 / 翻页
+  #   （辅助功能）与缺辅助功能时的只读窗口标题识别（屏幕录制）；首次检查（first-run.ts）会列出这两项。
   extendInfo:
     LSUIElement: true
     NSMicrophoneUsageDescription: 桌面助理需要麦克风来听你说话（语音唤醒与按键听写）。录音只在本机处理，不上传任何音频。
     NSCameraUsageDescription: 桌面助理不使用摄像头；这一项仅为满足系统对媒体权限的完整性检查。
     NSAppleEventsUsageDescription: 桌面助理需要它来读取前台应用信息，用于生成你的活动记录（仅在你开启「活动记录」后）。
   # 硬件访问能力。没有 audio-input，即使声明了用途说明也拿不到麦克风。
+  # entitlements 与 hardenedRuntime 只在签名时生效；本配置不签名（identity: null），留着供日后授权签名时使用。
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   hardenedRuntime: true
-  gatekeeperAssess: false
+  # 不签名、不公证：签名证书与公证（Apple 开发者账号）都需要另行授权。
+  # 想在本机验证 entitlements 是否生效，可以临时用 -c.mac.identity=- 做 ad-hoc 签名 ——
+  # ad-hoc 不是开发者签名，产物同样只能本机测试，不能宣称已签名。
+  identity: null
+  notarize: false
 
 win:
   target:
     - target: nsis
       arch: [x64]
   # Windows 上麦克风权限由系统隐私设置管，不需要 Info.plist 那样的声明。
+  # 不给 CSC_LINK / WIN_CSC_LINK 就不会签名；electron-builder 仍会用 rcedit 写入版本信息与图标，这不是签名。
+
+nsis:
+  # 按用户安装到 %LOCALAPPDATA%\Programs，不需要管理员权限。
+  oneClick: true
+  perMachine: false
+  # 卸载时不删 userData（模型、设置、会议库）。"卸载时选择是否保留数据"属于 M5-07，需要自定义安装脚本。
+  deleteAppDataOnUninstall: false
 
 linux:
+  # 未在 Linux 上验证，不对外宣称可用。
   target:
     - target: AppImage
       arch: [x64]

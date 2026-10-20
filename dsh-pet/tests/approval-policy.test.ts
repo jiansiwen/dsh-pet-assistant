@@ -25,6 +25,33 @@ import {
   type SenderFacts,
 } from '../src/main/approval-policy.ts'
 
+describe('助理范围确认', () => {
+  const full: ApprovalProposal = {
+    kind: 'assistant', proposalId: 'assistant-1', revision: 1, digest: 'a'.repeat(64),
+    content: '仅允许读取指定项目；可能交给当前模型处理。\n不授权修改或读取其他目录。',
+    target: 'D:/项目/' + '完整目录/'.repeat(40), epoch: 'epoch-1', expiresAt: 2000,
+    state: 'pending', tool: 'authorize_context', risk: 'medium',
+  }
+  it('完整范围与目标不截断且不伪装为日报', () => {
+    const view = cardView(full, null, 1000)
+    assert.equal(view.canDecide, true)
+    assert.equal(view.report, null)
+    assert.equal(view.assistant?.content, full.content)
+    assert.equal(view.target, full.target)
+  })
+  for (const field of ['revision', 'digest', 'content', 'target', 'epoch', 'expiresAt', 'state', 'tool'] as const) {
+    it(`缺少 ${field} 时不能批准`, () => {
+      const view = cardView({ ...full, [field]: undefined }, null, 1000)
+      assert.equal(view.canDecide, false)
+      assert.match(view.blockedReason!, /绑定信息缺失/)
+    })
+  }
+  it('删除即使声明中风险仍须原生确认，过期拒批', () => {
+    assert.equal(cardView({ ...full, tool: 'delete_activity' }, null, 1000).needsNativeConfirm, true)
+    assert.equal(cardView(full, null, 2000).canDecide, false)
+  })
+})
+
 function proposal(patch: Partial<ApprovalProposal> = {}): ApprovalProposal {
   return {
     proposalId: 'p-1',
@@ -217,18 +244,18 @@ describe('formatCountdown：审批提案的剩余时间', () => {
 
 describe('cardView：把原始提案投影成卡片内容', () => {
   it('待批且未过期时可以决定', () => {
-    const view = cardView(proposal(), '孙悟空', 1_000)
+    const view = cardView(proposal(), '助理1', 1_000)
     assert.equal(view.canDecide, true)
     assert.equal(view.blockedReason, null)
     // 这里断言截止时间而不是倒计时文案：文案要每秒跳一次，由界面自己用 formatCountdown 算，
     // 那组用例在 formatCountdown 的 describe 里。投影只负责把原始截止时间原样交出去。
     assert.equal(view.expiresAt, 2_000)
     assert.equal(view.riskLabel, '低风险')
-    assert.equal(view.requester, '孙悟空')
+    assert.equal(view.requester, '助理1')
   })
 
   it('过期后不能决定，而且原因要显示出来', () => {
-    const view = cardView(proposal({ expiresAt: 1_000 }), '孙悟空', 1_500)
+    const view = cardView(proposal({ expiresAt: 1_000 }), '助理1', 1_500)
     assert.equal(view.canDecide, false)
     assert.equal(view.expired, true)
     // 只禁用按钮不告诉原因，用户就不知道自己在等什么。
@@ -237,27 +264,27 @@ describe('cardView：把原始提案投影成卡片内容', () => {
   })
 
   it('已批准/已驳回的提案不能决定，原因里说清是哪种', () => {
-    const approved = cardView(proposal({ state: 'approved' }), '孙悟空', 0)
+    const approved = cardView(proposal({ state: 'approved' }), '助理1', 0)
     assert.equal(approved.canDecide, false)
     assert.ok(approved.blockedReason?.includes('批准'))
 
-    const rejected = cardView(proposal({ state: 'rejected' }), '孙悟空', 0)
+    const rejected = cardView(proposal({ state: 'rejected' }), '助理1', 0)
     assert.ok(rejected.blockedReason?.includes('驳回'))
 
-    const expiredState = cardView(proposal({ state: 'expired' }), '孙悟空', 0)
+    const expiredState = cardView(proposal({ state: 'expired' }), '助理1', 0)
     assert.ok(expiredState.blockedReason?.includes('结束'))
   })
 
   it('没有有效期的提案不显示倒计时，也不判为过期', () => {
     // expiresAt 是 null 而不是一个过去的时刻：那条提案根本没有期限，说它过期是误导。
-    const view = cardView(proposal({ expiresAt: undefined }), '孙悟空', 9_999_999)
+    const view = cardView(proposal({ expiresAt: undefined }), '助理1', 9_999_999)
     assert.equal(view.expiresAt, null)
     assert.equal(view.expired, false)
     assert.equal(view.canDecide, true)
   })
 
   it('state 缺失按 pending 处理：宿主不推这个字段时提案仍然可以批', () => {
-    const view = cardView(proposal({ state: undefined }), '孙悟空', 0)
+    const view = cardView(proposal({ state: undefined }), '助理1', 0)
     assert.equal(view.canDecide, true)
   })
 
@@ -271,7 +298,7 @@ describe('cardView：把原始提案投影成卡片内容', () => {
 
   it('目标先规范化：反斜杠统一成正斜杠', () => {
     const long = 'D:\\work\\dsh-personal-assistant\\dist\\index-0905192905.js'
-    const view = cardView(proposal({ target: long }), '孙悟空', 0)
+    const view = cardView(proposal({ target: long }), '助理1', 0)
     // 先收窄类型：给了目标就该有目标，而 assert.ok 是断言函数，后面两条不必再写可选链。
     assert.ok(typeof view.target === 'string', '给了目标就该有目标')
     assert.ok(view.target.startsWith('D:/java/'), '反斜杠应当已经统一')
@@ -298,11 +325,11 @@ describe('cardView：把原始提案投影成卡片内容', () => {
 
 describe('confirmDialogSpec：原生确认框的文案', () => {
   it('写出操作、目标、说明、提请者、风险与剩余时间', () => {
-    const spec = confirmDialogSpec(cardView(proposal(), '孙悟空', 1_000), '孙悟空', 1_000)
-    assert.ok(spec.message.includes('孙悟空'))
+    const spec = confirmDialogSpec(cardView(proposal(), '助理1', 1_000), '助理1', 1_000)
+    assert.ok(spec.message.includes('助理1'))
     assert.ok(spec.message.includes('read_file'))
     assert.ok(spec.message.includes('真的动手'), '要让用户知道批准后是真执行')
-    for (const line of ['操作：read_file', '目标：D:/java/project/report.md', '说明：读一下今天的日报', '提请：孙悟空', '风险：低风险', '剩余：0:01']) {
+    for (const line of ['操作：read_file', '目标：D:/java/project/report.md', '说明：读一下今天的日报', '提请：助理1', '风险：低风险', '剩余：0:01']) {
       assert.ok(spec.detail.includes(line), `detail 里应当有「${line}」，实际是：${spec.detail}`)
     }
   })
@@ -310,9 +337,9 @@ describe('confirmDialogSpec：原生确认框的文案', () => {
   it('剩余时间按弹框那一刻算，不按卡片渲染那一刻算', () => {
     // 用户可能先读了十几秒卡片才点批准。显示卡片时刻的剩余时间会多报，
     // 而多报的那几秒正是用户以为还来得及的部分。
-    const view = cardView(proposal({ expiresAt: 60_000 }), '孙悟空', 0)
-    assert.ok(confirmDialogSpec(view, '孙悟空', 0).detail.includes('剩余：1:00'))
-    assert.ok(confirmDialogSpec(view, '孙悟空', 30_000).detail.includes('剩余：0:30'))
+    const view = cardView(proposal({ expiresAt: 60_000 }), '助理1', 0)
+    assert.ok(confirmDialogSpec(view, '助理1', 0).detail.includes('剩余：1:00'))
+    assert.ok(confirmDialogSpec(view, '助理1', 30_000).detail.includes('剩余：0:30'))
   })
 
   it('没有提请者时退回「助理」，不显示 null', () => {
@@ -442,5 +469,134 @@ describe('sameLocalPage：什么才算"就是那个打包进来的本地页面"'
 
   it('期望值本身不是本地页面时也不通过：配置错了要失败，不要放行', () => {
     assert.equal(sameLocalPage(page, 'https://example/approval.html'), false)
+  })
+})
+
+describe('可信执行器动作的审批卡：差异、命令与复核结论必须完整摊开，对不上就不能批', () => {
+  const changeDocument = (patch: Record<string, unknown> = {}) => ({
+    format: 'dsh-change-review@1', root: 'D:/work/repo', revision: 2,
+    files: [
+      { path: 'src/calc.js', action: 'modify', added: 1, removed: 1, baseHash: 'b'.repeat(64), newHash: 'c'.repeat(64),
+        diff: '@@ -1,3 +1,3 @@\n function add(a, b) {\n-  return a - b\n+  return a + b\n }', diffTruncated: false },
+      { path: 'src/new.js', action: 'create', added: 1, removed: 0, baseHash: 'absent', newHash: 'd'.repeat(64),
+        diff: '@@ -0,0 +1,1 @@\n+exports.y = 1', diffTruncated: false },
+    ],
+    totalAdded: 2, totalRemoved: 1, truncated: false, notice: null, ...patch,
+  })
+  const change = (document: unknown = changeDocument(), patch: Partial<ApprovalProposal> = {}): ApprovalProposal => ({
+    proposalId: 'change-1', tool: 'apply_change', target: 'D:/work/repo', summary: '改动第 2 版：2 个文件（+2 −1）',
+    risk: 'medium', state: 'pending', expiresAt: 2_000, assistantId: 'member-tangseng',
+    content: JSON.stringify(document), digest: 'e'.repeat(64), revision: 2, ...patch,
+  })
+
+  it('改动卡：文件清单、增删行数与逐行差异都在，标题与操作名说清是「应用改动」', () => {
+    const view = cardView(change(), '总助理', 1_000)
+    assert.equal(view.canDecide, true)
+    assert.equal(view.title, '请审阅这次改动')
+    assert.equal(view.toolLabel, '应用改动（apply_change）')
+    assert.equal(view.change?.files.length, 2)
+    assert.deepEqual(view.change?.files.map(file => [file.path, file.actionLabel, file.added, file.removed]),
+      [['src/calc.js', '修改', 1, 1], ['src/new.js', '新建', 1, 0]])
+    assert.equal(view.change?.totalAdded, 2)
+    assert.deepEqual(view.change?.files[0]?.lines.map(line => line.kind), ['hunk', 'ctx', 'del', 'add', 'ctx'])
+    assert.equal(view.change?.digest, 'e'.repeat(64))
+    assert.equal(view.change?.notice, null)
+  })
+
+  it('截断时必须带提示，增删行数仍按完整改动显示', () => {
+    const truncated = changeDocument({ truncated: true, notice: '差异太长，审批卡只显示了前 4 行' })
+    ;(truncated.files as Array<Record<string, unknown>>)[0]!.diffTruncated = true
+    ;(truncated.files as Array<Record<string, unknown>>)[0]!.diff = '@@ -1,3 +1,3 @@'
+    const view = cardView(change(truncated), null, 1_000)
+    assert.equal(view.canDecide, true)
+    assert.equal(view.change?.truncated, true)
+    assert.match(view.change?.notice ?? '', /只显示了前 4 行/)
+    assert.equal(view.change?.files[0]?.added, 1)
+    const silent = changeDocument({ truncated: true, notice: null })
+    ;(silent.files as Array<Record<string, unknown>>)[0]!.diffTruncated = true
+    assert.equal(cardView(change(silent), null, 1_000).canDecide, false, '截断却不提示就不能批')
+  })
+
+  it('差异与声明的增删行数对不上、总数不符、修订或摘要缺失、格式不对：一律不能批', () => {
+    const lying = changeDocument()
+    ;(lying.files as Array<Record<string, unknown>>)[0]!.added = 0
+    const cases: ApprovalProposal[] = [
+      change(lying),
+      change(changeDocument({ totalAdded: 5 })),
+      change(changeDocument({ revision: 3 })),
+      change(changeDocument({ format: 'other' })),
+      change(changeDocument({ files: [] })),
+      change(changeDocument(), { digest: undefined }),
+      change(changeDocument(), { revision: undefined }),
+      change(changeDocument(), { content: '不是 JSON' }),
+      change(changeDocument(), { content: undefined }),
+    ]
+    for (const proposal of cases) {
+      const view = cardView(proposal, null, 1_000)
+      assert.equal(view.canDecide, false)
+      assert.match(view.blockedReason ?? '', /改动差异、版本或绑定信息缺失或对不上/)
+      assert.equal(view.change, null)
+    }
+  })
+
+  const verification = (patch: Partial<ApprovalProposal> = {}, document: Record<string, unknown> = {}): ApprovalProposal => ({
+    proposalId: 'verify-1', tool: 'run_verification', target: 'C:/node/node.exe --test test/calc.test.js', risk: 'high', state: 'pending',
+    expiresAt: 2_000, assistantId: 'member-tangseng', summary: '在 . 运行验证命令（超时 60 秒）', digest: 'f'.repeat(64), revision: 1,
+    content: JSON.stringify({
+      format: 'dsh-verification-review@1', root: 'D:/work/repo', cwd: 'D:/work/repo', cwdRelative: '.', program: 'C:/node/node.exe',
+      requested: 'node', args: ['--test', 'test/calc.test.js'], timeoutMs: 60_000, expectedEffects: '只运行单元测试，不修改源文件',
+      env: '只传基础环境变量', afterChange: { changeId: 'c', revision: 2, files: ['src/calc.js'] }, notes: ['不经过 shell'], ...document,
+    }),
+    ...patch,
+  })
+
+  it('验证命令卡：cwd、程序绝对路径、逐项参数、超时、预期副作用都摊开；高风险要原生确认', () => {
+    const view = cardView(verification(), '总助理', 1_000)
+    assert.equal(view.canDecide, true)
+    assert.equal(view.title, '请确认这条验证命令')
+    assert.deepEqual(view.verification?.args, ['--test', 'test/calc.test.js'])
+    assert.equal(view.verification?.timeoutLabel, '1 分 0 秒')
+    assert.equal(view.verification?.afterChange?.revision, 2)
+    assert.equal(view.needsNativeConfirm, true)
+    const spec = confirmDialogSpec(view, '总助理', 1_000)
+    for (const line of ['工作目录：D:/work/repo', '程序：C:/node/node.exe', '参数：["--test","test/calc.test.js"]', '超时：1 分 0 秒', '预期副作用：只运行单元测试，不修改源文件']) {
+      assert.ok(spec.detail.includes(line), `确认框里应当有「${line}」，实际：${spec.detail}`)
+    }
+    assert.match(spec.message, /运行验证命令/)
+  })
+
+  it('验证命令缺参数数组、超时或预期副作用说明：不能批', () => {
+    for (const document of [{ args: 'node --test' }, { timeoutMs: 0 }, { expectedEffects: '' }, { format: 'x' }]) {
+      const view = cardView(verification({}, document), null, 1_000)
+      assert.equal(view.canDecide, false, JSON.stringify(document))
+      assert.match(view.blockedReason ?? '', /验证命令的完整范围缺失/)
+    }
+  })
+
+  it('人工复核卡：写明被复核的操作与要写进账本的结论；信息不全不能批', () => {
+    const review = (document: Record<string, unknown> = {}): ApprovalProposal => ({
+      proposalId: 'review-1', tool: 'review_unknown', target: 'operation:op-1', risk: 'medium', state: 'pending', expiresAt: 2_000,
+      digest: 'a'.repeat(64), revision: 1,
+      content: JSON.stringify({
+        format: 'dsh-unknown-review@1',
+        operation: { operationId: 'op-1', kind: 'bash', target: 'deploy --prod', startedAt: 10, executedAt: 20, detail: '进程中断' },
+        resolution: 'verified-failed', resolutionLabel: '已核实失败', note: '日志显示没部署上', effect: '只改写账本里这一项操作的结论', ...document,
+      }),
+    })
+    const view = cardView(review(), null, 1_000)
+    assert.equal(view.canDecide, true)
+    assert.equal(view.title, '请确认人工复核结论')
+    assert.equal(view.review?.resolutionLabel, '已核实失败')
+    assert.equal(view.review?.target, 'deploy --prod')
+    assert.match(confirmDialogSpec(view, null, 1_000).detail, /标记为「已核实失败」/)
+    assert.equal(cardView(review({ resolution: 'succeeded' }), null, 1_000).canDecide, false)
+    assert.equal(cardView(review({ operation: null }), null, 1_000).canDecide, false)
+  })
+
+  it('普通团队提案与日报、助理卡片照旧：没有审阅区，操作名就是工具名', () => {
+    const plain = cardView(proposal(), '助理1', 1_000)
+    assert.equal(plain.change, undefined)
+    assert.equal(plain.toolLabel, 'read_file')
+    assert.equal(plain.title, '有个操作等你点头')
   })
 })

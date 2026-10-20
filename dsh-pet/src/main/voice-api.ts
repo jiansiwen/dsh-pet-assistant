@@ -49,7 +49,7 @@ function endpointOf(value: unknown, kind: VoiceApiKind, provider: VoiceApiProvid
   try { url = new URL(source) } catch { fail('语音接口地址无效') }
   const loopback = url.hostname === 'localhost' || url.hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(url.hostname)
   if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) || url.username || url.password || url.search || url.hash) fail('语音接口仅支持安全地址或本机地址，且不能包含认证信息、查询或片段')
-  const suffix = provider === 'mimo' && kind === 'asr' ? '/chat/completions' : kind === 'tts' ? '/audio/speech' : '/audio/transcriptions'
+  const suffix = provider === 'mimo' ? '/chat/completions' : kind === 'tts' ? '/audio/speech' : '/audio/transcriptions'
   const pathname = url.pathname.replace(/\/+$/, '')
   const known = /\/audio\/(speech|transcriptions)$|\/chat\/completions$/
   if (known.test(pathname) && !pathname.endsWith(suffix)) fail('语音接口端点与种类不匹配')
@@ -262,6 +262,7 @@ function isMp3(buffer: Buffer): boolean {
 }
 
 export async function synthesizeApi(profile: ResolvedVoiceApi, text: string, signal?: AbortSignal): Promise<Buffer> {
+  if (profile.provider === 'mimo') return synthesizeMimo(profile, text, signal)
   return request(profile, 'tts', signal, () => {
     if (typeof text !== 'string' || !text.trim() || text.length > 5000) fail('语音合成文本不能为空且不能超过五千字')
     return { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: profile.model, input: text, voice: profile.voice, response_format: 'mp3' }) }
@@ -271,6 +272,51 @@ export async function synthesizeApi(profile: ResolvedVoiceApi, text: string, sig
     const buffer = await boundedBody(response, 20 * MB)
     if (!isMp3(buffer)) fail('语音服务返回的音频数据无效')
     return buffer
+  })
+}
+
+/** MiMo TTS 的请求体（chat.completions 形态）。纯函数，便于单测。 */
+export function buildMimoTtsBody(model: string, voice: string, text: string): Record<string, unknown> {
+  const useVoice = typeof voice === 'string' && voice.trim() ? voice.trim() : 'mimo_default'
+  return {
+    model,
+    messages: [
+      // 合成文本必须放在 assistant 角色里；user 角色只用于风格指令（这里不用，保持默认播报语气）。
+      { role: 'assistant', content: text },
+    ],
+    audio: { format: 'wav', voice: useVoice },
+  }
+}
+
+/** MiMo TTS 响应（chat.completion，choices[0].message.audio.data 为 base64 音频）→ 音频字节。 */
+export function parseMimoTtsPayload(value: unknown): Buffer {
+  const choices = Array.isArray((value as { choices?: unknown } | null)?.choices) ? (value as { choices: unknown[] }).choices : []
+  const choice = choices[0] !== null && typeof choices[0] === 'object' ? choices[0] as Record<string, unknown> : {}
+  const message = choice.message !== null && typeof choice.message === 'object' ? choice.message as Record<string, unknown> : {}
+  const audio = message.audio !== null && typeof message.audio === 'object' ? message.audio as Record<string, unknown> : {}
+  const data = audio.data
+  if (typeof data !== 'string' || data.length === 0 || data.length > 40 * MB) fail('语音服务返回的音频数据无效')
+  let buffer: Buffer
+  try { buffer = Buffer.from(data, 'base64') } catch { fail('语音服务返回的音频数据无效') }
+  if (buffer.length === 0) fail('语音服务返回的音频数据无效')
+  return buffer
+}
+
+/** MiMo TTS：与 OpenAI 的 /audio/speech 不同，走 chat.completions，音频以 base64 放在 JSON 里。 */
+async function synthesizeMimo(profile: ResolvedVoiceApi, text: string, signal?: AbortSignal): Promise<Buffer> {
+  return request(profile, 'tts', signal, () => {
+    if (typeof text !== 'string' || !text.trim() || text.length > 5000) fail('语音合成文本不能为空且不能超过五千字')
+    return {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildMimoTtsBody(profile.model, profile.voice, text)),
+    }
+  }, async response => {
+    const mime = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
+    if (mime !== 'application/json') fail('语音服务返回的音频类型无效')
+    const body = await boundedBody(response, 20 * MB)
+    let parsed: unknown
+    try { parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body)) } catch { fail('语音服务返回的合成结果格式无效') }
+    return parseMimoTtsPayload(parsed)
   })
 }
 

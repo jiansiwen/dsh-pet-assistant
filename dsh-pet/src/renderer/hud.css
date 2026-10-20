@@ -557,6 +557,93 @@
   gap: 8px;
 }
 
+/*
+ * 环境检查（M5-06）：按"运行时 / 模型 / 权限"分组，每组一张清单。
+ *
+ * 用带左边框的列表而不是卡片：这一页要同时列出十几条（含数据去向），卡片间距会把
+ * "还有几项要处理"这句话挤到看不见。左边框 + 状态色让"哪几条要动手"一眼能扫出来。
+ */
+.pet-management .management-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pet-management .management-group > h4 {
+  font-size: 12px;
+  font-weight: 600;
+  color: #24526b;
+}
+
+.pet-management .management-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pet-management .management-checklist > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 8px;
+  border-left: 3px solid #cfe0e9;
+  background: #f7fbfd;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* 状态色：要处理的红、装不了的红加粗、可选与读不到的中性灰。 */
+.pet-management .management-checklist > li[data-status='action'] {
+  border-left-color: #c9584b;
+}
+
+.pet-management .management-checklist > li[data-status='blocked'] {
+  border-left-color: #a3271b;
+  background: #fdf3f2;
+}
+
+.pet-management .management-checklist > li[data-status='ready'] {
+  border-left-color: #3f8f66;
+}
+
+.pet-management .management-checklist > li[data-status='optional'],
+.pet-management .management-checklist > li[data-status='unknown'] {
+  border-left-color: #b9c9d2;
+}
+
+.pet-management .management-checklist > li > strong {
+  font-weight: 600;
+  color: #243b4b;
+}
+
+.pet-management .management-checklist > li > p {
+  flex-basis: 100%;
+  margin: 0;
+  color: #40596b;
+}
+
+.pet-management .management-status {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #e6eef3;
+  color: #40596b;
+  font-size: 11px;
+}
+
+.pet-management .management-checklist > li[data-status='action'] .management-status {
+  background: #f7e3e0;
+  color: #a3271b;
+}
+
+.pet-management .management-checklist > li[data-status='ready'] .management-status {
+  background: #e2f1e8;
+  color: #2f7357;
+}
+
 .pet-management .management-button {
   align-self: flex-start;
   padding: 5px 10px;

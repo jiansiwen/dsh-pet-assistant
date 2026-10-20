@@ -16,10 +16,11 @@
  */
 import type { DatabaseSync } from 'node:sqlite'
 import type { ActivitySpan, Note, SemanticEvent } from './domain.ts'
+import { isNoteEvent } from './materials.ts'
 import { MemoryStore, type MemoryRecord } from './memory.ts'
 import { ObservationStore, type Observation } from './observation.ts'
 import { ReportStore, makeReportId } from './report.ts'
-import { inTransaction, sha256, type Row } from './store.ts'
+import { inTransaction, sha256, tableExists, type Row } from './store.ts'
 
 /** 迁移要读的旧数据。做成接口是为了让测试能喂夹具，不需要真的开一个存储域。 */
 export interface LegacySource {
@@ -283,15 +284,41 @@ function importPreferences(deps: MigrationDeps): BatchBodyResult {
   return { imported, skipped, detail: `旧偏好 ${rows.length} 条，新导入 ${imported} 条，已存在、已删除或无效 ${skipped} 条` }
 }
 
+/**
+ * 删除账本：迁移是"旧记录回填"路径，用户删过的东西不能借它回来。
+ * 资料墓碑（删资料时按笔记编号立）与活动删除区间由各自的存储类建表；
+ * 旧库里还没有这些表时视为没删过任何东西。
+ */
+function deletionLedgers(db: DatabaseSync): { noteDeleted(id: string): boolean; spanDeleted(start: number, end: number): boolean } {
+  const tombstones = tableExists(db, 'material_tombstones')
+  const ranges = tableExists(db, 'deleted_activity_ranges')
+    ? (db.prepare('SELECT from_ms, to_ms FROM deleted_activity_ranges').all() as Row[]).map(row => ({ from: Number(row.from_ms), to: Number(row.to_ms) }))
+    : []
+  const tombstone = tombstones ? db.prepare('SELECT 1 FROM material_tombstones WHERE material_id = ?') : null
+  return {
+    noteDeleted: id => tombstone !== null && tombstone.get(id) !== undefined,
+    spanDeleted: (start, end) => ranges.some(range => start < range.to && end > range.from),
+  }
+}
+
 /** 旧语义事项与用户笔记 → 观察记录，保留旧 id、时间和来源。 */
 function importDays(deps: MigrationDeps, options: MigrationOptions): BatchBodyResult {
   const days = deps.source.days().filter(day => inRange(day.date, options))
+  const ledgers = deletionLedgers(deps.db)
   const observations: Observation[] = []
   let invalid = 0
+  let deleted = 0
   for (const day of days) {
+    // 用户删掉的笔记，连同导入时由它生成的事项摘要（正文就在摘要里）一起挡在回填之外。
+    const deletedNotes = day.notes.filter(note => note.id && ledgers.noteDeleted(note.id))
     for (const event of day.events) {
       if (!event.id || !Number.isFinite(event.start) || !Number.isFinite(event.end)) {
         invalid += 1
+        continue
+      }
+      if ((event.evidence ?? []).some(ref => ref.startsWith('note:') && ledgers.noteDeleted(ref.slice(5)))
+        || deletedNotes.some(note => isNoteEvent(event, note))) {
+        deleted += 1
         continue
       }
       observations.push({
@@ -316,6 +343,10 @@ function importDays(deps: MigrationDeps, options: MigrationOptions): BatchBodyRe
         invalid += 1
         continue
       }
+      if (ledgers.noteDeleted(note.id)) {
+        deleted += 1
+        continue
+      }
       const createdAt = Number.isFinite(note.createdAt) ? note.createdAt : deps.now()
       observations.push({
         id: legacyNoteId(note.id),
@@ -335,11 +366,11 @@ function importDays(deps: MigrationDeps, options: MigrationOptions): BatchBodyRe
     }
   }
   const imported = deps.observations.putBatch(observations)
-  const skipped = invalid + (observations.length - imported)
+  const skipped = invalid + deleted + (observations.length - imported)
   return {
     imported,
     skipped,
-    detail: `${days.length} 天的旧记录，新导入 ${imported} 条，已存在或无效 ${skipped} 条`,
+    detail: `${days.length} 天的旧记录，新导入 ${imported} 条，已存在或无效 ${skipped - deleted} 条${deleted > 0 ? `，用户已删除不再导入 ${deleted} 条` : ''}`,
   }
 }
 
@@ -391,12 +422,19 @@ function importReports(deps: MigrationDeps, options: MigrationOptions): BatchBod
  */
 function importSpans(deps: MigrationDeps, options: MigrationOptions): BatchBodyResult {
   const dates = deps.source.sampleDates().filter(date => inRange(date, options))
+  const ledgers = deletionLedgers(deps.db)
   let imported = 0
   let skipped = 0
+  let deleted = 0
   for (const date of dates) {
     const payloadRef = deps.source.sampleFileOf(date)
     const observations: Observation[] = []
     for (const span of deps.source.spans(date)) {
+      // 用户删过的时段：采样原文即使被还原，也不借迁移回到观察库。
+      if (ledgers.spanDeleted(span.start, span.end)) {
+        deleted += 1
+        continue
+      }
       observations.push({
         id: legacySpanId(date, span),
         source: 'activity_span',
@@ -416,7 +454,11 @@ function importSpans(deps: MigrationDeps, options: MigrationOptions): BatchBodyR
     imported += added
     skipped += observations.length - added
   }
-  return { imported, skipped, detail: `${dates.length} 天采样原文，导入活动片段 ${imported} 条，已存在 ${skipped} 条` }
+  return {
+    imported,
+    skipped: skipped + deleted,
+    detail: `${dates.length} 天采样原文，导入活动片段 ${imported} 条，已存在 ${skipped} 条${deleted > 0 ? `，落在用户已删除时段而不再导入 ${deleted} 条` : ''}`,
+  }
 }
 
 function describe(error: unknown): string {

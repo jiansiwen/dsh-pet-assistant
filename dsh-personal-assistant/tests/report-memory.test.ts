@@ -435,6 +435,62 @@ describe('删除传播：没有依据的结论不能继续当事实', () => {
   })
 })
 
+describe('观察来源删除传播', () => {
+  test('非记忆来源沿多路径闭包删除并入账，重复删除为空操作', () => {
+    const child = importMemory({ id: 'a-child', status: 'confirmed', sourceRefs: ['观察一', 'z-parent'] })
+    const parent = importMemory({ id: 'z-parent', status: 'confirmed', sourceRefs: ['观察一'] })
+    const leaf = importMemory({ id: 'leaf', status: 'confirmed', sourceRefs: [child.id] })
+    assert.equal(memories.get('观察一', NOW), null)
+    const outcome = memories.deleteSource('观察一', '用户删除观察', NOW + 1)
+    assert.deepEqual(new Set(outcome.deleted.map(item => item.id)), new Set([child.id, parent.id, leaf.id]))
+    assert.deepEqual(outcome.weakened, [])
+    assert.equal(outcome.ledgerEntries, 3)
+    assert.equal(memories.count(), 0)
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memory_sources').get()?.n, 0)
+    assert.equal(memories.importRecord(child), false)
+    assert.deepEqual(memories.deleteSource('观察一', '重复删除', NOW + 2), {
+      deleted: [], weakened: [], restored: [], ledgerEntries: 0,
+    })
+  })
+
+  test('多来源及下游退候选并清除确认，过期不复活，重复调用不改版本', () => {
+    const child = importMemory({ id: 'child', status: 'confirmed', sourceRefs: ['观察一', '观察二'] })
+    const leaf = importMemory({ id: 'leaf', status: 'confirmed', sourceRefs: [child.id] })
+    const expired = importMemory({ id: 'expired', status: 'confirmed', sourceRefs: [leaf.id], expiresAt: NOW })
+    const outcome = memories.deleteSource('观察一', '删除观察', NOW + 1)
+    assert.deepEqual(outcome.deleted, [])
+    assert.deepEqual(new Set(outcome.weakened.map(item => item.id)), new Set([child.id, leaf.id, expired.id]))
+    for (const record of outcome.weakened) {
+      assert.equal(record.confirmedBy, null)
+      assert.equal(record.status, record.id === expired.id ? 'expired' : 'candidate')
+      assert.equal(record.revision, 2)
+      assert.equal(record.updatedAt, NOW + 1)
+      assert.deepEqual(record, memories.get(record.id, NOW + 1))
+    }
+    assert.deepEqual(memories.get(child.id, NOW)?.sourceRefs, ['观察二'])
+    assert.deepEqual(memories.injectable({}, NOW + 1), [])
+    const before = memories.list({}, NOW + 1)
+    assert.deepEqual(memories.deleteSource('观察一', '重复删除', NOW + 2), {
+      deleted: [], weakened: [], restored: [], ledgerEntries: 0,
+    })
+    assert.deepEqual(memories.list({}, NOW + 2), before)
+    const final = memories.deleteSource('观察二', '删除最后来源', NOW + 3)
+    assert.equal(final.deleted.length, 3)
+    assert.equal(final.ledgerEntries, 3)
+    assert.equal(memories.count(), 0)
+  })
+
+  test('来源 id 与记忆碰撞时保留同名本体及其入边', () => {
+    const collision = importMemory({ id: '观察一', status: 'confirmed', sourceRefs: ['其他观察'] })
+    const child = importMemory({ id: 'child', status: 'confirmed', sourceRefs: [collision.id] })
+    const outcome = memories.deleteSource(collision.id, '删除观察而非记忆', NOW + 1)
+    assert.deepEqual(outcome.deleted.map(item => item.id), [child.id])
+    assert.deepEqual(memories.get(collision.id, NOW + 1), collision)
+    assert.equal(outcome.ledgerEntries, 1)
+    assert.deepEqual(outcome.restored, [])
+  })
+})
+
 describe('删除历史冲突后恢复剩余项，不补造用户确认', () => {
   for (const confirmedBy of [USER.id, null]) {
     test(`只剩一项时${confirmedBy ? '恢复历史确认' : '退回候选'}，报告与注入一致`, () => {
@@ -711,6 +767,58 @@ describe('日报：确认绑定内容摘要，改一个字就作废', () => {
     assert.equal(reports.revision(reportId, 1)?.state, 'publishing')
     assert.deepEqual(reports.openJobs().map(item => item.operationId), ['op-1'])
   })
+})
+
+describe('活动日期保守失效日报', () => {
+  test('多日期草稿、待批和已批失效，归档、其他日期与非日报保留', () => {
+    const reports = new ReportStore(db)
+    const dates = ['2026-09-01', '2026-09-02', '2026-09-03']
+    const ids = dates.map(date => makeReportId('daily', date))
+    reports.importArchived(ids[0], '已导出正文', '仅登记不访问的归档路径', NOW)
+    const archived = reports.revision(ids[0], 1)
+    const draft = reports.saveDraft(ids[0], '草稿仍含原文', NOW + 1)
+    const pending = reports.saveDraft(ids[1], '待批正文', NOW)
+    reports.submitForConfirmation(ids[1], pending.revision)
+    const approved = reports.saveDraft(ids[2], '已批正文', NOW)
+    const approval = reports.approve(ids[2], approved.revision, approved.digest, '仅登记的发布路径', USER, NOW)
+    assert.ok(approval.ok)
+    const other = reports.saveDraft('daily:2026-09-04', '其他日期', NOW)
+    const weekly = reports.saveDraft('weekly:2026-09-01', '周报', NOW)
+    const revoked = reports.invalidateActivityDates([...dates, dates[0]], '删除活动，按日期保守失效')
+    assert.deepEqual(revoked.map(record => record.reportId), ids)
+    assert.ok(revoked.every(record => record.state === 'revoked' && record.revokedReason === '删除活动，按日期保守失效'))
+    assert.deepEqual(revoked.map(record => record.content), [draft.content, pending.content, approved.content])
+    assert.deepEqual(reports.revision(ids[0], 1), archived)
+    assert.deepEqual(reports.current(other.reportId), other)
+    assert.deepEqual(reports.current(weekly.reportId), weekly)
+    assert.equal(reports.beginPublish('失效后的缓存批准', approval.record, NOW + 2), null)
+    assert.deepEqual(reports.invalidateActivityDates(dates, '重复删除'), [])
+    assert.deepEqual(reports.invalidateActivityDates([], '空日期'), [])
+  })
+
+  for (const state of ['running', 'unknown'] as const) {
+    test(`${state} 作业使整批日期在任何更新前拒绝`, () => {
+      const reports = new ReportStore(db)
+      const first = reports.saveDraft('daily:2026-09-01', '先处理的草稿', NOW)
+      const second = reports.saveDraft('daily:2026-09-02', '发布正文', NOW)
+      const approved = reports.approve(second.reportId, second.revision, second.digest, '仅登记的发布路径', USER, NOW)
+      assert.ok(approved.ok)
+      assert.ok(reports.beginPublish('发布作业', approved.record, NOW))
+      if (state === 'unknown') reports.finishJob('发布作业', state, NOW + 1)
+      const before = reports.current(second.reportId)
+      const job = reports.job('发布作业')
+      // 即便报告状态与作业不一致，也必须以未核清的作业为门禁。
+      if (state === 'unknown') reports.setReportState(second.reportId, second.revision, 'approved')
+      const secondBefore = reports.current(second.reportId)
+      db.exec(`CREATE TRIGGER 禁止提前更新 BEFORE UPDATE ON reports
+        BEGIN SELECT RAISE(ABORT, '发生了提前更新'); END`)
+      assert.throws(() => reports.invalidateActivityDates(['2026-09-01', '2026-09-02'], '删除活动'), /正在发布或发布结果未知/)
+      assert.deepEqual(reports.current(first.reportId), first)
+      assert.deepEqual(reports.current(second.reportId), secondBefore)
+      assert.deepEqual(reports.job('发布作业'), job)
+      assert.equal(before?.state, 'publishing')
+    })
+  }
 })
 
 describe('发布：临时产物 → 校验摘要 → 原子更名', () => {

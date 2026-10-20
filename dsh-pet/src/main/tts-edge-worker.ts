@@ -24,7 +24,7 @@ import type { ResolvedVoiceApi } from '../voice-api-types.ts'
 export type WorkerEvent =
   | { readonly ready: true; readonly voice: string }
   | { readonly started: { readonly id: string } }
-  | { readonly finished: { readonly id: string } }
+  | { readonly finished: { readonly id: string; readonly text?: string; readonly audio?: string } }
   | { readonly cancelled: { readonly id: string } }
   | { readonly ok: false; readonly error: string }
 
@@ -38,6 +38,24 @@ interface SpeakDeps {
   /** 掐掉正在出声的子进程。 */
   stopAudio(): void
   emit(event: WorkerEvent): void
+  /**
+   * 只合成模式（"外放插话"实验开关，M1-05）：合成好的音频交出去由渲染层播放，这里不播。
+   * 给出它时：派发时不报 started（渲染层实际开始时由主进程报），交出音频即结算这一句；
+   * 离线回退仍在本地播放并照常报 started / finished。缺省（undefined）就是原有的本地播放路径。
+   */
+  handoff?(id: string, audio: Buffer): void
+}
+
+/** 合成进程交给渲染层的那一句音频。 */
+export type SynthOnlyWorkerEvent = WorkerEvent | { readonly audio: { readonly id: string; readonly b64: string; readonly mime: string } }
+
+/** 音频字节 → MIME。渲染层 decodeAudioData 不需要它，只给日志和诊断看。 */
+export function sniffAudioMime(audio: Buffer): string {
+  if (audio.length >= 4 && audio.toString('ascii', 0, 4) === 'RIFF') return 'audio/wav'
+  if (audio.length >= 4 && audio.toString('ascii', 0, 4) === 'OggS') return 'audio/ogg'
+  if (audio.length >= 3 && audio.toString('ascii', 0, 3) === 'ID3') return 'audio/mpeg'
+  if (audio.length >= 2 && audio[0] === 0xff && (audio[1] & 0xe0) === 0xe0) return 'audio/mpeg'
+  return 'application/octet-stream'
 }
 
 /** 生产合成选择：保留会话的配置与取消信号，自定义失败不改用其他服务。 */
@@ -57,33 +75,59 @@ class SpeakSession {
   private readonly onSettled: () => void
   private readonly controller = new AbortController()
   private readonly api: ResolvedVoiceApi | undefined
+  /** 预合成好的音频：有它就不用再等一次合成往返，直接播。 */
+  private readonly cached: Buffer | undefined
+  /** 这次实际要播的音频（缓存命中或合成结果），播完时回传给主进程写缓存。 */
+  private lastAudio: Buffer | undefined
+  /**
+   * 播完是否把音频回传给主进程写缓存。
+   *
+   * 只有固定话术（唤醒应答）需要：那是每次唤醒都会重复的一句，缓存下来几乎零延迟。
+   * 回答正文每次都不同，回传只会白白把音频搬一遍，所以默认不带 —— 这也让原有的事件形状不变。
+   */
+  private readonly echoAudio: boolean
 
-  constructor(id: string, text: string, deps: SpeakDeps, onSettled: () => void, api?: ResolvedVoiceApi) {
+  constructor(id: string, text: string, deps: SpeakDeps, onSettled: () => void, api?: ResolvedVoiceApi, cached?: Buffer, echoAudio = false) {
     this.id = id
     this.text = text
     this.deps = deps
     this.onSettled = onSettled
     this.api = api
+    this.cached = cached
+    this.echoAudio = echoAudio
   }
 
   async start(): Promise<void> {
     if (this.settled) return
-    let mp3: Buffer | undefined
-    try {
-      mp3 = await this.deps.synthesize(this.text, this.controller.signal, this.api)
-    } catch {
-      if (this.settled) return
-      if (this.api) {
-        this.settled = true
-        this.onSettled()
-        this.deps.emit({ ok: false, error: '自定义语音 API 合成失败，请检查配置或服务状态；未切换到其他服务' })
-        return
+    let mp3: Buffer | undefined = this.cached
+    if (mp3 === undefined) {
+      try {
+        mp3 = await this.deps.synthesize(this.text, this.controller.signal, this.api)
+      } catch {
+        if (this.settled) return
+        if (this.api) {
+          this.settled = true
+          this.onSettled()
+          this.deps.emit({ ok: false, error: '自定义语音 API 合成失败，请检查配置或服务状态；未切换到其他服务' })
+          return
+        }
+        // 仅默认方案允许离线回退，自定义服务失败不能偷偷切换音色或发送到另一服务。
       }
-      // 仅默认方案允许离线回退，自定义服务失败不能偷偷切换音色或发送到另一服务。
     }
     // 合成不能强制中止，但取消必须立即确认；迟到的成功和失败都不得再启动音频。
     if (this.settled) return
+    if (this.deps.handoff && mp3 !== undefined) {
+      // 只合成：交出音频即结算，实际开始 / 播完 / 停下由渲染层回执、主进程转报。
+      this.settled = true
+      this.lastAudio = mp3
+      this.onSettled()
+      this.deps.handoff(this.id, mp3)
+      return
+    }
+    // 只合成模式下派发时没报过 started：离线回退要在本地真正开始播之前补上。
+    if (this.deps.handoff) this.deps.emit({ started: { id: this.id } })
     this.phase = 'audio'
+    this.lastAudio = mp3
     try {
       const onDone = (completed: boolean): void => this.finish(completed)
       if (mp3 === undefined) this.deps.fallback(this.text, onDone)
@@ -107,38 +151,100 @@ class SpeakSession {
       if (stopAudio && this.phase === 'audio') this.deps.stopAudio()
     } finally {
       this.onSettled()
-      this.deps.emit(completed ? { finished: { id: this.id } } : { cancelled: { id: this.id } })
+      // 播完时把音频、文本一起带回去：主进程据此把"固定话术"写进缓存，下次直接复用。
+      // 半句（cancelled）不带 —— 没完整播过的句子不该被缓存成完整音频。
+      // 只有固定话术（echoAudio）才带，别把回答正文的音频也搬一遍。
+      this.deps.emit(completed
+        ? {
+            finished: this.echoAudio && this.lastAudio !== undefined
+              ? { id: this.id, text: this.text, audio: this.lastAudio.toString('base64') }
+              : { id: this.id },
+          }
+        : { cancelled: { id: this.id } })
     }
   }
+}
+
+/** 预合成好的一句：id → 音频字节。 */
+interface PrefetchedAudio {
+  readonly id: string
+  readonly audio: Buffer
 }
 
 export class TtsEdgeEngine {
   private session: SpeakSession | null = null
   private readonly deps: SpeakDeps
+  /**
+   * 预合成缓存：一句在播的同时，后台把下一句合成好。
+   *
+   * 没有它，每句之间都要等一次合成往返（网络服务几百毫秒到几秒），用户听到的就是
+   * "每个句号后面空一大段"。有它之后，下一句音频通常已经在手边，接缝只剩播放启动时间。
+   * 只缓存一句：再多就是拿内存换用不上的东西，而且用户一打断就得全丢。
+   */
+  private prefetched: PrefetchedAudio | null = null
+  private prefetching: { id: string; controller: AbortController } | null = null
+  /** 下一句的文本与配置：由主进程在派发当前句时一并捎来。 */
+  private next: { id: string; text: string; api?: ResolvedVoiceApi } | null = null
+  /**
+   * 哪些句子是"固定话术"、值得缓存。
+   *
+   * 由主进程在拉起 worker 时用环境变量给出（与 `FIXED_PHRASES` 同一份清单）：
+   * 这里不 import 主进程模块，worker 保持只依赖合成与播放这两条边界。
+   */
+  private readonly cacheTexts: Set<string> | null
 
-  constructor(deps: SpeakDeps) {
+  constructor(deps: SpeakDeps, cacheTexts?: ReadonlySet<string>) {
     this.deps = deps
+    this.cacheTexts = cacheTexts === undefined ? null : new Set(cacheTexts)
   }
 
-  speak(id: string, text: string, api?: ResolvedVoiceApi): void {
+  speak(id: string, text: string, api?: ResolvedVoiceApi, next?: { id: string; text: string; api?: ResolvedVoiceApi }, injected?: Buffer): void {
     if (this.session !== null) {
       this.deps.emit({ ok: false, error: 'busy' })
       return
     }
+    // 下一次派发前先认一认：这个 id 是不是已经预合成好了。
+    const cached = injected ?? (this.prefetched?.id === id ? this.prefetched.audio : undefined)
+    if (this.prefetched !== null && this.prefetched.id !== id) this.prefetched = null
+    this.next = next ?? null
     const session = new SpeakSession(id, text, this.deps, () => {
       if (this.session === session) this.session = null
-    }, api)
+    }, api, cached, this.cacheTexts?.has(text) === true)
     this.session = session
-    this.deps.emit({ started: { id } })
-    void session.start()
+    if (!this.deps.handoff) this.deps.emit({ started: { id } })
+    void session.start().then(() => this.prefetchNext())
   }
 
   stop(): void {
+    // 打断语义：用户不想再听，预取中的和已合成好的下一句都作废 —— 留着会把旧内容播到新一轮。
+    // 要注意的是正常播放路径不会调 stop（主进程在 finished 之后直接派下一句），
+    // 所以这里的清理只影响"被打断"这一条路，不会让预合成白做。
+    if (this.prefetching !== null) {
+      this.prefetching.controller.abort()
+      this.prefetching = null
+    }
+    this.prefetched = null
+    this.next = null
     this.session?.stop()
   }
 
   get busy(): boolean {
     return this.session !== null
+  }
+
+  /** 后台把"下一句"合成好放进缓存。失败就算了：真派到时再合成一次，不因为预取失败而报错。 */
+  private prefetchNext(): void {
+    const next = this.next
+    if (next === null || this.prefetching !== null || this.prefetched?.id === next.id) return
+    const controller = new AbortController()
+    this.prefetching = { id: next.id, controller }
+    void this.deps.synthesize(next.text, controller.signal, next.api).then(audio => {
+      if (this.prefetching?.id !== next.id) return
+      this.prefetching = null
+      this.prefetched = { id: next.id, audio }
+    }).catch(() => {
+      if (this.prefetching?.id === next.id) this.prefetching = null
+    })
   }
 }
 
@@ -193,10 +299,13 @@ export function createAudioPlayer(
   }
 
   return {
-    play: (mp3, onDone) => {
-      const file = path.join(tmpRoot, `seg-${++seq}.mp3`)
+    play: (audioBytes, onDone) => {
+      // 自定义 TTS（MiMo 等）可能返回 wav：扩展名按真实格式挑，MCI / afplay 才认。
+      const mime = sniffAudioMime(audioBytes)
+      const ext = mime === 'audio/wav' ? '.wav' : mime === 'audio/ogg' ? '.ogg' : '.mp3'
+      const file = path.join(tmpRoot, `seg-${++seq}${ext}`)
       try {
-        writeFileSync(file, mp3)
+        writeFileSync(file, audioBytes)
       } catch (error) {
         removeFile(file)
         throw error
@@ -226,7 +335,7 @@ export function unsupportedAudioMessage(platform: SupportedPlatform): string {
 }
 
 function main(): void {
-  const emit = (event: WorkerEvent): void => {
+  const emit = (event: SynthOnlyWorkerEvent): void => {
     process.stdout.write(JSON.stringify(event) + '\n')
   }
   const dir = path.dirname(fileURLToPath(import.meta.url))
@@ -237,11 +346,28 @@ function main(): void {
       stdio: ['ignore', 'ignore', 'ignore'],
       windowsHide: true,
     })
+  // 只合成模式由主进程在拉起时用环境变量指定（"外放插话"实验开关）；缺省走原有本地播放。
+  const synthOnly = process.env.DSH_TTS_SYNTH_ONLY === '1'
+  // 固定话术清单：只有这些句子播完才回传音频、供主进程落盘复用。
+  // 用 JSON 数组传（环境变量不能含空字节，所以不能用分隔符串起来）。
+  const cacheTexts = ((): string[] => {
+    const raw = process.env.DSH_TTS_CACHE_TEXTS ?? ''
+    if (raw.length === 0) return []
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      return Array.isArray(parsed)
+        ? parsed.filter((text): text is string => typeof text === 'string' && text.length > 0)
+        : []
+    } catch {
+      return []
+    }
+  })()
   const engine = new TtsEdgeEngine({
     synthesize: synthesizeForWorker,
     ...createAudioPlayer(dir, tmpRoot, spawnHidden, platformOf()),
     emit,
-  })
+    ...(synthOnly ? { handoff: (id: string, audio: Buffer) => emit({ audio: { id, b64: audio.toString('base64'), mime: sniffAudioMime(audio) } }) } : {}),
+  }, cacheTexts.length > 0 ? new Set(cacheTexts) : undefined)
   process.once('exit', () => {
     engine.stop()
     try { rmSync(tmpRoot, { recursive: true, force: true }) } catch { /* 子进程尚未释放文件 */ }
@@ -253,7 +379,16 @@ function main(): void {
   const handle = (line: string): void => {
     const trimmed = line.trim()
     if (trimmed.length === 0) return
-    let message: { speak?: { id?: string; b64?: string; api?: unknown }; stop?: unknown; exit?: unknown }
+    let message: {
+      speak?: {
+        id?: string
+        b64?: string
+        api?: unknown
+        next?: { id?: string; b64?: string; api?: unknown }
+      }
+      stop?: unknown
+      exit?: unknown
+    }
     try {
       message = JSON.parse(trimmed)
     } catch {
@@ -270,7 +405,20 @@ function main(): void {
     }
     if (message.speak && typeof message.speak.id === 'string' && typeof message.speak.b64 === 'string') {
       const text = Buffer.from(message.speak.b64, 'base64').toString('utf8')
-      engine.speak(message.speak.id, text, message.speak.api as ResolvedVoiceApi | undefined)
+      const api = message.speak.api as ResolvedVoiceApi | undefined
+      // 主进程命中固定话术缓存时直接把音频带下来：跳过这次合成。
+      const cached = typeof (message.speak as { audio?: unknown }).audio === 'string'
+        ? Buffer.from((message.speak as { audio: string }).audio, 'base64')
+        : undefined
+      const rawNext = message.speak.next
+      const next = rawNext && typeof rawNext.id === 'string' && typeof rawNext.b64 === 'string'
+        ? {
+            id: rawNext.id,
+            text: Buffer.from(rawNext.b64, 'base64').toString('utf8'),
+            api: rawNext.api as ResolvedVoiceApi | undefined,
+          }
+        : undefined
+      engine.speak(message.speak.id, text, api, next, cached)
     }
   }
 

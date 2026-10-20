@@ -15,7 +15,7 @@ import type { BridgeCallbacks, ChatReply } from '../src/main/harness.ts'
 import type { InterruptLevel, SpeechRequest } from '../src/main/speech.ts'
 import { Narrator, type NarratorHooks, type TtsTransport, type TtsWorkerEvent } from '../src/main/tts.ts'
 import type { DocRoots, DocState } from '../src/renderer/types.js'
-import type { SessionCommand, SessionResult, SessionSnapshot } from '../src/session-types.ts'
+import type { SessionCommand, SessionResult, SessionSnapshot, VoiceTurn, VoiceTurnCompletion } from '../src/session-types.ts'
 
 /** tsconfig 的 lib 停在 ES2022，这里按 tts-edge-worker.test.ts 的写法自备一个延迟量。 */
 function deferred<T>() {
@@ -69,15 +69,38 @@ class FakeBridge {
     return deferredReply.promise
   }
   async reportPetState(): Promise<void> {}
+  get connected(): boolean { return true }
+  async startSession(): Promise<{ ok: true; outcome: string; owned: boolean }> {
+    sessionStarts += 1
+    bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, bindingId: '桌面开启绑定', reset: true } })
+    return { ok: true, outcome: 'created', owned: true }
+  }
   dispose(): void {
     for (const chat of chats) chat.resolve({ ok: false, error: '测试已结束' })
   }
 }
+let sessionStarts = 0
 mock.module('../src/main/harness.ts', {
   namedExports: {
     BridgeClient: FakeBridge,
     readBridgeInfo: () => null,
     probeHealth: () => { throw new Error('文档测试不得连接真实运行时') },
+  },
+})
+const wpsOpens: string[] = []
+mock.module('../src/main/wps-control.ts', {
+  namedExports: {
+    // 端到端不得拉起真实 WPS 辅助脚本：替身一律报"未安装"，只记录被要求打开的真实路径。
+    createWpsController: () => ({
+      platform: 'win32', unverifiedOnDevice: false,
+      open: async (file: string) => {
+        wpsOpens.push(file)
+        return { ok: false, error: { code: 'not-installed', message: '未安装 WPS', guidance: '请先安装 WPS' }, evidence: {} }
+      },
+      syncTo: async () => { throw new Error('未打开时不得同步') },
+      status: async () => { throw new Error('未打开时不得查询') },
+      dispose() {},
+    }),
   },
 })
 mock.module('../src/main/wake.ts', {
@@ -189,6 +212,20 @@ mock.module('electron', {
     shell: {
       openPath: () => { throw new Error('文档测试不得打开外部应用') },
       openExternal: () => { throw new Error('文档测试不得打开浏览器') },
+    },
+    // 会议回环声的桌面采集授权（M4-03）：装配时注册一次。文档测试里没有会议在录，
+    // 这个 handler 永远不该被调用，给了就报错。
+    session: {
+      defaultSession: {
+        setDisplayMediaRequestHandler: () => {},
+      },
+    },
+    desktopCapturer: {
+      getSources: () => { throw new Error('文档测试不得抓屏') },
+    },
+    // 模型下载走 Electron 的 net.fetch；文档测试不联网，给了就报错。
+    net: {
+      fetch: () => { throw new Error('文档测试不得发起网络请求') },
     },
     nativeImage: {
       // resize 的结果要能接 setTemplateImage —— macOS 分支会把托盘图标标成单色蒙版。
@@ -695,3 +732,172 @@ for (const index of [-1, 3, 99, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
     assert.equal(chats.length, 0)
   })
 }
+
+function voicePrompt(text: string, roundId: string, overrides: Partial<VoiceTurn> = {}): Promise<SessionResult & { reply?: string }> {
+  return invoke('session-command', {
+    kind: 'prompt', bindingId: session.bindingId, text, spoken: true,
+    voiceTurn: { bindingId: session.bindingId, generation: 7, roundId, ...overrides },
+  })
+}
+async function continuousVoice(on: boolean): Promise<void> {
+  assert.equal((await invoke<{ ok: boolean }>('save-settings', { voiceConversation: on, continuousVoice: on })).ok, true)
+}
+const outcomes = () => sent<VoiceTurnCompletion>('voice-turn-complete').map(item => [item.roundId, item.outcome])
+
+test('连续对话：句间空档不算播完，生成结束且最后一句播完才回执一次', async () => {
+  await continuousVoice(true)
+  try {
+    const sending = voicePrompt('说说今天的安排', '7:1')
+    const chat = await chatAt(0)
+    chat.onDelta!('第一句。')
+    await nextTurn()
+    assert.equal(finishSentence(), '第一句。')
+    await nextTurn()
+    assert.deepEqual(outcomes(), [], '生成没结束，句间空档不能触发续听')
+    chat.onDelta!('第二句。')
+    await nextTurn()
+    await answer(chat, '第一句。第二句。')
+    assert.equal((await sending).ok, true)
+    assert.deepEqual(outcomes(), [], '回复已返回但最后一句还没播完')
+    assert.equal(finishSentence(), '第二句。')
+    await nextTurn()
+    assert.deepEqual(sent('voice-turn-complete'), [{ bindingId: session.bindingId, generation: 7, roundId: '7:1', outcome: 'played' }])
+  } finally { await continuousVoice(false) }
+})
+
+test('连续对话：模型无回复回执 stopped，不续听', async () => {
+  await continuousVoice(true)
+  try {
+    const sending = voicePrompt('随便问问', '7:2')
+    ;(await chatAt(0)).resolve({ ok: false, error: '本轮失败' })
+    assert.equal((await sending).ok, false)
+    await nextTurn()
+    assert.deepEqual(outcomes(), [['7:2', 'stopped']])
+  } finally { await continuousVoice(false) }
+})
+
+test('连续对话：停止朗读立即回执 stopped，迟到终稿不复活也不重复回执', async () => {
+  await continuousVoice(true)
+  try {
+    const sending = voicePrompt('讲一段', '7:3')
+    const chat = await chatAt(0)
+    chat.onDelta!('第一句。第二句。')
+    await nextTurn()
+    send('speech-stop')
+    assert.deepEqual(outcomes(), [['7:3', 'stopped']])
+    const count = narrator.requests.length
+    await answer(chat, '第一句。第二句。迟到的一句。')
+    await sending
+    await nextTurn()
+    assert.equal(playing, null)
+    assert.equal(narrator.requests.length, count)
+    assert.deepEqual(outcomes(), [['7:3', 'stopped']])
+  } finally { await continuousVoice(false) }
+})
+
+test('连续对话：斜杠与文档路径退出连续模式，原有处理不变', async () => {
+  await continuousVoice(true)
+  try {
+    assert.equal((await voicePrompt('/help', '7:4')).ok, true)
+    const forwarded = sessionCommands.at(-1) as Extract<SessionCommand, { kind: 'prompt' }>
+    assert.deepEqual([forwarded.text, forwarded.spoken, forwarded.voiceTurn], ['/help', false, undefined])
+    assert.equal((await voicePrompt('讲讲讲解样本', '7:5')).ok, true)
+    assert.equal(outline().total, 3)
+    assert.deepEqual(outcomes(), [['7:4', 'excluded'], ['7:5', 'excluded']])
+    assert.equal(chats.length, 0, '文档开场说明未播完，不能被连续对话提前推进')
+  } finally { await continuousVoice(false) }
+})
+
+test('连续对话：选项关闭、轮次绑定不符或打字带轮次时拒绝，不请求模型', async () => {
+  await continuousVoice(false)
+  assert.equal((await voicePrompt('问一句', '7:6')).error, '连续对话选项已关闭')
+  await continuousVoice(true)
+  try {
+    assert.equal((await voicePrompt('问一句', '7:7', { bindingId: '别的绑定' })).error, '连续对话轮次无效')
+    const typed = await invoke<SessionResult>('session-command', {
+      kind: 'prompt', bindingId: session.bindingId, text: '打字', spoken: false,
+      voiceTurn: { bindingId: session.bindingId, generation: 7, roundId: '7:8' },
+    })
+    assert.equal(typed.error, '连续对话轮次无效')
+    assert.equal(chats.length, 0)
+    assert.equal(sessionCommands.length, 0)
+  } finally { await continuousVoice(false) }
+})
+
+test('连续对话：关闭选项时停止本轮朗读并通知界面退出', async () => {
+  await continuousVoice(true)
+  const sending = voicePrompt('讲一段', '7:9')
+  const chat = await chatAt(0)
+  chat.onDelta!('第一句。')
+  await nextTurn()
+  await continuousVoice(false)
+  assert.ok(sent('voice-conversation-stop').length >= 1)
+  assert.deepEqual(outcomes(), [['7:9', 'stopped']])
+  assert.equal(chat.signal?.aborted, true)
+  await answer(chat, '第一句。')
+  await sending
+})
+
+test('会话未开启时桌面开启一次并用新绑定；已在线时原样返回，不抢网页会话', async () => {
+  const existing = await invoke<SessionResult & { outcome?: string }>('session-start')
+  assert.equal(existing.ok, true)
+  assert.equal(existing.outcome, 'existing')
+  assert.equal(sessionStarts, 0, '已在线不得再请插件建会话')
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: {
+    ...session, bindingId: '未绑定快照', status: 'disconnected', reset: true,
+    capabilities: { ...session.capabilities, prompt: false, cancel: false },
+  } })
+  const opened = await invoke<SessionResult & { outcome?: string }>('session-start')
+  assert.equal(opened.ok, true, opened.error)
+  assert.equal(opened.outcome, 'created')
+  assert.equal(opened.state?.bindingId, '桌面开启绑定')
+  assert.equal(sessionStarts, 1)
+  assert.equal((await invoke<SessionResult>('session-command', { kind: 'prompt', bindingId: '桌面开启绑定', text: '开启个人助理模式' })).ok, true)
+  assert.deepEqual(sessionCommands.map(command => command.kind === 'prompt' ? [command.bindingId, command.text] : null), [['桌面开启绑定', '开启个人助理模式']])
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, reset: true } })
+})
+
+test('打字点名 WPS 讲解：铺提纲并按指定应用打开，WPS 失败如实说明，不退回系统关联', async () => {
+  wpsOpens.length = 0
+  // 文件名"讲解样本"本身含讲解动词，这句按讲解意图处理：打字只铺提纲，同时把文件交给 WPS 打开。
+  const result = await prompt('用wps打开讲解样本')
+  assert.equal(result.ok, true)
+  assert.equal(outline().total, 3)
+  assert.match(result.reply ?? '', /WPS 没能打开《讲解样本.txt》：请先安装 WPS/)
+  assert.equal(wpsOpens.length, 1)
+  assert.equal(path.basename(wpsOpens[0]), '讲解样本.txt')
+  assert.equal(chats.length, 0)
+  assert.equal(sessionCommands.length, 0)
+})
+
+test('点名 WPS 语音讲解但不能同步：不开讲、不出声，也不悄悄换成阅读视图', async () => {
+  const result = await prompt('用wps讲讲讲解样本', true)
+  assert.equal(result.ok, false)
+  assert.match(result.error ?? '', /WPS 同步讲解目前只支持 PDF/)
+  assert.equal(narrator.requests.length, 0)
+  assert.equal(chats.length, 0)
+  assert.notEqual(sent<DocState>('doc-state').at(-1)?.kind, 'outline', '没有装上讲解链')
+})
+
+test('讲解暂停后又打断了一次回答：一句“继续”不替用户猜，说明两件事并分别给出口令', async () => {
+  await answer(await startExplanation())
+  assert.match(finishSentence(), /先说明授权范围/)
+  assert.equal((await prompt('停止讲解')).ok, true)
+  const asking = prompt('顺便问一句别的', true)
+  const chat = await chatAt(1)
+  chat.onDelta!('回答的第一句。回答的第二句。')
+  await nextTurn()
+  assert.ok(playing, '回答已经开始播放')
+  send('speech-stop')
+  await answer(chat, '回答的第一句。回答的第二句。')
+  await asking
+  const requests = narrator.requests.length
+  const ambiguous = await prompt('继续', true)
+  assert.equal(ambiguous.ok, true)
+  assert.match(ambiguous.reply ?? '', /有两件被打断的事：《讲解样本\.txt》的讲解，和刚才的回答/)
+  assert.equal(narrator.requests.length, requests, '没有替用户选，任何一件都没恢复播放')
+  assert.equal(chats.length, 2)
+  const resumed = await prompt('继续讲解', true)
+  assert.equal(resumed.ok, true)
+  assert.ok(playing, '明确说继续讲解后从原句接着讲')
+})

@@ -106,7 +106,7 @@ export function idleScene(now: number): SceneState {
   return { kind: 'none', phase: 'exit', seated: [], proposer: null, phaseSince: now, cooldownUntil: 0 }
 }
 
-/** 当前还空着的角色，按编制顺序。座位号跟着编制走，所以唐僧永远是 0 号位。 */
+/** 当前还空着的角色，按编制顺序。座位号跟着编制走，所以总助理永远是 0 号位。 */
 export function freeCast(cast: readonly SceneCandidate[]): readonly string[] {
   return cast.filter(member => !member.working).map(member => member.assistantId)
 }

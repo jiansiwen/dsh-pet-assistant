@@ -29,6 +29,14 @@
   --risk-medium: #b45309;
   --risk-high: #b91c1c;
 
+  /* 差异配色：增删行的底色很浅，文字仍用正文色，对比度不因底色下降；颜色之外每行都保留 +/- 前缀。 */
+  --diff-add-bg: #ecfdf3;
+  --diff-add-fg: #166534;
+  --diff-del-bg: #fef2f2;
+  --diff-del-fg: #991b1b;
+  --diff-hunk-fg: #4f5ac0;
+  --diff-meta-fg: #5a6070;
+
   --easing: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -112,11 +120,20 @@ body {
   color: var(--risk-high);
 }
 
-.card-scope {
+/* 唯一的滚动区。`min-height: 0` 是让 flex 子项真的能收缩的那一句，漏了就不滚，按钮会被挤出窗口。 */
+.card-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   margin: 12px 0 0;
+}
+
+.card-scope {
+  margin: 0;
+}
+
+.card-scope.nested {
+  margin: 4px 0 0;
 }
 
 .card-row {
@@ -170,6 +187,147 @@ body {
 
 .card-countdown.expired {
   color: var(--risk-high);
+}
+
+/* —— 可信执行器动作的审阅区：改动差异 / 验证命令 / 人工复核 —— */
+
+.review-block {
+  margin: 10px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--card-border);
+}
+
+.review-summary,
+.review-resolution {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.review-notice {
+  margin: 6px 0;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: var(--card-note-bg);
+  color: var(--card-label);
+  font-size: 13px;
+}
+
+.review-files {
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+}
+
+.review-file {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+
+.review-action {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  color: var(--card-label);
+  font-size: 12px;
+}
+
+.review-action.action-create {
+  border-color: var(--diff-add-fg);
+  color: var(--diff-add-fg);
+}
+
+.review-path {
+  min-width: 0;
+  flex: 1 1 auto;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.review-hash {
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  color: var(--card-label);
+  overflow-wrap: anywhere;
+}
+
+.diff-add-count {
+  color: var(--diff-add-fg);
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-del-count {
+  color: var(--diff-del-fg);
+  font-variant-numeric: tabular-nums;
+}
+
+.review-diff {
+  margin: 8px 0 0;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.review-diff-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 8px;
+  background: var(--card-target-bg);
+}
+
+.diff-body {
+  margin: 0;
+  padding: 4px 0;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  /* 长行横向滚，不折行：折行会让一行改动看起来像两行。 */
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.diff-line {
+  display: block;
+  padding: 0 8px;
+}
+
+.diff-add {
+  background: var(--diff-add-bg);
+  color: var(--diff-add-fg);
+}
+
+.diff-del {
+  background: var(--diff-del-bg);
+  color: var(--diff-del-fg);
+}
+
+.diff-hunk {
+  color: var(--diff-hunk-fg);
+}
+
+.diff-meta {
+  color: var(--diff-meta-fg);
+  font-style: italic;
+}
+
+.review-cut {
+  margin: 0;
+  padding: 4px 8px;
+  color: var(--card-label);
+  font-size: 12px;
+}
+
+.review-args {
+  margin: 0;
+  padding-left: 20px;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
 }
 
 .card-note {

@@ -322,14 +322,14 @@ async function main(): Promise<void> {
     store.upsertMember({ ...store.getMember('member-bajie')!, displayName: '用户改过的名字', revision: 2 })
     team.ensureRoster()
     assert.equal(store.getMember('member-bajie')?.displayName, '用户改过的名字')
-    store.upsertMember({ ...store.getMember('member-bajie')!, displayName: '猪八戒', revision: 3 })
+    store.upsertMember({ ...store.getMember('member-bajie')!, displayName: '助理2', revision: 3 })
   })
 
   check('点名解析：别名可用，未启用席位与未知名字都返回 null', () => {
     assert.equal(team.resolveByName('悟空')?.assistantId, 'member-wukong')
     assert.equal(team.resolveByName('WuKong')?.assistantId, 'member-wukong')
     assert.equal(team.resolveByName('总助理')?.assistantId, 'member-tangseng')
-    assert.equal(team.resolveByName('沙僧'), null, '未启用席位不能接单')
+    assert.equal(team.resolveByName('助理3'), null, '未启用席位不能接单')
     assert.equal(team.resolveByName('哪吒'), null, '未知名字不换人')
   })
 
@@ -574,7 +574,7 @@ async function main(): Promise<void> {
     const delegation = delegations.at(-1)!
     assert.equal(delegation.provider, 'spawn')
     const request = delegation.request
-    assert.match(request.persona, /孙悟空/)
+    assert.match(request.persona, /助理1/)
     assert.ok(request.outputSchema.required.includes('summary'))
     assert.equal(request.parent, parentAgent)
     // 委派拿到的是「调用方信号 + 运行自身控制器」的合成信号（AbortSignal.any）：
@@ -659,7 +659,7 @@ async function main(): Promise<void> {
     const payload = done[0].payload as Record<string, any>
     assert.equal(payload.requestId, 'req-wukong')
     assert.equal(payload.assistantId, 'member-wukong')
-    assert.equal(payload.displayName, '孙悟空')
+    assert.equal(payload.displayName, '助理1')
     assert.equal(payload.skinId, 'boy-glasses')
     assert.equal(payload.status, 'awaiting-approval')
     assert.deepEqual(payload.needsApproval, ['需要写入修复补丁'])
@@ -718,14 +718,17 @@ async function main(): Promise<void> {
     assert.equal((done[0].payload as Record<string, any>).text, '纯文本结论')
   })
 
-  await checkAsync('副作用委派在启动前被拒：当前宿主没有启动前审批门禁，不硬跑', async () => {
+  await checkAsync('副作用委派在启动前被拒：宿主工具没有参数定义，核实不到可绑定目标的门禁工具，不硬跑', async () => {
+    // 假宿主的 tools.get 只回空对象（没有 parameters）：verifiedGatedTools 一个都认不出，
+    // 批准无法绑定到具体目标（command / file_path / path / job_id），副作用任务必须在委派前如实拒启。
     const before = delegations.length
     const task = team.submitTask({ goal: '要动磁盘的任务', ownerId: 'member-tangseng', toolScope: 'side-effect' })
     const outcome = await team.runTask(task.taskId, parentAgent, signal)
     assert.ok(outcome)
     assert.equal(outcome.task.status, 'review')
     assert.equal(outcome.stopReason, 'side-effect-unsupported')
-    assert.match(outcome.diagnostic ?? '', /副作用委派尚未接入启动前审批门禁/)
+    assert.match(outcome.diagnostic ?? '', /未核实到参数里带可绑定目标字段的副作用工具/)
+    assert.match(outcome.diagnostic ?? '', /批准无法绑定到具体目标/)
     assert.equal(delegations.length, before, '被拒的任务不得委派子代理')
     assert.equal(store.listRuns(task.taskId).length, 0, '没启动就不该留下运行记录')
   })

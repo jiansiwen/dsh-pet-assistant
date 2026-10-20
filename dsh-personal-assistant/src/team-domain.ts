@@ -8,8 +8,13 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 
-/** 业务库 schema 版本，单调递增；不兼容变更必须新增迁移步骤而不是原地改表。 */
-export const TEAM_SCHEMA_VERSION = 3
+/**
+ * 业务库 schema 版本，单调递增；不兼容变更必须新增迁移步骤而不是原地改表。
+ * v4：操作账本补成员、规范化目标、输入摘要、运行、执行开始时间与结果说明，重启后可直接定位复核。
+ * v5：帮助任务（授权项目绑定）、改动提案（基线哈希与修订）、验证命令、unknown 人工复核；
+ *     提案补基线哈希与审阅内容，操作账本补验收证据与人工复核结论。
+ */
+export const TEAM_SCHEMA_VERSION = 5
 
 export const ROLE_IDS = ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma'] as const
 export type RoleId = (typeof ROLE_IDS)[number]
@@ -110,6 +115,22 @@ export interface ActionProposal {
   readonly state: ProposalState
   readonly createdAt: number
   readonly expiresAt: number
+  /**
+   * 写类目标在提案时的内容版本（sha256 或 `absent`）。给出时执行点会重读目标，版本不符就拒绝：
+   * 批准绑定的是「把这一版文件改成这样」，用户在批准后改过文件，旧批准不能套到新内容上。
+   */
+  readonly baseHash?: string | null
+  /** 可信执行器动作（改动 / 验证 / 复核）的审阅全文，桌面审批卡按它展示差异或命令；其余提案没有。 */
+  readonly content?: string
+  /** 审阅全文对应的绑定摘要（与 paramsDigest 相同），只随带审阅全文的提案给出。 */
+  readonly digest?: string
+  /** 提案修订：同一任务里第几版改动提案；只随带审阅全文的提案给出。 */
+  readonly revision?: number
+}
+
+/** 门禁查找批准用的绑定字段；baseHash 是写类目标此刻的内容版本（不传 = 不按版本筛）。 */
+export type GateBinding = Pick<ActionProposal, 'assistantId' | 'inputRevision' | 'paramsDigest'> & {
+  readonly baseHash?: string | null
 }
 
 /** 一条批准记录，只能被消费一次。 */
@@ -123,10 +144,38 @@ export interface Approval {
   readonly consumedAt: number | null
 }
 
-export const OPERATION_STATES = ['planned', 'running', 'succeeded', 'failed', 'unknown'] as const
+/**
+ * abandoned 只能由可信人工复核产生：用户确认结果仍然无法核实、决定放弃追查。它不再挡住后续动作，
+ * 但永远不会被当成成功。
+ */
+export const OPERATION_STATES = ['planned', 'running', 'succeeded', 'failed', 'unknown', 'abandoned'] as const
 export type OperationState = (typeof OPERATION_STATES)[number]
 
-/** 副作用操作记账。超时进入 unknown，必须先核查真实外部状态，禁止盲重试。 */
+/** 已有结论、不再接受迟到结果的操作状态。 */
+export const SETTLED_OPERATION_STATES: readonly OperationState[] = ['succeeded', 'failed', 'abandoned']
+
+/** 结果不明时用户可选的三种人工复核结论。 */
+export const REVIEW_RESOLUTIONS = ['verified-succeeded', 'verified-failed', 'abandoned'] as const
+export type ReviewResolution = (typeof REVIEW_RESOLUTIONS)[number]
+
+/** 写在被复核操作上的人工结论；只能来自桌面可信批准，模型自报无效。 */
+export interface OperationReview {
+  readonly reviewId: string
+  readonly proposalId: string
+  readonly resolution: ReviewResolution
+  readonly note: string
+  readonly decidedAt: number
+  /** 复核前的结果说明，原样保留以便追溯。 */
+  readonly previousDetail: string | null
+}
+
+/**
+ * 副作用操作记账。超时进入 unknown，必须先核查真实外部状态，禁止盲重试。
+ *
+ * 状态只按真实工具生命周期推进：planned（批准已消费、尚未进入工具体）→ running（即将进入工具体，
+ * executedAt 落库）→ succeeded / failed / unknown（来自 tools/result）。进程在任一步中断，重启对账一律
+ * 记 unknown 等人工核查，绝不自动重发。账本只存摘要：目标、参数摘要与结果摘要，不复制正文。
+ */
 export interface OperationRecord {
   readonly operationId: string
   readonly taskId: string
@@ -134,8 +183,133 @@ export interface OperationRecord {
   readonly kind: string
   readonly state: OperationState
   readonly resultDigest: string | null
+  /** 预登记（消费批准）的时间。 */
   readonly startedAt: number
   readonly endedAt: number | null
+  /** 执行成员；可信调度器绑定，不取模型自报。旧版行为 null。 */
+  readonly assistantId?: string | null
+  /** 规范化后的作用目标（写类为解析符号链接后的真实路径）。旧版行为 null。 */
+  readonly target?: string | null
+  /** 完整参数的摘要，不存参数正文。旧版行为 null。 */
+  readonly paramsDigest?: string | null
+  /** 执行它的那次运行。 */
+  readonly runId?: string | null
+  /** 真正进入工具体的时间；null 表示还没开始执行（或无从得知）。 */
+  readonly executedAt?: number | null
+  /** 结果的简短说明（成功 / 错误码与截断信息 / 中断原因），不含正文。 */
+  readonly resultDetail?: string | null
+  /**
+   * 验收证据（v5）：改动应用记前后哈希；验证命令记真实退出码、截断后的输出与文件结果。
+   * 由可信执行器写入，模型拿不到写入口。
+   */
+  readonly evidence?: unknown
+  /** 人工复核结论（v5）；只有可信批准能写。 */
+  readonly review?: OperationReview | null
+}
+
+/** 帮助任务：把团队账本里的一个任务绑到一次已授权的帮助范围（M2-06 / M3-07）。 */
+export interface HelpTaskLink {
+  readonly taskId: string
+  /** 授权项目目录的真实路径；读取、改动与验证都只认它。 */
+  readonly projectRoot: string
+  /** 文件级授权时唯一允许的文件（真实路径）；目录级授权为 null。 */
+  readonly currentFile: string | null
+  /** 助理库 help_contexts.id：跨库引用，只用于追溯。 */
+  readonly helpContextId: string | null
+  /** 主动帮助 episode id（跨库引用）；用户直接发起的帮助为 null。 */
+  readonly episodeId: string | null
+  readonly createdAt: number
+}
+
+export const CHANGE_STATES = [
+  'pending', 'approved', 'applying', 'applied', 'conflict', 'failed', 'unknown',
+  'rejected', 'expired', 'superseded', 'abandoned',
+] as const
+export type ChangeState = (typeof CHANGE_STATES)[number]
+
+/** 改动提案里的一个文件。路径是真实绝对路径；基线 `absent` 表示新建。 */
+export interface ChangeFile {
+  readonly seq: number
+  readonly path: string
+  readonly action: 'modify' | 'create'
+  readonly baseHash: string
+  readonly newHash: string
+  readonly added: number
+  readonly removed: number
+  /** 应用后实测的哈希；未应用为 null。 */
+  readonly afterHash: string | null
+}
+
+/** 一版改动提案。批准绑定修订、根目录与每个文件的（路径, 基线哈希, 新哈希）。 */
+export interface ChangeSet {
+  readonly changeId: string
+  readonly taskId: string
+  readonly revision: number
+  readonly proposalId: string | null
+  readonly root: string
+  readonly summary: string
+  readonly digest: string
+  readonly state: ChangeState
+  readonly operationId: string | null
+  readonly detail: string | null
+  readonly files: readonly ChangeFile[]
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+export const VERIFICATION_STATES = [
+  'pending', 'approved', 'running', 'passed', 'failed', 'timed-out', 'error', 'unknown', 'reviewed',
+  'rejected', 'expired', 'superseded',
+] as const
+export type VerificationState = (typeof VERIFICATION_STATES)[number]
+
+/** 一条验证命令：程序与参数数组（不经 shell）、授权项目内的 cwd、超时与预期副作用说明，以及真实结果。 */
+export interface VerificationRecord {
+  readonly verificationId: string
+  readonly taskId: string
+  readonly proposalId: string | null
+  readonly cwd: string
+  /** 解析后的程序绝对路径。 */
+  readonly program: string
+  readonly args: readonly string[]
+  readonly timeoutMs: number
+  readonly expectedEffects: string
+  readonly digest: string
+  /** 这条验证针对的已应用改动；没有改动时为 null。 */
+  readonly afterChangeId: string | null
+  readonly state: VerificationState
+  readonly exitCode: number | null
+  readonly signal: string | null
+  readonly durationMs: number | null
+  readonly stdout: string | null
+  readonly stderr: string | null
+  readonly stdoutTruncated: boolean
+  readonly stderrTruncated: boolean
+  readonly fileResults: unknown
+  readonly operationId: string | null
+  readonly detail: string | null
+  readonly createdAt: number
+  readonly startedAt: number | null
+  readonly endedAt: number | null
+}
+
+export const REVIEW_STATES = ['pending', 'applied', 'refused', 'rejected', 'expired', 'superseded'] as const
+export type ReviewState = (typeof REVIEW_STATES)[number]
+
+/** 一条 unknown 人工复核申请；结论绑在提案里，用户在桌面可信批准后才写进账本。 */
+export interface OperationReviewRecord {
+  readonly reviewId: string
+  readonly operationId: string
+  readonly taskId: string
+  readonly proposalId: string | null
+  readonly resolution: ReviewResolution
+  readonly note: string
+  /** 提案时被复核操作的状态快照摘要；应用时不符就拒绝（账目在此期间变过）。 */
+  readonly snapshotDigest: string
+  readonly state: ReviewState
+  readonly detail: string | null
+  readonly createdAt: number
+  readonly decidedAt: number | null
 }
 
 export const TEAM_EVENT_TYPES = [
@@ -185,7 +359,7 @@ function json(value: unknown): string {
 
 /** action_proposals 行 → ActionProposal。getProposal / listProposals / findGateProposal 共用一份映射。 */
 function rowToProposal(row: Row): ActionProposal {
-  return {
+  const proposal: ActionProposal = {
     proposalId: String(row.proposal_id),
     taskId: String(row.task_id),
     assistantId: String(row.assistant_id),
@@ -198,6 +372,24 @@ function rowToProposal(row: Row): ActionProposal {
     state: String(row.state) as ProposalState,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
+    baseHash: text(row.base_hash as string | null | undefined),
+  }
+  // 审阅全文只属于可信执行器动作；其余提案不带这三个字段，桌面按原样展示。
+  if (typeof row.review_content !== 'string') return proposal
+  return {
+    ...proposal,
+    content: row.review_content,
+    digest: String(row.params_digest),
+    revision: row.review_revision === null || row.review_revision === undefined ? Number(row.input_revision) : Number(row.review_revision),
+  }
+}
+
+function parseJson(raw: unknown): unknown {
+  if (typeof raw !== 'string') return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
   }
 }
 
@@ -212,8 +404,105 @@ function rowToOperation(row: Row): OperationRecord {
     resultDigest: text(row.result_digest as string | null),
     startedAt: Number(row.started_at),
     endedAt: row.ended_at === null ? null : Number(row.ended_at),
+    assistantId: text(row.assistant_id as string | null),
+    target: text(row.target as string | null),
+    paramsDigest: text(row.params_digest as string | null),
+    runId: text(row.run_id as string | null),
+    executedAt: row.executed_at === null || row.executed_at === undefined ? null : Number(row.executed_at),
+    resultDetail: text(row.result_detail as string | null),
+    evidence: parseJson(row.evidence),
+    review: (parseJson(row.review) as OperationReview | null) ?? null,
   }
 }
+
+function rowToHelpTask(row: Row): HelpTaskLink {
+  return {
+    taskId: String(row.task_id),
+    projectRoot: String(row.project_root),
+    currentFile: text(row.current_file as string | null),
+    helpContextId: text(row.help_context_id as string | null),
+    episodeId: text(row.episode_id as string | null),
+    createdAt: Number(row.created_at),
+  }
+}
+
+function rowToChangeFile(row: Row): ChangeFile {
+  return {
+    seq: Number(row.seq),
+    path: String(row.path),
+    action: row.action === 'create' ? 'create' : 'modify',
+    baseHash: String(row.base_hash),
+    newHash: String(row.new_hash),
+    added: Number(row.added),
+    removed: Number(row.removed),
+    afterHash: text(row.after_hash as string | null),
+  }
+}
+
+function rowToVerification(row: Row): VerificationRecord {
+  const args = parseJson(row.args)
+  return {
+    verificationId: String(row.verification_id),
+    taskId: String(row.task_id),
+    proposalId: text(row.proposal_id as string | null),
+    cwd: String(row.cwd),
+    program: String(row.program),
+    args: Array.isArray(args) ? args.filter((item): item is string => typeof item === 'string') : [],
+    timeoutMs: Number(row.timeout_ms),
+    expectedEffects: String(row.expected_effects),
+    digest: String(row.digest),
+    afterChangeId: text(row.after_change_id as string | null),
+    state: String(row.state) as VerificationState,
+    exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
+    signal: text(row.signal as string | null),
+    durationMs: row.duration_ms === null || row.duration_ms === undefined ? null : Number(row.duration_ms),
+    stdout: text(row.stdout as string | null),
+    stderr: text(row.stderr as string | null),
+    stdoutTruncated: Number(row.stdout_truncated) === 1,
+    stderrTruncated: Number(row.stderr_truncated) === 1,
+    fileResults: parseJson(row.file_results),
+    operationId: text(row.operation_id as string | null),
+    detail: text(row.detail as string | null),
+    createdAt: Number(row.created_at),
+    startedAt: row.started_at === null || row.started_at === undefined ? null : Number(row.started_at),
+    endedAt: row.ended_at === null || row.ended_at === undefined ? null : Number(row.ended_at),
+  }
+}
+
+function rowToReview(row: Row): OperationReviewRecord {
+  return {
+    reviewId: String(row.review_id),
+    operationId: String(row.operation_id),
+    taskId: String(row.task_id),
+    proposalId: text(row.proposal_id as string | null),
+    resolution: String(row.resolution) as ReviewResolution,
+    note: String(row.note),
+    snapshotDigest: String(row.snapshot_digest),
+    state: String(row.state) as ReviewState,
+    detail: text(row.detail as string | null),
+    createdAt: Number(row.created_at),
+    decidedAt: row.decided_at === null || row.decided_at === undefined ? null : Number(row.decided_at),
+  }
+}
+
+/** 操作账本在 v4 / v5 补的列：老库按列名逐个补，重复打开也安全。 */
+const OPERATION_LEDGER_COLUMNS: readonly (readonly [string, string])[] = [
+  ['assistant_id', 'TEXT'],
+  ['target', 'TEXT'],
+  ['params_digest', 'TEXT'],
+  ['run_id', 'TEXT'],
+  ['executed_at', 'INTEGER'],
+  ['result_detail', 'TEXT'],
+  ['evidence', 'TEXT'],
+  ['review', 'TEXT'],
+]
+
+/** 提案在 v5 补的列：写类目标的基线哈希、可信执行器动作的审阅全文与修订。 */
+const PROPOSAL_V5_COLUMNS: readonly (readonly [string, string])[] = [
+  ['base_hash', 'TEXT'],
+  ['review_content', 'TEXT'],
+  ['review_revision', 'INTEGER'],
+]
 
 function parseList(raw: string | null): string[] {
   if (!raw) return []
@@ -224,6 +513,8 @@ function parseList(raw: string | null): string[] {
 /** 团队业务库。所有写操作都在这里，读取用只读投影方法。 */
 export class TeamStore {
   private readonly db: DatabaseSync
+  /** 事务嵌套深度：内层调用跟随外层一起提交或回滚（SQLite 对嵌套 BEGIN 直接报错）。 */
+  private transactionDepth = 0
 
   constructor(dbPath: string) {
     mkdirSync(path.dirname(dbPath), { recursive: true })
@@ -305,7 +596,10 @@ export class TeamStore {
         risk TEXT NOT NULL,
         state TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        base_hash TEXT,
+        review_content TEXT,
+        review_revision INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS approvals (
@@ -326,7 +620,94 @@ export class TeamStore {
         state TEXT NOT NULL,
         result_digest TEXT,
         started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        assistant_id TEXT,
+        target TEXT,
+        params_digest TEXT,
+        run_id TEXT,
+        executed_at INTEGER,
+        result_detail TEXT,
+        evidence TEXT,
+        review TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS help_tasks (
+        task_id TEXT PRIMARY KEY,
+        project_root TEXT NOT NULL,
+        current_file TEXT,
+        help_context_id TEXT,
+        episode_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS change_sets (
+        change_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        proposal_id TEXT,
+        root TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        state TEXT NOT NULL,
+        operation_id TEXT,
+        detail TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS change_files (
+        change_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        action TEXT NOT NULL,
+        base_hash TEXT NOT NULL,
+        new_hash TEXT NOT NULL,
+        added INTEGER NOT NULL,
+        removed INTEGER NOT NULL,
+        new_content TEXT,
+        after_hash TEXT,
+        PRIMARY KEY (change_id, seq)
+      );
+
+      CREATE TABLE IF NOT EXISTS verifications (
+        verification_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        proposal_id TEXT,
+        cwd TEXT NOT NULL,
+        program TEXT NOT NULL,
+        args TEXT NOT NULL,
+        timeout_ms INTEGER NOT NULL,
+        expected_effects TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        after_change_id TEXT,
+        state TEXT NOT NULL,
+        exit_code INTEGER,
+        signal TEXT,
+        duration_ms INTEGER,
+        stdout TEXT,
+        stderr TEXT,
+        stdout_truncated INTEGER NOT NULL DEFAULT 0,
+        stderr_truncated INTEGER NOT NULL DEFAULT 0,
+        file_results TEXT,
+        operation_id TEXT,
+        detail TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
         ended_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS operation_reviews (
+        review_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        proposal_id TEXT,
+        resolution TEXT NOT NULL,
+        note TEXT NOT NULL,
+        snapshot_digest TEXT NOT NULL,
+        state TEXT NOT NULL,
+        detail TEXT,
+        created_at INTEGER NOT NULL,
+        decided_at INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS events_outbox (
@@ -353,10 +734,26 @@ export class TeamStore {
     if (!proposalColumns.some((column) => String(column.name) === 'tool')) {
       this.db.exec(`ALTER TABLE action_proposals ADD COLUMN tool TEXT NOT NULL DEFAULT ''`)
     }
+    // v4 及更早的库：提案的基线哈希与审阅全文同样按列名补。
+    const proposalNames = new Set(proposalColumns.map((column) => String(column.name)))
+    for (const [name, type] of PROPOSAL_V5_COLUMNS) {
+      if (!proposalNames.has(name)) this.db.exec(`ALTER TABLE action_proposals ADD COLUMN ${name} ${type}`)
+    }
     // 门禁的热路径：每次副作用工具调用前都要按这四列找一条可消费的批准。
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_proposals_gate ON action_proposals (task_id, tool, target, state)`,
     )
+    // v3 的库里 operations 已经存在，账本新列同样只能显式补；按列名判断，v4 形状的库上重跑也安全。
+    const operationColumns = new Set(
+      (this.db.prepare('PRAGMA table_info(operations)').all() as Row[]).map((column) => String(column.name)),
+    )
+    for (const [name, type] of OPERATION_LEDGER_COLUMNS) {
+      if (!operationColumns.has(name)) this.db.exec(`ALTER TABLE operations ADD COLUMN ${name} ${type}`)
+    }
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_operations_task ON operations (task_id, started_at)`)
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_change_sets_revision ON change_sets (task_id, revision)`)
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications (task_id, created_at)`)
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_operation ON operation_reviews (operation_id, created_at)`)
 
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
@@ -364,9 +761,21 @@ export class TeamStore {
       .run(TEAM_SCHEMA_VERSION, Date.now())
   }
 
-  /** 在一个事务里执行写入；发件箱事件与业务变更同事务提交。 */
+  /**
+   * 在一个事务里执行写入；发件箱事件与业务变更同事务提交。
+   * 可以重入：内层调用跟随外层一起提交或回滚（例如改动提案与它的审批卡必须同生同灭）。
+   */
   transaction<T>(body: () => T): T {
+    if (this.transactionDepth > 0) {
+      this.transactionDepth += 1
+      try {
+        return body()
+      } finally {
+        this.transactionDepth -= 1
+      }
+    }
     this.db.exec('BEGIN')
+    this.transactionDepth = 1
     try {
       const result = body()
       this.db.exec('COMMIT')
@@ -374,6 +783,8 @@ export class TeamStore {
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
+    } finally {
+      this.transactionDepth = 0
     }
   }
 
@@ -626,8 +1037,9 @@ export class TeamStore {
     this.db
       .prepare(
         `INSERT INTO action_proposals (proposal_id, task_id, assistant_id, summary, tool, target, params_digest,
-                                       input_revision, risk, state, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                       input_revision, risk, state, created_at, expires_at,
+                                       base_hash, review_content, review_revision)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         proposal.proposalId,
@@ -642,6 +1054,9 @@ export class TeamStore {
         proposal.state,
         proposal.createdAt,
         proposal.expiresAt,
+        text(proposal.baseHash),
+        text(proposal.content),
+        num(proposal.revision),
       )
   }
 
@@ -668,6 +1083,60 @@ export class TeamStore {
       )
       .get(taskId, tool, target, ...(binding ? [binding.assistantId, binding.inputRevision, binding.paramsDigest] : [])) as Row | undefined
     return row ? rowToProposal(row) : null
+  }
+
+  /**
+   * 门禁查找可以真正消费的那一条：已批准、批准未消费且未过期、提案也未过期。
+   * 同一调用被重新批准过时，旧的已消费批准不能挡住新批准，也不能被当成新批准重放。
+   * 给出 baseHash（写类目标当前的内容版本）时，绑定了别的版本的批准不算可用；没绑定版本的旧提案照旧可用。
+   */
+  findUsableGateProposal(taskId: string, tool: string, target: string,
+    binding: GateBinding, now: number,
+  ): ActionProposal | null {
+    const versioned = binding.baseHash !== undefined && binding.baseHash !== null
+    const row = this.db
+      .prepare(
+        `SELECT p.* FROM action_proposals p JOIN approvals a ON a.proposal_id = p.proposal_id
+          WHERE p.task_id = ? AND p.tool = ? AND p.target = ? AND p.state = 'approved'
+            AND p.assistant_id = ? AND p.input_revision = ? AND p.params_digest = ?
+            AND a.consumed_at IS NULL AND a.expires_at > ? AND p.expires_at > ?
+            ${versioned ? 'AND (p.base_hash IS NULL OR p.base_hash = ?)' : ''}
+          ORDER BY a.issued_at DESC LIMIT 1`,
+      )
+      .get(taskId, tool, target, binding.assistantId, binding.inputRevision, binding.paramsDigest, now, now,
+        ...(versioned ? [binding.baseHash as string] : [])) as Row | undefined
+    return row ? rowToProposal(row) : null
+  }
+
+  /** 同一调用还在等用户决定的提案（未过期，且绑定的文件版本相同）；门禁据此复用审批卡，不重复刷卡。 */
+  findPendingGateProposal(taskId: string, tool: string, target: string,
+    binding: GateBinding, now: number,
+  ): ActionProposal | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM action_proposals
+          WHERE task_id = ? AND tool = ? AND target = ? AND state = 'pending'
+            AND assistant_id = ? AND input_revision = ? AND params_digest = ? AND expires_at > ?
+            AND base_hash IS ?
+          ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(taskId, tool, target, binding.assistantId, binding.inputRevision, binding.paramsDigest, now,
+        binding.baseHash ?? null) as Row | undefined
+    return row ? rowToProposal(row) : null
+  }
+
+  /**
+   * 把某任务（可限定输入修订）仍在等待的提案改成 expired，返回被改的那些。
+   * 不开事务：调用方在自己的事务里连同发件箱事件一起提交。
+   */
+  expirePendingProposals(taskId: string, inputRevision?: number): ActionProposal[] {
+    const rows = (inputRevision === undefined
+      ? this.db.prepare(`SELECT * FROM action_proposals WHERE task_id = ? AND state = 'pending'`).all(taskId)
+      : this.db.prepare(`SELECT * FROM action_proposals WHERE task_id = ? AND state = 'pending' AND input_revision = ?`)
+        .all(taskId, inputRevision)) as Row[]
+    const expired = rows.map(rowToProposal)
+    for (const proposal of expired) this.setProposalState(proposal.proposalId, 'expired')
+    return expired
   }
 
   listProposals(state?: ProposalState): ActionProposal[] {
@@ -745,8 +1214,9 @@ export class TeamStore {
   insertOperation(operation: OperationRecord): void {
     this.db
       .prepare(
-        `INSERT INTO operations (operation_id, task_id, approval_id, kind, state, result_digest, started_at, ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO operations (operation_id, task_id, approval_id, kind, state, result_digest, started_at, ended_at,
+                                 assistant_id, target, params_digest, run_id, executed_at, result_detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         operation.operationId,
@@ -757,13 +1227,37 @@ export class TeamStore {
         text(operation.resultDigest),
         operation.startedAt,
         num(operation.endedAt),
+        text(operation.assistantId),
+        text(operation.target),
+        text(operation.paramsDigest),
+        text(operation.runId),
+        num(operation.executedAt),
+        text(operation.resultDetail),
       )
   }
 
-  setOperationState(operationId: string, state: OperationState, resultDigest: string | null): void {
+  /** 结算或对账一条操作；detail 不传就保留原说明。 */
+  setOperationState(operationId: string, state: OperationState, resultDigest: string | null, detail?: string | null): void {
+    if (detail === undefined) {
+      this.db
+        .prepare('UPDATE operations SET state = ?, result_digest = ?, ended_at = ? WHERE operation_id = ?')
+        .run(state, text(resultDigest), Date.now(), operationId)
+      return
+    }
     this.db
-      .prepare('UPDATE operations SET state = ?, result_digest = ?, ended_at = ? WHERE operation_id = ?')
-      .run(state, text(resultDigest), Date.now(), operationId)
+      .prepare('UPDATE operations SET state = ?, result_digest = ?, ended_at = ?, result_detail = ? WHERE operation_id = ?')
+      .run(state, text(resultDigest), Date.now(), text(detail), operationId)
+  }
+
+  /**
+   * planned → running，并记下真正进入工具体的时间。只认 planned：已被对账成 unknown 的操作
+   * （例如任务已停止）不能再被标成执行中，调用方据此拒绝执行。
+   */
+  markOperationRunning(operationId: string, at: number): boolean {
+    const result = this.db
+      .prepare(`UPDATE operations SET state = 'running', executed_at = ? WHERE operation_id = ? AND state = 'planned'`)
+      .run(at, operationId)
+    return Number(result.changes) === 1
   }
 
   getOperation(operationId: string): OperationRecord | null {
@@ -792,6 +1286,248 @@ export class TeamStore {
         : this.db.prepare('SELECT * FROM operations ORDER BY started_at DESC').all()
     ) as Row[]
     return rows.map(rowToOperation)
+  }
+
+  /** 写入验收证据（可信执行器专用）。 */
+  setOperationEvidence(operationId: string, evidence: unknown): void {
+    this.db.prepare('UPDATE operations SET evidence = ? WHERE operation_id = ?').run(json(evidence), operationId)
+  }
+
+  /**
+   * 人工复核：只把仍是 unknown 的操作改成复核结论，同时留下复核记录与原说明。
+   * 返回 false 表示操作已不是 unknown（并发复核或迟到结果先到），调用方必须拒绝。
+   */
+  reviewOperation(operationId: string, state: OperationState, review: OperationReview, detail: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE operations SET state = ?, review = ?, result_detail = ?, ended_at = COALESCE(ended_at, ?)
+                WHERE operation_id = ? AND state = 'unknown'`)
+      .run(state, json(review), detail, Date.now(), operationId)
+    return Number(result.changes) === 1
+  }
+
+  insertHelpTask(link: HelpTaskLink): void {
+    this.db
+      .prepare(`INSERT INTO help_tasks (task_id, project_root, current_file, help_context_id, episode_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(link.taskId, link.projectRoot, text(link.currentFile), text(link.helpContextId), text(link.episodeId), link.createdAt)
+  }
+
+  getHelpTask(taskId: string): HelpTaskLink | null {
+    const row = this.db.prepare('SELECT * FROM help_tasks WHERE task_id = ?').get(taskId) as Row | undefined
+    return row ? rowToHelpTask(row) : null
+  }
+
+  listHelpTasks(): HelpTaskLink[] {
+    return (this.db.prepare('SELECT * FROM help_tasks ORDER BY created_at DESC').all() as Row[]).map(rowToHelpTask)
+  }
+
+  /** 新建一版改动提案及其文件；新内容只为应用保留，应用或作废后清空。 */
+  insertChangeSet(change: ChangeSet, contents: readonly string[]): void {
+    this.db
+      .prepare(`INSERT INTO change_sets (change_id, task_id, revision, proposal_id, root, summary, digest, state, operation_id,
+                                         detail, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(change.changeId, change.taskId, change.revision, text(change.proposalId), change.root, change.summary, change.digest,
+        change.state, text(change.operationId), text(change.detail), change.createdAt, change.updatedAt)
+    const insert = this.db.prepare(`INSERT INTO change_files (change_id, seq, path, action, base_hash, new_hash, added, removed,
+                                                              new_content, after_hash)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    change.files.forEach((file, index) => {
+      insert.run(change.changeId, file.seq, file.path, file.action, file.baseHash, file.newHash, file.added, file.removed,
+        contents[index] ?? null, text(file.afterHash))
+    })
+  }
+
+  private changeFiles(changeId: string): ChangeFile[] {
+    return (this.db.prepare('SELECT * FROM change_files WHERE change_id = ? ORDER BY seq').all(changeId) as Row[]).map(rowToChangeFile)
+  }
+
+  private toChangeSet(row: Row): ChangeSet {
+    const changeId = String(row.change_id)
+    return {
+      changeId,
+      taskId: String(row.task_id),
+      revision: Number(row.revision),
+      proposalId: text(row.proposal_id as string | null),
+      root: String(row.root),
+      summary: String(row.summary),
+      digest: String(row.digest),
+      state: String(row.state) as ChangeState,
+      operationId: text(row.operation_id as string | null),
+      detail: text(row.detail as string | null),
+      files: this.changeFiles(changeId),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
+  getChangeSet(changeId: string): ChangeSet | null {
+    const row = this.db.prepare('SELECT * FROM change_sets WHERE change_id = ?').get(changeId) as Row | undefined
+    return row ? this.toChangeSet(row) : null
+  }
+
+  changeSetByProposal(proposalId: string): ChangeSet | null {
+    const row = this.db.prepare('SELECT * FROM change_sets WHERE proposal_id = ?').get(proposalId) as Row | undefined
+    return row ? this.toChangeSet(row) : null
+  }
+
+  /** 某任务的全部改动提案，修订从新到旧。 */
+  listChangeSets(taskId: string): ChangeSet[] {
+    return (this.db.prepare('SELECT * FROM change_sets WHERE task_id = ? ORDER BY revision DESC').all(taskId) as Row[])
+      .map(row => this.toChangeSet(row))
+  }
+
+  latestChangeRevision(taskId: string): number {
+    const row = this.db.prepare('SELECT MAX(revision) AS revision FROM change_sets WHERE task_id = ?').get(taskId) as Row | undefined
+    return row?.revision === null || row?.revision === undefined ? 0 : Number(row.revision)
+  }
+
+  /**
+   * 条件更新改动状态：from 给出时只在当前状态属于其中时才改，返回是否改到。
+   * 执行器靠它做「只有 approved 能进入 applying」这类单次推进。
+   */
+  setChangeState(changeId: string, state: ChangeState, patch: { detail?: string | null; operationId?: string | null; from?: readonly ChangeState[] } = {}): boolean {
+    const sets = ['state = ?', 'updated_at = ?']
+    const values: (string | number | null)[] = [state, Date.now()]
+    if (patch.detail !== undefined) { sets.push('detail = ?'); values.push(text(patch.detail)) }
+    if (patch.operationId !== undefined) { sets.push('operation_id = ?'); values.push(text(patch.operationId)) }
+    let where = 'change_id = ?'
+    values.push(changeId)
+    if (patch.from && patch.from.length > 0) {
+      where += ` AND state IN (${patch.from.map(() => '?').join(', ')})`
+      values.push(...patch.from)
+    }
+    const result = this.db.prepare(`UPDATE change_sets SET ${sets.join(', ')} WHERE ${where}`).run(...values)
+    return Number(result.changes) === 1
+  }
+
+  setChangeProposal(changeId: string, proposalId: string): void {
+    this.db.prepare('UPDATE change_sets SET proposal_id = ?, updated_at = ? WHERE change_id = ?').run(proposalId, Date.now(), changeId)
+  }
+
+  /** 应用后实测哈希。 */
+  setChangeFileAfter(changeId: string, seq: number, afterHash: string | null): void {
+    this.db.prepare('UPDATE change_files SET after_hash = ? WHERE change_id = ? AND seq = ?').run(text(afterHash), changeId, seq)
+  }
+
+  /** 应用时取新内容；已清空时返回 null（执行器据此拒绝）。 */
+  changeContents(changeId: string): Map<number, string | null> {
+    const rows = this.db.prepare('SELECT seq, new_content FROM change_files WHERE change_id = ? ORDER BY seq').all(changeId) as Row[]
+    return new Map(rows.map(row => [Number(row.seq), text(row.new_content as string | null)]))
+  }
+
+  /** 应用、冲突或作废之后清掉保存的新内容：账本只留哈希。 */
+  purgeChangeContents(changeId: string): void {
+    this.db.prepare('UPDATE change_files SET new_content = NULL WHERE change_id = ?').run(changeId)
+  }
+
+  insertVerification(record: VerificationRecord): void {
+    this.db
+      .prepare(`INSERT INTO verifications (verification_id, task_id, proposal_id, cwd, program, args, timeout_ms, expected_effects,
+                                           digest, after_change_id, state, exit_code, signal, duration_ms, stdout, stderr,
+                                           stdout_truncated, stderr_truncated, file_results, operation_id, detail, created_at,
+                                           started_at, ended_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(record.verificationId, record.taskId, text(record.proposalId), record.cwd, record.program, json(record.args),
+        record.timeoutMs, record.expectedEffects, record.digest, text(record.afterChangeId), record.state, num(record.exitCode),
+        text(record.signal), num(record.durationMs), text(record.stdout), text(record.stderr), bool(record.stdoutTruncated),
+        bool(record.stderrTruncated), record.fileResults === null || record.fileResults === undefined ? null : json(record.fileResults),
+        text(record.operationId), text(record.detail), record.createdAt, num(record.startedAt), num(record.endedAt))
+  }
+
+  getVerification(verificationId: string): VerificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM verifications WHERE verification_id = ?').get(verificationId) as Row | undefined
+    return row ? rowToVerification(row) : null
+  }
+
+  verificationByProposal(proposalId: string): VerificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM verifications WHERE proposal_id = ?').get(proposalId) as Row | undefined
+    return row ? rowToVerification(row) : null
+  }
+
+  /** 某任务的全部验证，从新到旧。 */
+  listVerifications(taskId: string): VerificationRecord[] {
+    return (this.db.prepare('SELECT * FROM verifications WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as Row[])
+      .map(rowToVerification)
+  }
+
+  setVerificationProposal(verificationId: string, proposalId: string): void {
+    this.db.prepare('UPDATE verifications SET proposal_id = ? WHERE verification_id = ?').run(proposalId, verificationId)
+  }
+
+  /** 条件更新验证状态，语义同 setChangeState。 */
+  setVerificationState(verificationId: string, state: VerificationState,
+    patch: { detail?: string | null; operationId?: string | null; startedAt?: number; from?: readonly VerificationState[] } = {},
+  ): boolean {
+    const sets = ['state = ?']
+    const values: (string | number | null)[] = [state]
+    if (patch.detail !== undefined) { sets.push('detail = ?'); values.push(text(patch.detail)) }
+    if (patch.operationId !== undefined) { sets.push('operation_id = ?'); values.push(text(patch.operationId)) }
+    if (patch.startedAt !== undefined) { sets.push('started_at = ?'); values.push(patch.startedAt) }
+    let where = 'verification_id = ?'
+    values.push(verificationId)
+    if (patch.from && patch.from.length > 0) {
+      where += ` AND state IN (${patch.from.map(() => '?').join(', ')})`
+      values.push(...patch.from)
+    }
+    const result = this.db.prepare(`UPDATE verifications SET ${sets.join(', ')} WHERE ${where}`).run(...values)
+    return Number(result.changes) === 1
+  }
+
+  /** 记下一次真实运行的结果：退出码、截断输出与文件结果。只认 running。 */
+  finishVerification(verificationId: string, state: VerificationState, result: {
+    exitCode: number | null; signal: string | null; durationMs: number | null; stdout: string; stderr: string
+    stdoutTruncated: boolean; stderrTruncated: boolean; fileResults: unknown; detail: string
+  }): boolean {
+    const outcome = this.db
+      .prepare(`UPDATE verifications SET state = ?, exit_code = ?, signal = ?, duration_ms = ?, stdout = ?, stderr = ?,
+                       stdout_truncated = ?, stderr_truncated = ?, file_results = ?, detail = ?, ended_at = ?
+                WHERE verification_id = ? AND state = 'running'`)
+      .run(state, num(result.exitCode), text(result.signal), num(result.durationMs), result.stdout, result.stderr,
+        bool(result.stdoutTruncated), bool(result.stderrTruncated), json(result.fileResults), result.detail, Date.now(), verificationId)
+    return Number(outcome.changes) === 1
+  }
+
+  insertReview(review: OperationReviewRecord): void {
+    this.db
+      .prepare(`INSERT INTO operation_reviews (review_id, operation_id, task_id, proposal_id, resolution, note, snapshot_digest,
+                                               state, detail, created_at, decided_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(review.reviewId, review.operationId, review.taskId, text(review.proposalId), review.resolution, review.note,
+        review.snapshotDigest, review.state, text(review.detail), review.createdAt, num(review.decidedAt))
+  }
+
+  getReview(reviewId: string): OperationReviewRecord | null {
+    const row = this.db.prepare('SELECT * FROM operation_reviews WHERE review_id = ?').get(reviewId) as Row | undefined
+    return row ? rowToReview(row) : null
+  }
+
+  reviewByProposal(proposalId: string): OperationReviewRecord | null {
+    const row = this.db.prepare('SELECT * FROM operation_reviews WHERE proposal_id = ?').get(proposalId) as Row | undefined
+    return row ? rowToReview(row) : null
+  }
+
+  listReviews(operationId: string): OperationReviewRecord[] {
+    return (this.db.prepare('SELECT * FROM operation_reviews WHERE operation_id = ? ORDER BY created_at DESC').all(operationId) as Row[])
+      .map(rowToReview)
+  }
+
+  /** 某任务名下的全部复核申请（对账用）。 */
+  listReviewsForTask(taskId: string): OperationReviewRecord[] {
+    return (this.db.prepare('SELECT * FROM operation_reviews WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as Row[])
+      .map(rowToReview)
+  }
+
+  setReviewProposal(reviewId: string, proposalId: string): void {
+    this.db.prepare('UPDATE operation_reviews SET proposal_id = ? WHERE review_id = ?').run(proposalId, reviewId)
+  }
+
+  /** 条件更新复核状态：只从 pending 推进。 */
+  setReviewState(reviewId: string, state: ReviewState, detail: string | null, decidedAt: number | null): boolean {
+    const result = this.db
+      .prepare(`UPDATE operation_reviews SET state = ?, detail = ?, decided_at = ? WHERE review_id = ? AND state = 'pending'`)
+      .run(state, text(detail), num(decidedAt), reviewId)
+    return Number(result.changes) === 1
   }
 
   /** 提交一条展示事件，返回单调序号；必须与业务变更同事务调用。 */

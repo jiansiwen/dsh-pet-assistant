@@ -9,6 +9,9 @@
  * 启动入口用的是 dsh 自己的 launcher（`--profile <name> --patch <overlay>`），不是另写一套：
  * `--patch` 覆盖层排在 profile 层之后，所以团队模式挂在任意一个已经能正常启动的 profile 上即可，
  * 不必新建 profile、也不必改写用户已有的 cordis.patch.yml。
+ *
+ * 桌面壳自身的目录布局（开发态 / 打包态）也收在这里（`resolveAppLayout`、`toUnpackedPath`）：
+ * 随包 CLI、.ps1 脚本、worker 入口在打包后都在 app.asar.unpacked，开发态则一切照旧。
  */
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import path from 'node:path'
@@ -51,10 +54,107 @@ export interface RuntimePlan {
 export interface LaunchOptions {
   dshHome: string
   profile: string
-  /** 桌面壳自身的根目录：dsh CLI 是它的依赖，随包携带。 */
+  /**
+   * 随包 dsh CLI 的查找根：`<appDir>/node_modules/@deepseek-ai/dsh`。
+   * 开发态是 dsh-pet 目录；打包态必须是真实目录 `app.asar.unpacked`（见 `resolveAppLayout().realAppDir`）。
+   */
   appDir: string
   /** 用来跑 CLI 的可执行文件。默认 process.execPath + ELECTRON_RUN_AS_NODE。 */
   execPath?: string
+  /** 是否为打包后的安装版。只影响失败时给用户的下一步（安装版里没有"去 dsh-pet 目录装依赖"这回事）。 */
+  packaged?: boolean
+}
+
+// ===== 应用目录布局：开发态与打包态 =====
+
+/** 路径里第一个以 `.asar` 结尾的段（后面紧跟分隔符或到结尾）。`.asar.unpacked` 不会命中。 */
+const ASAR_SEGMENT = /(\.asar)(?=[\\/]|$)/i
+
+/**
+ * asar 内的路径 → `*.asar.unpacked` 里同一个文件的真实路径；不在 asar 里的路径原样返回。
+ *
+ * 用在"交给 Electron 之外的读者"的路径上：PowerShell（`-File x.ps1`）、worker 线程入口、
+ * 以 ELECTRON_RUN_AS_NODE 起的子进程入口、`createRequire` 的解析基点。这些读者不经过
+ * Electron 的 asar 文件补丁，拿到 `app.asar/...` 只会报"找不到文件"——而打包配置
+ * （build/electron-builder.yml 的 asarUnpack）已经把对应文件放到了 `app.asar.unpacked`。
+ * 开发态的路径里没有 `.asar` 段，调用方无需区分开发与打包。
+ *
+ * 纯字符串处理，两种分隔符都认：在 Windows 上也能测 macOS 的路径。
+ */
+export function toUnpackedPath(file: string): string {
+  return file.replace(ASAR_SEGMENT, '$1.unpacked')
+}
+
+export interface AppLayoutInput {
+  /** 主进程产物所在目录：`path.dirname(fileURLToPath(import.meta.url))`（dist/main）。 */
+  readonly mainDir: string
+  /** `app.isPackaged`。 */
+  readonly isPackaged: boolean
+  /** `app.getAppPath()`。打包态是 `<resources>/app.asar`；不给时按 mainDir 往上两级推出。 */
+  readonly appPath?: string
+  /** `process.resourcesPath`。extraResources 的根；不给时取 appDir 的上一级。 */
+  readonly resourcesPath?: string
+}
+
+/** 桌面壳自身的目录布局。开发态与打包态的差别只收在这里，调用方不再自己拼 `../..`。 */
+export interface AppLayout {
+  readonly packaged: boolean
+  /** 应用根，Electron 自己读文件（页面、preload、托盘图标）用它。打包态在 asar 里。 */
+  readonly appDir: string
+  /** 应用根的真实目录：随包 dsh CLI、原生模块、worker 与子进程入口都从这里找。 */
+  readonly realAppDir: string
+  /** dist/main 的真实目录：.ps1 脚本与 worker 入口所在。 */
+  readonly scriptDir: string
+  /** extraResources 的根。当前打包配置没有 extraResources，留给随包附带的独立资源。 */
+  readonly resourcesDir: string
+}
+
+/**
+ * 解析桌面壳的目录布局。
+ *
+ * - 开发态：与改造前完全一致 —— `dist/main` 往上两级就是 dsh-pet 目录，node_modules 就在那里；
+ *   不碰 `process.resourcesPath`（开发态它指向 Electron 自己的 resources，与本应用无关）。
+ * - 打包态：应用根取 `app.getAppPath()`（`<resources>/app.asar`），真实目录是旁边的
+ *   `app.asar.unpacked`（打包配置把 node_modules 与脚本解包到了那里）。若打包时关掉了 asar，
+ *   应用根本身就是真实目录 `<resources>/app`，两者相同。
+ */
+export function resolveAppLayout(input: AppLayoutInput): AppLayout {
+  const derived = path.resolve(input.mainDir, '..', '..')
+  if (!input.isPackaged) {
+    return { packaged: false, appDir: derived, realAppDir: derived, scriptDir: input.mainDir, resourcesDir: derived }
+  }
+  const appDir = input.appPath ? path.resolve(input.appPath) : derived
+  return {
+    packaged: true,
+    appDir,
+    realAppDir: toUnpackedPath(appDir),
+    scriptDir: toUnpackedPath(path.resolve(input.mainDir)),
+    resourcesDir: input.resourcesPath ? path.resolve(input.resourcesPath) : path.dirname(appDir),
+  }
+}
+
+/**
+ * 把随包 CLI 的一次调用写成用户能复制进终端执行的一行命令。**只用于展示**，这里不执行任何东西。
+ *
+ * 安装版里 `dsh` 不在 PATH 上：CLI 是装在 app.asar.unpacked 里的一个 JS 文件，要用壳自己的
+ * 可执行文件带 `ELECTRON_RUN_AS_NODE=1` 来跑（与 planRuntimeLaunch 的启动方式相同）。
+ * Windows 写成 PowerShell（单引号字面量，`'` 双写转义；用完把环境变量删掉，不污染当前终端），
+ * 其余写成 POSIX shell（`VAR=1 cmd` 只作用于这一条命令）。
+ */
+export function bundledCliCommandLine(
+  platform: string,
+  execPath: string,
+  cliPath: string,
+  args: readonly string[],
+): string {
+  if (platform === 'win32') {
+    const quote = (value: string): string => `'${value.replace(/'/g, "''")}'`
+    const call = ['&', quote(execPath), quote(cliPath), ...args.map(quote)].join(' ')
+    return `$env:ELECTRON_RUN_AS_NODE='1'; try { ${call} } finally { Remove-Item Env:ELECTRON_RUN_AS_NODE }`
+  }
+  const quote = (value: string): string =>
+    /^[A-Za-z0-9_./:=@%+,-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
+  return ['ELECTRON_RUN_AS_NODE=1', quote(execPath), quote(cliPath), ...args.map(quote)].join(' ')
 }
 
 /**
@@ -184,9 +284,12 @@ export function resolvePluginDir(profileDir: string): PluginLocation | null {
 export function planRuntimeLaunch(options: LaunchOptions): RuntimePlan | LaunchFailure {
   const cli = resolveCli(options.appDir)
   if (!cli) {
+    const cliDir = path.join(options.appDir, 'node_modules', '@deepseek-ai', 'dsh')
     return fail(
       'locate-cli',
-      `桌面壳没有找到随包的 dsh 命令行（${path.join(options.appDir, 'node_modules', '@deepseek-ai', 'dsh')}）：请先在 dsh-pet 目录安装依赖`,
+      options.packaged
+        ? `安装包里没有随包的 dsh 命令行（${cliDir}）：安装包不完整（node_modules 需要解包到 app.asar.unpacked），请重新安装完整的安装包`
+        : `桌面壳没有找到随包的 dsh 命令行（${cliDir}）：请先在 dsh-pet 目录安装依赖`,
     )
   }
   if (!versionAtLeast(cli.version, MIN_DSH_VERSION)) {
@@ -213,9 +316,19 @@ export function planRuntimeLaunch(options: LaunchOptions): RuntimePlan | LaunchF
 
   const plugin = resolvePluginDir(profileDir)
   if (!plugin) {
+    // 安装版里 dsh 不在 PATH 上，给出用壳自身可执行文件跑随包 CLI 的完整命令。
+    // 这条命令会改动用户的 profile（依赖与图层列表），所以只展示、由用户自己执行，壳不代劳。
+    const install = options.packaged
+      ? bundledCliCommandLine(process.platform, options.execPath ?? process.execPath, cli.cliPath, [
+        'plugin', '--profile', options.profile, 'add', '<插件包路径>',
+      ])
+      : `dsh plugin --profile ${options.profile} add <插件目录>`
     return fail(
       'locate-plugin',
-      `profile「${options.profile}」里没有安装 ${PLUGIN_PACKAGE}：运行 dsh plugin --profile ${options.profile} add <插件目录> 后重试`,
+      options.packaged
+        ? `profile「${options.profile}」里没有安装 ${PLUGIN_PACKAGE}。插件不随安装包自动装进 profile（那会改动你的 dsh 配置）；`
+          + `确认后在终端执行：${install}（<插件包路径> 换成随安装包提供的插件 .tgz 或插件目录；需要本机已装 pnpm），完成后重试`
+        : `profile「${options.profile}」里没有安装 ${PLUGIN_PACKAGE}：运行 ${install} 后重试`,
     )
   }
 

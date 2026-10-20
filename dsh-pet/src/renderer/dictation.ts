@@ -1,12 +1,13 @@
 /**
- * 听写录音（渲染层）：getUserMedia 采 16kHz mono，静音检测自动停，编码成 wav 给主进程。
+ * 听写录音（渲染层）：订阅共享采集（`audio-capture.ts`），静音检测自动停，编码成 wav 给主进程。
  *
  * 录音放渲染层而不是 PowerShell 的原因：浏览器拿得到真实电平，能"说完即停"；MCI 录音
  * 只能录满固定窗口，用户说完还得干等。麦克风仲裁（停唤醒监听）仍由主进程在 asr-begin
- * 时完成，这里拿到的设备是空闲的。
+ * 时完成，并经 audio-grants 把"听写"授权下发给共享采集；这里拿到的设备是受控的唯一来源。
  *
  * VAD 参数刻意保守：宁可多录一点（识别前主进程还会裁静音），不可把话头切掉。
  */
+import { sharedCapture, type AudioCaptureService, type CaptureFrame, type CaptureReceipt, type CaptureSubscription } from './audio-capture.ts'
 
 /**
  * 有声判定阈值：不能是固定值。麦克风流带自动增益，底噪电平因设备差着一个数量级
@@ -131,37 +132,8 @@ export interface DictationResult {
   readonly error?: string
 }
 
-interface AudioCtor {
-  new (options?: { sampleRate?: number }): AudioContextLike
-}
-
-interface AudioContextLike {
-  sampleRate: number
-  createMediaStreamSource(stream: MediaStream): MediaStreamAudioSourceNodeLike
-  createScriptProcessor(bufferSize: number, inputs: number, outputs: number): ScriptProcessorLike
-  readonly destination: unknown
-  close(): Promise<void>
-}
-
-interface MediaStreamAudioSourceNodeLike {
-  connect(node: unknown): void
-}
-
-interface ScriptProcessorLike {
-  connect(node: unknown): void
-  disconnect(): void
-  onaudioprocess: ((event: { inputBuffer: { getChannelData(channel: number): Float32Array } }) => void) | null
-}
-
-export interface MediaDeps {
-  getUserMedia(constraints: { audio: MediaTrackConstraints }): Promise<MediaStream>
-  AudioContext: AudioCtor
-}
-
-const defaultDeps = (): MediaDeps => ({
-  getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
-  AudioContext: window.AudioContext as AudioCtor,
-})
+/** 噪声基线的采样时长：前 0.7 秒（带自动增益的流底噪要几百毫秒才稳定）。按时长而不是帧数，帧大小变了也不漂。 */
+export const BASELINE_MS = 700
 
 /** 进行中那场录音的停止钩子；null 表示没有录音在进行。 */
 let activeStop: (() => void) | null = null
@@ -188,77 +160,105 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 /**
+ * 插话交接：插话检测（`barge-in.ts`）检出用户开口后，把检出点之前的预滚动音频和交接期间的
+ * 实时帧一起交给听写，用户的话头不丢。`baselineRms` 是检测器在播放期间量到的残余底噪 ——
+ * 交接来的音频一开头就是人声，不能再拿开头 0.7 秒当噪声基线。
+ */
+export interface DictationHandover {
+  readonly frames: readonly CaptureFrame[]
+  readonly baselineRms: number
+  /** 检测器检出时用的阈值：交接后的"说完了"判定沿用它（不低于按基线算的听写阈值）。 */
+  readonly threshold?: number
+}
+
+/**
  * 录一段听写。返回 wav；完全没录到内容返回 wav=null。
  * 任何失败都以 error 收场，**绝不挂起**——调用方靠这一点保证麦克风图标一定会灭。
  *
  * 交互：点按钮**立即开始录**（开口与否不决定能不能录，只决定说完要不要自动停）；
  * 说完静音 END_SILENCE_MS 自动停；**再点一下红点手动停**（已录内容照常转写）；
  * 20 秒上限兜底。就算声音判定完全失灵，点两下也能完成一次听写。
+ *
+ * 设备来自共享采集服务（`audio-capture.ts`）：这里只是"听写"这个消费者，订阅需要主进程在
+ * asr-begin 时下发的授权；录到的音频只在内存里，编码成 wav 交给主进程识别后即丢弃。
  */
 export interface RecordOptions {
-  deps?: MediaDeps
+  /** 测试注入；缺省用渲染层单例。 */
+  capture?: AudioCaptureService
   /**
    * 流式喂数回调：每帧音频重采样到 16kHz 后调用（含开头的基线段——流式识别器
    * 自己消化静音）。给出它，听写期间模型就能边收边出字。
    */
   onChunk?: (pcm16k: Float32Array) => void
+  /** 插话交接：在订阅建立之后调用，取走检测器手里的帧（含预滚动）。 */
+  takeHandover?: () => DictationHandover | null
+  /**
+   * 第一次判到"有人在说话"时回调一次。
+   *
+   * 连续对话拿它来撤掉"多久没开口就关麦"的计时：静默窗量的是用户开口前的等待，
+   * 一开口就该交给这句本身说完 —— 否则用户说到一半会被静默超时掐掉。
+   */
+  onSpeechStart?: () => void
+  /** 等授权到达的上限。 */
+  grantTimeoutMs?: number
+  /** 测试注入的墙钟（兜底超时用）。 */
+  now?: () => number
 }
 
 export async function recordDictation(options: RecordOptions = {}): Promise<DictationResult> {
-  const deps = options.deps ?? defaultDeps()
-  if (typeof navigator === 'undefined' || !navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-    console.error('[dictation] mediaDevices unavailable in this page')
-    return { wav: null, error: '当前页面拿不到麦克风接口' }
-  }
-
-  let stream: MediaStream
-  let context: AudioContextLike
-  let source: MediaStreamAudioSourceNodeLike
-  let processor: ScriptProcessorLike
-  let mute: ScriptProcessorLike
-  try {
-    stream = await deps.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
-    // 不强制采样率：指定 sampleRate 与部分麦克风流组合时 onaudioprocess 可能永远不来
-    //（Chromium 已知问题），用设备默认采样率，编码时如实写进 wav 头即可。
-    context = new deps.AudioContext()
-    source = context.createMediaStreamSource(stream)
-    processor = context.createScriptProcessor(4096, 1, 1)
-    mute = context.createScriptProcessor(256, 1, 1)
-  } catch (error) {
-    // 失败文本进 console：这条链路的故障在界面上只有一句 toast，没有日志就永远查不了。
-    console.error('[dictation] media setup failed:', error)
-    return { wav: null, error: '无法访问麦克风：' + describeMediaError(error) }
+  const capture = options.capture ?? sharedCapture()
+  const now = options.now ?? (() => Date.now())
+  if (!await capture.waitForGrant('dictation', options.grantTimeoutMs ?? 1500)) {
+    console.error('[dictation] capture grant missing')
+    return { wav: null, error: '麦克风没有授权给听写，请再试一次' }
   }
 
   const samples: Float32Array[] = []
   let totalFrames = 0
+  let sampleRate = 0
   /** 点按钮即开始录：开口与否不再决定"能不能录"，只决定"说完要不要自动停"。 */
   let hasSpoken = false
   let silenceMs = 0
   let elapsedMs = 0
   let finished = false
+  let endedBy: CaptureReceipt | null = null
   const baselineSamples: number[] = []
+  let baselineMs = 0
   let threshold = 0
+  /** 交接帧的最后一个序号：订阅自己收到的实时帧里 ≤ 它的是重复，跳过。 */
+  let handoverSeq = -1
+  let takenOver = false
+  const live: CaptureFrame[] = []
 
-  processor.onaudioprocess = (event) => {
+  const process = (frame: CaptureFrame): void => {
     if (finished) return
-    const chunk = event.inputBuffer.getChannelData(0)
-    elapsedMs += (chunk.length / context.sampleRate) * 1000
+    if (sampleRate === 0) sampleRate = frame.sampleRate
+    if (frame.sampleRate !== sampleRate) {
+      // 设备中途换了采样率（切了设备）：已录的照常交出去，后面的不混进同一个 wav。
+      finished = true
+      return
+    }
+    const chunk = frame.samples
+    elapsedMs += frame.durationMs
     // 流式喂数在一切判定之前：识别器要的是完整时间轴，静音也照喂。
-    options.onChunk?.(resampleTo16k(chunk, context.sampleRate))
-    const rms = frameRms(chunk)
+    options.onChunk?.(resampleTo16k(chunk, sampleRate))
+    const rms = frame.rms
     // 前 0.7 秒量噪声基线（带自动增益的流底噪要几百毫秒才稳定），阈值供静音判定用。
     // 判定失灵的代价只是"不会自动停"（点一下红点手动停兜底），绝不会再卡住录音。
-    if (baselineSamples.length < BASELINE_FRAMES) {
+    if (threshold === 0 && baselineMs < BASELINE_MS) {
       baselineSamples.push(rms)
-      if (baselineSamples.length >= BASELINE_FRAMES) threshold = speechThreshold(noiseBaseline(baselineSamples))
+      baselineMs += frame.durationMs
+      if (baselineMs >= BASELINE_MS) threshold = speechThreshold(noiseBaseline(baselineSamples))
     }
-    samples.push(new Float32Array(chunk))
+    samples.push(chunk)
     totalFrames += chunk.length
-    if (rms >= threshold && threshold > 0) hasSpoken = true
+    if (rms >= threshold && threshold > 0 && !hasSpoken) {
+      hasSpoken = true
+      options.onSpeechStart?.()
+    }
     if (hasSpoken) {
       if (rms < threshold) {
-        silenceMs += (chunk.length / context.sampleRate) * 1000
+        silenceMs += frame.durationMs
         if (silenceMs >= END_SILENCE_MS) finished = true
       } else {
         silenceMs = 0
@@ -267,17 +267,45 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
     if (elapsedMs >= MAX_DURATION_MS) finished = true
   }
 
-  source.connect(processor)
-  // ScriptProcessor 需要 connect 到 destination 才会跑；直连会外放，挂一个静音节点。
-  mute.onaudioprocess = () => undefined
-  processor.connect(mute)
-  mute.connect(context.destination)
+  let subscription: CaptureSubscription
+  try {
+    subscription = await capture.subscribe({
+      kind: 'dictation',
+      onFrame: (frame) => {
+        if (!takenOver && options.takeHandover) {
+          // 交接还没取走时先攒着，取走后按序号去重再处理。
+          live.push(frame)
+          return
+        }
+        if (frame.seq <= handoverSeq) return
+        process(frame)
+      },
+      onEnd: (receipt) => {
+        if (receipt.reason !== 'unsubscribed') {
+          endedBy = receipt
+          finished = true
+        }
+      },
+    })
+  } catch (error) {
+    // 失败文本进 console：这条链路的故障在界面上只有一句 toast，没有日志就永远查不了。
+    console.error('[dictation] capture subscribe failed:', error)
+    return { wav: null, error: error instanceof Error ? error.message : String(error) }
+  }
 
-  const cleanup = (): void => {
-    try { processor.disconnect() } catch { /* 已断开 */ }
-    try { mute.disconnect() } catch { /* 已断开 */ }
-    for (const track of stream.getTracks()) track.stop()
-    void context.close().catch(() => undefined)
+  if (options.takeHandover) {
+    const handover = options.takeHandover()
+    takenOver = true
+    if (handover !== null && handover.frames.length > 0) {
+      // 交接来的开头就是人声：直接用检测器量到的播放期残余做基线，并认定已经开口。
+      threshold = Math.max(speechThreshold(Math.max(handover.baselineRms, 0)), handover.threshold ?? 0)
+      hasSpoken = true
+      for (const frame of handover.frames) {
+        process(frame)
+        handoverSeq = Math.max(handoverSeq, frame.seq)
+      }
+    }
+    for (const frame of live.splice(0)) if (frame.seq > handoverSeq) process(frame)
   }
 
   // 点一下红点 = 手动停止：立即收尾，已录到的话照样送转写。同一时刻至多一场录音。
@@ -287,19 +315,20 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
 
   try {
     return await new Promise<DictationResult>((resolve) => {
-      const startedAt = Date.now()
+      const startedAt = now()
       const check = (): void => {
         // 音频回调可能整体不来（设备挂起等）。兜底判据不看回调，只看墙钟：
         // 超过硬上限强制收——交互上点两下总能完成一次听写，不存在永久卡住的路径。
-        if (!finished && Date.now() - startedAt >= MAX_DURATION_MS + 3000) finished = true
+        if (!finished && now() - startedAt >= MAX_DURATION_MS + 3000) finished = true
         if (!finished) {
           setTimeout(check, 50)
           return
         }
-        cleanup()
+        subscription.close()
         activeStop = null
         if (totalFrames === 0) {
-          resolve({ wav: null, error: undefined })
+          const ended = endedBy as CaptureReceipt | null
+          resolve({ wav: null, error: ended !== null ? describeEnd(ended) : undefined })
           return
         }
         const merged = new Float32Array(totalFrames)
@@ -308,20 +337,26 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
           merged.set(chunk, offset)
           offset += chunk.length
         }
-        resolve({ wav: encodeWav(merged, context.sampleRate) })
+        resolve({ wav: encodeWav(merged, sampleRate) })
       }
       setTimeout(check, 50)
     })
   } catch (error) {
     console.error('[dictation] recording loop failed:', error)
-    cleanup()
-    return { wav: null, error: describeMediaError(error) }
+    subscription.close()
+    activeStop = null
+    return { wav: null, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
-function describeMediaError(error: unknown): string {
-  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-  if (/NotAllowedError|Permission/i.test(message)) return '麦克风权限被拒绝，请在系统设置里允许'
-  if (/NotFoundError|DevicesNotFound/i.test(message)) return '没有找到可用的麦克风'
-  return message
+/** 订阅被外部结束时给用户看的话。 */
+function describeEnd(receipt: CaptureReceipt): string {
+  switch (receipt.reason) {
+    case 'track-ended': return '麦克风中途断开了（权限被撤销或设备被拔出）'
+    case 'device-changed': return receipt.detail ?? '麦克风设备切换后没能重新打开'
+    case 'resumed': return receipt.detail ?? '休眠恢复后麦克风没能重新打开'
+    case 'revoked': return '麦克风授权已收回'
+    case 'consumer-error': return '听写处理出错，请再试一次'
+    default: return receipt.detail ?? '录音中断了'
+  }
 }

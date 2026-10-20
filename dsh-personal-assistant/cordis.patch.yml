@@ -8,7 +8,8 @@
 - insert:
     - id: personal-assistant
       name: dsh-personal-assistant
-      config:
-        # 桌面宠物工程目录：召唤宠物时在此执行 pnpm start 自动拉起。
-        # 留空则不会自动拉起，需要手动启动 dsh-pet（自动接入桥接）。
-        petDir: 'D:/work/dsh-pet'
+      # petDir（桌面宠物工程目录）属于「每台机器自己的设置」，不写进插件自带的这一层：
+      # 插件发布后必须能在任何人的机器上加载，作者本机的绝对路径对别人没有意义。
+      # 需要「召唤宠物时自动拉起 dsh-pet」时，在你本机 profile 的 cordis.patch.yml 里
+      # 给这行加上 config.petDir 指向自己的 dsh-pet 目录（见 README「配置」一节）。
+      # 不配置时召唤只会绑定会话，桌宠需要你自行启动（启动后会自动接入桥接）。

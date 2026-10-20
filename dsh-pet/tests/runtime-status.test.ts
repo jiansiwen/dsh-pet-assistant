@@ -10,18 +10,49 @@ import { describe, test } from 'node:test'
 
 import {
   RUNTIME_LABEL,
+  operationLabels,
   runtimeCanStart,
   runtimeDetail,
   runtimeLabel,
   runtimeTone,
 } from '../src/renderer/runtime-status.ts'
-import type { CompanionState } from '../src/renderer/types.js'
+import type { CompanionState, OperationalState } from '../src/renderer/types.js'
+
+const operational: OperationalState = {
+  connection: 'connected', listener: 'wake-requested', activity: null, meeting: 'idle', speaking: false, execution: 'idle',
+}
+const labels = (patch: Partial<OperationalState> = {}) => Object.fromEntries(operationLabels({ ...operational, ...patch }).map(item => [item.label, item.value]))
+
+test('连接、监听申请和采集证据分开，静音不代表任务停止', () => {
+  const view = labels()
+  assert.equal(Object.keys(view).length, 6)
+  assert.equal(view['会话连接'], '已连接')
+  assert.match(view['麦克风'], /未验证实际收音/)
+  assert.equal(view['活动记录'], '未取得采集状态')
+  assert.match(view['朗读'], /不代表后台任务已停止/)
+  assert.match(view['模型会话'], /不代表所有外部操作已停止/)
+})
+
+test('采样进程与模式分开，断连不展示旧采集快照', () => {
+  assert.match(labels({ activity: { active: true, capturing: false, titles: true } })['活动记录'], /未在采样/)
+  assert.match(labels({ activity: { active: true, capturing: true, titles: false } })['活动记录'], /不含标题/)
+  assert.equal(labels({ activity: { active: false, capturing: false, titles: false } })['活动记录'], '已关闭')
+  assert.equal(labels({ connection: 'disconnected', activity: { active: true, capturing: true, titles: true } })['活动记录'], '未取得采集状态')
+})
+
+test('会议录音、转写和朗读互不替代', () => {
+  assert.match(labels({ meeting: 'recording', speaking: false, listener: 'meeting' })['会议'], /音轨状态请看会议页/)
+  assert.equal(labels({ meeting: 'transcribing' })['会议'], '正在转写')
+  assert.equal(labels({ meeting: null })['会议'], '未取得会议状态')
+  assert.equal(labels({ speaking: true, listener: 'unavailable' })['朗读'], '合成或播放中')
+})
 
 function state(patch: Partial<CompanionState> = {}): CompanionState {
   return {
     link: 'none',
     stageVisible: true,
     focusMode: false,
+    presentationMode: false,
     trayResident: false,
     profile: 'web',
     lastStage: null,

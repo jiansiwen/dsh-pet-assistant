@@ -1,5 +1,5 @@
 /**
- * 常驻唤醒词监听：拉起 wake.ps1（Windows System.Speech 离线识别）持续听"小潘小潘"。
+ * 常驻唤醒词监听：拉起 wake.ps1（Windows System.Speech 离线识别）持续听"小潘同学"。
  * 词本身在 `wake-grammar.ps1` 里构造 —— 那份构造器同时被离线探针复用，改词只需改一处。
  * 进程意外退出时延迟自动重启；每次识别到唤醒词调用 onWake 回调。
  *
@@ -13,6 +13,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { toUnpackedPath } from './runtime-launch.ts'
 
 const RESTART_DELAY_MS = 3000
 
@@ -20,9 +21,21 @@ let child: ChildProcess | null = null
 let stopping = false
 let restartTimer: NodeJS.Timeout | null = null
 
+/**
+ * 唤醒脚本的路径。
+ *
+ * 打包后主进程代码在 `app.asar` 里，而 PowerShell 读不了 asar —— 直接把
+ * `app.asar/dist/main/wake.ps1` 交给 `-File` 只会报"找不到文件"。打包配置已把
+ * `dist/main/*.ps1` 解到 `app.asar.unpacked`，所以这里过一次 `toUnpackedPath`。
+ * 开发态路径里没有 `.asar` 段，函数原样返回，行为不变。
+ */
+function wakeScriptPath(): string {
+  return toUnpackedPath(path.join(path.dirname(fileURLToPath(import.meta.url)), 'wake.ps1'))
+}
+
 function start(onWake: (text: string) => void, onLost: (reason: string) => void): void {
   if (stopping) return
-  const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'wake.ps1')
+  const scriptPath = wakeScriptPath()
   child = spawn(
     'powershell',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
@@ -40,9 +53,12 @@ function start(onWake: (text: string) => void, onLost: (reason: string) => void)
         try {
           const parsed = JSON.parse(line.trim()) as { wake?: boolean; text?: string; ok?: boolean; error?: string }
           if (parsed.wake === true) {
+            // 诊断：识别命中一定要能在日志里看见，否则"喊了没反应"就无从判断是没听清还是没传播。
+            console.log(`[dsh-pet] wake.ps1 识别到：「${parsed.text ?? ''}」`)
             onWake(parsed.text ?? '')
           } else if (parsed.ok === false) {
             // 初始化失败（无麦克风/无中文语音包）：不重启，避免反复拉起进程
+            console.log('[dsh-pet] wake.ps1 初始化失败：', parsed.error ?? '')
             stopping = true
             onLost(parsed.error ?? '语音识别初始化失败')
           }
@@ -83,3 +99,4 @@ export function stopWakeListener(): void {
     child = null
   }
 }
+

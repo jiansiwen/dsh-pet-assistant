@@ -14,7 +14,7 @@
  * 这样 node --test 能直接跑，不需要把 cordis 或文件系统拖进测试。
  */
 import type { DatabaseSync } from 'node:sqlite'
-import { inTransaction, sha256, text, type Row } from './store.ts'
+import { dryRun, inTransaction, sha256, text, type Row } from './store.ts'
 
 /** 记忆的六类。design.md §2.6。 */
 export const MEMORY_KINDS = [
@@ -513,6 +513,21 @@ export class MemoryStore {
   }
 
   /**
+   * 只取某一个项目范围的记忆，不混入全局。调用方必须先确认该项目仍在有效授权内——
+   * 本方法不做授权判断，授权边界在工具层（帮助范围实际路径校验）执行。
+   */
+  listProject(projectId: string, now: number): MemoryRecord[] {
+    if (!projectId) return []
+    return this.list({ projectId }, now).filter(record => record.scope.kind === 'project' && record.scope.id === projectId)
+  }
+
+  /** 各项目范围的记忆条数；列表展示时据此如实告知"有多少条因授权失效而隐藏"。 */
+  projectScopeCounts(): Map<string, number> {
+    const rows = this.db.prepare(`SELECT scope_id, COUNT(*) AS n FROM memories WHERE scope_kind = 'project' GROUP BY scope_id`).all() as Row[]
+    return new Map(rows.map(row => [String(row.scope_id), Number(row.n)]))
+  }
+
+  /**
    * 用户确认候选或选择历史冲突中的一条；只失效 replaceIds 点名的旧记忆。
    * 省略 replaceIds 时其余同主题规则不变，可逐条确认多条兼容的历史冲突。
    * 非用户、已过期的选择或无效替换目标返回 null，且整次不写入。
@@ -560,17 +575,42 @@ export class MemoryStore {
    * 历史冲突只剩一项时，有确认记录才恢复已确认，否则仍需用户确认。
    */
   delete(id: string, reason: string, now: number): DeletionOutcome {
+    return this.deleteWithPropagation(id, reason, now, false)
+  }
+
+  /** 删除非记忆来源的引用；即使来源 id 与记忆撞名，也不删除或修改同名记忆本体。 */
+  public deleteSource(sourceId: string, reason: string, now: number): DeletionOutcome {
+    return this.deleteWithPropagation(sourceId, reason, now, true)
+  }
+
+  /**
+   * 删除影响预览：跑一遍真实的删除传播再整体回滚。展示给用户的"将删除/将失效/会恢复"
+   * 与批准后实际发生的出自同一段代码，不会出现预览一套、执行一套。
+   */
+  previewDelete(id: string, now: number): DeletionOutcome {
+    return dryRun(this.db, () => this.delete(id, '预览', now))
+  }
+
+  previewDeleteSource(sourceId: string, now: number): DeletionOutcome {
+    return dryRun(this.db, () => this.deleteSource(sourceId, '预览', now))
+  }
+
+  private deleteWithPropagation(id: string, reason: string, now: number, sourceOnly: boolean): DeletionOutcome {
     return inTransaction(this.db, () => {
       const deleted: MemoryRecord[] = []
       const weakened: MemoryRecord[] = []
       const restored: MemoryRecord[] = []
-      const target = this.get(id, now)
-      if (!target) return { deleted, weakened, restored, ledgerEntries: 0 }
+      const target = sourceOnly ? null : this.get(id, now)
+      if (!sourceOnly && !target) return { deleted, weakened, restored, ledgerEntries: 0 }
 
       const ledgerBefore = this.ledgerSize()
       const remaining = new Set(this.dependentsOf(id))
-      this.removeRow(target, reason, now)
-      deleted.push(target)
+      if (target) {
+        this.removeRow(target, reason, now)
+        deleted.push(target)
+      } else {
+        this.db.prepare('DELETE FROM memory_sources WHERE source_id = ?').run(id)
+      }
 
       // ponytail: 小规模记忆图反复扫描至稳定，最坏 O(n²)；规模增大再换入度队列。
       // 不能只遍历一次：多路径引用中，后处理的父项可能删掉先处理子项的最后一个来源。
@@ -582,7 +622,7 @@ export class MemoryStore {
           if (!record) {
             remaining.delete(derivedId)
           } else if (record.sourceRefs.length === 0) {
-            this.removeRow(record, `来源记忆 ${id} 被删除`, now)
+            this.removeRow(record, `来源 ${id} 被删除：${reason}`, now)
             deleted.push(record)
             remaining.delete(derivedId)
             changed = true
@@ -592,11 +632,15 @@ export class MemoryStore {
 
       for (const derivedId of remaining) {
         const record = this.get(derivedId, now)!
-        this.setStatus(derivedId, record.status === 'expired' ? 'expired' : 'candidate', now, null)
+        // setStatus 会保留历史确认；来源失效必须显式清除，不能让旧确认再次恢复。
+        this.db.prepare(`UPDATE memories SET status = ?, confirmed_by = NULL,
+          revision = revision + 1, updated_at = ? WHERE memory_id = ?`)
+          .run(record.status === 'expired' ? 'expired' : 'candidate', now, derivedId)
         weakened.push(this.get(derivedId, now)!)
       }
 
-      for (const record of deleted) {
+      // 非记忆来源没有用户裁决冲突的含义，也不能间接修改同名记忆。
+      for (const record of sourceOnly ? [] : deleted) {
         if (!record.topic) continue
         // 仅检查旧版本标记过的冲突；后来追加的同主题兼容规则不算冲突对手。
         const survivors = this.findByTopic(record.kind, record.scope, record.topic)

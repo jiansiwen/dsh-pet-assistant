@@ -1,0 +1,48 @@
+/* 阅读视图：只为"看清这一页、知道讲到哪"服务，不加载角色包与舞台样式。 */
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; height: 100%; }
+body {
+  font: 13px/1.5 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  color: #1f2933;
+  background: #e9ecef;
+}
+.dv-root { display: flex; flex-direction: column; height: 100%; }
+.dv-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 12px; background: #fff; border-bottom: 1px solid #d5dbe1;
+}
+.dv-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.dv-nav { display: flex; align-items: center; gap: 6px; flex: none; }
+.dv-nav button {
+  width: 28px; height: 28px; border: 1px solid #c4cdd5; border-radius: 6px; background: #f8f9fa;
+  font-size: 16px; cursor: pointer;
+}
+.dv-nav button:disabled { opacity: 0.4; cursor: default; }
+.dv-page-input { width: 48px; height: 28px; text-align: center; border: 1px solid #c4cdd5; border-radius: 6px; }
+.dv-page-total { color: #52606d; }
+.dv-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 6px 12px;
+  background: #f8f9fa; border-bottom: 1px solid #e1e5ea; color: #52606d; font-size: 12px;
+}
+.dv-warn { color: #b44d12; }
+.dv-note { color: #3e6b48; }
+.dv-status { padding: 6px 12px; font-size: 12px; background: #eef5ff; color: #1d4f91; }
+.dv-status-detached { background: #fff6e5; color: #8a5300; }
+.dv-status-stopped { background: #fdecec; color: #9b1c1c; }
+.dv-status-scanned { background: #f1f0fb; color: #4c3f91; }
+.dv-detached {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; background: #fff3cd; border-bottom: 1px solid #f0d58a;
+}
+.dv-detached button {
+  padding: 4px 10px; border: 1px solid #c79a2b; border-radius: 6px; background: #fff; cursor: pointer;
+}
+.dv-failure { margin: 12px; padding: 12px; border-radius: 8px; background: #fdecec; color: #9b1c1c; }
+.dv-loading { margin: 12px; color: #52606d; }
+.dv-stage { flex: 1; overflow: auto; padding: 12px; display: flex; justify-content: center; align-items: flex-start; }
+.dv-sheet { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2); }
+.dv-sheet canvas { display: block; }
+/* 页级高亮：只说明"讲解在这一页"，不在正文上画任何东西。 */
+.dv-sheet-current { outline: 3px solid rgba(37, 99, 235, 0.55); outline-offset: 2px; }
+/* 文字层片段高亮：画在整个文字项上，而不是按字切，避免暗示逐字精度。 */
+.dv-mark { position: absolute; background: rgba(250, 204, 21, 0.38); border-radius: 2px; pointer-events: none; mix-blend-mode: multiply; }

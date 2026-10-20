@@ -5,8 +5,11 @@ import DocPanel from './DocPanel.js'
 import MeetingPanel from './meeting-panel.js'
 import VoiceApiSettings from './VoiceApiSettings.js'
 import ChatOverlay from './ChatOverlay.js'
-import PetSettingsPanel from './PetSettingsPanel.js'
+import PetSettingsPanel, { PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
+import { EnvironmentCheck } from './FirstRunSettings.js'
 import { useSession } from './useSession.js'
+import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, parseInterruptPhrase } from '../voice-conversation.ts'
+import type { VoiceTurn } from '../session-types.js'
 import {
   clearStageHitboxes,
   hitTest,
@@ -19,9 +22,13 @@ import {
 } from './stage-layout.js'
 import { manifestFor, manifestForLegacySkin } from './character-manifest.js'
 import { PROACTIVE_ACCEPT_MESSAGE } from './proactive-ui.js'
-import { arrayBufferToBase64, pcm16Base64, recordDictation, stopDictation } from './dictation.js'
+import { arrayBufferToBase64, pcm16Base64, recordDictation, stopDictation, type DictationHandover } from './dictation.js'
+import { installAudioBridge, isWakePhraseOnly } from './barge-in.ts'
+import { isSelfSpeech, rememberSelfSpeech } from './self-speech.ts'
+import { LOCAL_ACKS } from '../main/greetings.ts'
 import { approvalBanner } from './team-panel.js'
-import { runtimeCanStart, runtimeDetail, runtimeLabel, runtimeTone } from './runtime-status.js'
+import { operationLabels, runtimeCanStart, runtimeDetail, runtimeLabel, runtimeTone } from './runtime-status.js'
+import { presentationCutoffOf } from './session-view.js'
 import type { PetBehavior } from './usePetBehavior.js'
 import type { PortalPhase } from './PortalExit.js'
 import type {
@@ -30,6 +37,7 @@ import type {
   CompanionState,
   DocRoots,
   DocState,
+  OperationalState,
   PetPosition,
   SettingsPage,
   SkinOverrides,
@@ -55,6 +63,17 @@ const UI_BUILD = '0923-hud1'
 
 /** 语音唤醒命中时的应答。角色被隐藏时这句要等舞台挂回来再补说，所以提成常量。 */
 const WAKE_GREETING = '我在呢！找我什么事？'
+
+/**
+ * 又只喊了一句名字时的本地应答。
+ *
+ * 这几句**不进会话、不调模型**：用户只是叫了一声，没有任何需要模型处理的内容；
+ * 塞进会话就是凭空多一条用户消息，还会让模型对着一句名字答题。
+ * 清单从主进程那份复用：预热缓存与显示必须是同一批句子，否则总有一半要当场合成。
+ */
+function pickLocalGreeting(): string {
+  return LOCAL_ACKS[Math.floor(Math.random() * LOCAL_ACKS.length)]
+}
 
 /** 合成进程报的故障码。协议在 `main/tts-edge-worker.ts` 头部。 */
 const SPEECH_ERROR_TEXT: Record<string, string> = {
@@ -97,6 +116,17 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [listening, setListening] = useState(false)
   const [voiceConversation, setVoiceConversation] = useState(false)
+  const [continuousVoice, setContinuousVoice] = useState(false)
+  const [readReplies, setReadReplies] = useState(false)
+  const conversation = useRef(new VoiceConversation()).current
+  const [continuousActive, setContinuousActive] = useState(false)
+  const dictationGeneration = useRef(0)
+  const currentBinding = useRef(session?.bindingId)
+  currentBinding.current = session?.bindingId
+  const continueListening = useRef<() => void>(() => {})
+  const continuousTimer = useRef<ReturnType<typeof setTimeout>>()
+  /** 回复播完后的静默窗定时器：到点没听到开口就关麦，开一次口就作废。 */
+  const idleTimer = useRef<ReturnType<typeof setTimeout>>()
   const listeningRef = useRef(false)
   const busyRef = useRef(false)
   /** 角色是不是正在念回答。念的时候面板上要给一个能让它闭嘴的按钮。 */
@@ -141,6 +171,23 @@ export default function App() {
   const [stageVisible, setStageVisible] = useState(true)
   /** 主动提醒的候选（§2.7）。null = 没有 待回应的气泡。 */
   const [proactive, setProactive] = useState<{ message: string; suggestDisable: boolean } | null>(null)
+  /**
+   * 演示隐私模式的历史分界（M5-05）。
+   *
+   * 记的是"开启那一刻已存在条目的最大 seq"，不是当前最大 seq —— 演示期间新产生的消息
+   * 要照常显示（用户正在演示它们）。用 seq 而不是下标：往上翻历史会在数组前面插入条目。
+   */
+  const [presentationCutoff, setPresentationCutoff] = useState<number | null>(null)
+  const presentation = companion?.presentationMode === true
+  const wasPresenting = useRef(false)
+  useEffect(() => {
+    if (presentation === wasPresenting.current) return
+    wasPresenting.current = presentation
+    if (!presentation) { setPresentationCutoff(null); return }
+    const entries = session?.entries ?? []
+    // 空历史就没得藏：null 表示不隐藏。分界之后的新消息仍然可见。
+    setPresentationCutoff(presentationCutoffOf(entries))
+  }, [presentation, session])
 
   const positionsRef = useRef(positions)
   positionsRef.current = positions
@@ -154,12 +201,14 @@ export default function App() {
   const wakeLockRef = useRef(0)
   /** 角色隐藏时被唤醒：应答留到舞台挂回来再说，否则用户喊了一声却没人应。 */
   const pendingGreetingRef = useRef(false)
+  /** 补发时必须用**当时那句**（语音已经念过这一句）：换成模板会与听到的对不上。 */
+  const pendingGreetingLineRef = useRef<string | null>(null)
   const stageRef = useRef<TeamStageHandle | null>(null)
 
   /**
    * 桥接没连上（插件没启动、dsh 没跑）时的降级编制。
    *
-   * 用旧皮肤映射到对应角色，所以单宠物时代的熊猫仍然是唐僧、眼镜男生仍然是孙悟空 ——
+   * 用旧皮肤映射到对应角色，所以单宠物时代的熊猫仍然是总助理、眼镜男生仍然是助理1 ——
    * 桌面宠物不该因为团队服务没起来就变成一片空白。
    */
   const cast = useMemo<StageMember[]>(() => {
@@ -231,6 +280,8 @@ export default function App() {
     void window.petApi.getState().then((state) => {
       setPet(state.pet)
       setVoiceConversation(state.voiceConversation === true)
+      setContinuousVoice(state.continuousVoice === true)
+      setReadReplies(state.readReplies === true)
       setCharacters(state.characters ?? {})
       setSleepSettings({ idleSleepMinutes: state.idleSleepMinutes ?? 2, sleepMinutes: state.sleepMinutes ?? 20 })
       if (state.positions && Object.keys(state.positions).length > 0) {
@@ -338,6 +389,67 @@ export default function App() {
   const dictationCancelled = useRef(false)
   /** 语音识别流式增量的累积文本；最终文本以 asrTranscribe 返回值为准。 */
   const asrDeltaText = useRef('')
+  const stopContinuous = useCallback((stopSpeech = true) => {
+    const active = conversation.active
+    conversation.stop()
+    ++dictationGeneration.current
+    dictationCancelled.current = true
+    voiceRoundRef.current = false
+    clearTimeout(continuousTimer.current)
+    clearTimeout(idleTimer.current)
+    setContinuousActive(false)
+    stopDictation()
+    if (active && stopSpeech) window.petApi.stopSpeech()
+  }, [conversation])
+  const syncContinuous = useCallback((resume: boolean) => {
+    setContinuousActive(conversation.active)
+    if (!conversation.active) {
+      clearTimeout(continuousTimer.current)
+      clearTimeout(idleTimer.current)
+    }
+    if (resume) continueListening.current()
+  }, [conversation])
+  /**
+   * 静默窗：回复播完、重新开麦之后，连续这么长时间一句都没听到才关麦。
+   *
+   * 只在这个窗口里生效 —— 生成与播放期间用户本来就不说话，按静默关麦就是"说完一句就再也开不起来"。
+   * 用户一开口（`onSpeechStart`）就撤掉计时：那是下一轮的问题，不该被打断。
+   */
+  const armIdleDeadline = useCallback(() => {
+    clearTimeout(idleTimer.current)
+    const generation = conversation.generation
+    const check = () => {
+      if (!conversation.active || conversation.generation !== generation) return
+      // 还在等开口（waiting）或已经在收这一句（recording 但没开口）才关；一开口就不再计时了。
+      if (conversation.phase !== 'waiting' && conversation.phase !== 'recording') return
+      stopContinuous(false)
+      showToast(`连续 ${Math.round(CONTINUOUS_IDLE_TIMEOUT_MS / 1000)} 秒没听到你说话，语音输入已关闭`)
+    }
+    const left = conversation.idleDeadline > 0 ? conversation.idleDeadline - Date.now() : CONTINUOUS_IDLE_TIMEOUT_MS
+    idleTimer.current = setTimeout(check, Math.max(0, left))
+  }, [conversation, stopContinuous, showToast])
+  /** 到墙钟上限即结束；正在说的那句等它说完，交给 submit 判定超时并留在输入框。正在播的回答不掐断。 */
+  const armContinuousDeadline = useCallback(() => {
+    clearTimeout(continuousTimer.current)
+    const generation = conversation.generation
+    const check = () => {
+      if (!conversation.active || conversation.generation !== generation) return
+      if (conversation.phase === 'recording') { continuousTimer.current = setTimeout(check, 1000); return }
+      stopContinuous(false)
+      showToast('连续对话已到 5 分钟上限，已结束')
+    }
+    continuousTimer.current = setTimeout(check, Math.max(0, conversation.deadline - Date.now()))
+  }, [conversation, stopContinuous, showToast])
+  useEffect(() => {
+    const offComplete = window.petApi.onVoiceTurnComplete(event => syncContinuous(conversation.complete(event)))
+    const offStop = window.petApi.onVoiceConversationStop(() => { if (conversation.active) stopContinuous(false) })
+    return () => { offComplete(); offStop(); clearTimeout(continuousTimer.current); clearTimeout(idleTimer.current) }
+  }, [conversation, syncContinuous, stopContinuous])
+  // 关闭会话框、换绑或断连都退出连续对话，且不会被迟到结果重新打开。
+  useEffect(() => {
+    if (!conversation.active) return
+    if (!panelOpen || session?.bindingId !== conversation.bindingId || session?.status === 'disconnected') stopContinuous()
+  }, [panelOpen, session?.bindingId, session?.status, conversation, stopContinuous])
   const saveSleep = useCallback(async (key: 'idleSleepMinutes' | 'sleepMinutes', value: number) => {
     if (!Number.isInteger(value) || value < 1 || value > 120) { showToast('请输入 1–120 之间的整数分钟'); return }
     setSavingSleep(true)
@@ -350,15 +462,45 @@ export default function App() {
   }, [showToast])
 
   const send = useCallback(
-    async (raw: string) => {
+    async (raw: string, voiceTurn?: VoiceTurn) => {
       const text = raw.trim()
-      if (!text || busyRef.current) return
+      if (voiceTurn && !conversation.valid(voiceTurn.generation, voiceTurn.bindingId)) return
+      if (!voiceTurn && conversation.active) stopContinuous()
+      if (!text || busyRef.current) {
+        if (voiceTurn) stopContinuous(false)
+        return
+      }
       setPanelOpen(true)
       const restoreDraft = () => setInput(draft => !draft || draft.trim() === text ? raw : `${raw}\n${draft}`)
-      if (!session?.capabilities.prompt) {
-        restoreDraft()
-        showToast('当前会话暂不能发送，请连接原生 dsh 后重试')
-        return
+      let target = session
+      if (!target?.capabilities.prompt) {
+        if (voiceTurn) {
+          stopContinuous(false)
+          restoreDraft()
+          showToast('当前会话暂不能发送，请稍后重试')
+          return
+        }
+        // 会话还没开：先由桌面开启或恢复（运行时都没有时按壳的规则附着或启动），成功后照常发送这一条。
+        busyRef.current = true
+        setBusy(true)
+        try {
+          const started = await window.petApi.startSession()
+          if (!started.ok || !started.state?.capabilities.prompt) {
+            restoreDraft()
+            showToast(started.error ?? '助理会话没能开启，请稍后重试')
+            return
+          }
+          mirror.adopt(started.state)
+          if (started.notice) showToast(started.notice)
+          target = started.state
+        } catch (error) {
+          restoreDraft()
+          showToast(error instanceof Error ? error.message : String(error))
+          return
+        } finally {
+          busyRef.current = false
+          setBusy(false)
+        }
       }
       busyRef.current = true
       setBusy(true)
@@ -366,23 +508,49 @@ export default function App() {
       voiceRoundRef.current = false
       // 快捷命令不清除尚未提交的其他草稿；消息只从原生镜像进入界面。
       setInput(draft => draft.trim() === text ? '' : draft)
+      let accepted = false
       try {
-        const result = await mirror.command({ kind: 'prompt', bindingId: session.bindingId, text, spoken })
+        const result = await mirror.command({ kind: 'prompt', bindingId: target.bindingId, text, spoken, voiceTurn })
+        if (voiceTurn && (!conversation.valid(voiceTurn.generation, voiceTurn.bindingId)
+          || currentBinding.current !== voiceTurn.bindingId)) return
+        accepted = result.ok
         if (result.notice) showToast(result.notice)
         if (!result.ok) {
           restoreDraft()
           showToast(result.error ?? '消息未提交，请重试')
         }
       } catch (error) {
-        restoreDraft()
-        showToast(error instanceof Error ? error.message : String(error))
+        if (!voiceTurn || conversation.valid(voiceTurn.generation, voiceTurn.bindingId)) {
+          restoreDraft()
+          showToast(error instanceof Error ? error.message : String(error))
+        }
       } finally {
         busyRef.current = false
         setBusy(false)
+        if (voiceTurn) syncContinuous(conversation.result(voiceTurn, accepted))
       }
     },
-    [session?.bindingId, session?.capabilities.prompt, mirror.command, showToast],
+    // send 只读 session 的 bindingId 与 capabilities.prompt：按这两项更新即可，避免每条增量都重建回调。
+    [session?.bindingId, session?.capabilities.prompt, mirror.command, mirror.adopt, showToast, conversation, stopContinuous, syncContinuous],
   )
+
+  const openSession = useCallback(async () => {
+    if (busyRef.current) return
+    busyRef.current = true
+    setBusy(true)
+    try {
+      const started = await window.petApi.startSession()
+      if (started.ok && started.state) {
+        mirror.adopt(started.state)
+        showToast(started.notice ?? (started.outcome === 'existing' ? '助理会话已在线' : '助理会话已开启'))
+      } else showToast(started.error ?? '助理会话没能开启，请稍后重试')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error))
+    } finally {
+      busyRef.current = false
+      setBusy(false)
+    }
+  }, [mirror.adopt, showToast])
 
   /** 主动提醒气泡上的点选（§2.7）：先撤气泡再回执，「好」把用户带进帮助流程。 */
   const handleProactive = useCallback((kind: 'accept' | 'decline' | 'disable') => {
@@ -427,19 +595,94 @@ export default function App() {
     [snapshot],
   )
 
-  const startListen = useCallback(async (autoSend = false) => {
+  /**
+   * 第三个参数只在外放插话（M1-05）时给：插话检测器检出用户开口后，把检出点之前的预滚动音频
+   * 交给这次听写，用户开头那几个字不丢。
+   */
+  const startListen = useCallback(async (autoSend = false, continuous = false, takeHandover?: () => DictationHandover | null, gateInterrupt = false) => {
     if (listeningRef.current) {
-      if (!autoSend) stopDictation()
+      if (continuous) stopContinuous(false)
+      else if (!autoSend) stopDictation()
       return
     }
     if (busyRef.current && !autoSend) return
+    // 手动开麦是用户自己接管：连续对话退出，本次仍按原样只填输入框。
+    if (!continuous && conversation.active) stopContinuous(false)
+    const generation = conversation.generation
+    if (continuous && !conversation.record(generation, conversation.bindingId)) {
+      if (conversation.active && conversation.generation === generation) stopContinuous(false)
+      return
+    }
+    const token = ++dictationGeneration.current
+    // 停止连续对话先让代号失效，迟到的申请结果和转写都在这里挡掉。
+    const cancelled = () => dictationCancelled.current || token !== dictationGeneration.current
+      || (continuous && !(conversation.active && conversation.generation === generation))
     listeningRef.current = true
     dictationCancelled.current = false
-    window.petApi.stopSpeech()
+    // 口令式打断：先听清是不是明确口令，是才停朗读；普通声音（含助理自己的回声）不停。
+    if (!gateInterrupt) window.petApi.stopSpeech()
     setListening(true)
     asrDeltaText.current = ''
     const accept = async (text: string): Promise<void> => {
-      if (dictationCancelled.current) return
+      if (cancelled()) return
+      if (gateInterrupt) {
+        const phrase = parseInterruptPhrase(text)
+        if (!phrase.matched) return
+        window.petApi.stopSpeech()
+        if (conversation.active) stopContinuous(false)
+        if (phrase.rest.length > 0) {
+          // 口令后面还带了问题：当场回答，不用再说一遍。
+          voiceRoundRef.current = true
+          setInput(phrase.rest)
+          if (!busyRef.current) void send(phrase.rest)
+          else showToast('上一条消息尚未提交完成，语音已保留在输入框')
+          return
+        }
+        // 只说了口令：停下，再开一次麦听你要问什么。
+        showToast('已停下，请说你的问题')
+        window.setTimeout(() => { void startListen(true) }, 150)
+        return
+      }
+      // 插话时自己念了唤醒词：那是"停下"的意思，不是要发出去的一句话，也不重新进入唤醒流程。
+      if (takeHandover && isWakePhraseOnly(text)) {
+        showToast('已停下。想问什么直接说，或点麦克风')
+        return
+      }
+      // 自回声：这段是不是助理自己刚说过的话被麦克风录回来了？
+      // 外放时唤醒应答会紧跟开麦，不挡住就会凭空多出一句用户消息（现场故障）。
+      if (isSelfSpeech(text)) {
+        showToast('刚才是我的回声，已忽略；请再说一次')
+        return
+      }
+      // 又只喊了一句名字（没有具体需求）：这是**本地的应答往返**，不该进 DSH 会话，
+      // 也不该调模型。回一句"我在，你说"，然后继续等真正的问题。
+      if (isWakePhraseOnly(text)) {
+        const again = pickLocalGreeting()
+        const who = selectedId ?? cast[0]?.assistantId
+        if (who) stageRef.current?.sayTo(who, again, 2600)
+        window.petApi.speakLocal(again)
+        // 继续听，不算一轮对话。
+        window.setTimeout(() => { void startListen(true, continuous) }, 1200)
+        return
+      }
+      if (continuous) {
+        if (isVoiceStop(text)) {
+          stopContinuous(false)
+          showToast('已结束连续对话')
+          return
+        }
+        const turn = conversation.submit()
+        if (turn === null) {
+          setInput(text)
+          stopContinuous(false)
+          showToast('连续对话已到上限，这句话留在输入框里，可以手动发送')
+          return
+        }
+        voiceRoundRef.current = true
+        setInput(text)
+        void send(text, turn)
+        return
+      }
       voiceRoundRef.current = true
       setInput(text)
       if (autoSend && !busyRef.current) void send(text)
@@ -453,7 +696,7 @@ export default function App() {
         showToast(granted.error || '麦克风正被占用')
         return
       }
-      if (dictationCancelled.current) {
+      if (cancelled()) {
         if (granted.streaming) await window.petApi.asrStreamStop()
         else await window.petApi.asrTranscribe('')
         return
@@ -463,19 +706,22 @@ export default function App() {
       const streaming = granted.streaming === true
       let feedChain: Promise<void> = Promise.resolve()
       const { wav, error } = await recordDictation({
+        takeHandover,
+        // 开口就撤掉静默窗：接下来用户说的是完整一句，不能被"多久没听到"掐断。
+        onSpeechStart: () => { if (continuous) clearTimeout(idleTimer.current) },
         onChunk: (pcm16k) => {
           // 若隐藏发生在申请麦克风期间，首个音频帧也要补停，不能重新开始听写。
-          if (dictationCancelled.current) { stopDictation(); return }
+          if (cancelled()) { stopDictation(); return }
           if (!streaming) return
           feedChain = feedChain
-            .then(() => dictationCancelled.current ? { text: '' } : window.petApi.asrStreamFeed(pcm16Base64(pcm16k)))
+            .then(() => cancelled() ? { text: '' } : window.petApi.asrStreamFeed(pcm16Base64(pcm16k)))
             .then((partial) => {
-              if (partial.text && !dictationCancelled.current) setInput(partial.text)
+              if (partial.text && !cancelled()) setInput(partial.text)
             })
             .catch(() => undefined)
         },
       })
-      if (dictationCancelled.current) {
+      if (cancelled()) {
         await feedChain
         if (streaming) await window.petApi.asrStreamStop()
         else await window.petApi.asrTranscribe('')
@@ -486,7 +732,7 @@ export default function App() {
         // 整句精修（准确），精修结果非空则无感替换。两个模型都在本地。
         await feedChain
         const partial = await window.petApi.asrStreamStop()
-        if (dictationCancelled.current) return
+        if (cancelled()) return
         if (partial.text) {
           voiceRoundRef.current = true
           setInput(partial.text)
@@ -537,8 +783,43 @@ export default function App() {
     } finally {
       listeningRef.current = false
       setListening(false)
+      // 这一句没交出去（静默、识别失败、被占用）就结束连续对话：静默一次即退出，不反复重开麦克风。
+      if (continuous && conversation.generation === generation && conversation.phase === 'recording') {
+        stopContinuous(false)
+      }
     }
-  }, [send, showToast])
+  }, [send, showToast, conversation, stopContinuous, selectedId, cast])
+  /**
+   * 外放插话检出（M1-05，实验开关）：渲染层已经本地止声，主进程随后停掉整段播报。
+   * 连续对话里插话就是下一轮（本轮作废、立即续听）；不在连续对话里就按一次自动发送的听写。
+   */
+  const bargeInRef = useRef<(takeHandover: () => DictationHandover | null) => void>(() => undefined)
+  bargeInRef.current = (takeHandover) => {
+    if (exitingRef.current || listeningRef.current) {
+      takeHandover()
+      return
+    }
+    const continuous = conversation.active && conversation.interruptForBargeIn()
+    if (continuous) {
+      // 插话本身就是下一轮：静默窗从这次接管重新起算，别让上一轮的到期时间马上把麦关掉。
+      conversation.awaiting()
+      setContinuousActive(true)
+      armIdleDeadline()
+    }
+    // 口令式打断：只有明确口令才停朗读，其余声音（包括助理自己的回声）不打断。
+    void startListen(true, continuous, takeHandover, true)
+  }
+  useEffect(() => {
+    const bridge = installAudioBridge(window.petApi, { onBargeIn: take => bargeInRef.current(take) })
+    return () => bridge.dispose()
+  }, [])
+  continueListening.current = () => {
+    if (conversation.phase !== 'waiting') return
+    // 静默窗从"真的开始听"这一刻起算，并把到期关麦的定时器挂上。
+    conversation.awaiting()
+    void startListen(true, true)
+    armIdleDeadline()
+  }
 
   const onDragStart = useCallback((event: React.MouseEvent, behavior: PetBehavior) => {
     if (event.button !== 0 || exitingRef.current) return
@@ -598,6 +879,7 @@ export default function App() {
     return () => {
       dictationCancelled.current = true
       stopDictation()
+      if (conversation.active) stopContinuous()
       dragCleanupRef.current?.()
       clearStageHitboxes()
       interactiveRef.current = false
@@ -650,24 +932,50 @@ export default function App() {
     }
 
     window.petApi.onSummon(summon)
-    window.petApi.onWake(() => {
-      if (exitingRef.current) return
+    window.petApi.onWake((greeting) => {
+      // 连续对话进行中再听到唤醒词多半是自己播报的回声：不重入、不重开麦克风。
+      if (exitingRef.current || conversation.active) return
       const now = Date.now()
       if (now - wakeLockRef.current < 2600) return
       wakeLockRef.current = now
       const who = selectedId ?? cast[0]?.assistantId
       const stage = stageRef.current
+      // 主进程已经用 TTS 念了应答；这里只把它显示成气泡，不再另念一遍。
+      // 显示的必须是**同一句**：语音说 A、气泡显示 B 会让人以为它答非所问。
+      const line = greeting && greeting.length > 0 ? greeting : WAKE_GREETING
       if (who && stage) {
-        stage.sayTo(who, WAKE_GREETING, 3000)
-        stage.pokeOf(who)
+        // 被叫到时先站定：正在走、打盹、看书都收回来，做一个明确的"我在"姿态。
+        stage.forceAll('idle')
+        stage.sayTo(who, line, 3000)
       } else if (who) {
         // 角色刚被隐藏：主进程先发"显示"再发唤醒事件，这一刻舞台还没挂回来，应答留给下面的 effect。
         pendingGreetingRef.current = true
+        pendingGreetingLineRef.current = line
       }
       summon()
-      if (voiceConversation) void startListen(true)
+      if (!voiceConversation) return
+      const binding = currentBinding.current
+      // 唤醒应答是**外放**的，而紧接着就要开麦克风听用户说话 —— 两者一重叠，
+      // 麦克风就会录到助理自己的声音，识别成一句话当成用户输入发出去
+      // （现场现象：对话里凭空多出一句「我在这。」）。
+      // 先等应答播完再开麦；同时把这句话记进自回声过滤表，双保险。
+      rememberSelfSpeech(line)
+      const beginListen = (): void => {
+        if (exitingRef.current) return
+        if (continuousVoice && binding && conversation.start(binding, voiceConversation, continuousVoice)) {
+          setContinuousActive(true)
+          armContinuousDeadline()
+          armIdleDeadline()
+          void startListen(true, true)
+        } else {
+          void startListen(true)
+        }
+      }
+      // 应答大约按字数走：中文每秒约 4–5 字，再加一点启动余量；至少留 900ms。
+      const waitMs = Math.min(6000, Math.max(900, Math.round((line.length / 4.5) * 1000) + 500))
+      window.setTimeout(beginListen, waitMs)
     })
-  }, [selectedId, cast, voiceConversation, startListen])
+  }, [selectedId, cast, voiceConversation, continuousVoice, startListen, conversation, armContinuousDeadline, armIdleDeadline])
 
   /** 壳推来的两件事：启动握手走到哪一步、角色该不该在桌面上。 */
   useEffect(() => {
@@ -720,9 +1028,10 @@ export default function App() {
   useEffect(() => {
     window.petApi.onDocState(setDocState)
     window.petApi.onDocReply(reply => addDocResult(reply.text))
-    window.petApi.onDocNotice(message => addDocResult(message))
+    // 文档提示同时弹一条气泡：这条路径不一定打开文档面板，只写结果区用户就看不见。
+    window.petApi.onDocNotice(message => { addDocResult(message); showToast(message) })
     void window.petApi.docRoots().then(setDocRoots)
-  }, [addDocResult])
+  }, [addDocResult, showToast])
 
   /**
    * 文档操作的统一收口。
@@ -788,7 +1097,12 @@ export default function App() {
     if (!stageVisible || !pendingGreetingRef.current) return
     pendingGreetingRef.current = false
     const who = selectedId ?? cast[0]?.assistantId
-    if (who) stageRef.current?.sayTo(who, WAKE_GREETING, 3000)
+    const line = pendingGreetingLineRef.current ?? WAKE_GREETING
+    pendingGreetingLineRef.current = null
+    if (who) {
+      stageRef.current?.forceAll('idle')
+      stageRef.current?.sayTo(who, line, 3000)
+    }
   }, [stageVisible, selectedId, cast])
 
   /**
@@ -816,9 +1130,25 @@ export default function App() {
    * 这个 return 必须排在所有 hook 之后。退场动画、快捷键、语音唤醒的监听都挂在 hook 上，
    * 跟着舞台一起卸掉的话，用户再按快捷键就没人应答，主进程只能靠 7s 兜底定时器退出。
    */
+  const [operations, setOperations] = useState<OperationalState | null>(null)
+  useEffect(() => {
+    if (settingsPage !== 'general' || !stageVisible) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout>
+    setOperations(null)
+    const refresh = async () => {
+      try {
+        const state = await window.petApi.getState(true)
+        if (!cancelled) setOperations(state.operations ?? null)
+      } catch { if (!cancelled) setOperations(null) }
+      if (!cancelled) timer = setTimeout(() => void refresh(), 2000)
+    }
+    void refresh()
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [settingsPage, stageVisible])
+
   if (!stageVisible) return null
 
-  /** 状态行要显示的内容一次算好：语气、文字、要不要摊开主进程那句话、给哪些按钮。 */
   const runtime = companion && {
     tone: runtimeTone(companion),
     label: runtimeLabel(companion),
@@ -841,14 +1171,21 @@ export default function App() {
           setInput={value => { voiceRoundRef.current = false; setInput(value) }}
           onSend={() => void send(input)}
           onClose={() => setPanelOpen(false)}
-          onCommand={mirror.command}
+          onCommand={command => {
+            if (command.kind === 'cancel') stopContinuous(false)
+            return mirror.command(command)
+          }}
           onListen={() => void startListen()}
           listening={listening}
           sending={busy}
           speaking={speech.speaking}
-          onStopSpeech={() => window.petApi.stopSpeech()}
+          onStopSpeech={() => { stopContinuous(false); window.petApi.stopSpeech() }}
+          continuous={continuousActive}
+          onEndContinuous={() => { stopContinuous(); showToast('已结束连续对话') }}
+          onStartSession={() => void openSession()}
           loadingOlder={mirror.loadingOlder}
           loadOlder={mirror.loadOlder}
+          hiddenThroughSeq={presentationCutoff}
         />
       )}
 
@@ -869,6 +1206,11 @@ export default function App() {
                     {runtime.detail && <div className="runtime-detail">{runtime.detail}</div>}
                   </div>
                 ) : <p className="management-hint">正在获取运行时状态…</p>}
+                <dl aria-label="助理能力实际状态">
+                  {operations ? operationLabels(operations).map(item => (
+                    <div className="card-row" key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>
+                  )) : <div><dt>能力状态</dt><dd>尚未取得状态，不能据此判断正在记录或已停止。</dd></div>}
+                </dl>
                 <p className="management-diagnostic">界面构建 <code>{UI_BUILD}</code></p>
                 {companion && <p className="management-diagnostic">运行配置 <code>{companion.profile}</code></p>}
                 <button className="management-button" onClick={() => void mirror.refresh().catch(error => showToast(String(error)))}>重新同步会话</button>
@@ -895,10 +1237,50 @@ export default function App() {
                         if (result.ok) setVoiceConversation(enabled)
                         else showToast('语音对话设置未保存')
                       } catch { showToast('语音对话设置未保存') }
+                      if (!enabled && conversation.active) stopContinuous()
                     }} />
                   唤醒后自动听取并发送本次语音
                 </label>
+                <label className="management-voice">
+                  <input type="checkbox" checked={continuousVoice} disabled={listening || !voiceConversation}
+                    onChange={async event => {
+                      const enabled = event.target.checked
+                      try {
+                        const result = await window.petApi.saveSettings({ continuousVoice: enabled })
+                        if (result.ok) setContinuousVoice(enabled)
+                        else showToast('连续对话设置未保存')
+                      } catch { showToast('连续对话设置未保存') }
+                      if (!enabled && conversation.active) stopContinuous()
+                    }} />
+                  唤醒后的连续对话：最多 10 轮或 5 分钟；一轮回答播完后会继续听，连续 10 秒没听到你开口才结束。沿用当前识别、朗读服务与数据去向。保存后从下一次唤醒起生效，不会立刻开麦。
+                </label>
+                <label className="management-voice">
+                  <input type="checkbox" checked={readReplies}
+                    onChange={async event => {
+                      const enabled = event.target.checked
+                      try {
+                        const result = await window.petApi.saveSettings({ readReplies: enabled })
+                        if (result.ok) setReadReplies(enabled)
+                        else showToast('朗读回复设置未保存')
+                      } catch { showToast('朗读回复设置未保存') }
+                    }} />
+                  朗读回复：打字发出的消息也把回答念出来（语音发起的那一轮本来就会念）
+                </label>
               </section>
+              <ResidencySettings
+                activity={operations && operations.connection === 'connected' ? operations.activity : null}
+                onOpenActivity={() => {
+                  // 活动记录的授权走插件的可信审批：这里只把开启指令放进输入框，由用户自己发出去。
+                  setSettingsPage(null)
+                  setPanelOpen(true)
+                  setInput('开启个人助理模式')
+                  window.setTimeout(() => inputRef.current?.focus(), 60)
+                }}
+                showToast={showToast}
+              />
+              <EnvironmentCheck showToast={showToast} />
+              <WorkEvidenceSettings showToast={showToast} />
+              <PresentationSettings active={presentation} />
               <VoiceApiSettings />
               <section className="management-section" aria-label="快捷操作">
                 <h3>快捷操作</h3>
@@ -909,6 +1291,9 @@ export default function App() {
                       void send(command)
                     }}>{command}</button>
                   ))}
+                  <button className="management-button" onClick={() => void window.petApi.openReportWorkbench()
+                    .then(result => { if (!result.ok) showToast('日报工作台未能打开') })
+                    .catch(() => showToast('日报工作台未能打开'))}>日报工作台</button>
                   <button className="management-button" onClick={() => void window.petApi.openReportDir()
                     .then(result => { if (!result.ok) showToast('日报文件夹未能打开') })
                     .catch(() => showToast('日报文件夹未能打开'))}>打开日报文件夹</button>
@@ -927,7 +1312,7 @@ export default function App() {
                 </div>
               )}
               <p className="management-hint">运行时启停与连接诊断请到通用设置。</p>
-              <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} />
+              <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} bindingId={session?.bindingId} />
               {snapshot?.team && <form className="management-section" onSubmit={async event => {
                 event.preventDefault()
                 if (!delegateId || !delegateText.trim() || delegating) return
@@ -1003,7 +1388,7 @@ export default function App() {
         onContextMenu={(target: CharacterMenuTarget) => window.petApi.contextMenu(target)}
         onDragStart={onDragStart}
         // 专注模式一开提醒就必须立刻消失：渲染层再挡一道，和主进程的评估输入同一道闸。
-        proactive={companion?.focusMode === true ? null : proactive}
+        proactive={companion?.focusMode === true || presentation ? null : proactive}
         onProactiveRespond={handleProactive}
         handleRef={stageRef}
       />

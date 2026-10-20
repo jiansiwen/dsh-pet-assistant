@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { BridgeAgent } from './bridge.ts'
 import type { SessionCommand, SessionEntry, SessionModel, SessionResult, SessionSnapshot, SessionUpdate } from '../../dsh-pet/src/session-types.ts'
 
@@ -9,7 +10,7 @@ export interface MirrorEvent {
   type: string
   data: Record<string, unknown>
   seq?: number
-  surfaceOp?: { op: string }
+  surfaceOp?: { op: string } | 'append'
 }
 
 type RecordValue = Record<string, unknown>
@@ -22,6 +23,16 @@ function visible(content: unknown): string {
     const item = record(block)
     return item.type === 'text' ? text(item.text) : ''
   }).join('')
+}
+
+/** 读会话事件日志：0.2.x 起 Session.events 数组改名 snapshotEvents()，旧宿主替身仍可能只有 events。 */
+function eventsOf(agent: BridgeAgent): readonly MirrorEvent[] {
+  const session = agent.session as unknown as {
+    snapshotEvents?: () => readonly MirrorEvent[]
+    events?: readonly MirrorEvent[]
+  }
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return session.events ?? []
 }
 
 /** 按轮次、步序及工具身份 upsert，完成消息覆盖 chunk，而非追加第二份文本。 */
@@ -46,8 +57,12 @@ export class SessionProjection {
     const prefix = `assistant:${turn}:${step}`
     if (event.type === 'turn/start') this.turn = number(d.turn)
     // 压缩后的模型专用替换不是第二条用户可见消息。
-    if (event.surfaceOp?.op === 'replace') return
+    if (typeof event.surfaceOp === 'object' && event.surfaceOp?.op === 'replace') return
     if (event.type === 'user/message') {
+      // 只把真人输入铺成对话气泡：运行时上下文/时间块等注入消息在网页端是折叠的，
+      // 宠物里也不该把它们当作用户说过的话铺出来。
+      const sourceKind = text(record(d.source).kind)
+      if (sourceKind !== '' && sourceKind !== 'user') return
       this.put({ id: `user:${text(d.id) || seq}`, seq, turn, role: 'user', kind: 'text', text: visible(d.content), streaming: false })
     } else if (event.type === 'assistant/chunk' && turn !== undefined && step !== undefined) {
       const chunk = record(d.chunk)
@@ -109,12 +124,10 @@ export class SessionProjection {
   }
 }
 
-type RpcMethod = (request: { rpcId: string; payload: RecordValue }) => Promise<unknown>
-type Sessions = Partial<Record<'history' | 'models' | 'selectModel' | 'prompt' | 'cancel', RpcMethod>>
 interface Presets {
   names: readonly string[]
   optionOf(value: string): { value: string; name: string }
-  current(events: BridgeAgent['session']['events']): string
+  current(events: readonly MirrorEvent[]): string
 }
 interface Commands {
   find(agent: BridgeAgent, name: string): unknown
@@ -123,12 +136,21 @@ interface Commands {
   } | undefined>
 }
 interface Projections { snapshot(session: BridgeAgent['session']): { values: RecordValue } }
+interface LlmLike {
+  listProviders?: () => readonly { id: string; name?: string }[]
+  listModels?: (provider: string) => Promise<readonly { provider?: string; id?: string; name?: string }[]>
+}
 
 const MODEL_CACHE_MS = 5_000
 const PAGE_MESSAGES = 50
 const stale = (): SessionResult => ({ ok: false, error: '会话绑定已变化，旧请求结果已丢弃；不会自动重发' })
 
-/** 只适配已安装宿主的服务；最小测试 agent 没有服务时不伪造原生能力或运行态。 */
+/**
+ * 只适配已安装宿主的服务；最小测试 agent 没有服务时不伪造原生能力或运行态。
+ *
+ * 0.2.x 起宿主不再给插件提供 `apiProxy` 会话 RPC：历史分页直接读会话事件日志，
+ * 输入与停止直接走 live agent 的 followup / cancel，模型目录走 `ctx.llm`。
+ */
 export class SessionMirror {
   readonly bindingId = randomUUID()
   readonly projection = new SessionProjection()
@@ -162,8 +184,8 @@ export class SessionMirror {
   }
 
   private service<T>(name: string): T | undefined { return this.agent?.ctx?.get(name) as T | undefined }
-  private sessions(): Sessions { return this.service<{ sessions?: Sessions }>('apiProxy')?.sessions ?? {} }
   private sessionId(): string | null { return this.agent?.session.id ?? this.agent?.id ?? null }
+  private sessionEvents(): readonly MirrorEvent[] | undefined { return this.agent ? eventsOf(this.agent) : undefined }
 
   observe(event: MirrorEvent, index: number): void {
     this.projection.apply(event, index)
@@ -172,22 +194,25 @@ export class SessionMirror {
   }
 
   private metadata(): Omit<SessionSnapshot, 'entries'> {
-    const sessions = this.sessions()
     const presets = this.service<Presets>('permissionPresets')
     const commands = this.service<Commands>('commands')
+    const llm = this.service<LlmLike>('llm')
     const projected = record(this.agent && this.service<Projections>('sessionProjections')?.snapshot(this.agent.session).values.permissions)
     const permissions = projected.options ? list(projected.options).map(record).map(option => ({ value: text(option.value), label: text(option.name) }))
       : (presets?.names ?? []).map(value => { const option = presets!.optionOf(value); return { value: option.value, label: option.name } })
-    const permission = text(projected.currentValue) || (this.agent && presets?.current(this.agent.session.events)) || null
+    const events = this.sessionEvents()
+    const permission = text(projected.currentValue) || (this.agent && presets?.current(events ?? [])) || null
     const available = this.active && this.sessionId() !== null
+    const agent = this.agent as { followup?: unknown; cancel?: unknown } | null
     return {
       sessionId: this.sessionId(), bindingId: this.bindingId, cursor: this.cursor, title: this.title,
       status: this.active ? this.status : 'disconnected', hasMore: this.hasMore, beforeSeq: this.beforeSeq,
       model: this.model, models: this.models, permissions, permission,
       capabilities: {
-        prompt: available && typeof sessions.prompt === 'function', cancel: available && typeof sessions.cancel === 'function',
-        history: available && typeof sessions.history === 'function',
-        models: available && typeof sessions.models === 'function' && typeof sessions.selectModel === 'function',
+        prompt: available && typeof agent?.followup === 'function',
+        cancel: available && typeof agent?.cancel === 'function',
+        history: available,
+        models: available && !!llm,
         permissions: available && !!presets && !!commands?.find(this.agent!, 'permission'),
       },
       ...(this.modelError ? { error: this.modelError } : {}),
@@ -209,16 +234,13 @@ export class SessionMirror {
     void this.refreshModels()
   }
 
-  private async rpc(method: keyof Sessions, payload: RecordValue): Promise<RecordValue> {
-    const sessions = this.sessions()
-    if (!this.active || !this.sessionId() || typeof sessions[method] !== 'function') throw new Error(`宿主会话能力不可用：${method}`)
-    const rpcId = randomUUID()
-    const response = record(await sessions[method]!.call(sessions, { rpcId, payload: { sessionId: this.sessionId(), ...payload } }))
-    if (!this.active) throw new Error(stale().error)
-    if (response.rpcId !== rpcId) throw new Error('宿主返回了不匹配的请求身份')
-    const result = record(response.result)
-    if (result.ok !== true) throw new Error(text(record(result.error).message) || '宿主请求失败')
-    return record(result.value)
+  /** 会话历史分页：0.2.x 没有 apiProxy，宿主把会话事件日志直接交给插件。 */
+  private historyPage(beforeSeq: number | undefined): { events: Array<{ event: MirrorEvent }>; hasMore: boolean } {
+    const all = this.sessionEvents() ?? []
+    const withSeq = all.filter((event): event is MirrorEvent & { seq: number } => typeof event.seq === 'number')
+    const older = beforeSeq === undefined ? withSeq : withSeq.filter(event => event.seq < beforeSeq)
+    const page = older.slice(-PAGE_MESSAGES)
+    return { events: page.map(event => ({ event })), hasMore: older.length > PAGE_MESSAGES }
   }
 
   private asModel(value: unknown): SessionModel | null {
@@ -231,21 +253,28 @@ export class SessionMirror {
 
   private refreshModels(): Promise<void> {
     if (this.modelsPending) return this.modelsPending
-    if (!this.active || !this.sessionId() || !this.sessions().models || Date.now() - this.modelsAt < MODEL_CACHE_MS) return Promise.resolve()
+    if (!this.active || !this.sessionId() || Date.now() - this.modelsAt < MODEL_CACHE_MS) return Promise.resolve()
     this.modelsAt = Date.now()
     const revision = this.modelRevision
-    this.modelsPending = this.rpc('models', {}).then(value => {
-      if (!this.active || revision !== this.modelRevision) return
-      this.models = list(value.groups).flatMap(group => {
-        const provider = record(group)
-        return list(provider.models).map(model => {
-          const item = record(model)
-          return { provider: text(provider.id), model: text(item.id), label: text(item.name) || text(item.id) }
-        })
-      })
-      this.model = this.asModel(value.current)
-      this.modelError = list(value.failures).map(failure => text(record(failure).message)).filter(Boolean).join('；') || undefined
-    }).catch(error => {
+    const llm = this.service<LlmLike>('llm')
+    this.modelsPending = (async () => {
+      if (llm?.listProviders && llm.listModels) {
+        const groups = await Promise.all(llm.listProviders().map(async provider => ({
+          id: provider.id,
+          models: await llm.listModels!(provider.id).catch(() => []),
+        })))
+        if (!this.active || revision !== this.modelRevision) return
+        this.models = groups.flatMap(group => group.models.map(model => ({
+          provider: group.id, model: text(model.id), label: text(model.name) || text(model.id),
+        })))
+      }
+      // 当前模型取自 live agent 的 options；列不出目录也要如实显示它。
+      const options = (this.agent as { options?: RecordValue } | null)?.options
+      if (options && typeof options.provider === 'string' && typeof options.model === 'string') {
+        this.model = this.asModel(options)
+      }
+      this.modelError = undefined
+    })().catch(error => {
       if (this.active && revision === this.modelRevision) this.modelError = String(error instanceof Error ? error.message : error)
     }).finally(() => { this.modelsPending = null; if (this.active) this.flush() })
     return this.modelsPending
@@ -257,8 +286,8 @@ export class SessionMirror {
       return { ok: false, error: '历史分页必须提供有效 beforeSeq 和 bindingId' }
     }
     try {
-      let page: RecordValue | undefined
-      if (this.metadata().capabilities.history) page = await this.rpc('history', { maxMessages: PAGE_MESSAGES, ...(beforeSeq === undefined ? {} : { beforeSeq }) })
+      let page: { events: Array<{ event: MirrorEvent }>; hasMore: boolean } | undefined
+      if (this.metadata().capabilities.history) page = this.historyPage(beforeSeq)
       else if (beforeSeq !== undefined) return { ok: false, error: '宿主历史分页不可用' }
       await this.refreshModels()
       if (!this.active) return stale()
@@ -303,26 +332,21 @@ export class SessionMirror {
           if (value.spoken !== undefined && typeof value.spoken !== 'boolean') throw new Error('spoken 必须是布尔值')
           const body = value.text.trim()
           if (body.startsWith('/')) await this.slash(body)
-          else await this.rpc('prompt', { mode: 'queue', content: [{ type: 'text', text: value.text }], clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone })
+          else (this.agent as { followup: (message: unknown) => void } | null)!.followup(createUserMessage({
+            content: [{ type: 'text', text: value.text }],
+            // 宠物面板输入的就是用户本人的话，不能伪装成插件注入的上下文。
+            source: { kind: 'user' },
+          }))
           break
         }
-        case 'cancel':
+        case 'cancel': {
           if (!capabilities.cancel) throw new Error('宿主停止能力不可用')
-          await this.rpc('cancel', {})
+          ;(this.agent as unknown as { cancel: (cause: unknown) => void }).cancel({ kind: 'user' })
           break
+        }
         case 'model': {
-          if (!capabilities.models) throw new Error('宿主模型选择不可用')
-          if (!text(value.provider).trim() || !text(value.model).trim() || (value.reasoningEffort !== undefined && typeof value.reasoningEffort !== 'string')) throw new Error('模型参数无效')
-          this.modelRevision += 1
-          const result = await this.rpc('selectModel', { provider: value.provider, model: value.model,
-            ...(value.reasoningEffort === undefined ? {} : { reasoningEffort: value.reasoningEffort }) })
-          const selected = this.asModel(result.selected)
-          if (!selected) throw new Error('宿主未返回选中的模型')
-          this.modelRevision += 1
-          this.model = selected
-          this.modelsAt = Date.now()
-          this.modelError = undefined
-          break
+          // 0.2.x 宿主没有面向插件的运行时模型切换接口：如实拒绝，让用户去应用设置里换。
+          throw new Error('当前宿主不支持从宠物侧切换模型，请在应用的模型设置里切换')
         }
         case 'permission': {
           if (!capabilities.permissions) throw new Error('宿主权限切换不可用')

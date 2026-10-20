@@ -9,7 +9,7 @@ DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里�
 
 ### 活动记录与日报
 
-- **开启个人助理模式**：后台采样 Windows 前台窗口（进程名，以及授权后的窗口标题），
+- **开启个人助理模式**：后台采样前台窗口（Windows 与 macOS；进程名，以及授权后的窗口标题），
   分类为聊天 / 浏览器 / 文档 / 开发 / 会议 / AI / 终端等
 - **我今天干了啥**：把活动片段增量解释为工作事项（如「与张三讨论了需求」），
   推断出来的结论标 `confidence: medium`，与证据直接支持的分开
@@ -30,10 +30,21 @@ DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里�
 - **召唤桌面宠物**：把宠物绑定到当前会话——宠物的对话经 `agent.followup` 注入本会话，
   使用相同的模型与凭据，**宠物端不需要配置任何 API key**
 - 宠物消息**串行注入**，与 web 页面输入共用同一 inbox，不产生交错
+- **插件加载即监听**：桥接在 apply 时就起来（未绑定）并写出 `bridge.json`，桌面壳不必等网页召唤就能找到运行时。
+  未绑定时 `/health` 如实报 `bound:false`；对话（`/chat`）、会话命令（`POST /session`）与三类审批一律回
+  `503` + `code:"unbound"` 和可展示的原因，**不伪装成已连接**（`GET /session` 照常返回 `disconnected` 快照）
+- **从桌面开始会话**：`POST /session/start`（聊天令牌鉴权）。已绑定且会话在线就原样返回当前绑定；否则经宿主
+  `ctx.agents` 恢复插件上次自建的会话（id 记在助理库 `user_flags`），恢复失败就新建并在 `resumeError` 里如实给出原因，
+  再走与召唤相同的 bind。宿主没有 `ctx.agents` 时回 `503` + `code:"agents-unavailable"`，不降级成假成功
+- **会话所有权**：只有 `/session/start` 建出或恢复的会话归插件所有，插件卸载时按所有权释放；网页里创建、经召唤绑定过来的
+  会话插件从不 dispose 也不 cancel。网页召唤到另一会话时照旧换绑，旧审批随之失效
+- `agents` 不写进 `inject`：cordis 4 的 inject 每一项都是**必需**依赖（对象形式的值是拦截配置；cordis 3 的
+  `{ required, optional }` 写法在这里会被当成两个服务名，插件永远起不来），写进去会让没有该服务的宿主里整个插件停在 pending。
+  插件改用 `ctx.get('agents')` 现取，经它拿到的服务按调用方追踪，所有权因此落在本插件的 fiber 上
 
 ### 桌面专家助理团（可选，默认关闭）
 
-- **编制**：唐僧（总助理，可执行副作用）+ 孙悟空 / 猪八戒（只读专家）+ 沙僧 / 白龙马（未启用席位）。
+- **编制**：总助理（总助理，可执行副作用）+ 助理1 / 助理2（只读专家）+ 助理3 / 助理4（未启用席位）。
   默认只有前三人上台，谁上台由配置 `teamSeats` 决定
 - **派活**：`desktop_team_assign` 把任务交给指定成员，走真实子代理运行
   （`spawn` 不继承父上下文，专家只看得到任务材料），等真实结果回来
@@ -41,6 +52,24 @@ DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里�
   批准绑定「任务 + 操作目标 + 参数摘要 + 输入修订」的哈希，改任何一项旧批准即失效
 - **执行点门禁**：门禁装在子代理自己的 agent ctx 上，没有有效批准就调不动 write / bash 这类工具；
   装在全局 ctx 会连用户自己的调用一起拦，所以不那样做
+- **副作用代执行**：只有「副作用成员（总助理）× 副作用任务」才会启动可信执行器（目前由桌面点名总助理发起）。
+  启动前先按随机运行标签 + 父会话装定向审批门禁，start() 返回前子代理发出的副作用调用一律拦截；
+  启动后在精确的子代理 agent ctx 上装审批门禁，绑定调度器给出的任务、成员与输入修订（不取模型自报）。
+  允许集合只有观测工具，加上 write / edit / str_replace_editor / bash / pwsh / job_kill 中按宿主参数定义核实过目标字段的那几个；
+  每次副作用调用都先在桌面审批窗口生成审批卡（摘要由门禁按真实工具与目标生成），批准前调用停住等待，
+  批准后只放行这一次；改参数、目标变化、过期、重放、转委派一律拒绝。bash / pwsh 按高风险走独立确认，
+  每条命令单独批准，批准不授予后续任意 shell 能力
+- **写类目标的范围**：write / edit / str_replace_editor 的目标先解析成真实路径（逐级解开符号链接 / 联接点）再比对，
+  只能落在父会话工作目录之内；符号链接越界、相似前缀（D:/a 与 D:/ab）、路径穿越、悬空链接都拒绝，
+  批准绑定的就是这条真实路径。会话没有工作目录时写类工具不开放
+- **执行账本**：每个动作落库动作标识、成员、规范化目标、参数摘要、预登记与真正开始执行的时间、结果摘要与最终状态，
+  重启后用 `desktop_team_status` 仍可查。进程停在执行前、执行中、执行后但回执没落库的任一位置，重启对账一律记
+  unknown 等人工核查：任务不再被领取、相关审批卡作废、绝不自动重发；模型自报不能把 unknown 改成成功。
+  子代理释放失败时门禁与额度先保留，退出只重试释放
+- **预算与费用**：用户 2026-10-17 选择**不设累计 Token 预算**，`defaultBudgetTokens` 默认 0。
+  后果是**团队任务的模型费用不封顶**：宿主只有单次输出上限（子代理沿用父会话每次请求的 maxTokens），没有累计硬上限；
+  仍然生效的只有单次输出上限、墙钟超时（`taskTimeoutMs`，默认 10 分钟）与并发上限（推理 2 / 副作用 1）。
+  显式给出非零预算的任务会如实拒启（`budget-unsupported`），不假装能守住
 
 ### 主动提醒（design.md §2.7）
 
@@ -61,14 +90,16 @@ DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里�
 ```
 dsh web（常驻）── 会话 S
  └─ dsh-personal-assistant 插件（profile 根作用域，单例）
-     ├─ 会话桥接 SessionBridge：从 ToolRunContext.agent 捕获活体 agent
+     ├─ 会话桥接 SessionBridge：从 ToolRunContext.agent 捕获活体 agent；插件加载即监听（未绑定）
      │    → node:http 长轮询（127.0.0.1 随机端口 + token，零外部依赖）
      │    → POST /chat   GET /events?since=N   GET /team   POST /approval   GET /health
+     │    → GET/POST /session（原生会话镜像）   POST /session/start（从桌面开始/恢复会话，经 ctx.agents）
      │    → POST /proactive/{accept,decline,disable,enable}   POST /pet-state（§2.7 反馈）
-     │    → 写 ~/.dsh/personal-assistant/bridge.json（端口 + 聊天令牌）
+     │    → 写 ~/.dsh/personal-assistant/bridge.json（端口 + 聊天令牌；加载时不抢健康运行时，召唤时接管）
      │    → 写 ~/.dsh/personal-assistant/bridge-approval.json（审批凭据，与聊天令牌分离）
      │    → 配了 petDir 就 spawn `cmd /c pnpm start` 拉起宠物
      ├─ 采样器：插件托管子进程（不分离），插件卸载时由 ctx.effect 回收，不留孤儿进程
+     │    → Windows：assets/sampler.ps1（PowerShell + user32）；macOS：assets/sampler-macos.js（osascript JXA）
      ├─ 助理库 assistant.sqlite：记忆 / 观察 / 日报版本 / 迁移批次
      ├─ 团队库 team.sqlite（teamEnabled 时）：成员编制 / 任务 / 提案 / 批准 / 操作记录
      └─ 系统提示词：偏好、模式状态、记忆冲突经 ctx.systemPrompt.variable 渲染进去
@@ -87,7 +118,7 @@ dsh web（常驻）── 会话 S
 | `personal-assistant/assistant.sqlite` | 记忆、观察、日报版本、迁移批次 |
 | `personal-assistant/samples/<yyyy-MM-dd>.jsonl` | 原始采样，一行一个 JSON |
 | `personal-assistant/reports/` | 定稿日报 Markdown |
-| `personal-assistant/bridge.json` | 桥接端口与聊天令牌（宠物读） |
+| `personal-assistant/bridge.json` | 桥接端口与聊天令牌（宠物读）。插件加载即写；另一运行时正健康服务时加载不抢、召唤时接管；卸载只删自己写的那份 |
 | `personal-assistant/bridge-approval.json` | 审批凭据（只有桌面壳主进程读） |
 | `desktop-team/team.sqlite` | 团队编制与任务（`teamEnabled` 时） |
 | `storages/personal_assistant/` | **旧版**存储域，默认只读导入新库，不自动删 |
@@ -95,12 +126,12 @@ dsh web（常驻）── 会话 S
 ## 安装
 
 ```powershell
-cd D:\work\dsh-personal-assistant
+cd <插件目录>            # 例：D:\work\dsh-personal-assistant
 pnpm install
 pnpm run build
 
 # 装到 web profile（推荐：web 常驻、会话寿命长，最适合挂载宠物）
-cd D:\work
+cd <仓库根目录>          # 插件目录的上一级
 npx @deepseek-ai/dsh plugin --profile web add ./dsh-personal-assistant
 ```
 
@@ -110,12 +141,25 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-personal-assistant
 > `"dsh-personal-assistant": "link:<插件绝对路径>"` 依赖并加入 `dsh.profile.bundles`，
 > 再在 profile 的 node_modules 里对插件目录建符号链接（junction 即可）。
 
+### 桌面宠物（dsh-pet）
+
+桌宠是独立的 Electron 应用，不在本插件包内；插件负责桥接（宠物与当前会话共用历史、模型与凭据）。
+召唤宠物时按以下顺序找桌宠目录，找到即在其中执行 `pnpm start` 自动拉起：
+
+1. profile 里给 `personal-assistant` 配置的 `config.petDir`；
+2. 环境变量 `DSH_PET_DIR`；
+3. 插件目录同级的 `dsh-pet`（从同一仓库克隆时天然满足：`dsh-personal-assistant` 与 `dsh-pet` 是兄弟目录）。
+
+一个都找不到时，召唤只会绑定会话，工具返回里会说明去哪放 dsh-pet；你也可以随时在 dsh-pet 目录
+手动运行 `pnpm start`——启动后会自动接入桥接，无需其它配置。
+
+
 ### 开启团队（可选）
 
 团队是**覆盖层**，不需要新建 profile：
 
 ```powershell
-dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
+dsh --profile web --patch <插件目录>/cordis.team.patch.yml
 ```
 
 想常开就把那一条抄进该 profile 的 `cordis.patch.yml`。注意两点：
@@ -123,8 +167,10 @@ dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
 - 覆盖层用 `- id: personal-assistant` 而不是 `- insert:`。loader 对同 id 的 insert **不去重**，
   插件自带的 patch 已经 insert 过这一行，再 insert 一次会抛
   `duplicate loader entry id: personal-assistant`，整个 dsh 起不来。按 id 覆盖走的是另一条分支。
-- `config` 是**整体替换，不是深合并**。所以覆盖层里必须把 `petDir` 一起重复写上，
-  否则 bundle 层给的 `petDir` 会被顶掉，召唤宠物时就再也不会自动拉起 dsh-pet。
+- `config` 是**整体替换，不是深合并**。如果 profile 层里给 personal-assistant 配过
+  `petDir`，覆盖层里不写就会把它顶掉——想让「召唤宠物」自动拉起 dsh-pet，就在覆盖层的
+  `config` 里写上你自己的 `petDir`（模板里默认注释掉，留空 = 只绑定会话、不自动拉起）。
+
 
 写完补丁先跑 `dsh --profile web --dump-config`（零副作用）看最终 entry 列表，再真启动。
 
@@ -147,7 +193,7 @@ dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
         # 路径
         reportDir: ''               # 留空 = ~/.dsh/personal-assistant/reports
         storePath: ''               # 留空 = ~/.dsh/personal-assistant/assistant.sqlite
-        petDir: ''                  # dsh-pet 工程目录；留空则召唤时不自动拉起
+        petDir: ''                  # dsh-pet 工程目录；留空 = 按「桌面宠物」一节的顺序自动查找
 
         # 记忆与迁移
         maxInjectedMemories: 40     # 注入提示词的记忆条数上限（限的是注入，不是存储）
@@ -166,7 +212,7 @@ dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
         maxConcurrentInference: 2
         maxConcurrentSideEffect: 1  # 必须小于推理上限
         taskTimeoutMs: 600000
-        defaultBudgetTokens: 200000
+        defaultBudgetTokens: 0      # 0 = 用户选择不设累计预算（费用不封顶）；非零值会因宿主没有累计硬上限而拒启
         approvalTtlMs: 300000       # 批准有效期；运行时代次变化会让旧批准立即失效
         denyExpertTools: []         # 额外从只读专家手里禁用的工具名
 
@@ -214,21 +260,25 @@ dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
 |---|---|
 | `desktop_team_start` | 把当前会话登记为总助理宿主，写入编制 |
 | `desktop_team_assign` | 派任务给指定成员并等真实结果 |
-| `desktop_team_status` | 成员 / 任务 / 待批提案 / 已执行操作 |
+| `desktop_team_status` | 成员 / 任务 / 待批提案 / 执行账本（目标、开始与结束时间、状态） |
 | `desktop_team_cancel` | 取消任务（已发生的外部副作用不撤回，会列出来） |
-| `desktop_team_propose_action` | 提交副作用提案走用户审批 |
-| `desktop_team_finish_operation` | 回填操作结果（succeeded / failed / unknown） |
+| `desktop_team_propose_action` | 提交副作用提案走用户审批（写类目标按会话工作区规范化成真实路径） |
+| `desktop_team_finish_operation` | 查询一次副作用的可信执行记录（只读，不接受模型自报结账） |
 
 ## 隐私与授权
 
 **分级授权落在采集侧，不是先写进去再声称不会用。**
 
-- `captureWindowTitles: false` 时，`assets/sampler.ps1` **压根不调用 `GetWindowText`**，
-  未授权的标题不会先落进 JSONL 再被过滤。代价是活动只剩进程名，
+- `captureWindowTitles: false` 时，`assets/sampler.ps1` **压根不调用 `GetWindowText`**，macOS 的
+  `assets/sampler-macos.js` 也**完全不碰 System Events**，未授权的标题不会先落进 JSONL 再被过滤。代价是活动只剩进程名，
   日报只能说到「用了 Word」而说不出「在写哪份文档」
+- 两个平台都先按排除名单判定应用、命中就只记 `excluded`，**判定在读标题之前**，被排除的应用一次标题都不读
+- macOS 上应用名、pid 与空闲时间（`ioreg` 的 `HIDIdleTime`）不需要任何权限；读窗口标题要给拉起 dsh 的应用
+  「辅助功能」权限，并允许它控制「System Events」（自动化）。缺权限时样本如实写
+  `titleUnavailable: "accessibility" | "automation"` 且不带标题，模式状态里也会提示原因，不拿应用名冒充标题
 - `captureActivity: false` 时不开采样进程、不产生任何采样文件
 - 只采集**前台窗口**，不读取任何应用内容；聊天内容只能由你主动导入
-- 锁屏 / 无前台窗口期间记为 idle
+- 锁屏 / 无前台窗口期间记为 idle（macOS 上前台是登录窗口或屏保时同样记 idle）
 - 保留期到点是**真删 JSONL 文件**，不是只删库里的派生观察——只删派生数据的话
   「保留 N 天」就是一句空话。语义事项和用户笔记是已经确认过的成果，不被保留期抹掉，留到你自己删为止
 - 审批凭据与聊天令牌分离，只写给桌面壳主进程，**不进入模型上下文**
@@ -238,7 +288,12 @@ dsh --profile web --patch D:/work/dsh-personal-assistant/cordis.team.patch.yml
 
 这些是当前实现的真实边界，不是待修的 bug：
 
-- **仅支持 Windows**（采样依赖 PowerShell + user32）
+- **采样只支持 Windows 与 macOS**（Windows：PowerShell + user32；macOS：系统自带 `osascript -l JavaScript`，不加依赖）。
+  其他平台（如 Linux）如实拒绝开启采集。**macOS 版尚未真机验证**，验证步骤交由团队成员在 Mac 上执行，结果到回前保持「待验证」。
+  分类规则仍以 Windows 进程名为主，macOS 应用（如 `Google Chrome`、`Microsoft Word`）多数会归到 other，可用 `customRules` 补
+- **从桌面开始会话依赖宿主的 `ctx.agents`**：真实宿主里 create / resume 的行为（会话 id 格式、`meta.cwd`、
+  恢复需要 `sessionPersistence`）只按类型声明与 agent-loop 源码核对过，尚未在真实 dsh 里跑过；
+  恢复失败时插件新建会话并如实给出原因
 - **`~/.dsh/profiles/headless/cordis.patch.yml` 当前起不来**：它 insert 了 `id: personal-assistant`，
   与插件自带的 patch 撞同一个 id → `duplicate loader entry id`。修法是删掉 profile 层那几行。
   `~/.dsh` 在工作区外，改它需要你自己动手。开发与验证走 `web` profile
@@ -293,9 +348,16 @@ bundle 落在包内 `node_modules/.dsh-smoke` 而不是系统临时目录——�
 | 现象 | 原因与处理 |
 |---|---|
 | `duplicate loader entry id: personal-assistant` | profile 层与插件层都 insert 了同一 id。删掉 profile 层那几行，或改用 `- id:` 覆盖 |
-| 覆盖配置后宠物不自动拉起了 | `config` 是整体替换。覆盖层里必须把 `petDir` 一起写上 |
+| 覆盖配置后宠物不自动拉起了 | `config` 是整体替换：覆盖层里没写 `petDir` 就会留空。要自动拉起就在覆盖层里写上你自己的 `petDir` |
 | 开启助理模式被拒，提示迁移未完成 | 旧数据没搬完时采集闸门会拦住，避免新旧两套记录搅在一起。看日志里的 `migration <id>` 行 |
-| 日报说不出在写哪份文档 | `captureWindowTitles` 关着，活动只剩进程名 |
+| 日报说不出在写哪份文档 | `captureWindowTitles` 关着，活动只剩进程名；macOS 上若样本带 `titleUnavailable`，是拉起 dsh 的应用缺「辅助功能」或「自动化（System Events）」权限 |
 | 宠物自己重影了 | 起了两个运行时抢同一份 `bridge.json` 与采样器。桌面壳的逻辑是只要还有活着的运行时就绝不启动第二个 |
 | 专家说调不动 write / bash | 执行点门禁生效了，需要走 `desktop_team_propose_action` 让用户批 |
 | 批准明明给过却说失效 | 计划摘要变了（目标 / 参数 / 输入修订任一），或运行时代次变了，或超过 `approvalTtlMs` |
+| 副作用任务的调用停住不动 | 在等桌面审批窗口的决定；批准前不会执行，驳回或到期（`approvalTtlMs`）就拒绝 |
+| 任务停在 unknown | 有副作用结果不明（进程中断、工具报错或子代理没能释放），先人工核查真实外部状态；不会自动重发 |
+| 带预算的任务拒启 `budget-unsupported` | 宿主没有累计硬上限，非零累计预算守不住；用户已选择不设累计预算，按 0 提交即可 |
+| 宠物说「还没有连上 dsh 会话」（`503`，`code: unbound`） | 桥接已起但没绑定会话：在 dsh 里召唤宠物，或调 `POST /session/start` 从桌面开始。未绑定时对话与审批都不受理，待办留着，绑定后再处理 |
+| `/session/start` 回 `agents-unavailable` | 当前宿主没有 `ctx.agents`（或还没装上）：只能在 dsh 里召唤宠物；插件不会退化成假成功 |
+| 开始会话回 `created` 且带 `resumeError` | 上次自建的会话恢复不了（例如宿主没配会话持久化），已新建并如实给出原因；旧会话记录不会被删 |
+| 新起的运行时没写 `bridge.json` | 另一个运行时正健康地占着它，加载时不抢；在这个运行时里召唤宠物即可接管 |

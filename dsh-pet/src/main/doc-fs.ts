@@ -6,9 +6,12 @@
  *
  * electron 只在显式系统关联打开时加载，磁盘出口可直接用 Node 测试。
  */
+import { spawn as nodeSpawn } from 'node:child_process'
 import { open, readdir, realpath as realpathFs, stat as statFs } from 'node:fs/promises'
 import path from 'node:path'
-import { DocSizeError, fingerprintBytes, MAX_DOC_BYTES, type DocFile, type DocFileSystem } from './document.ts'
+import { fail, ok, type ActionResult, type AppLaunchTarget, type OpenOutcome } from './desktop-actions.ts'
+import { canOpenWithApp, DocSizeError, fingerprintBytes, MAX_DOC_BYTES, type DocFile, type DocFileSystem } from './document.ts'
+import { openWithSpec, platformOf } from './platform.ts'
 
 /** 句柄级再次验体积，并逐块守限，防止文件在 stat 之后增长。所有退出路径都关闭句柄。 */
 async function readBoundedBytes(target: string, signal?: AbortSignal): Promise<Uint8Array> {
@@ -123,5 +126,74 @@ export function createDocFileSystem(): DocFileSystem {
       const failure = await shell.openPath(target)
       if (failure !== '') throw new Error(failure)
     },
+  }
+}
+
+/** 启动器：spawn 一条命令并在"进程确实起来了 / 起不来"时返回。测试可替换。 */
+export type AppLauncher = (command: string, args: readonly string[]) => Promise<{ pid?: number }>
+
+export const defaultAppLauncher: AppLauncher = (command, args) => new Promise((resolve, reject) => {
+  // 参数数组直接交给 CreateProcess / execve，没有 shell 参与；detached + unref 让被打开的
+  // 应用不随宠物退出。stdio 全部忽略：WPS 不需要我们的管道，留着反而可能把它挂住。
+  const child = nodeSpawn(command, [...args], { detached: true, stdio: 'ignore', windowsHide: false, shell: false })
+  child.once('error', reject)
+  child.once('spawn', () => {
+    child.unref()
+    resolve({ pid: child.pid })
+  })
+})
+
+export interface OpenWithAppDeps {
+  platform?: string
+  launcher?: AppLauncher
+  statFile?: (target: string) => Promise<{ isFile(): boolean } | null>
+}
+
+async function defaultStatFile(target: string): Promise<{ isFile(): boolean } | null> {
+  try { return await statFs(target) } catch { return null }
+}
+
+/**
+ * 用**指定的应用**打开文件（不经系统默认关联）。与 `openWithAssociatedApp` 并存：
+ * 后者交给系统关联，这里明确指定由哪个 exe / .app 打开，例如"用 WPS 打开"。
+ *
+ * 前置检查与 `reveal` 同一份白名单（不打开宏文档、不执行程序）。调用方负责传入已经过
+ * 授权目录判断的真实路径（DocumentLibrary 的结果）。
+ *
+ * 成功只表示"已交给目标应用"（`verified: false`）：文档是否真的打开、打开在哪个窗口，
+ * 要由 `findWindow` 核验，不能拿这里的成功当成目标达成。
+ */
+export async function openWithSpecifiedApp(
+  target: string,
+  app: AppLaunchTarget,
+  deps: OpenWithAppDeps = {},
+): Promise<ActionResult<OpenOutcome>> {
+  const platform = platformOf(deps.platform ?? process.platform)
+  const base = { action: 'openWith' as const, platform }
+  if (!canOpenWithApp(platform === 'win32' ? path.win32.basename(target) : path.posix.basename(target))) {
+    return fail('invalid-argument', '这种文件不允许交给外部应用打开', base)
+  }
+  const spec = openWithSpec(platform, app, target)
+  if (spec === null) {
+    return fail(platform === 'linux' ? 'unsupported' : 'invalid-argument',
+      platform === 'linux' ? '这个平台没有实现指定应用打开' : '文件或应用路径必须是绝对路径', base)
+  }
+  const evidence = { ...base, command: { command: spec.command, args: spec.args } }
+  const statFile = deps.statFile ?? defaultStatFile
+  const file = await statFile(target)
+  if (file === null || !file.isFile()) return fail('invalid-argument', '要打开的文件不存在或不是普通文件', evidence)
+  // macOS 用 bundle id 打开时可执行文件是 /usr/bin/open，应用本身的存在由定位阶段核过。
+  if (platform === 'win32' || app.bundleId === undefined) {
+    const exe = await statFile(app.executable)
+    if (exe === null) return fail('not-installed', '指定的应用不存在', evidence)
+  }
+  try {
+    const { pid } = await (deps.launcher ?? defaultAppLauncher)(spec.command, spec.args)
+    return ok({ launched: true, pid, verified: false }, evidence)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ENOENT') return fail('not-installed', '指定的应用无法启动（找不到可执行文件）', evidence)
+    if (code === 'EACCES' || code === 'EPERM') return fail('permission-denied', '没有权限启动指定的应用', evidence)
+    return fail('failed', `启动失败：${error instanceof Error ? error.message : String(error)}`, evidence)
   }
 }

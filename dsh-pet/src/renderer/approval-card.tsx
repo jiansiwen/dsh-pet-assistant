@@ -12,7 +12,13 @@
  * 能力搬进签发口，前面拆开的两件事又粘回去了。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { formatCountdown, type ApprovalCardView } from '../main/approval-policy.js'
+import {
+  formatCountdown,
+  type ApprovalCardView,
+  type ChangeReviewView,
+  type UnknownReviewView,
+  type VerificationReviewView,
+} from '../main/approval-policy.js'
 import type { ApprovalCardApi } from '../preload/approval.js'
 import type { ApprovalDecision, DecideApprovalResult } from './types.js'
 import './approval-card.css'
@@ -21,6 +27,105 @@ declare global {
   interface Window {
     approvalCard: ApprovalCardApi
   }
+}
+
+function shortHash(hash: string): string {
+  return hash === 'absent' ? '（新建）' : hash.slice(0, 12)
+}
+
+function formatTime(at: number | null): string {
+  return at === null ? '—' : new Date(at).toLocaleString()
+}
+
+/**
+ * 改动提案的审阅区：先给全量的文件清单与增删行数（永远完整），再逐个文件展开差异。
+ * 截断提示放在最上面：用户先知道「这里看不全」，再决定要不要批。
+ */
+function ChangeReview({ change }: { change: ChangeReviewView }) {
+  return (
+    <section className="review-block" aria-label="改动差异">
+      <p className="review-summary">
+        第 {change.revision} 版 · {change.files.length} 个文件 · <span className="diff-add-count">+{change.totalAdded}</span>{' '}
+        <span className="diff-del-count">−{change.totalRemoved}</span>
+      </p>
+      {change.notice && <p className="review-notice" role="status">{change.notice}</p>}
+      <ul className="review-files">
+        {change.files.map(file => (
+          <li key={file.path} className="review-file">
+            <span className={`review-action action-${file.action}`}>{file.actionLabel}</span>
+            <span className="review-path" title={file.path}>{file.path}</span>
+            <span className="diff-add-count">+{file.added}</span>
+            <span className="diff-del-count">−{file.removed}</span>
+          </li>
+        ))}
+      </ul>
+      {change.files.map(file => (
+        <div key={`diff-${file.path}`} className="review-diff">
+          <div className="review-diff-head">
+            <span className="review-path">{file.path}</span>
+            <span className="review-hash" title={`基线 ${file.baseHash}\n新内容 ${file.newHash}`}>
+              {shortHash(file.baseHash)} → {shortHash(file.newHash)}
+            </span>
+          </div>
+          <pre className="diff-body">
+            {file.lines.map((line, index) => (
+              <span key={index} className={`diff-line diff-${line.kind}`}>{line.text || ' '}{'\n'}</span>
+            ))}
+          </pre>
+          {file.truncated && <p className="review-cut">这个文件的差异没有显示完整。</p>}
+        </div>
+      ))}
+    </section>
+  )
+}
+
+function VerificationReview({ verification }: { verification: VerificationReviewView }) {
+  return (
+    <section className="review-block" aria-label="验证命令">
+      <dl className="card-scope nested">
+        <div className="card-row"><dt>工作目录</dt><dd className="card-target" title={verification.cwd}>{verification.cwd}</dd></div>
+        <div className="card-row"><dt>程序</dt><dd className="card-target" title={verification.program}>{verification.program}</dd></div>
+        <div className="card-row">
+          <dt>参数</dt>
+          <dd>
+            {verification.args.length === 0 ? '（无）' : (
+              <ol className="review-args">
+                {verification.args.map((arg, index) => <li key={index}><code>{JSON.stringify(arg)}</code></li>)}
+              </ol>
+            )}
+          </dd>
+        </div>
+        <div className="card-row"><dt>超时</dt><dd>{verification.timeoutLabel}（到点结束整个进程树）</dd></div>
+        <div className="card-row"><dt>预期副作用</dt><dd className="card-summary">{verification.expectedEffects}</dd></div>
+        <div className="card-row"><dt>环境</dt><dd className="card-summary">{verification.env}</dd></div>
+        {verification.afterChange && (
+          <div className="card-row">
+            <dt>针对改动</dt>
+            <dd>第 {verification.afterChange.revision} 版：{verification.afterChange.files.join('、')}</dd>
+          </div>
+        )}
+        <div className="card-row"><dt>绑定摘要</dt><dd className="review-hash">{verification.digest}</dd></div>
+      </dl>
+      {verification.notes.map(note => <p key={note} className="review-notice">{note}</p>)}
+    </section>
+  )
+}
+
+function UnknownReview({ review }: { review: UnknownReviewView }) {
+  return (
+    <section className="review-block" aria-label="人工复核">
+      <p className="review-resolution">把这项操作标记为：<strong>{review.resolutionLabel}</strong></p>
+      <dl className="card-scope nested">
+        <div className="card-row"><dt>操作</dt><dd className="card-tool">{review.kind}</dd></div>
+        {review.target && <div className="card-row"><dt>目标</dt><dd className="card-target">{review.target}</dd></div>}
+        <div className="card-row"><dt>开始</dt><dd>{formatTime(review.startedAt)}</dd></div>
+        <div className="card-row"><dt>进入执行</dt><dd>{formatTime(review.executedAt)}</dd></div>
+        {review.detail && <div className="card-row"><dt>原结果说明</dt><dd className="card-summary">{review.detail}</dd></div>}
+        {review.note && <div className="card-row"><dt>核对依据</dt><dd className="card-summary">{review.note}</dd></div>}
+      </dl>
+      <p className="review-notice">{review.effect}</p>
+    </section>
+  )
 }
 
 export default function ApprovalCardPage() {
@@ -129,49 +234,69 @@ export default function ApprovalCardPage() {
   return (
     <div className={`card risk-${view.risk}`}>
       <header className="card-head">
-        <h1 className="card-title">{view.report ? '请确认这版日报' : '有个操作等你点头'}</h1>
+        <h1 className="card-title">{view.title}</h1>
         <span className={`card-risk risk-${view.risk}`}>{view.riskLabel}</span>
       </header>
 
-      <dl className="card-scope">
-        <div className="card-row">
-          <dt>要做什么</dt>
-          <dd className="card-tool">{view.tool}</dd>
-        </div>
-        {view.target && (
+      {/* 唯一的滚动区：范围与审阅内容再长也只在这里滚，页脚的按钮永远够得着。 */}
+      <div className="card-body">
+        <dl className="card-scope">
           <div className="card-row">
-            <dt>作用在</dt>
-            <dd className="card-target" title={view.target}>
-              {view.target}
+            <dt>要做什么</dt>
+            <dd className="card-tool">{view.toolLabel}</dd>
+          </div>
+          {view.target && (
+            <div className="card-row">
+              <dt>作用在</dt>
+              <dd className="card-target" title={view.target}>
+                {view.target}
+              </dd>
+            </div>
+          )}
+          {view.summary && (
+            <div className="card-row">
+              <dt>说明</dt>
+              <dd className="card-summary">{view.summary}</dd>
+            </div>
+          )}
+          {view.report && (
+            <>
+              <div className="card-row"><dt>日报版本</dt><dd>{view.report.reportId} · 第 {view.report.revision} 版</dd></div>
+              <div className="card-row"><dt>内容摘要</dt><dd>{view.report.digest}</dd></div>
+              <div className="card-row"><dt>日报全文</dt><dd className="card-summary">{view.report.content}</dd></div>
+            </>
+          )}
+          {view.assistant && (
+            <>
+              <div className="card-row"><dt>提案版本</dt><dd>第 {view.assistant.revision} 版</dd></div>
+              <div className="card-row"><dt>内容摘要</dt><dd>{view.assistant.digest}</dd></div>
+              <div className="card-row"><dt>完整范围</dt><dd className="card-summary">{view.assistant.content}</dd></div>
+            </>
+          )}
+          {view.requester && (
+            <div className="card-row">
+              <dt>谁提请的</dt>
+              <dd>{view.requester}</dd>
+            </div>
+          )}
+          <div className="card-row">
+            <dt>有效期</dt>
+            <dd className={left !== null && left <= 0 ? 'card-countdown expired' : 'card-countdown'}>
+              {left === null ? '不限时' : formatCountdown(left)}
             </dd>
           </div>
-        )}
-        {view.summary && (
-          <div className="card-row">
-            <dt>说明</dt>
-            <dd className="card-summary">{view.summary}</dd>
-          </div>
-        )}
-        {view.report && (
-          <>
-            <div className="card-row"><dt>日报版本</dt><dd>{view.report.reportId} · 第 {view.report.revision} 版</dd></div>
-            <div className="card-row"><dt>内容摘要</dt><dd>{view.report.digest}</dd></div>
-            <div className="card-row"><dt>日报全文</dt><dd className="card-summary">{view.report.content}</dd></div>
-          </>
-        )}
-        {view.requester && (
-          <div className="card-row">
-            <dt>谁提请的</dt>
-            <dd>{view.requester}</dd>
-          </div>
-        )}
-        <div className="card-row">
-          <dt>有效期</dt>
-          <dd className={left !== null && left <= 0 ? 'card-countdown expired' : 'card-countdown'}>
-            {left === null ? '不限时' : formatCountdown(left)}
-          </dd>
-        </div>
-      </dl>
+          {view.change && (
+            <div className="card-row">
+              <dt>绑定摘要</dt>
+              <dd className="review-hash">{view.change.digest}</dd>
+            </div>
+          )}
+        </dl>
+
+        {view.change && <ChangeReview change={view.change} />}
+        {view.verification && <VerificationReview verification={view.verification} />}
+        {view.review && <UnknownReview review={view.review} />}
+      </div>
 
       {view.needsNativeConfirm && view.canDecide && (
         <p className="card-note">

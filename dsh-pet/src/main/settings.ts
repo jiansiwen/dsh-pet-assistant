@@ -23,6 +23,9 @@ export const LAYOUT_VERSION = 1
 export interface PetSettings {
   pet: PetId
   voiceConversation?: boolean
+  continuousVoice?: boolean
+  /** 朗读回复：打开后，打字发出的消息也把回答念出来（原来只有语音发起的那一轮会念）。 */
+  readReplies?: boolean
   /** 分钟，范围 1–120；缺省分别为 2 和 20。 */
   idleSleepMinutes?: number
   sleepMinutes?: number
@@ -52,6 +55,14 @@ export interface PetSettings {
   docRoots?: string[]
   /** 最近用系统关联打开过的文档所在目录，新的在前，最多 `MAX_RECENT_DIRS` 条。 */
   docRecentDirs?: string[]
+  /**
+   * 下载本地模型时用的镜像前缀（例如 `https://gh-proxy.com/`），空 = 直连上游。
+   *
+   * 存下来而不是每次问：模型是几百 MB，国内直连 GitHub 常常超时，用户会反复下载失败。
+   * 只接受 https 前缀，且落位前仍按清单 sha256 校验（见 `model-resources.ts` 的 `normalizeMirror`）——
+   * 镜像只负责转发，不能因为它"看起来是自家的"就跳过校验。
+   */
+  modelMirror?: string
 }
 
 const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false }
@@ -73,6 +84,8 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   }
   if (typeof merged.trayResident !== 'boolean') merged.trayResident = false
   merged.voiceConversation = merged.voiceConversation === true
+  merged.continuousVoice = merged.continuousVoice === true
+  merged.readReplies = merged.readReplies === true
   for (const [key, fallback] of [['idleSleepMinutes', 2], ['sleepMinutes', 20]] as const) {
     const value = merged[key]
     if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 120) merged[key] = fallback

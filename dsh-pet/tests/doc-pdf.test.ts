@@ -293,3 +293,28 @@ test('运行中的解析取消后不缓存；解析期间撤销目录授权也�
   })
   assert.equal((await revoked.open(h.file)).kind, 'denied')
 })
+
+test('解析线程与阅读视图共用拼接规则：大纵向间距成自然段，渲染层拼出的文字与提纲逐字一致', async () => {
+  const { joinTextRuns, textDigest, paragraphsOf } = await import('../src/main/doc-presenter.ts')
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const stream = [
+    'BT /F1 12 Tf 50 750 Td (First paragraph line one) Tj ET',
+    'BT /F1 12 Tf 50 730 Td (first paragraph line two) Tj ET',
+    'BT /F1 12 Tf 50 680 Td (Second paragraph after gap) Tj ET',
+  ].join('\n')
+  const data = syntheticPdf(['ignored'], { contentStream: stream })
+  const [page] = pagesOf(await parsePdf(data.slice()))
+  assert.equal(page.text, 'First paragraph line one\nfirst paragraph line two\n\nSecond paragraph after gap')
+  assert.equal(paragraphsOf(page.text).length, 2)
+
+  const task = getDocument({ data: data.slice(), useSystemFonts: false, disableFontFace: true, useWasm: false, verbosity: 0 })
+  try {
+    const pdf = await task.promise
+    const content = await (await pdf.getPage(1)).getTextContent({ includeMarkedContent: false })
+    const joined = joinTextRuns(content.items.filter((item) => 'str' in item) as never)
+    assert.equal(joined.text, page.text)
+    assert.equal(textDigest(joined.text), textDigest(page.text))
+  } finally {
+    await task.destroy()
+  }
+})

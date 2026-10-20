@@ -517,6 +517,25 @@ export type OpenResult =
 
 export type RevealResult = { readonly ok: true } | { readonly ok: false; readonly error: string }
 
+/** 是否按 PDF 处理（阅读视图只接 PDF）。 */
+export function isPdfName(name: string): boolean {
+  return PDF.has(extensionOf(name))
+}
+
+/**
+ * 阅读视图每一次取数的结果。
+ *
+ * 与 `open` 分开，是因为它**不走缓存**：缓存只能省掉解析，不能省掉授权。每次都重新 realpath、
+ * 重新判授权根、重新读一份有界快照并现算指纹，与期望指纹对不上就报 `changed`。
+ */
+export type SnapshotResult =
+  | { readonly kind: 'snapshot'; readonly path: string; readonly bytes: Uint8Array; readonly fingerprint: string }
+  | { readonly kind: 'denied' }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'too-big'; readonly size: number }
+  | { readonly kind: 'changed'; readonly fingerprint: string | null }
+  | { readonly kind: 'unreadable'; readonly reason: string }
+
 /**
  * 授权文档的查找、解析与缓存。
  *
@@ -628,6 +647,34 @@ export class DocumentLibrary {
   }
 
   /**
+   * 授权后的二进制快照（阅读视图的唯一字节来源）。
+   *
+   * `target` 必须是先前 open 得到的真实路径：再 realpath 一次，结果变了（符号链接被换指向）
+   * 就按 `changed` 拒绝，而不是跟着新目标走。读完再判一次授权：读的过程中目录可能被撤销。
+   */
+  async snapshot(target: string, expectedFingerprint?: string, signal?: AbortSignal): Promise<SnapshotResult> {
+    let real: string
+    try { real = await this.files.realpath(target) } catch { return { kind: 'missing' } }
+    if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied' }
+    if (fold(real) !== fold(target)) return { kind: 'changed', fingerprint: null }
+    const info = await this.files.stat(real)
+    if (info === null) return { kind: 'missing' }
+    if (info.size > MAX_DOC_BYTES) return { kind: 'too-big', size: info.size }
+    let bytes: Uint8Array
+    try {
+      bytes = await this.files.readBytes(real, signal)
+    } catch (error) {
+      if (error instanceof DocSizeError) return { kind: 'too-big', size: error.size }
+      return { kind: 'unreadable', reason: error instanceof Error ? error.message : String(error) }
+    }
+    if (bytes.byteLength > MAX_DOC_BYTES) return { kind: 'too-big', size: bytes.byteLength }
+    if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied' }
+    const fingerprint = fingerprintBytes(bytes)
+    if (expectedFingerprint !== undefined && fingerprint !== expectedFingerprint) return { kind: 'changed', fingerprint }
+    return { kind: 'snapshot', path: real, bytes, fingerprint }
+  }
+
+  /**
    * 用系统关联的应用打开。
    *
    * 白名单在调用之前挡一道：`openWithAssociatedApp` 的实现是 electron 的 `shell.openPath`，
@@ -637,6 +684,19 @@ export class DocumentLibrary {
    * 打开成功就把所在目录记进"最近选择的范围"，下次用户只说文件名也能找到。
    */
   async reveal(target: string, rememberDir: (dir: string) => void): Promise<RevealResult> {
+    const allowed = await this.authorizedForApp(target)
+    if (!allowed.ok) return allowed
+    try {
+      await this.files.openWithAssociatedApp(allowed.path)
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+    rememberDir(path.dirname(allowed.path))
+    return { ok: true }
+  }
+
+  /** 交给应用打开前的授权与白名单核对，返回真实路径。不读不解析，所以不受讲解的大小上限约束。 */
+  async authorizedForApp(target: string): Promise<{ readonly ok: true; readonly path: string } | { readonly ok: false; readonly error: string }> {
     let real: string
     try { real = await this.files.realpath(target) } catch { return { ok: false, error: '无法确认文件真实路径' } }
     if (!isInsideAuthorized(real, await this.authorizedRoots())) {
@@ -645,12 +705,6 @@ export class DocumentLibrary {
     if (!canOpenWithApp(path.basename(real))) {
       return { ok: false, error: `${extensionOf(real) || '这种'}文件不允许用系统关联打开` }
     }
-    try {
-      await this.files.openWithAssociatedApp(real)
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) }
-    }
-    rememberDir(path.dirname(real))
-    return { ok: true }
+    return { ok: true, path: real }
   }
 }

@@ -21,7 +21,8 @@ import type {
   TeamSnapshot,
 } from '../renderer/types.js'
 import type { HealthBody } from './runtime-launch.ts'
-import type { SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
+import type { CancelReceipt, SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
+import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
 
 export interface BridgeInfo {
   port: number
@@ -46,6 +47,7 @@ export interface BridgeInfo {
 interface ApprovalCredential {
   approvalToken?: string
   reportApprovalToken?: string
+  assistantApprovalToken?: string
   epoch?: string
   port?: number
 }
@@ -56,7 +58,14 @@ export interface ChatReply {
   ok: boolean
   reply?: string
   error?: string
+  /** 这条请求被定向取消时的插件回执；本地停止等待（静音）不会带它。 */
+  cancel?: CancelReceipt
 }
+
+/** outcome 取自插件：existing（已在线，未抢占）/ reattached / resumed / created。 */
+export type SessionStartResult =
+  | { ok: true; outcome: string; owned: boolean; resumeError?: string }
+  | { ok: false; error: string; code?: string }
 
 export interface BridgeCallbacks {
   onStatus: (status: BridgeStatus) => void
@@ -119,9 +128,10 @@ export function readApprovalCredential(): ApprovalCredential | null {
     const raw = JSON.parse(readFileSync(approvalCredentialPath(), 'utf8')) as Partial<ApprovalCredential>
     const approvalToken = typeof raw.approvalToken === 'string' && raw.approvalToken ? raw.approvalToken : undefined
     const reportApprovalToken = typeof raw.reportApprovalToken === 'string' && raw.reportApprovalToken ? raw.reportApprovalToken : undefined
-    if (approvalToken || reportApprovalToken) {
+    const assistantApprovalToken = typeof raw.assistantApprovalToken === 'string' && raw.assistantApprovalToken ? raw.assistantApprovalToken : undefined
+    if (approvalToken || reportApprovalToken || assistantApprovalToken) {
       return {
-        approvalToken, reportApprovalToken,
+        approvalToken, reportApprovalToken, assistantApprovalToken,
         epoch: typeof raw.epoch === 'string' && raw.epoch ? raw.epoch : undefined,
         port: typeof raw.port === 'number' && raw.port > 0 ? raw.port : undefined,
       }
@@ -138,9 +148,27 @@ function sleep(ms: number): Promise<void> {
 
 /** 快照与审批都是短请求，不能让界面挂在一次卡死的连接上。 */
 const SNAPSHOT_TIMEOUT_MS = 4_000
+/**
+ * 证据收件的超时。比快照宽得多：正文可能有几百 KB，插件那边要算哈希并写库。
+ * 4 秒会把一次正常的收件判成失败，用户重试一次就产生两条重复证据。
+ */
+const INTAKE_TIMEOUT_MS = 30_000
 const APPROVAL_TIMEOUT_MS = 10_000
+/** 新建会话要等宿主建 agent，比读快照慢得多；恢复失败再新建也在这一次请求里。 */
+const SESSION_START_TIMEOUT_MS = 30_000
 /** 长轮询服务端 25s 超时返回，客户端要留足余量，否则会先于服务端断开。 */
 const LONG_POLL_TIMEOUT_MS = 30_000
+/** 定向取消要等插件取证（团队任务最多等 5s 的运行结束与释放），客户端留足余量。 */
+const CANCEL_TIMEOUT_MS = 8_000
+/** 宠物发起、后台尚未结算的请求记账上限。 */
+const OUTSTANDING_LIMIT = 64
+
+/** 本地拿不到插件回执时的如实口径：后台状态未知，不重发。 */
+function unknownReceipt(kind: string, message: string, extra: Record<string, unknown> = {}): CancelReceipt {
+  return { state: 'unknown', evidence: { kind, at: Date.now(), ...extra }, message }
+}
+
+const CANCEL_STATES = ['not-executed', 'cancelling', 'terminated', 'partially-executed', 'unknown']
 
 /**
  * 读一次 `/health`，返回响应体；连不上或响应不是 JSON 时返回 null。
@@ -166,6 +194,11 @@ export class BridgeClient {
   private seq = 0
   private stopped = false
   private pending = new Map<string, { resolve: (reply: ChatReply) => void; onDelta?: (text: string) => void }>()
+  /**
+   * 宠物经 /chat 发起、后台还没推回 reply 的请求。与 pending 分开：静音或本地停止等待只解除 pending，
+   * 后台可能仍在跑，「停止生成」靠这份记账才能按请求 id 定向取消它们。
+   */
+  private readonly outstanding = new Map<string, { assistantId?: string; startedAt: number }>()
   private callbacks: BridgeCallbacks | null = null
   private sessionBinding: string | null = null
   private sessionCursor = -1
@@ -203,10 +236,13 @@ export class BridgeClient {
    *
    * `onDelta` 收到的是**显示用**增量文本：最终回复仍以返回值为准。宿主不吐增量时它一次都不会被调用，
    * 调用方要能接受整段回复一次到达。
+   *
+   * `signal` 只停止本地等待（静音、换话题、暂停讲解都走它），**不向后台发取消**：后台可能仍在跑。
+   * 要停掉后台运行用 {@link cancelChat}（按请求 id 定向取消），回执如实区分未执行 / 取消中 / 已终止 / 未知。
    */
   async chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string): Promise<ChatReply> {
     const info = this.info
-    if (!info) return { ok: false, error: '未连接到 dsh 会话：请先在 dsh 里说"召唤宠物"' }
+    if (!info) return { ok: false, error: '未连接到助理运行时：请先从托盘启动团队，或在 dsh 里说"召唤宠物"' }
     const interrupted = (): ChatReply => ({ ok: false, error: signal?.aborted
       ? '已停止等待回复；后台任务是否停止仍需核对，不会自动重发'
       : '助理响应超时，请先核对后台任务状态，不会自动重发' })
@@ -218,6 +254,8 @@ export class BridgeClient {
     const onAbort = (): void => { this.pending.get(id)?.resolve(interrupted()) }
     abortSignal.addEventListener('abort', onAbort, { once: true })
     const timer = setTimeout(() => controller.abort(), 320_000)
+    this.outstanding.set(id, { assistantId, startedAt: Date.now() })
+    while (this.outstanding.size > OUTSTANDING_LIMIT) this.outstanding.delete(this.outstanding.keys().next().value as string)
     try {
       const response = await fetch(`http://127.0.0.1:${info.port}/chat?token=${info.token}`, {
         method: 'POST',
@@ -226,6 +264,8 @@ export class BridgeClient {
         body: JSON.stringify({ id, text, assistantId, epoch: info.epoch, bindingId }),
       })
       if (!response.ok) {
+        // 明确没受理：后台没有这条请求，不必再取消。
+        this.outstanding.delete(id)
         const body = await response.json().catch(() => ({})) as { error?: string }
         if (body.error === 'stale binding') return { ok: false, error: '语音消息的会话绑定已变化，未发送到新会话' }
         if (response.status === 409) {
@@ -242,6 +282,78 @@ export class BridgeClient {
       clearTimeout(timer)
       abortSignal.removeEventListener('abort', onAbort)
       this.pending.delete(id)
+    }
+  }
+
+  /** 是否还有宠物发起、后台尚未结算的请求（「停止生成」据此选择定向取消还是原生 cancel）。 */
+  get hasOutstandingChats(): boolean {
+    return this.outstanding.size > 0
+  }
+
+  /**
+   * 按请求 id 定向取消（POST /chat/cancel）。回执描述后台那次运行的真实状态：
+   * 队列里撤回为未执行；已交给共享主会话只停止等待、后台是否停止未知；团队委派带运行结束 / 释放证据。
+   * 同时解除这条请求的本地等待，迟到的回复不会再完成它。连不上或没有回执时如实报未知，不重发。
+   */
+  async cancelChat(id: string): Promise<CancelReceipt> {
+    const receipt = await this.postCancel('/chat/cancel', { id }, { requestId: id })
+    // 取消中还要能再查一次；其余状态后台已不再归这条请求结算，或无从再取消。
+    if (receipt.state !== 'cancelling') this.outstanding.delete(id)
+    const entry = this.pending.get(id)
+    if (entry) {
+      this.pending.delete(id)
+      entry.resolve({ ok: false, error: receipt.message, cancel: receipt })
+    }
+    return receipt
+  }
+
+  /** 定向取消全部宠物发起、尚未结算的请求；不碰共享会话里别人的轮次。 */
+  async cancelOutstandingChats(): Promise<CancelReceipt[]> {
+    return Promise.all([...this.outstanding.keys()].map(id => this.cancelChat(id)))
+  }
+
+  /** 按团队任务 id 定向取消插件持有的子代理（POST /team/cancel）。 */
+  cancelTeamTask(taskId: string): Promise<CancelReceipt> {
+    return this.postCancel('/team/cancel', { taskId }, { taskId })
+  }
+
+  /** 暂停 / 恢复团队后续步骤（POST /team/pause）：只挡新的领取，不中止在跑的运行。 */
+  async pauseTeam(paused: boolean): Promise<{ ok: boolean; paused: boolean; message: string }> {
+    const info = this.info
+    if (!info || this.stopped) return { ok: false, paused: false, message: '未连接到助理运行时，没有暂停团队后续步骤' }
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/team/pause?token=${encodeURIComponent(info.token)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paused }),
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]),
+      })
+      const body = await response.json().catch(() => ({})) as { ok?: unknown; paused?: unknown; message?: unknown; error?: unknown }
+      const message = typeof body.message === 'string' ? body.message : typeof body.error === 'string' ? body.error : `暂停请求返回 ${response.status}`
+      return { ok: response.ok && body.ok === true, paused: body.paused === true, message }
+    } catch (error) {
+      return { ok: false, paused: false, message: `暂停请求没有送达，团队后续步骤状态未变或未知：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  private async postCancel(route: string, body: Record<string, string>, target: Record<string, string>): Promise<CancelReceipt> {
+    const info = this.info
+    if (!info || this.stopped) {
+      return unknownReceipt('not-connected', '未连接到助理运行时，取消没有送达；后台状态未知，不会自动重发', target)
+    }
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}${route}?token=${encodeURIComponent(info.token)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(CANCEL_TIMEOUT_MS)]),
+      })
+      const parsed = await response.json().catch(() => ({})) as Partial<CancelReceipt> & { error?: unknown; code?: unknown }
+      if (typeof parsed.state === 'string' && CANCEL_STATES.includes(parsed.state) && typeof parsed.message === 'string'
+        && parsed.evidence && typeof parsed.evidence === 'object' && typeof parsed.evidence.kind === 'string') {
+        return { state: parsed.state, evidence: parsed.evidence, message: parsed.message }
+      }
+      const reason = typeof parsed.message === 'string' ? parsed.message : typeof parsed.error === 'string' ? parsed.error : `取消请求返回 ${response.status}`
+      return unknownReceipt(parsed.code === 'unbound' ? 'unbound' : 'no-receipt', `${reason}；后台状态未知，不会自动重发`, target)
+    } catch (error) {
+      return unknownReceipt('transport-error',
+        `取消请求没有得到回执（${error instanceof Error ? error.message : String(error)}）；后台状态未知，不会自动重发`, target)
     }
   }
 
@@ -306,6 +418,36 @@ export class BridgeClient {
 
   private staleSession(): SessionResult { return { ok: false, error: '会话绑定或快照已变化，旧结果已丢弃' } }
 
+  /** 桥接是否在线（插件已加载即可在线，不代表已绑定会话）。 */
+  get connected(): boolean { return this.info !== null && !this.stopped }
+
+  /**
+   * 请插件开启或恢复助理会话（POST /session/start）。
+   *
+   * 已绑定且在线时插件回 existing，不抢网页会话；成功后重拉一次基线，界面以新绑定为准。
+   */
+  async startSession(): Promise<SessionStartResult> {
+    const info = this.info
+    if (!info || this.stopped) return { ok: false, error: '还没连上助理运行时，无法开启会话' }
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/session/start?token=${encodeURIComponent(info.token)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(SESSION_START_TIMEOUT_MS)]),
+      })
+      const body = await response.json().catch(() => ({})) as {
+        ok?: boolean; outcome?: string; owned?: boolean; resumeError?: string; error?: string; code?: string
+      }
+      if (this.stopped || this.info !== info) return { ok: false, error: '桥接已变化，请重试' }
+      if (!response.ok || body.ok !== true || typeof body.outcome !== 'string') {
+        return { ok: false, error: body.error ?? `开启会话失败（${response.status}）`, code: body.code }
+      }
+      if (!await this.pushSessionSnapshot()) return { ok: false, error: '会话已开启，但没有取到会话快照，请点“重新同步会话”' }
+      return { ok: true, outcome: body.outcome, owned: body.owned === true, resumeError: body.resumeError }
+    } catch (error) {
+      return { ok: false, error: `开启会话失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
   private acceptSession(state: SessionSnapshot): void {
     if (state.bindingId !== this.sessionBinding) {
       if (this.sessionBinding) this.retiredBindings.add(this.sessionBinding)
@@ -321,6 +463,22 @@ export class BridgeClient {
     this.callbacks?.onEvent({ type: 'session/update', epoch: this.info?.epoch, payload: { ...result.state, reset: true } })
     this.sessionNeedsBaseline = false
     return true
+  }
+
+  async getActivityState(): Promise<{ active: boolean; capturing: boolean; titles: boolean } | null> {
+    const info = this.info
+    if (!info) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/health?token=${encodeURIComponent(info.token)}`, {
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]),
+      })
+      if (!response.ok || this.info !== info || this.stopped) return null
+      const body = await response.json() as { epoch?: string; activity?: { active?: unknown; capturing?: unknown; titles?: unknown } }
+      if (this.info !== info || body.epoch !== info.epoch) return null
+      const state = body.activity
+      return state && typeof state.active === 'boolean' && typeof state.capturing === 'boolean' && typeof state.titles === 'boolean'
+        ? { active: state.active, capturing: state.capturing, titles: state.titles } : null
+    } catch { return null }
   }
 
   /** 拉一次团队快照。未连接、未开启团队模式或请求失败都返回 null，界面自己降级。 */
@@ -361,7 +519,7 @@ export class BridgeClient {
   }
 
   /** 上报桌面状态（专注 / 可见），插件侧的提醒评估靠它实现"会议与免打扰不提醒"。 */
-  async reportPetState(state: { focus: boolean; visible: boolean }): Promise<void> {
+  async reportPetState(state: { focus: boolean; visible: boolean; meeting: boolean }): Promise<void> {
     const info = this.info
     if (!info) return
     try {
@@ -377,6 +535,41 @@ export class BridgeClient {
   }
 
   /**
+   * 把一份外部证据交给插件（会议纪要 / 窗口文本）。
+   *
+   * **不能静默失败**：调用方要据此告诉用户"收进去了没有"。所以这里返回结构化结果，
+   * 而且把插件给的具体原因（空正文、超上限、类型不符）原样带出来 —— 用户看到的应该是
+   * "窗口里没有读到文字"，而不是一句"操作失败"。
+   */
+  async postEvidenceIntake(request: EvidenceIntakeRequest): Promise<EvidenceIntakeOutcome> {
+    const info = this.info
+    if (!info) return { ok: false, error: '还没连上个人助理，这份证据没有收进去：请先在 dsh 里召唤宠物或从托盘启动助理团队' }
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/evidence/intake?token=${info.token}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+        signal: AbortSignal.timeout(INTAKE_TIMEOUT_MS),
+      })
+      const body = await response.json().catch(() => null) as
+        | { ok?: boolean; materialId?: string; duplicate?: boolean; warning?: string | null; error?: string }
+        | null
+      if (body?.ok === true && typeof body.materialId === 'string') {
+        return {
+          ok: true,
+          materialId: body.materialId,
+          duplicate: body.duplicate === true,
+          warning: typeof body.warning === 'string' ? body.warning : null,
+        }
+      }
+      // 服务端给了原因就用它的；没给就说 HTTP 码，别编一个像样的理由。
+      return { ok: false, error: body?.error ?? `收件失败（HTTP ${response.status}）` }
+    } catch (error) {
+      return { ok: false, error: `收件请求没能送达个人助理：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  /**
    * 批准或驳回一个提案。
    *
    * 走独立凭据（bridge-approval.json）；日报分路由使用日报令牌，团队保留原令牌。
@@ -386,19 +579,21 @@ export class BridgeClient {
     proposalId: string,
     decision: ApprovalDecision,
     windowId?: number,
-    kind: 'team' | 'report' = 'team',
+    kind: 'team' | 'report' | 'assistant' = 'team',
     expectedEpoch?: string,
   ): Promise<DecideApprovalResult> {
     const info = this.info
     if (!info) return { ok: false, error: '未连接到 dsh 会话' }
     const credential = readApprovalCredential()
-    const token = kind === 'report' ? credential?.reportApprovalToken : credential?.approvalToken
+    const token = kind === 'assistant' ? credential?.assistantApprovalToken
+      : kind === 'report' ? credential?.reportApprovalToken : credential?.approvalToken
     if (!token) return { ok: false, error: '没有这类操作的审批凭据，请重新连接助理' }
     if (!credential?.epoch || credential.epoch !== info.epoch
+      || (kind === 'assistant' && credential.port !== info.port)
       || (expectedEpoch !== undefined && expectedEpoch !== info.epoch)) {
       return { ok: false, error: '审批所属会话已变化，请重新查看待办' }
     }
-    const route = kind === 'report' ? '/report-approval' : '/approval'
+    const route = kind === 'assistant' ? '/assistant-approval' : kind === 'report' ? '/report-approval' : '/approval'
     try {
       const response = await fetch(`http://127.0.0.1:${info.port}${route}`, {
         method: 'POST',
@@ -467,6 +662,8 @@ export class BridgeClient {
     this.info = null
     this.seq = 0
     this.sessionGeneration += 1
+    // 新代次的运行时不认识旧请求 id，留着只会让「停止生成」去取消不存在的东西。
+    this.outstanding.clear()
     for (const entry of this.pending.values()) {
       entry.resolve({ ok: false, error: '助理会话已重启，这条消息没有送达' })
     }
@@ -544,6 +741,8 @@ export class BridgeClient {
           continue
         }
         if (event.type === 'reply' && typeof event.id === 'string') {
+          // 后台已为这条请求推过结论（含取消回执）：不再需要定向取消。
+          this.outstanding.delete(event.id)
           this.pending.get(event.id)?.resolve({
             ok: event.ok ?? false,
             reply: event.reply,
@@ -559,9 +758,10 @@ export class BridgeClient {
             this.pending.get(event.id)?.onDelta?.(event.text)
           }
         } else if (event.type === 'session-ended') {
-          this.callbacks?.onStatus('disconnected')
+          // 会话结束不等于桥接消失：插件仍在线（未绑定），之后网页召唤或桌面开启的新会话都从这条事件流到达，
+          // 所以继续轮询；未绑定的空快照随同一批事件到达，不必再伪报"连接断开"。
           this.callbacks?.onSessionEnded()
-          return
+          continue
         } else if (event.type === 'proactive') {
           const message = typeof event.message === 'string' ? event.message : ''
           const payload = (event.payload ?? {}) as { suggestDisable?: unknown }

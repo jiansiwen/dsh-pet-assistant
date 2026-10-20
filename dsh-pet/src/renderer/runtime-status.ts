@@ -8,7 +8,28 @@
  * `Record<CompanionState['link'], string>` 是刻意的：主进程将来加一种连接状态，
  * 这里会直接编译不过，而不是悄悄落到 default 分支显示成"未连接"。
  */
-import type { CompanionState } from './types.js'
+import type { CompanionState, OperationalState } from './types.js'
+
+export function operationLabels(state: OperationalState): Array<{ label: string; value: string }> {
+  const activity = state.connection === 'connected' ? state.activity : null
+  return [
+    { label: '会话连接', value: state.connection === 'connected' ? '已连接' : '未连接' },
+    { label: '麦克风', value: {
+      'wake-requested': '已申请唤醒监听，未验证实际收音', dictation: '听写占用中', meeting: '会议占用中',
+      idle: '未占用', unavailable: '唤醒不可用',
+    }[state.listener] },
+    { label: '活动记录', value: activity === null ? '未取得采集状态'
+      : activity.capturing ? `采样进程运行中${activity.titles ? '（含标题）' : '（不含标题）'}`
+      : activity.active ? '模式已开启，但未在采样' : '已关闭' },
+    { label: '会议', value: state.meeting === null ? '未取得会议状态' : ({
+      idle: '未录制', recording: '录音会话进行中（音轨状态请看会议页）', paused: '已暂停',
+      stopping: '正在停止录音', transcribing: '正在转写', transcribed: '转写已完成',
+      'transcript-failed': '转写失败',
+    } as Record<string, string>)[state.meeting] ?? `会议状态：${state.meeting}` },
+    { label: '朗读', value: state.speaking ? '合成或播放中' : '已静音；不代表后台任务已停止' },
+    { label: '模型会话', value: { idle: '当前空闲（不代表所有外部操作已停止）', running: '处理中', waiting: '等待中', unknown: '未取得运行状态' }[state.execution] },
+  ]
+}
 
 /** 语气驱动配色。文字本身也说明状态，颜色不是唯一载体。 */
 export type RuntimeTone = 'ok' | 'busy' | 'idle' | 'error'

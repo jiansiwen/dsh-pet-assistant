@@ -41,7 +41,7 @@ import {
 import { PET_WIDTH, STAGE_MARGIN } from '../src/renderer/pet-metrics.ts'
 
 /** 编制顺序。座位号跟着它走，所以断言里可以按名字认座位。 */
-const ROSTER = ['唐僧', '孙悟空', '猪八戒', '沙僧', '白龙马'] as const
+const ROSTER = ['总助理', '助理1', '助理2', '助理3', '助理4'] as const
 
 /** 造一批候选人。`busy` 里点名的角色算正在干活，不进场景。 */
 function cast(count: number, busy: readonly string[] = []): SceneCandidate[] {
@@ -91,8 +91,8 @@ describe('人数决定开哪种场景', () => {
 
   test('工作中的成员不算空闲，也不被拉来凑数', () => {
     // 五个人里三个在干活 —— 只剩两个，凑不出麻将，改成闲聊
-    assert.deepEqual(freeCast(cast(5, ['唐僧', '猪八戒', '白龙马'])), ['孙悟空', '沙僧'])
-    assert.equal(sceneForHeadcount(freeCast(cast(5, ['唐僧', '猪八戒', '白龙马'])).length), 'chat')
+    assert.deepEqual(freeCast(cast(5, ['总助理', '助理2', '助理4'])), ['助理1', '助理3'])
+    assert.equal(sceneForHeadcount(freeCast(cast(5, ['总助理', '助理2', '助理4'])).length), 'chat')
   })
 
   test('全员在干活时一个场景都不开：桌面上站着五个假装打牌的角色比空着更误导', () => {
@@ -103,25 +103,25 @@ describe('人数决定开哪种场景', () => {
   test('人数不足时切换成闲聊：麻将散了，歇一小会儿，三个人重开一场', () => {
     const { state, now } = looping(cast(4))
     assert.equal(state.kind, 'mahjong')
-    let current = stepScene(state, cast(4, ['沙僧']), now + 1)
+    let current = stepScene(state, cast(4, ['助理3']), now + 1)
     assert.equal(current.phase, 'exit', '撑不住就散场，不在演到一半时换场景种类')
     // 走完退场
     let at = now + 1
     while (current.kind !== 'none') {
       at += 500
-      current = stepScene(current, cast(4, ['沙僧']), at)
+      current = stepScene(current, cast(4, ['助理3']), at)
     }
     assert.equal(current.kind, 'none')
     // 冷却没过不开场；过了就按现在的三个人重开成闲聊
-    assert.equal(stepScene(current, cast(4, ['沙僧']), current.cooldownUntil - 1), current)
-    const reopened = stepScene(current, cast(4, ['沙僧']), current.cooldownUntil)
+    assert.equal(stepScene(current, cast(4, ['助理3']), current.cooldownUntil - 1), current)
+    const reopened = stepScene(current, cast(4, ['助理3']), current.cooldownUntil)
     assert.equal(reopened.kind, 'chat', '三个人凑不出麻将，改成闲聊 —— 这就是"切换"')
     assert.equal(reopened.phase, 'invite')
   })
 
   test('散场到重开之间的间隔是短冷却，不是自然收场那条长冷却', () => {
     const { state, now } = looping(cast(4))
-    const exiting = stepScene(state, cast(4, ['沙僧']), now + 1)
+    const exiting = stepScene(state, cast(4, ['助理3']), now + 1)
     assert.equal(exiting.cooldownUntil - (now + 1), PHASE_MS.exit + INTERRUPTED_COOLDOWN_MS)
     assert.ok(exiting.cooldownUntil - (now + 1) < PHASE_MS.exit + COOLDOWN_MS)
   })
@@ -144,9 +144,9 @@ describe('场景推进：邀请 → 占位 → 入场 → 循环 → 退场', ()
   })
 
   test('提议者是编制里第一个空闲的角色，不是随便挑的', () => {
-    // 唐僧在干活，所以提议的是孙悟空 —— 按编制顺序，不是按数组下标补位
-    const invite = stepScene(idleScene(0), cast(4, ['唐僧']), 0)
-    assert.equal(invite.proposer, '孙悟空')
+    // 总助理在干活，所以提议的是助理1 —— 按编制顺序，不是按数组下标补位
+    const invite = stepScene(idleScene(0), cast(4, ['总助理']), 0)
+    assert.equal(invite.proposer, '助理1')
     assert.equal(invite.kind, 'chat')
   })
 
@@ -217,10 +217,10 @@ describe('场景推进：邀请 → 占位 → 入场 → 循环 → 退场', ()
 describe('中断：任务一来，座位在同一次步进里就放掉', () => {
   test('循环中有人接到任务，立刻从座位表消失，不等退场动画演完', () => {
     const { state, now } = looping(cast(4))
-    assert.deepEqual(state.seated, ['唐僧', '孙悟空', '猪八戒', '沙僧'])
-    // 沙僧接了任务。这一步就得把它放掉 —— 动画延迟不能阻塞真实任务启动
-    const next = stepScene(state, cast(4, ['沙僧']), now + 1)
-    assert.ok(!next.seated.includes('沙僧'), '接了任务的角色必须在同一次步进里离开座位')
+    assert.deepEqual(state.seated, ['总助理', '助理1', '助理2', '助理3'])
+    // 助理3接了任务。这一步就得把它放掉 —— 动画延迟不能阻塞真实任务启动
+    const next = stepScene(state, cast(4, ['助理3']), now + 1)
+    assert.ok(!next.seated.includes('助理3'), '接了任务的角色必须在同一次步进里离开座位')
     assert.equal(next.phase, 'exit', '剩下三个撑不起麻将，这一场就地散掉')
     assert.equal(next.kind, 'mahjong', '散场途中还是这一场，别在中途换个种类穿帮')
   })
@@ -228,23 +228,23 @@ describe('中断：任务一来，座位在同一次步进里就放掉', () => {
   test('五个人开黑时走掉一个：散场，短冷却之后剩下四个重开一局麻将', () => {
     const { state, now } = looping(cast(5))
     assert.equal(state.kind, 'gaming')
-    let current = stepScene(state, cast(5, ['白龙马']), now + 1)
+    let current = stepScene(state, cast(5, ['助理4']), now + 1)
     // 四个人本来够开麻将，但那是"重开一场"，不是"接着演"：占位之后不原地换场景种类。
     assert.equal(current.phase, 'exit')
-    assert.deepEqual(current.seated, ['唐僧', '孙悟空', '猪八戒', '沙僧'])
+    assert.deepEqual(current.seated, ['总助理', '助理1', '助理2', '助理3'])
     let at = now + 1
     while (current.kind !== 'none') {
       at += 500
-      current = stepScene(current, cast(5, ['白龙马']), at)
+      current = stepScene(current, cast(5, ['助理4']), at)
     }
-    assert.equal(stepScene(current, cast(5, ['白龙马']), current.cooldownUntil).kind, 'mahjong')
+    assert.equal(stepScene(current, cast(5, ['助理4']), current.cooldownUntil).kind, 'mahjong')
   })
 
   test('降到只剩一个人时散场，用的是短冷却', () => {
     const { state, now } = looping(cast(4))
-    const next = stepScene(state, cast(4, ['孙悟空', '猪八戒', '沙僧']), now + 1)
+    const next = stepScene(state, cast(4, ['助理1', '助理2', '助理3']), now + 1)
     assert.equal(next.phase, 'exit')
-    assert.deepEqual(next.seated, ['唐僧'])
+    assert.deepEqual(next.seated, ['总助理'])
     assert.equal(next.cooldownUntil, now + 1 + PHASE_MS.exit + INTERRUPTED_COOLDOWN_MS)
   })
 
@@ -271,17 +271,17 @@ describe('中断：任务一来，座位在同一次步进里就放掉', () => {
 
   test('退场途中人数回升不复活这一场：让它走完，下一场自然带上回来的人', () => {
     const { state, now } = looping(cast(4))
-    const exiting = stepScene(state, cast(4, ['唐僧', '孙悟空', '猪八戒']), now + 1)
+    const exiting = stepScene(state, cast(4, ['总助理', '助理1', '助理2']), now + 1)
     assert.equal(exiting.phase, 'exit')
     const revived = stepScene(exiting, cast(4), now + 2)
     assert.equal(revived.phase, 'exit', '人回来了也不该把退场动画倒放')
-    assert.deepEqual(revived.seated, ['沙僧'])
+    assert.deepEqual(revived.seated, ['助理3'])
   })
 
   test('邀请途中人不够了：直接散伙进冷却，不演退场 —— 那时还没人占位', () => {
     const invite = stepScene(idleScene(0), cast(4), 0)
     assert.equal(invite.phase, 'invite')
-    const next = stepScene(invite, cast(4, ['唐僧', '孙悟空', '猪八戒']), 100)
+    const next = stepScene(invite, cast(4, ['总助理', '助理1', '助理2']), 100)
     assert.equal(next.kind, 'none')
     assert.equal(next.phase, 'exit')
     assert.deepEqual(next.seated, [])
@@ -299,35 +299,35 @@ describe('中断：任务一来，座位在同一次步进里就放掉', () => {
   test('邀请途中丢人：还没人起身，所以重选一个更小的桌面场景，而不是散伙去散步', () => {
     const invite = stepScene(idleScene(0), cast(5), 0)
     assert.equal(invite.kind, 'gaming')
-    const next = stepScene(invite, cast(5, ['白龙马']), 100)
+    const next = stepScene(invite, cast(5, ['助理4']), 100)
     assert.equal(next.kind, 'mahjong', '四个人正好一桌，没必要因为开不成黑就散伙')
     assert.equal(next.phase, 'invite', '还在邀请阶段，没占位就不需要退场')
-    assert.equal(next.proposer, '唐僧')
+    assert.equal(next.proposer, '总助理')
     assert.deepEqual(next.seated, [])
   })
 
   test('邀请途中丢到只剩两三个：重选成闲聊', () => {
     const invite = stepScene(idleScene(0), cast(5), 0)
-    const next = stepScene(invite, cast(5, ['猪八戒', '沙僧', '白龙马']), 100)
+    const next = stepScene(invite, cast(5, ['助理2', '助理3', '助理4']), 100)
     assert.equal(next.kind, 'chat')
     assert.equal(next.phase, 'invite')
   })
 
   test('成员从编制里消失（被停用）与接到任务同样立刻让出座位', () => {
     const { state, now } = looping(cast(4))
-    const shrunk = cast(4).filter(member => member.assistantId !== '猪八戒')
+    const shrunk = cast(4).filter(member => member.assistantId !== '助理2')
     const next = stepScene(state, shrunk, now + 1)
-    assert.ok(!next.seated.includes('猪八戒'), '不在编制里的角色不该继续占着座位')
+    assert.ok(!next.seated.includes('助理2'), '不在编制里的角色不该继续占着座位')
   })
 })
 
 describe('不在场景中途加人', () => {
   test('场景进行中多出一个空闲成员，也不把它塞进座位', () => {
     const { state, now } = looping(cast(4))
-    assert.deepEqual(state.seated, ['唐僧', '孙悟空', '猪八戒', '沙僧'])
-    // 白龙马本来在干活，现在干完了。这一场已经坐满了，它等下一场
+    assert.deepEqual(state.seated, ['总助理', '助理1', '助理2', '助理3'])
+    // 助理4本来在干活，现在干完了。这一场已经坐满了，它等下一场
     const next = stepScene(state, cast(5), now + 1)
-    assert.deepEqual(next.seated, ['唐僧', '孙悟空', '猪八戒', '沙僧'], '中途加人等于打断它刚在演的动作')
+    assert.deepEqual(next.seated, ['总助理', '助理1', '助理2', '助理3'], '中途加人等于打断它刚在演的动作')
     assert.equal(next, state, '什么都没变就该返回原对象')
   })
 
@@ -336,7 +336,7 @@ describe('不在场景中途加人', () => {
     const { state, now } = looping(members)
     let current = state
     let now2 = now
-    // 白龙马加入编制但这一场不加人；等这一场自然收场
+    // 助理4加入编制但这一场不加人；等这一场自然收场
     while (current.kind !== 'none') {
       now2 += PHASE_MS.loop / 4
       current = stepScene(current, cast(5), now2)
@@ -570,7 +570,7 @@ describe('表演节拍：轮到谁、谁反应', () => {
     assert.equal(sceneAction(entering, 0, entering.phaseSince), 'walk')
     const { state: reserved } = advanceTo(idleScene(0), members, 'reserve', 0)
     assert.equal(sceneAction(reserved, 0, reserved.phaseSince), null, '还没起身，交给行为引擎')
-    const exiting = stepScene(entering, cast(4, ['唐僧', '孙悟空', '猪八戒']), entering.phaseSince + 1)
+    const exiting = stepScene(entering, cast(4, ['总助理', '助理1', '助理2']), entering.phaseSince + 1)
     assert.equal(exiting.phase, 'exit')
     assert.equal(sceneAction(exiting, 0, exiting.phaseSince), 'walk')
   })
@@ -629,7 +629,7 @@ describe('朝向：围坐与面对面才像那么回事', () => {
 
   test('没有场景、没有座位表、只剩一个人时都不管朝向', () => {
     assert.equal(sceneFacing(idleScene(0), 0, []), null)
-    const one: SceneState = { ...idleScene(0), kind: 'chat', phase: 'loop', seated: ['唐僧'] }
+    const one: SceneState = { ...idleScene(0), kind: 'chat', phase: 'loop', seated: ['总助理'] }
     assert.equal(sceneFacing(one, 0, sceneSeats(one, WIDE.width, WIDE.height)), null)
     assert.equal(sceneFacing(one, 3, []), null, '座位号越界不该崩，也不该瞎给一个朝向')
   })
@@ -646,7 +646,7 @@ describe('角色投影：场景怎么临时接管一个角色', () => {
 
   test('不在场景里的角色什么都不被接管：走位、动作、朝向全归行为引擎', () => {
     const { state, now } = looping(cast(4))
-    const role = roleOf(state, '白龙马', now)
+    const role = roleOf(state, '助理4', now)
     assert.equal(role.destination, null)
     assert.equal(role.action, null)
     assert.equal(role.facing, null)
@@ -656,13 +656,13 @@ describe('角色投影：场景怎么临时接管一个角色', () => {
 
   test('邀请阶段只有提议者被接管，其余人继续过自己的日子', () => {
     const invite = stepScene(idleScene(0), cast(4), 0)
-    const proposer = roleOf(invite, '唐僧', 0)
+    const proposer = roleOf(invite, '总助理', 0)
     assert.equal(proposer.proposing, true)
     assert.equal(proposer.bound, true)
     assert.equal(proposer.action, 'happy', '提议得有个看得见的动作，不然谁也不知道要开局了')
     assert.equal(proposer.destination, null, '还没占位，谁都不用挪窝')
 
-    const other = roleOf(invite, '孙悟空', 0)
+    const other = roleOf(invite, '助理1', 0)
     assert.equal(other.proposing, false)
     assert.equal(other.bound, false)
     assert.equal(other.action, null)
@@ -672,13 +672,13 @@ describe('角色投影：场景怎么临时接管一个角色', () => {
     // happy 也没有专属素材，但容器类名用的是降级前的动作，pet-anim.css 里
     // `.action-happy .pet-flip` 那条 pa-hop 照样生效 —— 三套皮肤都看得见"跳一下"。
     const invite = stepScene(idleScene(0), cast(4), 0)
-    assert.equal(roleOf(invite, '唐僧', 0).action, 'happy')
+    assert.equal(roleOf(invite, '总助理', 0).action, 'happy')
   })
 
   test('占位阶段还不起步，让"被点到名"有一个静止的瞬间', () => {
     const members = cast(4)
     const { state } = advanceTo(idleScene(0), members, 'reserve', 0)
-    const role = roleOf(state, '唐僧', state.phaseSince)
+    const role = roleOf(state, '总助理', state.phaseSince)
     assert.equal(role.bound, true, '座位已经占了，随机调度这时候就得让路')
     assert.equal(role.destination, null, '占了位就该先愣一下，起步是入场阶段的事')
   })
@@ -688,15 +688,15 @@ describe('角色投影：场景怎么临时接管一个角色', () => {
     const { state } = advanceTo(idleScene(0), members, 'enter', 0)
     const seats = sceneSeats(state, WIDE.width, WIDE.height)
     assert.ok(seats[0].y < seats[2].y, '远排不抬高的话看不出纵深，四个人就是一排贴纸')
-    assert.deepEqual(roleOf(state, '唐僧', state.phaseSince).destination, { x: seats[0].x, y: seats[0].y })
-    assert.deepEqual(roleOf(state, '猪八戒', state.phaseSince).destination, { x: seats[2].x, y: seats[2].y })
+    assert.deepEqual(roleOf(state, '总助理', state.phaseSince).destination, { x: seats[0].x, y: seats[0].y })
+    assert.deepEqual(roleOf(state, '助理2', state.phaseSince).destination, { x: seats[2].x, y: seats[2].y })
   })
 
   test('退场的目的地是自己的家，不是座位：那 2.2 秒里座位已经不代表人在哪儿了', () => {
     const { state, now } = looping(cast(4))
-    const exiting = stepScene(state, cast(4, ['沙僧']), now + 1)
+    const exiting = stepScene(state, cast(4, ['助理3']), now + 1)
     assert.equal(exiting.phase, 'exit')
-    const role = roleOf(exiting, '唐僧', now + 1)
+    const role = roleOf(exiting, '总助理', now + 1)
     assert.deepEqual(role.destination, HOME, '退场是走回自己的位置，不是继续坐在桌子边')
     assert.equal(role.facing, null, '朝着家的方向走，别再盯着已经收掉的桌子')
     assert.equal(role.depth, DEFAULT_DEPTH, '桌子已经收了，没必要还分层')
@@ -716,7 +716,7 @@ describe('角色投影：场景怎么临时接管一个角色', () => {
   test('退场时道具先收：人一个个走掉、桌子还摆在原地，看着像场景坏了', () => {
     const { state, now } = looping(cast(4))
     assert.ok(sceneProp(state, sceneSeats(state, WIDE.width, WIDE.height), WIDE.width, WIDE.height))
-    const exiting = stepScene(state, cast(4, ['沙僧']), now + 1)
+    const exiting = stepScene(state, cast(4, ['助理3']), now + 1)
     assert.equal(exiting.phase, 'exit')
     const seats = sceneSeats(exiting, WIDE.width, WIDE.height)
     assert.equal(sceneProp(exiting, seats, WIDE.width, WIDE.height), null)

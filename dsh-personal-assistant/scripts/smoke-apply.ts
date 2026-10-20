@@ -529,10 +529,11 @@ async function scenarioUpgrade(root: string): Promise<void> {
     const before = countRows(storePath, 'SELECT COUNT(*) AS n FROM observations')
     harness.dispose()
 
-    check('收尾与注册顺序相反：采样器 → 桥接 → 团队 → 主动提醒 → 助理库 → 存储域', () => {
+    check('收尾与注册顺序相反：采样器 → 桥接 → 主动帮助工具 → 团队 → 主动提醒 → 助理库 → 存储域', () => {
       assert.deepEqual(harness.disposalOrder, [
         'personal-assistant:sampler',
         'personal-assistant:bridge',
+        'personal-assistant:help-episodes',
         'personal-assistant:team',
         'personal-assistant:proactive',
         'personal-assistant:store',
@@ -651,9 +652,9 @@ async function scenarioTeam(root: string): Promise<void> {
   seed.upsertMember({
     assistantId: 'member-wukong',
     roleId: 'wukong',
-    displayName: '孙悟空',
+    displayName: '助理1',
     skinId: 'boy-glasses',
-    persona: '你是孙悟空。',
+    persona: '你是助理1。',
     voiceProfile: 'bright-male',
     toolPolicy: { mode: 'read-only', denyTools: [] },
     enabled: true,
@@ -728,7 +729,7 @@ async function scenarioTeam(root: string): Promise<void> {
       }
       assert.ok(harness.section('desktop-team').includes('桌面专家助理团'))
       const roster = harness.variable('desktop_team_roster') ?? ''
-      assert.match(roster, /孙悟空/, '编制变量要能读到已启用成员')
+      assert.match(roster, /助理1/, '编制变量要能读到已启用成员')
       assert.equal(countRows(teamStorePath, 'SELECT COUNT(*) AS n FROM assistants'), 5, 'ensureRoster 补齐五人编制')
       assert.equal(
         String(readCell(assistantStorePath, `SELECT value FROM user_flags WHERE key = 'team_mode_enabled'`)),

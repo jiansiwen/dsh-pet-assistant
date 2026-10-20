@@ -17,8 +17,13 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 
 import { getDataKey, keyFilePath, type DpapiSpawn, type DpapiSpawnResult, type SafeStorageLike } from '../src/main/dpapi.ts'
+import { createHash } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import {
+  DIGEST_PREFIX,
+  FIELD_PREFIX,
   MeetingStore,
+  UNDECRYPTABLE_TEXT,
   validateMeetingConsent,
   type MeetingConsentInput,
   type TranscriptSegment,
@@ -545,6 +550,8 @@ describe('meeting-store：保留期到点删录音，转写与纪要保留', () 
     const meeting = store.getMeeting(meetingId)
     assert.equal(meeting?.state, 'expired')
     assert.equal(store.getSegments(meetingId).length, 1, '转写不是录音，保留期只删录音')
+    assert.equal(store.getSegments(meetingId)[0].text, '留着的转写', '保留期清理后转写仍能解密读出')
+    assert.equal(meeting?.name, CONSENT.name)
     store.close()
   })
 
@@ -574,5 +581,384 @@ describe('meeting-store：助理播报区间', () => {
       { startMs: 5000, endMs: 9000 },
     ])
     store.close()
+  })
+})
+
+// ===== M4-01：库内敏感字段加密、旧库迁移、密钥丢失 =====
+
+const MARKERS = ['M4MARK-NAME', 'M4MARK-CONSENT', 'M4MARK-TEXT', 'M4MARK-LABEL', 'M4MARK-MINUTES', 'M4MARK-DELETED'] as const
+
+/** 库文件 + WAL + SHM 的全部字节（存在的才读）。 */
+function dbFileBytes(dir: string): Array<{ file: string; bytes: Buffer }> {
+  return ['meetings.sqlite', 'meetings.sqlite-wal', 'meetings.sqlite-shm']
+    .map(file => path.join(dir, file))
+    .filter(file => existsSync(file))
+    .map(file => ({ file, bytes: readFileSync(file) }))
+}
+
+function assertNoMarkers(dir: string, where: string): void {
+  const files = dbFileBytes(dir)
+  assert.ok(files.length > 0)
+  for (const { file, bytes } of files) {
+    for (const marker of MARKERS) {
+      assert.ok(!bytes.includes(Buffer.from(marker, 'utf8')), `${where}：${path.basename(file)} 里出现了明文 ${marker}`)
+    }
+  }
+}
+
+function anyMarkerPresent(dir: string): boolean {
+  return dbFileBytes(dir).some(({ bytes }) => MARKERS.some(marker => bytes.includes(Buffer.from(marker, 'utf8'))))
+}
+
+/** 旁路连接读库原始列值（不经 store 解密）。 */
+function rawRows(dir: string): { meetings: unknown[]; segments: unknown[]; minutes: unknown[] } {
+  const db = new DatabaseSync(path.join(dir, 'meetings.sqlite'))
+  try {
+    return {
+      meetings: db.prepare('SELECT id, name, consent FROM meetings ORDER BY id').all().map(row => ({ ...row })),
+      segments: db.prepare('SELECT meetingId, revision, idx, label, text FROM transcript_segments ORDER BY meetingId, idx').all().map(row => ({ ...row })),
+      minutes: db.prepare('SELECT meetingId, revision, content, digest, state, confirmedAt FROM minutes ORDER BY meetingId').all().map(row => ({ ...row })),
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function rawExec(dir: string, sql: string, ...params: Array<string | number | null>): void {
+  const db = new DatabaseSync(path.join(dir, 'meetings.sqlite'))
+  try {
+    db.prepare(sql).run(...params)
+  } finally {
+    db.close()
+  }
+}
+
+const sha = (text: string): string => createHash('sha256').update(text).digest('hex')
+
+const LEGACY_SCHEMA = `
+CREATE TABLE meetings (id TEXT PRIMARY KEY, name TEXT NOT NULL, startedAt INTEGER NOT NULL, endedAt INTEGER, sources TEXT NOT NULL,
+  consent TEXT NOT NULL, retentionDays INTEGER NOT NULL, state TEXT NOT NULL, segmentsRevision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE chunks (meetingId TEXT NOT NULL, seq INTEGER NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (meetingId, seq));
+CREATE TABLE transcript_segments (meetingId TEXT NOT NULL, revision INTEGER NOT NULL, idx INTEGER NOT NULL, speaker TEXT NOT NULL,
+  label TEXT NOT NULL, uncertain INTEGER NOT NULL DEFAULT 1, startMs INTEGER, endMs INTEGER, text TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'asr', PRIMARY KEY (meetingId, idx));
+CREATE TABLE minutes (meetingId TEXT PRIMARY KEY, revision INTEGER NOT NULL, content TEXT NOT NULL, digest TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'draft', confirmedAt INTEGER);
+CREATE TABLE assistant_speech (meetingId TEXT NOT NULL, startMs INTEGER NOT NULL, endMs INTEGER NOT NULL);
+`
+
+const LEGACY_MINUTES = '# 会议纪要 M4MARK-MINUTES\n- 发言人：M4MARK-TEXT-0\n'
+
+/**
+ * 按旧版本的写法造一个明文库：会议 m1（两段转写、已确认纪要）、会议 m2（digest 对不上的已确认纪要），
+ * 外加一行先插后删的明文——旧版本没开 secure_delete，删掉的行会留在空闲空间里。
+ */
+function buildLegacyDb(dir: string): void {
+  const db = new DatabaseSync(path.join(dir, 'meetings.sqlite'))
+  db.exec('PRAGMA journal_mode = WAL')
+  db.exec(LEGACY_SCHEMA)
+  const consent = (name: string): string => JSON.stringify({ ...CONSENT, name, consentText: '同意 M4MARK-CONSENT' })
+  const insertMeeting = db.prepare(
+    "INSERT INTO meetings VALUES (?, ?, 1700000000000, 1700000100000, 'mic', ?, 30, 'transcribed', 1)",
+  )
+  insertMeeting.run('m1', '旧会 M4MARK-NAME-1', consent('旧会 M4MARK-NAME-1'))
+  insertMeeting.run('m2', '旧会 M4MARK-NAME-2', consent('旧会 M4MARK-NAME-2'))
+  const insertSegment = db.prepare("INSERT INTO transcript_segments VALUES ('m1', 1, ?, 's1', ?, 1, ?, ?, ?, 'asr')")
+  insertSegment.run(0, '发言人 M4MARK-LABEL', 0, 4000, '第一段 M4MARK-TEXT-0')
+  insertSegment.run(1, '发言人 M4MARK-LABEL', 4000, 8000, '第二段 M4MARK-TEXT-1')
+  db.prepare("INSERT INTO minutes VALUES ('m1', 1, ?, ?, 'confirmed', 1700000200000)").run(LEGACY_MINUTES, sha(LEGACY_MINUTES))
+  db.prepare("INSERT INTO minutes VALUES ('m2', 1, ?, ?, 'confirmed', 1700000200000)").run('另一份 M4MARK-MINUTES', 'f'.repeat(64))
+  db.prepare("INSERT INTO transcript_segments VALUES ('m2', 1, 9, 's1', 'x', 1, 0, 1, ?, 'asr')").run('删掉的 M4MARK-DELETED '.repeat(20))
+  db.prepare("DELETE FROM transcript_segments WHERE meetingId = 'm2'").run()
+  db.close()
+}
+
+function legacyStore(dir: string, opts: { key?: () => ReturnType<typeof getDataKey>; beforeMigrateRow?: (table: string, rowKey: string) => void } = {}): MeetingStore {
+  return new MeetingStore(dir, {
+    keyProvider: opts.key ?? ((): DpapiKeyOk => ({ status: 'ok', key: FAKE_KEY })),
+    now: fakeClock().now,
+    ...(opts.beforeMigrateRow !== undefined ? { beforeMigrateRow: opts.beforeMigrateRow } : {}),
+  })
+}
+
+/** 新库里造一场带全套敏感字段的会议。 */
+function seedEncrypted(store: MeetingStore): string {
+  const started = store.startMeeting({ ...CONSENT, name: '评审 M4MARK-NAME', consentText: '同意 M4MARK-CONSENT' })
+  if (!started.ok) throw new Error(started.error)
+  const replaced = store.replaceSegments(started.meetingId, [
+    { idx: 0, speaker: 's1', label: '发言人 M4MARK-LABEL', uncertain: true, startMs: 0, endMs: 4000, text: '第一段 M4MARK-TEXT-0', source: 'asr' },
+    { idx: 1, speaker: 's1', label: '发言人 M4MARK-LABEL', uncertain: true, startMs: 4000, endMs: 8000, text: '第二段 M4MARK-TEXT-1', source: 'asr' },
+    { idx: 2, speaker: 's1', label: '发言人 M4MARK-LABEL', uncertain: true, startMs: 8000, endMs: 12000, text: '第三段 M4MARK-TEXT-2', source: 'asr' },
+  ])
+  if (!replaced.ok) throw new Error(replaced.error)
+  const saved = store.saveMinutes(started.meetingId, '# 纪要 M4MARK-MINUTES\n', replaced.revision)
+  if (!saved.ok) throw new Error(saved.error)
+  return started.meetingId
+}
+
+/** 假 DPAPI：XOR 包装（自反），Protect/Unprotect 同一实现；可切换成"解不开"。 */
+function fakeDpapi(): { spawn: DpapiSpawn; calls: string[]; failUnprotect: boolean } {
+  const state = {
+    calls: [] as string[],
+    failUnprotect: false,
+    spawn: ((_command: string, args: readonly string[], input: string): DpapiSpawnResult => {
+      const script = args[args.length - 1]
+      const op = script.includes('Unprotect') ? 'Unprotect' : 'Protect'
+      state.calls.push(op)
+      if (op === 'Unprotect' && state.failUnprotect) return { status: 1, stdout: '', error: new Error('CryptographicException') }
+      const out = Buffer.from(Buffer.from(input, 'base64').map(byte => byte ^ 0x5a)).toString('base64')
+      return { status: 0, stdout: `${out}\n` }
+    }) as DpapiSpawn,
+  }
+  return state
+}
+
+describe('meeting-store：库内敏感字段加密（M4-01）', () => {
+  test('加密往返：名称/同意/转写/纪要读回原文，库与 WAL 字节里没有明文标记', () => {
+    const dir = freshDir()
+    const store = newStore(dir)
+    const meetingId = seedEncrypted(store)
+
+    const meeting = store.getMeeting(meetingId)
+    assert.equal(meeting?.name, '评审 M4MARK-NAME')
+    assert.equal(meeting?.consent.consentText, '同意 M4MARK-CONSENT')
+    assert.equal(meeting?.undecryptable, undefined)
+    const segments = store.getSegments(meetingId)
+    assert.deepEqual(segments.map(segment => segment.text), ['第一段 M4MARK-TEXT-0', '第二段 M4MARK-TEXT-1', '第三段 M4MARK-TEXT-2'])
+    assert.ok(segments.every(segment => segment.label === '发言人 M4MARK-LABEL' && segment.undecryptable === undefined))
+    const minutes = store.getMinutes(meetingId)
+    assert.equal(minutes?.content, '# 纪要 M4MARK-MINUTES\n')
+    assert.equal(minutes?.digest, sha('# 纪要 M4MARK-MINUTES\n'), '对外 digest 仍是 sha256(明文)')
+
+    // 原始列：全部带版本前缀；digest 列是 HMAC，不是可被猜内容比对的明文 sha256。
+    const raw = rawRows(dir) as {
+      meetings: Array<{ name: string; consent: string }>
+      segments: Array<{ label: string; text: string }>
+      minutes: Array<{ content: string; digest: string }>
+    }
+    assert.ok(raw.meetings.every(row => row.name.startsWith(FIELD_PREFIX) && row.consent.startsWith(FIELD_PREFIX)))
+    assert.ok(raw.segments.every(row => row.label.startsWith(FIELD_PREFIX) && row.text.startsWith(FIELD_PREFIX)))
+    assert.ok(raw.minutes[0].content.startsWith(FIELD_PREFIX))
+    assert.ok(raw.minutes[0].digest.startsWith(DIGEST_PREFIX))
+    assert.ok(!raw.minutes[0].digest.includes(sha('# 纪要 M4MARK-MINUTES\n')))
+
+    // 改名/合并/拆分照常可用，写回的仍是密文。
+    assert.equal(store.renameSpeaker(meetingId, 's1', '张三').ok, true)
+    assert.equal(store.splitSegments(meetingId, [2], '李四').ok, true)
+    assert.equal(store.mergeSpeakers(meetingId, 's2', 's1').ok, true)
+    assert.ok(store.getSegments(meetingId).every(segment => segment.label === '张三' && segment.undecryptable === undefined))
+    assert.equal(store.getSegments(meetingId)[2].text, '第三段 M4MARK-TEXT-2')
+
+    assertNoMarkers(dir, '库打开期间')
+    store.close()
+    assertNoMarkers(dir, '库关闭后')
+  })
+
+  test('密文挪行（AAD 不符）或纪要 HMAC 被改：如实标不可解密，修订与确认都拒绝，库不被改写', () => {
+    const dir = freshDir()
+    const store = newStore(dir)
+    const meetingId = seedEncrypted(store)
+    const raw = rawRows(dir) as { segments: Array<{ text: string }> }
+    // 把第 0 段的密文搬到第 1 段：GCM 的 AAD 绑了行键，必须解不开。
+    rawExec(dir, 'UPDATE transcript_segments SET text = ? WHERE meetingId = ? AND idx = 1', raw.segments[0].text, meetingId)
+    const segments = store.getSegments(meetingId)
+    assert.equal(segments[0].text, '第一段 M4MARK-TEXT-0')
+    assert.equal(segments[1].undecryptable, true)
+    assert.equal(segments[1].text, UNDECRYPTABLE_TEXT, '不可解密不能当成正常内容，也不能是空串')
+    const before = rawRows(dir)
+    const renamed = store.renameSpeaker(meetingId, 's1', '张三')
+    assert.equal(renamed.ok, false, '带不可解密段的修订必须拒绝，否则占位文本会被加密写回')
+    assert.equal(store.saveMinutes(meetingId, '新纪要', 1).ok, false)
+    assert.deepEqual(rawRows(dir), before, '拒绝时库里一个字节都不动')
+
+    // 纪要 digest 被改：内容完整性校验不过，按不可解密处理，不能确认。
+    rawExec(dir, 'UPDATE minutes SET digest = ? WHERE meetingId = ?', `${DIGEST_PREFIX}${'0'.repeat(64)}`, meetingId)
+    const minutes = store.getMinutes(meetingId)
+    assert.equal(minutes?.undecryptable, true)
+    assert.equal(minutes?.content, UNDECRYPTABLE_TEXT)
+    assert.equal(store.confirmMinutes(meetingId, { userClicked: true }).ok, false)
+    store.close()
+  })
+
+  test('纪要确认仍绑定 revision 与 digest：同版同文保留确认，改文或修订退回草稿', () => {
+    const store = newStore()
+    const meetingId = seedEncrypted(store)
+    const revision = store.getMeeting(meetingId)?.segmentsRevision ?? 0
+    assert.equal(store.confirmMinutes(meetingId, { userClicked: false }).ok, false)
+    assert.equal(store.confirmMinutes(meetingId, { userClicked: true }).ok, true)
+    // 同 revision 同内容重存：确认保留。
+    assert.equal(store.saveMinutes(meetingId, '# 纪要 M4MARK-MINUTES\n', revision).ok, true)
+    assert.equal(store.getMinutes(meetingId)?.state, 'confirmed')
+    // 内容变了：退回草稿。
+    assert.equal(store.saveMinutes(meetingId, '# 纪要（改）\n', revision).ok, true)
+    assert.equal(store.getMinutes(meetingId)?.state, 'draft')
+    assert.equal(store.getMinutes(meetingId)?.digest, sha('# 纪要（改）\n'))
+    assert.equal(store.confirmMinutes(meetingId, { userClicked: true }).ok, true)
+    // 段修订：退回草稿且旧版不能再确认。
+    store.renameSpeaker(meetingId, 's1', '王五')
+    assert.equal(store.getMinutes(meetingId)?.state, 'draft')
+    assert.equal(store.confirmMinutes(meetingId, { userClicked: true }).ok, false)
+    store.close()
+  })
+})
+
+describe('meeting-store：旧明文库迁移（M4-01）', () => {
+  test('旧库打开即迁移：内容不变、确认保留、库与 WAL 里找不到明文（含已删行残留）；重复迁移幂等', () => {
+    const dir = freshDir()
+    buildLegacyDb(dir)
+    assert.ok(anyMarkerPresent(dir), '前提：旧库里确有明文（否则下面的断言没有鉴别力）')
+
+    const store = legacyStore(dir)
+    const status = store.migrationStatus()
+    assert.equal(status.state, 'migrated')
+    if (status.state === 'migrated') {
+      assert.equal(status.rows, 6, '2 场会议 + 2 段转写 + 2 份纪要')
+      assert.equal(status.checkpoint, 'ok')
+    }
+    assertNoMarkers(dir, '迁移后')
+
+    assert.equal(store.getMeeting('m1')?.name, '旧会 M4MARK-NAME-1')
+    assert.equal(store.getMeeting('m1')?.consent.consentText, '同意 M4MARK-CONSENT')
+    assert.deepEqual(store.getSegments('m1').map(segment => segment.text), ['第一段 M4MARK-TEXT-0', '第二段 M4MARK-TEXT-1'])
+    const minutes = store.getMinutes('m1')
+    assert.equal(minutes?.content, LEGACY_MINUTES)
+    assert.equal(minutes?.digest, sha(LEGACY_MINUTES), '迁移前后 digest 语义一致')
+    assert.equal(minutes?.state, 'confirmed', '绑定成立的确认在迁移后保留')
+    assert.equal(store.getMinutes('m2')?.state, 'draft', '旧 digest 与内容对不上：不能借迁移洗成有效确认')
+
+    // 幂等：再跑一次是空操作，密文逐字节不变；重开库也一样。
+    const snapshot = rawRows(dir)
+    assert.equal(store.migrateLegacyPlaintext().state, 'not-needed')
+    assert.deepEqual(rawRows(dir), snapshot)
+    store.close()
+    const reopened = legacyStore(dir)
+    assert.equal(reopened.migrationStatus().state, 'not-needed')
+    assert.deepEqual(rawRows(dir), snapshot)
+    // 迁移后的旧库照常支持改名/确认。
+    assert.equal(reopened.renameSpeaker('m1', 's1', '张三').ok, true)
+    assert.equal(reopened.getMinutes('m1')?.state, 'draft')
+    reopened.close()
+    assertNoMarkers(dir, '迁移后再修订')
+  })
+
+  test('迁移中途失败：整体回滚、明文原样可读；之后重来能迁完', () => {
+    const dir = freshDir()
+    buildLegacyDb(dir)
+    const before = rawRows(dir)
+    let segmentCalls = 0
+    const store = legacyStore(dir, {
+      beforeMigrateRow: (table) => {
+        if (table === 'transcript_segments' && ++segmentCalls === 2) throw new Error('模拟磁盘错误')
+      },
+    })
+    const status = store.migrationStatus()
+    assert.equal(status.state, 'failed')
+    if (status.state === 'failed') assert.ok(status.error.includes('模拟磁盘错误'))
+    assert.deepEqual(rawRows(dir), before, '失败不得留下半迁移状态（已处理的会议行也要回滚）')
+    // 读取不受影响：旧明文原样返回、不带不可解密标记。
+    assert.equal(store.getMeeting('m1')?.name, '旧会 M4MARK-NAME-1')
+    assert.equal(store.getSegments('m1')[1].text, '第二段 M4MARK-TEXT-1')
+    assert.equal(store.getMinutes('m1')?.digest, sha(LEGACY_MINUTES))
+    store.close()
+
+    const retried = legacyStore(dir)
+    assert.equal(retried.migrationStatus().state, 'migrated')
+    assert.equal(retried.getSegments('m1')[1].text, '第二段 M4MARK-TEXT-1')
+    assert.equal(retried.getMinutes('m1')?.state, 'confirmed')
+    retried.close()
+    assertNoMarkers(dir, '重试迁移后')
+  })
+
+  test('密钥不可用：迁移 blocked、不改库、不崩溃；拿到密钥后（重开）补迁', () => {
+    const dir = freshDir()
+    buildLegacyDb(dir)
+    const before = rawRows(dir)
+    const lost = legacyStore(dir, { key: () => ({ status: 'lost', message: '密钥可能已损坏' }) })
+    const status = lost.migrationStatus()
+    assert.equal(status.state, 'blocked')
+    if (status.state === 'blocked') assert.ok(status.error.includes('密钥'))
+    assert.deepEqual(rawRows(dir), before)
+    assert.equal(lost.getMeeting('m1')?.name, '旧会 M4MARK-NAME-1', '旧明文如实返回（它本来就是明文，不是伪造）')
+    assert.equal(lost.startMeeting(CONSENT).ok, false)
+    lost.close()
+
+    const ok = legacyStore(dir)
+    assert.equal(ok.migrationStatus().state, 'migrated')
+    ok.close()
+    assertNoMarkers(dir, '补迁后')
+  })
+})
+
+describe('meeting-store：密钥丢失/不对时读取明确失败（M4-01）', () => {
+  test('lost 或换了密钥：字段标不可解密，修订/存纪要/确认全拒，库不被改写', () => {
+    const dir = freshDir()
+    const store = newStore(dir)
+    const meetingId = seedEncrypted(store)
+    store.close()
+    const snapshot = rawRows(dir)
+
+    for (const key of [
+      (): ReturnType<typeof getDataKey> => ({ status: 'lost', message: '密钥可能已损坏' }),
+      (): ReturnType<typeof getDataKey> => ({ status: 'ok', key: Buffer.alloc(32, 9) }),
+    ]) {
+      const reopened = newStore(dir, { key })
+      const meeting = reopened.getMeeting(meetingId)
+      assert.equal(meeting?.undecryptable, true)
+      assert.equal(meeting?.name, UNDECRYPTABLE_TEXT)
+      assert.equal(meeting?.consent.consentText, UNDECRYPTABLE_TEXT)
+      assert.equal(reopened.listMeetings().length, 1, '列表不崩溃')
+      const segments = reopened.getSegments(meetingId)
+      assert.ok(segments.length === 3 && segments.every(segment => segment.undecryptable === true && segment.text === UNDECRYPTABLE_TEXT))
+      const minutes = reopened.getMinutes(meetingId)
+      assert.equal(minutes?.undecryptable, true)
+      assert.equal(minutes?.content, UNDECRYPTABLE_TEXT)
+      assert.equal(minutes?.digest, '')
+      assert.equal(reopened.confirmMinutes(meetingId, { userClicked: true }).ok, false)
+      assert.equal(reopened.renameSpeaker(meetingId, 's1', '张三').ok, false)
+      assert.equal(reopened.splitSegments(meetingId, [0], '李四').ok, false)
+      assert.equal(reopened.saveMinutes(meetingId, '# 新纪要', 1).ok, false)
+      reopened.close()
+      assert.deepEqual(rawRows(dir), snapshot)
+    }
+  })
+
+  test('真实 DPAPI 路径（假 spawn）：key.bin 损坏不被覆盖；key.bin 被删也不新建密钥顶替', () => {
+    const dir = freshDir()
+    const dpapi = fakeDpapi()
+    const store = new MeetingStore(dir, { dpapi: { platform: 'win32', spawn: dpapi.spawn }, now: fakeClock().now })
+    const meetingId = seedEncrypted(store)
+    store.close()
+    const wrapped = readFileSync(keyFilePath(dir))
+
+    // 1) 解包失败（损坏/换账户）：读取标不可解密，key.bin 原样。
+    dpapi.failUnprotect = true
+    const broken = new MeetingStore(dir, { dpapi: { platform: 'win32', spawn: dpapi.spawn } })
+    assert.equal(broken.getMeeting(meetingId)?.undecryptable, true)
+    assert.equal(broken.getSegments(meetingId)[0].undecryptable, true)
+    const refused = broken.startMeeting(CONSENT)
+    assert.equal(refused.ok, false)
+    if (!refused.ok) assert.ok(refused.error.includes('密钥'))
+    broken.close()
+    assert.ok(readFileSync(keyFilePath(dir)).equals(wrapped), '损坏密钥文件必须原样保留')
+
+    // 2) key.bin 不见了：库里已有密文，绝不调 Protect 生成新密钥。
+    dpapi.failUnprotect = false
+    rmSync(keyFilePath(dir))
+    dpapi.calls.length = 0
+    const missing = new MeetingStore(dir, { dpapi: { platform: 'win32', spawn: dpapi.spawn } })
+    assert.equal(missing.getMeeting(meetingId)?.name, UNDECRYPTABLE_TEXT)
+    const again = missing.startMeeting(CONSENT)
+    assert.equal(again.ok, false)
+    if (!again.ok) assert.ok(again.error.includes('密钥'))
+    missing.close()
+    assert.equal(existsSync(keyFilePath(dir)), false, '不得新建密钥')
+    assert.deepEqual(dpapi.calls, [], '不得调用 DPAPI 生成新密钥')
+
+    // 3) 把原 key.bin 放回来：数据完好如初。
+    writeFileSync(keyFilePath(dir), wrapped)
+    const restored = new MeetingStore(dir, { dpapi: { platform: 'win32', spawn: dpapi.spawn } })
+    assert.equal(restored.getMeeting(meetingId)?.name, '评审 M4MARK-NAME')
+    assert.equal(restored.getMinutes(meetingId)?.content, '# 纪要 M4MARK-MINUTES\n')
+    restored.close()
   })
 })

@@ -6,24 +6,35 @@
  * - 壳层（`companion-host.ts`）：托盘、启动 dsh 团队运行时的分阶段握手、运行时所有权。
  * 壳层活着不代表角色可见，角色可见也不代表运行时连上了 —— 这两件事各自有各自的状态。
  */
-import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Menu, safeStorage, screen, shell, systemPreferences, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, net, safeStorage, screen, session, shell, systemPreferences, type MenuItemConstructorOptions } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os, { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { ApprovalWindow } from './approval-window.ts'
+import { registerReportWorkbench, type ReportWorkbenchHandle } from './report-workbench-window.ts'
 import { createStreamingSession, pcm16Base64ToFloat32, streamingAvailable, transcribeWav, type StreamingSession } from './asr.ts'
 import { INITIAL_AUDIO_STATE, nextAudio, type AudioEvent, type AudioState, type AudioTransition } from './audio.ts'
+import { AudioPrefsStore, loginItemAction, type AudioPrefs } from './audio-prefs.ts'
+import { kwsModelProblem, startKws, type KwsSession } from './kws.ts'
+import { RendererPlayback, createSwitchingTransport, type RendererReceipt } from './tts-renderer-transport.ts'
+import { TtsCache, voiceFingerprint } from './tts-cache.ts'
+import { WAKE_GREETINGS, fixedPhrases, pickPhrase } from './greetings.ts'
 import { CompanionHost } from './companion-host.ts'
 import { createDocFileSystem } from './doc-fs.ts'
+import { createPlaybackTap } from './doc-presenter.ts'
+import { createDocViewController, type DocViewController, type DocViewHostEvent } from './doc-view-window.ts'
+import { createWpsController, type WpsController } from './wps-control.ts'
+import { WpsViewTarget } from './wps-view-target.ts'
 import {
   askPrompt,
   describeOutline,
   detectDocIntent,
   DocumentLibrary,
   explainPrompt,
+  isPdfName,
   MAX_DOC_BYTES,
   mentionsDocs,
   stemOf,
@@ -32,6 +43,13 @@ import {
   type Outline,
   type ParseResult,
 } from './document.ts'
+import { FirstRunService, toPlanView } from './first-run-service.ts'
+import { intakeMinutes, intakeWindow, type EvidenceConfirmView, type EvidenceIntakeDeps } from './evidence-intake.ts'
+import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
+import { createWinActions, type WinDesktopActions } from './win-actions.ts'
+import { settingsUri, type MediaAccessStatus } from './first-run.ts'
+import { createMacActions } from './mac-actions.ts'
+import type { DownloadConfirmation } from './model-resources.ts'
 import { BridgeClient, type ChatReply } from './harness.ts'
 import {
   addDocRoot,
@@ -43,19 +61,44 @@ import {
   saveSettings,
   type PetId,
 } from './settings.ts'
-import { Narrator, spawnTtsEdgeWorker } from './tts.ts'
-import { VoiceApiStore, transcribeApi } from './voice-api.ts'
+import { Narrator, spawnTtsEdgeWorker, type TtsWorkerEvent } from './tts.ts'
+import { sniffAudioMime } from './tts-edge-worker.ts'
+import { DEFAULT_TTS_VOICE, synthesizeSpeech } from './edge-tts.ts'
+import { VoiceApiStore, synthesizeApi, transcribeApi } from './voice-api.ts'
 import type { VoiceApiKind, VoiceApiResult, VoiceApiState, ResolvedVoiceApi } from '../voice-api-types.ts'
 import { createMeetingRecorder, markAssistantSpeech, registerMeetingIpc, type MeetingRecorder } from './meeting-recorder.ts'
 import { splitIntoSegments } from './speech.ts'
 import { startWakeListener, stopWakeListener } from './wake.ts'
 import { PointerWatcher } from './pointer-watch.ts'
-import { platformOf, recordAudioSpec, supportsGlobalPointerWatch, supportsWakeWord } from './platform.ts'
+import { kwsWakeDeviceVerified, loginItemSpec, loopbackCapability, platformOf, playAudioSpec, recordAudioSpec, supportsGlobalPointerWatch, supportsWakeWord, supportsWpsControl, wakeEngines } from './platform.ts'
+import { resolveAppLayout } from './runtime-launch.ts'
 import { isSessionCommand, shouldDismissOverlay, validBoxes, type OverlayBox } from './overlay-state.ts'
-import type { SessionCommand, SessionSnapshot, SessionUpdate, SessionResult } from '../session-types.ts'
+import type { CancelReceipt, SessionCommand, SessionSnapshot, SessionUpdate, SessionResult } from '../session-types.ts'
 import type { SettingsPage } from '../renderer/types.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * 桌面壳自身的目录布局（开发态 / 打包态的唯一差异点，见 `runtime-launch.ts`）。
+ *
+ * 打包后 `import.meta.url` 落在 `app.asar/dist/main` 里，而**外部读者**（PowerShell、worker
+ * 线程、以 ELECTRON_RUN_AS_NODE 起的子进程）没有 asar 补丁，拿到 asar 内的路径只会报
+ * "找不到文件"。`layout.scriptDir` 已经是解包后的真实目录，凡是交给外部读者的路径都用它。
+ *
+ * 逐字段做能力探测而不是直接读：主进程测试里 electron 是替身，替身不保证提供
+ * `isPackaged` / `getAppPath`，在模块加载阶段硬读会让整个测试套件起不来。
+ */
+function resolveLayout() {
+  const packaged = app.isPackaged === true
+  return resolveAppLayout({
+    mainDir: here,
+    isPackaged: packaged,
+    appPath: packaged && typeof app.getAppPath === 'function' ? app.getAppPath() : undefined,
+    resourcesPath: packaged ? process.resourcesPath : undefined,
+  })
+}
+
+const layout = resolveLayout()
 
 function dshHome(): string {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
@@ -86,7 +129,7 @@ function setPointerWatch(enabled: boolean): void {
   pointerWatcher.setEnabled(enabled)
 }
 
-const pointerWatcher = new PointerWatcher(path.join(here, '../assets/pointer-watch.ps1'), press => {
+const pointerWatcher = new PointerWatcher(path.join(layout.scriptDir, '..', 'assets', 'pointer-watch.ps1'), press => {
   if (!win || !win.isVisible()) return
   const point = screen.screenToDipPoint({ x: press.x, y: press.y })
   const bounds = win.getBounds()
@@ -143,6 +186,8 @@ function stageSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent)
  * 有能力影响签发路径 —— 详见 `approval-window.ts` 的文件头。
  */
 const approvals = new ApprovalWindow(bridge)
+/** 日报工作台：只能请求打开专用审批窗口，自己不批准任何东西。 */
+let reportWorkbench: ReportWorkbenchHandle | null = null
 /** 壳层。app ready 之后才建（要用 userData 目录），所以这里是延迟赋值。 */
 let host: CompanionHost | null = null
 /**
@@ -150,6 +195,42 @@ let host: CompanionHost | null = null
  * 只在主进程里解开送给请求；页面拿到的列表里永远没有密钥本体。
  */
 let voiceApiStore: VoiceApiStore | null = null
+
+/**
+ * 会议要采"对方的声音"（系统回环声）时，必须由主进程批准一次桌面采集。
+ *
+ * Electron 17 起，渲染层的 `getDisplayMedia` 不再自己弹框，而是问主进程的
+ * `setDisplayMediaRequestHandler`；**没有这个处理器，请求直接失败**。
+ * 也就是说：不写这段，会议永远只有麦克风一条轨，"对方的声音"在状态里一直是缺失 ——
+ * 而用户看到的只是"对方没录到"，看不出是我们没实现。
+ *
+ * 三条约束：
+ *
+ * 1. **只在会议录制中批准**。这个应用别的地方不需要抓屏；一个常开的授予等于给页面
+ *    随时抓屏的能力，而这里唯一正当的用途就是会议回环声。
+ * 2. **只要音频，画面立刻在渲染层停掉**。会议不录屏：老板的屏幕上可能有别的东西，
+ *    我们只承诺录声音。`video` 仍然要给 —— Electron 的 handler 要求带上一个源。
+ * 3. macOS 13+ 才支持 `audio: 'loopback'`；更老的系统上它会静默拿不到音轨，
+ *    渲染层据此如实上报缺失（不循环重试、不录空轨）。
+ */
+function configureDisplayMedia(): void {
+  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+    const recording = meetingRecorder?.getState().recording === true
+    if (!recording) {
+      // 不在录会议：拒绝。给 null 而不是空对象，语义是"没有可批准的源"。
+      callback({})
+      return
+    }
+    void desktopCapturer.getSources({ types: ['screen'] }).then(sources => {
+      const primary = sources[0]
+      if (!primary) {
+        callback({})
+        return
+      }
+      callback({ video: primary, audio: 'loopback' })
+    }).catch(() => callback({}))
+  })
+}
 
 function createWindow(): void {
   const display = screen.getPrimaryDisplay().workArea
@@ -217,7 +298,8 @@ let petStageVisible = true
 let petFocusMode = false
 
 function reportPetState(): void {
-  void bridge.reportPetState({ focus: petFocusMode, visible: petStageVisible })
+  // 会议进行中插件不评估主动提醒；状态以录制器为准，不靠界面猜。
+  void bridge.reportPetState({ focus: petFocusMode, visible: petStageVisible, meeting: meetingRecorder?.getState().recording === true })
 }
 
 function applyStageVisible(visible: boolean): void {
@@ -239,46 +321,226 @@ function applyStageVisible(visible: boolean): void {
 /**
  * 麦克风仲裁器：这台机器上只有一个默认录音设备，唤醒词监听与按键听写必须轮流用。
  *
- * 规则全在 `audio.ts` 的纯函数里，这里只做两件事 —— 把状态存住，把副作用执行掉。副作用只有
- * 起/停唤醒监听两种：起两次会留下一个抢麦克风的孤儿进程（它拿静音流，日志还一切正常），
+ * 规则全在 `audio.ts` 的纯函数里，这里只做两件事 —— 把状态存住，把副作用执行掉。副作用是
+ * 起/停唤醒监听与起/停插话监听：起两次会留下一个抢麦克风的孤儿进程（它拿静音流，日志还一切正常），
  * 所以"起停份数和持有者始终对得上"这条被穷举测试钉住了。
+ *
+ * M1-03 之后多一件事：每次转移后把"谁能订阅渲染层共享采集"下发给渲染层（`audio-grants`）。
+ * 渲染层的听写 / 插话 / KWS / 会议麦克风轨只能凭它订阅，授权撤回即强制退订。
  */
 let audioState: AudioState = INITIAL_AUDIO_STATE
+
+/** 常驻与语音开关（唤醒 / 引擎 / 开机自启 / 外放插话）。懒建：userData 路径要等应用名定下来。 */
+let audioPrefsStore: AudioPrefsStore | null = null
+function audioPrefs(): AudioPrefs {
+  if (audioPrefsStore === null) audioPrefsStore = new AudioPrefsStore(path.join(app.getPath('userData'), 'audio-prefs.json'), platformOf())
+  return audioPrefsStore.get()
+}
+
+/** 正在跑的唤醒引擎。stop-wake 按它分派 —— 换引擎时 stop 停的是旧的、start 起的是新的。 */
+let runningWake: 'system' | 'kws' | null = null
+let kwsSession: KwsSession | null = null
+/** 唤醒不可用的原因（给设置页看）。 */
+let wakeProblem: string | null = null
+/** 插话监听最近一次意外结束的原因。 */
+let bargeProblem: string | null = null
+/** 正在录的会议 id：会议麦克风轨的订阅令牌。 */
+let meetingGrantId: string | null = null
+let lastGrants = ''
+
+function audioGrants(): { dictation: boolean; bargeIn: boolean; kws: boolean; meetingId: string | null; autoGainControl: boolean } {
+  return {
+    // 外放插话开着时关自动增益：否则回声残余被放大到人声量级，插话检测分不开（隔离验证实测）。
+    autoGainControl: !audioPrefs().bargeIn,
+    dictation: audioState.holder === 'dictation',
+    bargeIn: audioState.holder === 'barge-in',
+    kws: audioState.holder === 'wake' && runningWake === 'kws',
+    meetingId: audioState.holder === 'meeting' ? meetingGrantId : null,
+  }
+}
+
+function pushAudioGrants(): void {
+  const grants = audioGrants()
+  const key = JSON.stringify(grants)
+  if (key === lastGrants) return
+  lastGrants = key
+  sendToRenderer('audio-grants', grants)
+}
 
 function applyAudio(event: AudioEvent): AudioTransition {
   const turn = nextAudio(audioState, event)
   audioState = turn.state
-  for (const effect of turn.effects) {
-    if (effect === 'start-wake') {
-      // 平台上压根没有唤醒词能力时，**同步**把状态改掉，而不是走 onWakeLost 回调。
-      //
-      // 走回调会造成同步重入：applyAudio → startWakeListener → onLost → applyAudio。
-      // 里层那次会看到"外层的 audioState 刚被写进去、但 effects 还没执行完"的中间态，
-      // 于是 stopWakeListener 被调用在一个还没启动的监听上，状态机与进程的真实情况就分家了。
-      // 这条分支的结论是确定的（能力不存在，不用等任何事件），所以直接改状态最干净。
-      if (!supportsWakeWord(platformOf())) {
-        audioState = { ...audioState, holder: null, wakeUnavailable: true }
-        console.log('[dsh-pet] 语音唤醒只在 Windows 上可用；按键听写与快捷键不受影响')
-        continue
-      }
-      startWakeListener(onWakeWord, onWakeLost)
-    } else {
-      stopWakeListener()
-    }
+  if (event.type === 'meeting-requested' || event.type === 'meeting-finished') meetingGrantId = null
+  if (audioState.holder === 'meeting' || (event.type === 'focus' && event.on)) {
+    sendToRenderer('voice-conversation-stop', null)
+    if (spokenRound?.voiceTurn) interruptSpeech()
   }
+  for (const effect of turn.effects) {
+    if (effect === 'start-wake') startWake()
+    else if (effect === 'stop-wake') stopWake()
+    // 插话监听本身在渲染层：起停就是授权里 bargeIn 的有无，下面统一下发。
+  }
+  pushAudioGrants()
   return turn
 }
 
+/**
+ * 按当前引擎拉起唤醒。
+ *
+ * 能力或模型不存在时，**同步**把状态改掉，而不是走 onWakeLost 回调。
+ * 走回调会造成同步重入：applyAudio → start → onLost → applyAudio。里层那次会看到"外层的
+ * audioState 刚被写进去、但 effects 还没执行完"的中间态，状态机与进程的真实情况就分家了。
+ * 这类分支的结论是确定的（能力 / 模型不存在，不用等任何事件），所以直接改状态最干净。
+ */
+function startWake(): void {
+  const engine = audioPrefs().wakeEngine
+  const unavailable = (reason: string): void => {
+    audioState = { ...audioState, holder: null, wakeUnavailable: true }
+    wakeProblem = reason
+    console.log('[dsh-pet] 语音唤醒不可用（按键听写与快捷键不受影响）：', reason)
+  }
+  if (engine === 'system') {
+    if (!supportsWakeWord(platformOf())) return unavailable('这个系统上没有 System.Speech 唤醒')
+    runningWake = 'system'
+    wakeProblem = null
+    startWakeListener(onWakeWord, onWakeLost)
+    return
+  }
+  if (engine === 'kws') {
+    const problem = kwsModelProblem(app.getPath('userData'))
+    if (problem !== null) return unavailable(problem)
+    runningWake = 'kws'
+    wakeProblem = null
+    // KWS 吃渲染层共享采集：授权（kws=true）随后由 pushAudioGrants 下发，渲染层据此订阅并送 PCM。
+    kwsSession = startKws({
+      userDataDir: app.getPath('userData'),
+      onWake: () => onWakeWord(),
+      onLost: reason => { if (runningWake === 'kws') onWakeLost(reason) },
+      onReady: loadMs => console.log(`[dsh-pet] 本地唤醒模型已加载（${loadMs}ms）`),
+    })
+    return
+  }
+  unavailable('这个系统上还没有可用的本地唤醒方案')
+}
+
+function stopWake(): void {
+  if (runningWake === 'kws') {
+    kwsSession?.stop()
+    kwsSession = null
+  } else {
+    // 包括"没在跑"的情况：wake.ts 在意外退出时排了一个三秒后的自动重启，停一次才清得掉那个定时器。
+    stopWakeListener()
+  }
+  runningWake = null
+}
+
 function onWakeWord(): void {
+  // 诊断：唤醒链路每一步都要能在日志里看见。用户喊了没反应时，第一句就能定位卡在哪：
+  // 路径根本没进来（识别没命中）／被下面某个条件挡住／进来了但在合成/播放阶段失败。
+  console.log('[dsh-pet] 唤醒命中：',
+    JSON.stringify({ holder: audioState.holder, speaking: narrator.isSpeaking(), spokenRound: spokenRound !== null, focus: audioState.focus }))
+  if (spokenRound || narrator.isSpeaking() || audioState.holder === 'meeting') {
+    console.log('[dsh-pet] 唤醒被忽略：正在播报或会议中（这不是故障，喊完等它说完再喊一次）')
+    return
+  }
   // 用户是冲着说话来的：角色藏着就先叫出来，别对着一个隐藏窗口说话。
   host?.setStageVisible(true)
-  sendToRenderer('wake-triggered', null)
+  // 应答要**出声**：每次唤醒只说一句短的，并且换着说法（见 greetings.ts）。
+  // 这句话走**独立的合成与播放**，不经过 Narrator 的会话播报队列：
+  // 那个队列一次只吃一句、还要等 worker ready，任何一次状态残留都会让唤醒"听得见我叫它、
+  // 却听不见它回我"。唤醒应答只是"我听见了"的信号，值得用一条不共享状态的短路径。
+  const greeting = pickPhrase(WAKE_GREETINGS)
+  if (greeting.length > 0) void speakWakeGreeting(greeting)
+  sendToRenderer('wake-triggered', greeting)
+}
+
+/**
+ * 念一句唤醒应答。
+ *
+ * 独立于 Narrator：一来不会被会话播报的"一次一句 / awaitingStop"卡住，二来它失败也只影响
+ * 这一句，不该把正在进行的讲解或回答队列带崩。命中固定话术缓存时直接播本地音频。
+ */
+async function speakWakeGreeting(text: string): Promise<void> {
+  try {
+    const api = voiceApiStore?.resolve('tts') ?? null
+    const voiceKey = api === null ? null : voiceFingerprint({
+      provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
+    })
+    const key = voiceKey === null ? null : { voiceKey, text }
+    const cached = key === null ? null : ttsCache.get(key)
+    const startedAt = Date.now()
+    const audio = cached ?? await synthesizeOneShot(text, api)
+    if (cached === null && key !== null) ttsCache.put(key, audio)
+    playOneShot(audio)
+    // 把耗时打进日志：用户体感"喊完要等好几秒"时，这一行能直接分出是合成慢还是播放慢。
+    console.log(`[dsh-pet] 唤醒应答已出声（${cached === null ? '新合成' : '缓存命中'}，${Date.now() - startedAt}ms）：「${text}」`)
+    // 合成过的句子顺手补齐其余固定话术：下次抽到任何一句都能立刻出声。
+    if (cached === null) void warmGreetingCache(api)
+  } catch (error) {
+    console.log('[dsh-pet] 唤醒应答没能出声：', error instanceof Error ? error.message : String(error))
+  }
+}
+
+/** 合成一句（自定义服务优先，否则 edge-tts）。 */
+async function synthesizeOneShot(text: string, api: ResolvedVoiceApi | null): Promise<Buffer> {
+  if (api !== null) return synthesizeApi(api, text)
+  return synthesizeSpeech({ text, voice: DEFAULT_TTS_VOICE, rate: '+0%', pitch: '+0Hz' })
+}
+
+/**
+ * 把全部固定话术的音频补齐到缓存。
+ *
+ * 唤醒应答是随机挑的：只缓存"用过的那几句"等于每次都有概率抽到没缓存的，
+ * 于是用户会感觉"有时候很快、有时候要等好几秒"。启动后和首次合成后各补齐一次，
+ * 之后每句话都命中缓存，唤醒应答就是本地的、立刻出声。
+ *
+ * 串行是为了不和服务启动抢带宽；失败只记日志，下次启动再补。
+ */
+async function warmGreetingCache(api: ResolvedVoiceApi | null): Promise<void> {
+  try {
+    const voiceKey = api === null ? null : voiceFingerprint({
+      provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
+    })
+    if (voiceKey === null) return
+    for (const text of fixedPhrases()) {
+      if (ttsCache.get({ voiceKey, text }) !== null) continue
+      try {
+        const audio = await synthesizeOneShot(text, api)
+        ttsCache.put({ voiceKey, text }, audio)
+      } catch {
+        // 单句失败不影响其余句子；下次启动会再试。
+      }
+    }
+    console.log('[dsh-pet] 唤醒应答音频已预热完成')
+  } catch (error) {
+    console.log('[dsh-pet] 预热唤醒应答失败：', error instanceof Error ? error.message : String(error))
+  }
+}
+
+/**
+ * 直接播放一段音频字节。
+ *
+ * 用系统播放器（Windows 走 play.ps1 的 MCI、macOS 走 afplay），不经过渲染层：
+ * 渲染层播放要先有音频上下文、还可能因为没有用户手势被自动播放策略挂起 ——
+ * 唤醒应答必须"喊了就响"，不能赌这些条件。
+ */
+function playOneShot(audio: Buffer): void {
+  const mime = sniffAudioMime(audio)
+  const ext = mime === 'audio/wav' ? '.wav' : mime === 'audio/ogg' ? '.ogg' : '.mp3'
+  const dir = mkdtempSync(path.join(tmpdir(), 'dsh-wake-'))
+  const file = path.join(dir, `wake${ext}`)
+  writeFileSync(file, audio)
+  const spec = playAudioSpec(platformOf(), layout.scriptDir, file)
+  if (spec === null) { rmSync(dir, { recursive: true, force: true }); return }
+  const child = spawn(spec.command, [...spec.args], { windowsHide: true, stdio: 'ignore' })
+  child.once('close', () => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* 稍后清理 */ } })
+  child.once('error', () => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* 同上 */ } })
 }
 
 function onWakeLost(reason: string): void {
+  wakeProblem = reason
   applyAudio({ type: 'wake-lost' })
-  // 只写日志，不往渲染层发：界面上还没有读这条的地方，发过去就是个没人接的事件。
-  // 用户修好麦克风之后的恢复入口是托盘上"重新监听唤醒词"。
+  // 原因记进 wakeProblem 给设置页看；恢复入口是托盘"重新监听唤醒词"或设置页的重试。
   console.log('[dsh-pet] 唤醒词监听不可用（按键说话仍然可用）：', reason)
 }
 
@@ -287,32 +549,95 @@ function onWakeLost(reason: string): void {
  *
  * 取消会结束本地请求等待并阻止迟到播报；未取得服务端终止证据前，不声称后台任务已取消。
  */
-let spokenRound: { cancelled: boolean; controller: AbortController; utteranceId: string } | null = null
+interface SpokenRound {
+  cancelled: boolean
+  controller: AbortController
+  utteranceId: string
+  generationDone: boolean
+  played: number
+  voiceTurn?: import('../session-types.ts').VoiceTurn
+}
+let spokenRound: SpokenRound | null = null
 
+function completeSpokenRound(): void {
+  const round = spokenRound
+  if (!round || !round.generationDone || narrator.isSpeaking()) return
+  spokenRound = null
+  if (round.voiceTurn) sendToRenderer('voice-turn-complete', {
+    ...round.voiceTurn, outcome: !round.cancelled && round.played > 0 ? 'played' : 'stopped',
+  })
+}
+
+/**
+ * 静音（M1-06 三种动作之一）：停播放、丢弃本轮待播、暂停讲解链并解除本轮播报的本地等待。
+ * 它**不向后台发取消**——后台请求与团队任务照常运行；要停后台用 cancelCommand 的定向取消。
+ */
 function interruptSpeech(remember = true): void {
+  const chatRound = spokenRound !== null
   pauseDocTalk()
   if (spokenRound) {
-    spokenRound.cancelled = true
-    spokenRound.controller.abort()
-    narrator.dropFeed(spokenRound.utteranceId)
-    narrator.generationEnded()
+    const round = spokenRound
     spokenRound = null
+    round.cancelled = true
+    round.controller.abort()
+    narrator.dropFeed(round.utteranceId)
+    narrator.generationEnded()
+    if (round.voiceTurn) sendToRenderer('voice-turn-complete', { ...round.voiceTurn, outcome: 'stopped' })
   }
   const wasSpeaking = narrator.isSpeaking()
   narrator.interrupt('drop-queue')
-  if (remember && wasSpeaking) interruptedSpeech = narrator.interruptedContext()
+  if (remember && wasSpeaking) {
+    interruptedSpeech = narrator.interruptedContext()
+    interruptedChat = chatRound
+  }
 }
 
 function withInterruptedSpeech(text: string): string {
   const heard = interruptedSpeech
   interruptedSpeech = null
+  interruptedChat = false
   return heard === null ? text : `（上一段讲解被打断了。${heard}。若我要你接着讲，请从这里往下。）\n${text}`
 }
 
-async function sendChatReply(text: string, bindingId: string, spoken: boolean, assistantId?: string): Promise<ChatReply> {
+/** 语音/文字里的会议纪要指令。只在提到"会议"与"纪要/总结"时才命中，避免和普通总结混淆。 */
+const MEETING_MINUTES_INTENT = /(会议|开会|录音|转写)/u
+const MEETING_MINUTES_ACTION = /(纪要|总结|整理|归纳|摘要)/u
+
+export function mentionsMeetingMinutes(text: string): boolean {
+  return MEETING_MINUTES_INTENT.test(text) && MEETING_MINUTES_ACTION.test(text)
+}
+
+/**
+ * 按语音/文字指令直接生成会议纪要。
+ *
+ * 与会议页按钮走同一入口（`meeting-minutes` 的 `generate`）：授权仍然由主进程原生对话框确认，
+ * 语音口令只负责"把这次生成发起出来"，不能替代数据外发授权。
+ */
+async function summarizeMeetingByVoice(): Promise<ChatReply> {
+  const recorder = meetingRecorder
+  if (recorder === null) return { ok: false, error: '会议记录还没准备好，暂时不能生成纪要' }
+  const state = recorder.getState()
+  // 正在录的那场优先；否则取最近结束的一场（recent 已按时间倒序）。
+  const current = state.meetingId
+  const target = current !== null
+    ? { meetingId: current, name: state.name ?? '当前会议', recording: true }
+    : (() => {
+        const last = state.recent.find(item => item.state !== 'recording')
+        return last === undefined ? null : { meetingId: last.id, name: last.name, recording: false }
+      })()
+  if (target === null) return { ok: false, error: '还没有可整理纪要的会议记录：先开一场会议并结束它' }
+  if (target.recording) return { ok: false, error: `《${target.name}》还在录制中，结束后我才能整理` }
+  const result = await recorder.generateModelMinutes(target.meetingId, { userInitiated: true })
+  if (!result.ok) return { ok: false, error: result.error }
+  return { ok: true, reply: `已按《${target.name}》的转写生成会议纪要，可以在会议页查看、逐条修改。` }
+}
+
+async function sendChatReply(text: string, bindingId: string, spoken: boolean, assistantId?: string,
+  voiceTurn?: import('../session-types.ts').VoiceTurn): Promise<ChatReply> {
   interruptSpeech()
   const outgoing = withInterruptedSpeech(text)
-  const round = spoken ? { cancelled: false, controller: new AbortController(), utteranceId: `session-${randomUUID()}` } : null
+  const round: SpokenRound | null = spoken ? { cancelled: false, controller: new AbortController(),
+    utteranceId: `session-${randomUUID()}`, generationDone: false, played: 0, voiceTurn } : null
   spokenRound = round
   if (round) {
     narrator.beginRound()
@@ -345,10 +670,71 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   } finally {
     if (round && spokenRound === round) {
+      round.generationDone = true
       narrator.generationEnded()
-      spokenRound = null
+      completeSpokenRound()
     }
   }
+}
+
+const CANCEL_STATE_LABEL: Record<CancelReceipt['state'], string> = {
+  'not-executed': '未执行', cancelling: '取消中', terminated: '已终止', 'partially-executed': '已部分执行', unknown: '结果未知',
+}
+/** 多条回执里最需要用户关注的排前面：未知 > 部分执行 > 取消中 > 已终止 > 未执行。 */
+const CANCEL_STATE_RANK: Record<CancelReceipt['state'], number> = {
+  unknown: 0, 'partially-executed': 1, cancelling: 2, terminated: 3, 'not-executed': 4,
+}
+
+function receiptNotice(receipts: readonly CancelReceipt[]): string {
+  if (receipts.length === 1) return `${CANCEL_STATE_LABEL[receipts[0].state]}：${receipts[0].message}`
+  const sorted = [...receipts].sort((a, b) => CANCEL_STATE_RANK[a.state] - CANCEL_STATE_RANK[b.state])
+  return `已定向取消 ${receipts.length} 条宠物请求：${sorted.map(item => `${CANCEL_STATE_LABEL[item.state]}（${item.message}）`).join('；')}`
+}
+
+/**
+ * 停止类命令（M1-06）：三种动作分开，取消只按归属传到请求、播报与助理自己持有的任务。
+ * - mute：静音，只停播放与本次播报的本地等待，不向后台发取消；
+ * - pause / resume：暂停讲解与团队后续步骤（不再推进下一步），不中止在跑的运行；
+ * - run（缺省）/ taskId / requestId：定向取消。有宠物发起、未结算的 /chat 请求时只取消它们，绝不顺带取消
+ *   共享会话里网页发起的轮次；没有宠物请求时才走原生 cancel（与网页停止按钮相同）。
+ * HTTP 返回不当成任务终止：回执原样带回，界面按 state 如实显示。
+ */
+async function cancelCommand(command: Extract<SessionCommand, { kind: 'cancel' }>): Promise<SessionResult> {
+  const scope = command.scope ?? 'run'
+  if (command.taskId) {
+    const receipt = await bridge.cancelTeamTask(command.taskId)
+    return { ok: true, receipt, receipts: [receipt], notice: receiptNotice([receipt]) }
+  }
+  if (command.requestId) {
+    const receipt = await bridge.cancelChat(command.requestId)
+    interruptSpeech()
+    pushDocState()
+    return { ok: true, receipt, receipts: [receipt], notice: receiptNotice([receipt]) }
+  }
+  if (scope === 'mute') {
+    interruptSpeech()
+    pushDocState()
+    return { ok: true, notice: '已静音：只停止了播放，后台请求没有被取消' }
+  }
+  if (scope === 'pause' || scope === 'resume') {
+    if (scope === 'pause') {
+      interruptSpeech()
+      pushDocState()
+    }
+    const team = await bridge.pauseTeam(scope === 'pause')
+    const doc = scope === 'pause' ? '讲解已暂停并保留位置' : '讲解需说“继续讲解”才会接着讲'
+    return { ok: true, notice: `${doc}；${team.message}` }
+  }
+  if (bridge.hasOutstandingChats) {
+    // 先取回执再停播报：本地等待由回执解除，用户看到的是后台真实状态而不是「已停止等待」。
+    const receipts = await bridge.cancelOutstandingChats()
+    interruptSpeech()
+    pushDocState()
+    const receipt = [...receipts].sort((a, b) => CANCEL_STATE_RANK[a.state] - CANCEL_STATE_RANK[b.state])[0]
+    return { ok: true, receipt, receipts, notice: receiptNotice(receipts) }
+  }
+  // 没有宠物发起的请求：这是网页或原生队列里的轮次，保持原生 cancel 的现状语义。
+  return bridge.sessionCommand({ kind: 'cancel', bindingId: command.bindingId })
 }
 
 /**
@@ -359,6 +745,8 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
  * 开口时随消息一起送过去，送完即清 —— 一直挂着，三轮之后的消息里还在解释第一轮被打断的事。
  */
 let interruptedSpeech: string | null = null
+/** 最近被打断的是普通回答（不是文档讲解）。与暂停的讲解同时存在时，一句"继续"不替用户猜。 */
+let interruptedChat = false
 
 /**
  * 文档查找与讲解（design.md §2.10）。
@@ -369,6 +757,19 @@ let interruptedSpeech: string | null = null
  * 授权目录每次现取：用户随时可能在面板上增删，缓存一份就等于撤销不生效。
  */
 const documents = new DocumentLibrary(createDocFileSystem(), docSearchRoots)
+/** 合成进程的 started/finished/cancelled 原样旁路给阅读视图：翻页只跟实际播放走，不跟生成速度。 */
+const playbackTap = createPlaybackTap<TtsWorkerEvent>()
+const docView = createDocViewController({ library: documents, subscribePlayback: playbackTap.subscribe, onHostEvent: event => onDocViewEvent(event) })
+/** WPS 辅助脚本首次启动约 8 秒，用户第一次要求用 WPS 时才拉起。 */
+let wpsController: WpsController | null = null
+const wpsControl = (): WpsController => wpsController ??= createWpsController({ scriptDir: layout.scriptDir, ownerPids: [process.pid] })
+const wpsView = createDocViewController({
+  library: documents, subscribePlayback: playbackTap.subscribe, onHostEvent: event => onDocViewEvent(event),
+  target: new WpsViewTarget({ wps: wpsControl, notify: message => sendToRenderer('doc-notice', message) }),
+})
+/** 阅读视图当前展示的是哪一条讲解链、经哪个视图；暂停/停止只作用于它，换文档时不误停新打开的视图。 */
+let presentedSessionId: string | null = null
+let presentedView: DocViewController | null = null
 
 /**
  * 正在逐段讲解的那一份文档。打字或语音问一句普通问题是 null。
@@ -389,6 +790,8 @@ interface DocTalk {
   readonly fingerprint: string
   /** 讲这份文档时点名给谁。没点名就由总助理接待。 */
   readonly assistantId?: string
+  /** 讲解跟随哪个视图：内置阅读视图，或用户点名的 WPS。WPS 不可用时如实说明，不悄悄换成阅读视图。 */
+  readonly via: 'reading' | 'wps'
   /**
    * 这条链要不要出声。
    *
@@ -420,11 +823,76 @@ function pauseDocTalk(): void {
   if (docTalk !== null) docTalk.stopped = true
   docRequest?.abort()
   docRequest = null
+  if (docTalk !== null && docTalk.sessionId === presentedSessionId) presentedView?.pause()
 }
 
 function stopDocTalk(): void {
   pauseDocTalk()
+  if (docTalk !== null && docTalk.sessionId === presentedSessionId) {
+    presentedView?.stop('user')
+    presentedSessionId = null
+  }
   docTalk = null
+}
+
+/** 视图报上来的事：用户脱离/选择，或推进已停止。由这里决定讲解怎么办，不静默继续。 */
+function onDocViewEvent(event: DocViewHostEvent): void {
+  const talk = docTalk
+  const ours = talk !== null && talk.sessionId === presentedSessionId
+  if (event.type === 'detached') {
+    sendToRenderer('doc-notice', talk?.via === 'wps'
+      ? `你在 WPS 里翻到了第 ${event.page} 页，页面不再自动跟随讲解；说“继续讲解”会回到讲解位置`
+      : `已离开讲解位置（看到第 ${event.page} 页）：可在阅读视图里选择回到讲解位置，或从这一页讲`)
+    return
+  }
+  if (event.type === 'choice') {
+    if (event.choice === 'return') { presentedView?.reattach(); return }
+    if (!ours || !talk) return
+    if (event.section === null) { sendToRenderer('doc-notice', `第 ${event.page} 页没有可讲解的文字`); return }
+    void explainDocByPath(talk.path, event.section, true, talk.assistantId, true, talk.via)
+      .then(result => { if (!result.ok && result.error) sendToRenderer('doc-notice', result.error) })
+    return
+  }
+  // 自己叫停（用户停止、讲完、换文档）不再回头处理。
+  if (event.reason === 'user' || event.reason === 'completed' || event.reason === 'replaced') return
+  presentedSessionId = null
+  if (event.reason === 'file-changed' || event.reason === 'unauthorized') {
+    if (ours) stopDocTalk()
+    pushDocState()
+    sendToRenderer('doc-notice', event.reason === 'file-changed'
+      ? '文档内容变了，讲解已停止；请重新打开后再讲'
+      : '文档已不在授权范围，讲解已停止')
+    return
+  }
+  if (ours) interruptSpeech()
+  pushDocState()
+  // WPS 的暂停原因已由视图目标单独提示，这里不再重复一条笼统的话。
+  if (talk?.via !== 'wps') {
+    sendToRenderer('doc-notice', event.reason === 'view-closed'
+      ? '阅读视图已关闭，讲解已暂停；说“继续讲解”可接着讲'
+      : '阅读视图出错，讲解已暂停')
+  }
+}
+
+/**
+ * 给出声的 PDF 讲解打开视图。阅读视图打不开只提示一句、讲解照常；用户点名 WPS 时打不开就返回原因，
+ * 由调用方停下来问用户，不能静默换成阅读视图后报 WPS 成功。
+ */
+async function presentDocView(talk: DocTalk): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!talk.spoken || !isPdfName(talk.path)) {
+    return talk.via === 'wps' && talk.spoken ? { ok: false, error: 'WPS 同步讲解目前只支持 PDF' } : { ok: true }
+  }
+  if (talk.via === 'wps' && !supportsWpsControl(platformOf())) return { ok: false, error: '这个系统上不支持控制 WPS' }
+  const view = talk.via === 'wps' ? wpsView : docView
+  const shown = await view.present({ path: talk.path, fingerprint: talk.fingerprint, sessionId: talk.sessionId, startSection: talk.next })
+  if (shown.ok) {
+    presentedSessionId = talk.sessionId
+    presentedView = view
+    return { ok: true }
+  }
+  if (talk.via === 'wps') return { ok: false, error: `${shown.problem.message}。要改用内置阅读视图讲解吗？说“讲讲${stemOf(talk.name)}”即可` }
+  sendToRenderer('doc-notice', `阅读视图没能打开（${shown.problem.message}），讲解照常进行`)
+  return { ok: true }
 }
 
 function docUtteranceId(talk: DocTalk, index: number): string {
@@ -524,6 +992,7 @@ async function advanceDocTalk(): Promise<void> {
         sendToRenderer('doc-reply', { index, text: explanation })
       }
       const utteranceId = docUtteranceId(talk, index)
+      if (talk.sessionId === presentedSessionId) presentedView?.explanation(index, explanation, talk.sessionId)
       narrator.beginRound()
       narrator.speak({
         utteranceId,
@@ -540,6 +1009,7 @@ async function advanceDocTalk(): Promise<void> {
     }
     if (docTalk === talk && !talk.stopped) {
       sendToRenderer('doc-notice', `《${talk.outline.title}》讲完了`)
+      if (talk.sessionId === presentedSessionId) { presentedView?.stop('completed'); presentedSessionId = null }
       stopDocTalk()
       pushDocState()
     }
@@ -625,6 +1095,21 @@ async function openDocByName(name: string): Promise<ChatReply> {
   return openDocByPath(lookup.hit.path)
 }
 
+/** 「用 WPS 打开某文档」：按 WPS 安装登记指定打开并核验窗口身份，不走系统默认关联。 */
+async function openDocInWps(name: string): Promise<ChatReply> {
+  if (!supportsWpsControl(platformOf())) return { ok: false, error: '这个系统上不支持指定用 WPS 打开' }
+  const lookup = await lookupDoc(name)
+  if (lookup.kind === 'reply') return lookup.reply
+  const allowed = await documents.authorizedForApp(lookup.hit.path)
+  if (!allowed.ok) return { ok: false, error: `打不开：${allowed.error}` }
+  const opened = await wpsControl().open(allowed.path)
+  const title = path.basename(allowed.path)
+  if (!opened.ok) return { ok: false, error: `WPS 没能打开《${title}》：${opened.error.guidance ?? opened.error.message}` }
+  rememberDocDir(path.dirname(allowed.path))
+  const position = opened.value.position
+  return { ok: true, reply: `已用 WPS 打开《${title}》${position ? `（第 ${position.page} / ${position.total} 页）` : ''}。想听讲解就说"用 WPS 讲讲${stemOf(title)}"。` }
+}
+
 async function openDocByPath(target: string): Promise<ChatReply> {
   const revealed = await documents.reveal(target, rememberDocDir)
   if (!revealed.ok) return { ok: false, error: `打不开：${revealed.error}` }
@@ -641,10 +1126,10 @@ async function openDocByPath(target: string): Promise<ChatReply> {
  * 提纲是本地算出来的，不花一次模型调用 —— 让模型去复述文档结构，等于先把整份文档塞给它，
  * 正是那一节明令不要的做法。
  */
-async function explainDocByName(name: string, from: number, speak: boolean, assistantId?: string): Promise<ChatReply> {
+async function explainDocByName(name: string, from: number, speak: boolean, assistantId?: string, via: DocTalk['via'] = 'reading'): Promise<ChatReply> {
   const lookup = await lookupDoc(name)
   if (lookup.kind === 'reply') return lookup.reply
-  return explainDocByPath(lookup.hit.path, from, speak, assistantId)
+  return explainDocByPath(lookup.hit.path, from, speak, assistantId, false, via)
 }
 
 async function explainDocByPath(
@@ -653,6 +1138,7 @@ async function explainDocByPath(
   speak: boolean,
   assistantId?: string,
   strictSection = false,
+  via: DocTalk['via'] = 'reading',
 ): Promise<ChatReply> {
   const bindingId = sessionState?.bindingId
   const revision = docRevision
@@ -674,6 +1160,7 @@ async function explainDocByPath(
     outline,
     fingerprint: opened.doc.fingerprint,
     assistantId,
+    via,
     spoken: speak,
     next: clampSection(from, outline.sections.length),
     sessionId: randomUUID(),
@@ -681,6 +1168,15 @@ async function explainDocByPath(
     completed: new Set(),
     explanations: new Map(),
     stopped: false,
+  }
+  // 视图先装上新讲解计划再装链：装链会停掉旧链，停的只能是旧视图会话（见 presentedSessionId）。
+  if (speak) {
+    const shown = await presentDocView(talk)
+    if (bindingId !== sessionState?.bindingId || revision !== docRevision) {
+      if (presentedSessionId === talk.sessionId) { presentedView?.stop('replaced'); presentedSessionId = null }
+      return { ok: false, error: '会话已改变或讲解已停止，未开始原文档讲解' }
+    }
+    if (!shown.ok) return { ok: false, error: shown.error }
   }
   // 提纲算一次，两处共用：语音那条路念它的第一行，回执铺它的全部。
   const described = describeOutline(outline)
@@ -727,12 +1223,20 @@ async function resumeDocTalk(spoken: boolean): Promise<ChatReply> {
   const opened = await documents.open(talk.path)
   if (docTalk !== talk || revision !== docRevision) return { ok: false, error: '文档讲解已切换或停止。' }
   if (opened.kind !== 'opened' || opened.doc.fingerprint !== talk.fingerprint) {
+    if (talk.sessionId === presentedSessionId) presentedView?.fileChanged()
     stopDocTalk()
     pushDocState()
     return { ok: false, error: '文档已变化或不在授权范围，请重新解析后讲解。' }
   }
-  if (!talk.spoken) return explainDocByPath(talk.path, talk.next, true, talk.assistantId)
+  if (!talk.spoken) return explainDocByPath(talk.path, talk.next, true, talk.assistantId, false, talk.via)
   talk.stopped = false
+  // 视图还开着就接着推进；用户关过视图则重新打开到当前段，不静默只出声。
+  if (talk.sessionId === presentedSessionId) presentedView?.resume()
+  else {
+    const shown = await presentDocView(talk)
+    if (!shown.ok) { talk.stopped = true; return { ok: false, error: shown.error } }
+  }
+  if (docTalk !== talk || talk.stopped) return { ok: false, error: '文档讲解已切换或停止。' }
   void advanceDocTalk()
   return { ok: true, reply: `继续《${talk.name}》，从上次未完整播放的句子接着讲。` }
 }
@@ -822,8 +1326,88 @@ function docRootsPayload(): { roots: string[]; recent: string[] } {
  * 合成进程是懒起的：没用过语音的用户不该为一个常驻的合成进程买单（计划 §11.2 给五个角色
  * 的闲暇开销定了硬指标，一个空转的进程就吃掉不少）。
  */
-const narrator = new Narrator(spawnTtsEdgeWorker, {
+/**
+ * 合成传输的选择（M1-05）：
+ * - 缺省（"外放插话"关）：`spawnTtsEdgeWorker` 原样 —— 合成进程自己用 play.ps1 / afplay 播。
+ * - 打开：合成进程只合成，音频交给渲染层 WebAudio 播（Chromium 回声消除才拿得到参考信号），
+ *   实际开始 / 播完 / 停下的回执按原 TtsTransport 协议转报，Narrator 与阅读视图不需要知道。
+ * 开关在两次讲话之间生效：下一句派发时发现模式变了才换传输，正在播的那句不受影响。
+ */
+/** 固定话术的语音缓存（唤醒应答等）：合成一次，之后按音色复用。 */
+const ttsCache = new TtsCache(app.getPath('userData'))
+
+const rendererPlayback = new RendererPlayback(
+  deliver => spawnTtsEdgeWorker(deliver as (event: TtsWorkerEvent) => void, { synthOnly: true }),  {
+    play: (id, b64) => {
+      if (!win || win.isDestroyed()) return false
+      win.webContents.send('tts-play', { id, b64 })
+      return true
+    },
+    stop: id => sendToRenderer('tts-stop', { id }),
+  },
+  { log: message => console.log('[dsh-pet] ' + message) },
+)
+const openTtsTransport = createSwitchingTransport<'process' | 'renderer'>(
+  () => (audioPrefs().bargeIn ? 'renderer' : 'process'),
+  { process: deliver => spawnTtsEdgeWorker(deliver), renderer: rendererPlayback.open },
+)
+
+/** 插话监听的释放要缓一拍：流式回答的句与句之间 Narrator 会短暂报"没在说"，不能每个空档都起停一次唤醒。 */
+let bargeReleaseTimer: NodeJS.Timeout | null = null
+let bargeHandoverTimer: NodeJS.Timeout | null = null
+/** 最近的插话埋点（只在内存，只有时间没有音频）。 */
+const bargeMetrics: Array<{ onsetToDetectMs: number; detectToSilenceMs: number | null }> = []
+
+function noteSpeakingForBargeIn(speaking: boolean): void {
+  if (speaking) {
+    if (bargeReleaseTimer) { clearTimeout(bargeReleaseTimer); bargeReleaseTimer = null }
+    if (audioPrefs().bargeIn) applyAudio({ type: 'barge-in-requested' })
+    return
+  }
+  if (audioState.holder !== 'barge-in' || bargeReleaseTimer) return
+  bargeReleaseTimer = setTimeout(() => {
+    bargeReleaseTimer = null
+    if (!narrator.isSpeaking()) {
+      applyAudio({ type: 'barge-in-finished' })
+      // 插话监听交回麦克风后必须确保唤醒真的回来了：朗读期间它一直被插话占着，
+      // 用户这时候喊"小潘同学"没反应，正是因为他们以为唤醒一直开着。
+      ensureWakeRunning()
+    }
+  }, 1500)
+  bargeReleaseTimer.unref()
+}
+
+/**
+ * 唤醒监听是否还在跑；没跑而设置又允许时重新拉起。
+ *
+ * 为什么要单独兜一层：麦克风是独占的 —— 听写、会议、外放插话都会把它从唤醒手里拿走。
+ * 任何一条归还路径漏了，用户看到的就是"喊了没反应"，而且没有任何提示。
+ * 这里在每次归还之后做一次幂等检查，而不是依赖每个分支各自记得恢复。
+ *
+ * `wakeUnavailable` 也会被这里清掉：那个标志原本是"粘住等用户点重试"，可实际最常见的
+ * 起因是设备被短暂占用、识别引擎瞬时异常 —— 一次失败就让常驻的宠物永远不再听，用户
+ * 感受到的就是"有时候没反应"。看门狗每 20 秒给它一次机会，是真的取不到设备才会一直失败
+ * （那种情况下 `startWake` 会再次把标志置回，不会反复打印）。
+ */
+function ensureWakeRunning(): void {
+  const prefs = audioPrefs()
+  if (!prefs.wakeEnabled || prefs.wakeEngine === null) return
+  if (audioState.focus || audioState.holder !== null) return
+  if (runningWake !== null) return
+  if (audioState.wakeUnavailable) {
+    // 先清掉粘住的失败标志，再按正常路径重试；仍失败会重新标记，不会无限刷日志。
+    applyAudio({ type: 'wake-retry' })
+    return
+  }
+  applyAudio({ type: 'wake-config', enabled: true })
+}
+
+const narrator = new Narrator(playbackTap.wrap(openTtsTransport), {
   onSpoken: record => {
+    if (spokenRound?.utteranceId === record.segment.utteranceId) {
+      if (record.complete) spokenRound.played++
+      else spokenRound.cancelled = true
+    }
     const talk = docTalk
     const index = record.segment.origin?.paragraph
     if (!talk || !record.complete || index === undefined
@@ -839,6 +1423,7 @@ const narrator = new Narrator(spawnTtsEdgeWorker, {
   },
   onSpeaking: (speaking) => {
     sendToRenderer('speech-state', { speaking })
+    noteSpeakingForBargeIn(speaking)
     // 助理播报区间记进会议：纪要里这些段单列，不算真人发言。
     const startedAt = meetingRecorder?.getState().startedAt ?? null
     if (speaking) {
@@ -848,12 +1433,14 @@ const narrator = new Narrator(spawnTtsEdgeWorker, {
       assistantSpeechStartedAt = null
     }
     // 上一段念完了，接着讲下一段。打字问答不受影响：docTalk 为 null 时这里什么都不做。
-    if (!speaking) void advanceDocTalk()
+    if (!speaking) {
+      completeSpokenRound()
+      void advanceDocTalk()
+    }
   },
   onVoice: voice => console.log('[dsh-pet] 语音合成音色：', voice),
   onError: reason => {
-    console.log('[dsh-pet] 语音合成不可用：', reason)
-    // 念不出来是个听不见的故障：不报一句，用户只会觉得"它没反应"，然后去重启整个壳。
+    console.log('[dsh-pet] 语音合成不可用：', reason)    // 念不出来是个听不见的故障：不报一句，用户只会觉得"它没反应"，然后去重启整个壳。
     sendToRenderer('speech-state', { speaking: false, error: reason })
     if (spokenRound) {
       spokenRound.cancelled = true
@@ -873,6 +1460,8 @@ const narrator = new Narrator(spawnTtsEdgeWorker, {
 }, {
   // 派发每一句时才取配置：用户中途换服务，下一句就走新的，不用重启播放器。
   ttsApi: (): ResolvedVoiceApi | null => voiceApiStore?.resolve('tts') ?? null,
+  // 固定话术（唤醒应答等）合成一次就落盘复用；换音色自动失效重合成。
+  cache: ttsCache,
 })
 
 let exitFallbackTimer: NodeJS.Timeout | null = null
@@ -958,6 +1547,7 @@ function buildContextMenu(target: MenuTarget | null): Menu {
     { label: '团队管理', click: () => openSettings('team') },
     { label: '文档管理', click: () => openSettings('doc') },
     { label: '会议', click: () => openSettings('meeting') },
+    { label: '日报工作台', click: () => reportWorkbench?.open() },
     { label: '日报文件夹', click: () => { void shell.openPath(path.join(dshHome(), 'personal-assistant', 'reports')) } },
     { type: 'separator' },
     { label: '隐藏角色（截图 / 录屏）', click: () => host?.setStageVisible(false) },
@@ -966,13 +1556,60 @@ function buildContextMenu(target: MenuTarget | null): Menu {
   return Menu.buildFromTemplate(items)
 }
 
+/**
+ * 开启或恢复助理会话。已在线就沿用（不抢网页会话）；插件已加载但未绑定就请它新建或恢复；
+ * 连运行时都没有时先按壳的规则附着或启动自有运行时。首次活动采集仍要走可信审批，这里不开采集。
+ */
+async function startAssistantSession(): Promise<SessionResult & { outcome?: string }> {
+  if (sessionState && sessionState.status !== 'disconnected' && sessionState.capabilities.prompt) {
+    return { ok: true, state: sessionState, outcome: 'existing' }
+  }
+  if (!bridge.connected) {
+    if (!host) return { ok: false, error: '没有找到助理运行时：请先启动 dsh 并加载助理插件' }
+    await host.startRuntime()
+    const deadline = Date.now() + 15_000
+    while (!bridge.connected && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 500))
+    if (!bridge.connected) return { ok: false, error: '助理运行时没有就绪：请看设置页“运行时与诊断”里的最新提示' }
+  }
+  const started = await bridge.startSession()
+  if (!started.ok) {
+    return { ok: false, error: started.code === 'agents-unavailable'
+      ? '当前 dsh 运行时不支持由桌面开启会话，请在 dsh 会话里说“召唤宠物”'
+      : started.error }
+  }
+  if (!sessionState || sessionState.status === 'disconnected') return { ok: false, error: '会话已开启，但还没有同步到会话状态，请稍后重试' }
+  const notice = started.resumeError ? `已新建助理会话（上次的会话没能恢复：${started.resumeError}）` : undefined
+  return { ok: true, state: sessionState, outcome: started.outcome, notice }
+}
+
 async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' }>, assistantId?: string): Promise<SessionResult & ChatReply> {
-  if (command.text.trim().startsWith('/')) return bridge.sessionCommand({ ...command, spoken: false })
+  let voiceTurn = command.voiceTurn
+  if (voiceTurn && (voiceTurn.bindingId !== command.bindingId || !Number.isSafeInteger(voiceTurn.generation)
+    || typeof voiceTurn.roundId !== 'string' || voiceTurn.roundId.length > 128 || !command.spoken)) {
+    return { ok: false, error: '连续对话轮次无效' }
+  }
+  if (voiceTurn && (!loadSettings().voiceConversation || !loadSettings().continuousVoice)) {
+    return { ok: false, error: '连续对话选项已关闭' }
+  }
+  // 真正走文档、斜杠或专家路径时退出连续对话，不让文档自身的逐段推进被续听打断。
+  // 只含"讲/说说"这类动词但没对上文档的普通问句仍按连续对话处理。
+  const exclude = () => {
+    if (voiceTurn) sendToRenderer('voice-turn-complete', { ...voiceTurn, outcome: 'excluded' })
+    else sendToRenderer('voice-conversation-stop', null)
+    voiceTurn = undefined
+  }
+  if (assistantId || docTalk || command.text.trim().startsWith('/')
+    || /^(继续讲解|接着讲|继续讲|停止讲解|暂停讲解|结束讲解)/u.test(command.text.trim())) exclude()
+  if (command.text.trim().startsWith('/')) return bridge.sessionCommand({ ...command, voiceTurn: undefined, spoken: false })
   const current = () => command.bindingId === sessionState?.bindingId && sessionState.status !== 'disconnected'
   const text = command.text.trim().replace(/[。！!，,\s]+$/u, '')
   let local: ChatReply | null = null
   if (!assistantId) {
-    if (/^(继续讲解|接着讲|继续讲)$/.test(text) || (text === '继续' && docTalk !== null)) {
+    if (text === '继续' && docTalk !== null && interruptedChat && interruptedSpeech !== null) {
+      // 两件事都停在半路：讲解和刚才的回答。只有一件时才替用户接着做。
+      local = { ok: true, reply: `有两件被打断的事：《${docTalk.name}》的讲解，和刚才的回答。说“继续讲解”接着讲文档，说“接着说”继续刚才的回答。` }
+    } else if (/^(继续讲解|接着讲|继续讲)$/.test(text) || (text === '继续' && docTalk !== null)) {
+      interruptedChat = false
       local = await resumeDocTalk(command.spoken === true)
     } else if (/^(停止讲解|暂停讲解|结束讲解)$/.test(text) || (text === '停一下' && docTalk !== null)) {
       interruptSpeech()
@@ -982,11 +1619,34 @@ async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' 
     } else if (mentionsDocs(text)) {
       const intent = detectDocIntent(text, await docCandidates())
       if (!current()) return { ok: false, error: '会话已改变，文档请求未继续执行' }
-      if (intent.kind === 'open') local = await openDocByName(intent.mention.file.name)
-      if (intent.kind === 'explain') local = await explainDocByName(intent.mention.file.name, 0, command.spoken === true)
-      if (local?.ok && current()) sendToRenderer('settings-open', 'doc')
+      if (intent.kind !== 'none') exclude()
+      // 点名 WPS 就按指定应用处理；WPS 不可用时如实说明，不悄悄换成系统关联或阅读视图。
+      const viaWps = /wps/iu.test(text)
+      if (intent.kind === 'open') local = viaWps ? await openDocInWps(intent.mention.file.name) : await openDocByName(intent.mention.file.name)
+      if (intent.kind === 'explain') {
+        // 语音发起的讲解直接开讲；打字发起时按“朗读回复”设置决定是否出声（用户明确打开过就该念）。
+        // 不出声时仍要打开文档面板：否则用户只看到一句提纲，既没有文档也没有讲解入口。
+        const wantSpeak = command.spoken === true || loadSettings().readReplies === true
+        local = await explainDocByName(intent.mention.file.name, 0, wantSpeak, undefined, viaWps ? 'wps' : 'reading')
+        if (local.ok && viaWps && !wantSpeak) {
+          const shown = await openDocInWps(intent.mention.file.name)
+          local = { ...local, reply: `${local.reply ?? ''}\n${shown.ok ? shown.reply ?? '' : shown.error ?? ''}` }
+        }
+        if (local.ok && command.spoken !== true) {
+          // PDF 在出声时会由阅读视图显示；不出声或其他格式没有视图，至少把文档面板打开。
+          if (!wantSpeak || !isPdfName(intent.mention.file.name)) sendToRenderer('settings-open', 'doc')
+        }
+      }
+      // 文档结果属于对话：展开会话框把这件事说出来；不出声时上面已把文档面板一起打开。
+      if (local?.ok && current()) sendToRenderer('summon', null)
+    } else if (mentionsMeetingMinutes(text)) {
+      // 「总结会议纪要」直接触发模型纪要，不必再手动去会议页点按钮。
+      // 数据外发仍然要过原生对话框确认（授权不能由语音口令替代），这里只负责把流程跑起来。
+      exclude()
+      local = await summarizeMeetingByVoice()
+      if (current()) sendToRenderer('summon', null)
     }
-    if (!local && docTalk && /[？?]|为什么|这里|这句|这一段|这个|刚才/u.test(text)) {
+    if (!local && docTalk && /[？?]|什么|怎么|为什么|如何|哪|吗|呢|多少|是不是|能不能|这段|这里|这句|这个|刚才/u.test(text)) {
       const talk = docTalk
       local = await askAboutDoc(talk.path, talk.next, command.text, undefined, command.spoken === true)
     }
@@ -996,7 +1656,11 @@ async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' 
     if (local.reply) sendToRenderer('doc-notice', local.reply)
     return { ...local, notice: local.reply?.split('\n')[0] }
   }
-  if (command.spoken || assistantId) return sendChatReply(command.text, command.bindingId, command.spoken === true, assistantId)
+  // 朗读回复打开时，打字发出的消息也把回答念出来（原来只有语音发起的那一轮会念）。
+  const readReplies = loadSettings().readReplies === true
+  if (command.spoken || assistantId || readReplies) {
+    return sendChatReply(command.text, command.bindingId, command.spoken === true || readReplies, assistantId, voiceTurn)
+  }
   interruptSpeech()
   return bridge.sessionCommand({ ...command, text: withInterruptedSpeech(command.text), spoken: false })
 }
@@ -1005,12 +1669,145 @@ function registerIpc(): void {
   meetingRecorder = createMeetingRecorder({
     userDataDir: app.getPath('userData'),
     audio: applyAudio,
-    notifyRenderer: sendToRenderer,
+    notifyRenderer: (channel: string, payload: unknown) => {
+      // 会议开始：先把会议麦克风轨的授权（令牌 = 会议 id）下发，再通知渲染层开采 —— 顺序反了它订阅不上。
+      if (channel === 'meeting-started' && payload !== null && typeof payload === 'object'
+        && typeof (payload as { meetingId?: unknown }).meetingId === 'string') {
+        meetingGrantId = (payload as { meetingId: string }).meetingId
+        pushAudioGrants()
+      }
+      sendToRenderer(channel, payload)
+      if (channel === 'meeting-state-changed' || channel === 'meeting-started') reportPetState()
+    },
     // 密钥包装手段按平台分派（`dpapi.ts`）：Windows 走 DPAPI，macOS/Linux 走 safeStorage。
     // 这里把 safeStorage 递进去 —— dpapi.ts 自己不许 import electron（要能被 node --test 导入）。
     storeDeps: { dpapi: { safeStorage } },
+    // 纪要草稿经当前会话的模型生成。会议文字会进入该会话的上下文与历史：这一点写进授权说明，由用户决定。
+    summarize: (prompt, signal) => bridge.chat(prompt, undefined, signal, undefined, sessionState?.bindingId),
+    // 数据去向授权只走主进程原生对话框：用户在会议页点按钮后才会被调用，模型够不到这条路。
+    confirmEgress: async summary => {
+      try {
+        const { response } = await dialog.showMessageBox({
+          type: 'question',
+          title: '发送会议文字给模型？',
+          message: '用模型生成会议纪要需要发送会议文字',
+          detail: `${summary}\n\n这些文字会进入当前 dsh 会话的对话历史。`,
+          buttons: ['同意发送', '取消'],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        })
+        return response === 0
+      } catch {
+        return false
+      }
+    },
+    egressTarget: '当前 dsh 会话所用的模型服务商',
   })
   registerMeetingIpc({ ipc: ipcMain, recorder: meetingRecorder })
+
+  /**
+   * 系统音频（会议里的"对方的声音"）现在能不能采。
+   *
+   * 渲染层在开会前问一次，拿不到就不去尝试 —— 无权限时反复调 `getDisplayMedia` 只会
+   * 一次次被拒，日志刷满而用户什么也得不到；更糟的是循环重试会让人误以为"等一会儿就好了"。
+   *
+   * **麦克风权限与系统音频权限是两件事**（macOS 上尤其明显：前者在"麦克风"页，
+   * 后者在"屏幕与系统录音"页）。所以这里只回答后者，麦克风由 `getUserMedia` 自己报。
+   */
+  ipcMain.handle('meeting-loopback-capability', () => {
+    const platform = platformOf()
+    let screenAccess = 'unknown'
+    if (platform === 'darwin') {
+      try {
+        // Electron 里屏幕采集状态就用 'screen' 这个 key（没有单独的"系统音频"项）。
+        screenAccess = systemPreferences.getMediaAccessStatus('screen')
+      } catch {
+        // 读不到就当未知：放行去试，真拿不到时渲染层会如实上报缺失。
+        screenAccess = 'unknown'
+      }
+    }
+    return loopbackCapability(platform, screenAccess)
+  })
+
+  // ===== 外部证据收件（M3-03 / M4-06 后续）=====
+  //
+  // 两件事共用一套流程：取内容 → 原生对话框确认（显示真实正文预览）→ 上报插件。
+  // 编排在 `evidence-intake.ts` 里，这里只负责把"读窗口""取纪要""弹框""上报"接上真东西。
+  //
+  // Windows 的动作辅助进程按需创建：只有用了「记录当前窗口」才会拉起，
+  // 平时不为了一个可能用不到的功能常驻一个 PowerShell。
+  let evidenceActions: WinDesktopActions | null = null
+  const readForegroundForEvidence = async (): Promise<{ ok: true; text: string; title: string } | { ok: false; error: string }> => {
+    if (platformOf() !== 'win32') {
+      // 诚实说明做不到，而不是给一个点了没反应的按钮。
+      return {
+        ok: false,
+        error: 'macOS 上还没有实现「记录当前窗口」：系统需要按应用逐个适配辅助功能接口，这部分代码未完成。可以先在会话里让助理读取项目文件作为证据',
+      }
+    }
+    try {
+      evidenceActions ??= createWinActions({ scriptDir: layout.scriptDir })
+      const result = await evidenceActions.readForegroundText({
+        authorized: true,
+        reason: '用户主动要求把当前窗口内容记为工作证据',
+        maxChars: 20_000,
+      })
+      if (!result.ok) return { ok: false, error: `读不到当前窗口：${result.error.message}` }
+      return { ok: true, text: result.value.text, title: result.value.identity.title || '（无标题窗口）' }
+    } catch (error) {
+      return { ok: false, error: `读取当前窗口失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  const evidenceDeps: EvidenceIntakeDeps = {
+    confirm: async (view: EvidenceConfirmView): Promise<boolean> => {
+      // 用主进程原生对话框：渲染层弹的框可以被页面自己的样式伪装，
+      // 而"这段文字要不要交出去"必须由不可伪造的一方来问。
+      const detail = [
+        view.kind === 'meeting_minutes' ? `会议：${view.title}` : `窗口：${view.title}`,
+        `内容：${view.sizeText}`,
+        '',
+        '将记下的内容（开头部分）：',
+        view.preview,
+        '',
+        `去向：${view.destination}`,
+      ].join('\n')
+      const choice = await dialog.showMessageBox({
+        type: 'question',
+        buttons: ['取消', view.confirmLabel],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        title: '记为工作证据',
+        message: view.kind === 'meeting_minutes' ? '把这场会议的纪要交给个人助理？' : '把这段窗口文字记为工作证据？',
+        detail,
+      })
+      return choice.response === 1
+    },
+    post: (request: EvidenceIntakeRequest) => bridge.postEvidenceIntake(request),
+    readWindowText: readForegroundForEvidence,
+    exportMinutes: async (meetingId: string) => {
+      const recorder = meetingRecorder
+      if (!recorder) return { ok: false as const, error: '会议库还没就绪' }
+      const exported = recorder.exportMinutes(meetingId)
+      return exported.ok
+        ? { ok: true as const, content: exported.content, digest: exported.digest, confirmedAt: exported.confirmedAt }
+        : { ok: false as const, error: exported.error }
+    },
+    meetingName: async (meetingId: string) => meetingRecorder?.meetingName(meetingId) ?? null,
+    now: () => Date.now(),
+  }
+
+  ipcMain.handle('evidence-intake-minutes', (_event, meetingId: unknown): Promise<EvidenceIntakeOutcome> => {
+    if (typeof meetingId !== 'string' || meetingId.trim() === '') {
+      return Promise.resolve({ ok: false, error: '缺少会议编号' })
+    }
+    return intakeMinutes(meetingId, evidenceDeps)
+  })
+
+  ipcMain.handle('evidence-intake-window', (): Promise<EvidenceIntakeOutcome> => intakeWindow(evidenceDeps))
+
   meetingRecorder.sweepRetention()
   setInterval(() => meetingRecorder?.sweepRetention(), 6 * 3_600_000).unref()
 
@@ -1039,6 +1836,97 @@ function registerIpc(): void {
   ipcMain.handle('voice-api-remove', (_event, id: unknown) => voiceApiCall(() => apis.remove(id)))
   ipcMain.handle('voice-api-select', (_event, kind: unknown, id: unknown) => voiceApiCall(() => apis.select(kind as VoiceApiKind, id)))
 
+  // ===== 首次使用检查（M5-06 界面部分）=====
+  //
+  // 主进程只做"查"和"在用户确认后执行"，不主动下载、不主动申请权限：每一个会改动系统设置
+  // 或写盘的动作用户都要在界面上点一次（`firstRunReport` 里的 nextSteps 就是那些入口）。
+  //
+  // fetch 用 Electron 的 `net.fetch` 而不是全局 fetch：它走系统代理设置，公司网络下这是
+  // 唯一能通的那条路。注意它只在 app ready 之后可用 —— 这个 handler 只在用户点开检查时才调。
+  const firstRun = new FirstRunService({
+    userDataDir: app.getPath('userData'),
+    platform: platformOf(),
+    layout,
+    dshHome: dshHome(),
+    profile: () => loadSettings().runtimeProfile || 'web',
+    mediaAccess: () => {
+      try {
+        return systemPreferences.getMediaAccessStatus('microphone') as MediaAccessStatus
+      } catch {
+        // Windows 上这个接口对 microphone 也返回结果，但旧版本可能抛错 —— 读不到就如实说读不到。
+        return 'unknown'
+      }
+    },
+    macPermissions: async () => {
+      if (platformOf() !== 'darwin') return {}
+      const status = await createMacActions({}).checkPermissions()
+      // 探测本身失败时返回 unknown，而不是把"没查成"说成"没授权"。
+      return status.ok ? status.value : {}
+    },
+    voiceApi: () => {
+      // 「用户在设置里自配了自建服务」看的是选中的那一项，不是有没有配过别的。
+      // 存储可能还没建起来（装配顺序），那就按"没有自配"算 —— 报告里会显示走默认云端朗读。
+      const state = voiceApiStore?.snapshot()
+      return { asr: state?.selected.asr != null, tts: state?.selected.tts != null }
+    },
+    mirror: () => loadSettings().modelMirror ?? null,
+    fetchImpl: (url, init) => net.fetch(url, init),
+  })
+
+  ipcMain.handle('first-run-report', async () => {
+    try {
+      const snapshot = await firstRun.snapshot()
+      return {
+        ok: true as const,
+        report: snapshot.report,
+        plan: snapshot.plan ? toPlanView(snapshot.plan) : null,
+        planError: snapshot.planError,
+        modelRoot: snapshot.modelRoot,
+        modelCheckTimedOut: snapshot.modelCheckTimedOut,
+      }
+    } catch (error) {
+      // 检查失败（磁盘、权限）如实回报，界面可以给"重试"；不要把异常吞成一份"全部就绪"的报告。
+      return { ok: false as const, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('first-run-download', async (_event, confirmation: unknown) => {
+    if (!confirmation || typeof confirmation !== 'object') {
+      return { ok: false as const, error: '缺少下载确认信息' }
+    }
+    const raw = confirmation as Partial<DownloadConfirmation>
+    if (typeof raw.modelId !== 'string' || typeof raw.url !== 'string' || typeof raw.destinationDir !== 'string') {
+      return { ok: false as const, error: '下载确认信息不完整' }
+    }
+    try {
+      const outcome = await firstRun.download({
+        modelId: raw.modelId as DownloadConfirmation['modelId'],
+        url: raw.url,
+        destinationDir: raw.destinationDir,
+      })
+      return { ok: true as const, outcome }
+    } catch (error) {
+      return { ok: false as const, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  /**
+   * 打开系统隐私设置页。只接受白名单目标，URI 在主进程拼：
+   * 渲染层不该有能力让主进程打开任意地址。
+   */
+  ipcMain.handle('first-run-open-settings', async (_event, target: unknown) => {
+    if (target !== 'microphone') return { ok: false as const, error: '只支持打开麦克风权限设置页' }
+    const uri = settingsUri(platformOf(), 'microphone')
+    if (uri === null) return { ok: false as const, error: '这个平台没有可打开的设置页' }
+    try {
+      // openExternal 对 URI scheme 会走系统关联；失败时它 reject（返回 void 的那个 openPath 才用返回值）。
+      await shell.openExternal(uri)
+      return { ok: true as const }
+    } catch (error) {
+      return { ok: false as const, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
   ipcMain.on('mouse-state', (_event, interactive: boolean) => {
     if (!win || ignoreMouse === !interactive) return
     ignoreMouse = !interactive
@@ -1049,11 +1937,25 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('get-state', () => {
+  ipcMain.handle('get-state', async (event, includeOperations?: unknown) => {
     const settings = loadSettings()
+    const activity = includeOperations === true && stageSender(event) ? await bridge.getActivityState() : null
+    const meeting = meetingRecorder?.getState()
     return {
+      operations: {
+        connection: sessionState && sessionState.status !== 'disconnected' ? 'connected' : 'disconnected',
+        listener: audioState.holder === 'wake' ? 'wake-requested'
+          : audioState.holder === 'barge-in' ? 'dictation'
+          : audioState.holder ?? (audioState.wakeUnavailable ? 'unavailable' : 'idle'),
+        activity,
+        meeting: meeting ? (meeting.stopping ? 'stopping' : meeting.recording ? 'recording' : meeting.transcribe) : null,
+        speaking: narrator.isSpeaking(),
+        execution: sessionState?.status === 'disconnected' ? 'unknown' : sessionState?.status ?? 'unknown',
+      },
       pet: settings.pet,
       voiceConversation: settings.voiceConversation === true,
+      continuousVoice: settings.continuousVoice === true,
+      readReplies: settings.readReplies === true,
       bounds: settings.bounds,
       positions: settings.positions,
       characters: settings.characters,
@@ -1065,7 +1967,7 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'save-settings',
-    (_event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; idleSleepMinutes?: number; sleepMinutes?: number }) => {
+    (_event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; idleSleepMinutes?: number; sleepMinutes?: number }) => {
       if (!patch || typeof patch !== 'object') return { ok: false }
       // 设置只接受明确的整数分钟；不让无效输入被默默保存成默认值。
       for (const key of ['idleSleepMinutes', 'sleepMinutes'] as const) {
@@ -1077,9 +1979,15 @@ function registerIpc(): void {
         ...(patch.bounds ? { bounds: patch.bounds } : {}),
         ...(patch.positions ? { positions: patch.positions } : {}),
         ...(typeof patch.voiceConversation === 'boolean' ? { voiceConversation: patch.voiceConversation } : {}),
+        ...(typeof patch.continuousVoice === 'boolean' ? { continuousVoice: patch.continuousVoice } : {}),
+        ...(typeof patch.readReplies === 'boolean' ? { readReplies: patch.readReplies } : {}),
         ...(patch.idleSleepMinutes !== undefined ? { idleSleepMinutes: patch.idleSleepMinutes } : {}),
         ...(patch.sleepMinutes !== undefined ? { sleepMinutes: patch.sleepMinutes } : {}),
       })
+      if (patch.voiceConversation === false || patch.continuousVoice === false) {
+        sendToRenderer('voice-conversation-stop', null)
+        if (spokenRound?.voiceTurn) interruptSpeech()
+      }
       return { ok: true }
     },
   )
@@ -1136,7 +2044,9 @@ function registerIpc(): void {
     try {
       const result = value.kind === 'prompt'
         ? await dispatchPrompt(value)
-        : await bridge.sessionCommand(value)
+        : value.kind === 'cancel'
+          ? await cancelCommand(value)
+          : await bridge.sessionCommand(value)
       if (value.bindingId !== sessionState?.bindingId) return { ok: false, error: '会话已改变，请核对原会话的操作结果' }
       if (result.state?.bindingId === value.bindingId) acceptSession(result.state)
       return result
@@ -1164,6 +2074,17 @@ function registerIpc(): void {
   ipcMain.on('speech-stop', () => {
     interruptSpeech()
     pushDocState()
+  })
+
+  /**
+   * 只在本机说一句话：不进会话、不调模型。
+   *
+   * 用于"用户又只喊了一句名字"这种本地应答 —— 它只是确认"我听见了"，
+   * 没有任何需要模型参与的内容；塞进会话就等于凭空多出一条用户消息。
+   */
+  ipcMain.on('speech-local', (_event, text: unknown) => {
+    if (typeof text !== 'string' || text.trim().length === 0 || text.length > 200) return
+    void speakWakeGreeting(text.trim())
   })
 
   // 主动提醒的用户选择（design.md §2.7）。白名单之外的一律丢掉：
@@ -1196,6 +2117,9 @@ function registerIpc(): void {
       pushDocState()
       docCandidatesAt = 0
       docCandidatesCache = []
+      // 撤销授权当场重查阅读视图里那份文档：不在范围内就停，不等下一次翻页才发现。
+      void docView.recheck()
+      void wpsView.recheck()
     }
     return docRootsPayload()
   })
@@ -1208,6 +2132,8 @@ function registerIpc(): void {
       pushDocState()
       docCandidatesAt = 0
       docCandidatesCache = []
+      void docView.recheck()
+      void wpsView.recheck()
     }
     return docRootsPayload()
   })
@@ -1220,8 +2146,10 @@ function registerIpc(): void {
   ipcMain.handle('doc-explain', async (_event, target: unknown, from: unknown, speak: unknown, assistantId: unknown) => {
     if (typeof target !== 'string' || target === '') return { ok: false, error: '没有指定文档' }
     const who = typeof assistantId === 'string' && assistantId ? assistantId : undefined
+    // 提纲是点名 WPS 要来的，就在面板上点"开始讲"时仍跟随 WPS，不悄悄换成阅读视图。
+    const via = docTalk !== null && docTalk.path === target ? docTalk.via : 'reading'
     // 段号来自界面上点的那一条，无效就如实拒绝，不夹到别的段去讲。
-    return explainDocByPath(target, typeof from === 'number' ? from : 0, speak !== false, who, true)
+    return explainDocByPath(target, typeof from === 'number' ? from : 0, speak !== false, who, true, via)
   })
 
   /**
@@ -1249,11 +2177,25 @@ function registerIpc(): void {
   // approval-open / approval-card-read / approval-card-decide / approval-card-close
   // 都在 ApprovalWindow 里注册，回执核验也在那边（checkSender）。
   approvals.registerIpc()
+  reportWorkbench = registerReportWorkbench({ openApproval: id => approvals.request(id) })
+  ipcMain.handle('report-workbench-open', event => {
+    if (!stageSender(event)) return { ok: false }
+    reportWorkbench?.open()
+    return { ok: true }
+  })
+  // 阅读视图的五条通道（会话/字节/页许可/资源/回报）都在控制器里注册并核对发送方。
+  docView.registerIpc()
+  wpsView.registerIpc()
 
   ipcMain.handle('runtime-start', async (_event, profile?: unknown) => {
     if (!host) return { ok: false }
     await host.startRuntime(typeof profile === 'string' && profile ? profile : undefined)
     return { ok: true }
+  })
+
+  ipcMain.handle('session-start', async (event): Promise<SessionResult & { outcome?: string }> => {
+    if (!stageSender(event)) return { ok: false, error: '会话操作来源无效' }
+    return startAssistantSession()
   })
 
   ipcMain.handle('runtime-stop', async () => {
@@ -1268,6 +2210,12 @@ function registerIpc(): void {
 
   ipcMain.on('stage-set-focus', (_event, on: unknown) => {
     host?.setFocusMode(on === true)
+  })
+
+  // 演示隐私模式（M5-05）：只改"渲染哪些历史与预览"，不动麦克风、不动窗口、不动专注模式。
+  // 演示时用户往往还要讲解、还要插话，把它们一起掐掉就成了"关掉宠物"。
+  ipcMain.on('presentation-mode', (_event, on: unknown) => {
+    host?.setPresentationMode(on === true)
   })
 
   // 听写拆成两拍：begin 只做麦克风仲裁（渲染层录音时唤醒监听已停），transcribe 收 wav
@@ -1398,7 +2346,7 @@ function registerIpc(): void {
     const tmp = mkdtempSync(path.join(tmpdir(), 'dsh-dic-'))
     const wavPath = path.join(tmp, 'dictation.wav')
     try {
-      const spec = recordAudioSpec(platformOf(), here, wavPath, 12000)
+      const spec = recordAudioSpec(platformOf(), layout.scriptDir, wavPath, 12000)
       if (spec === null) return { ok: false, error: '这个系统上还没有录音回退实现，请检查麦克风权限后重试' }
       const code = await new Promise<number>((resolve) => {
         const child = spawn(spec.command, [...spec.args], { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true })
@@ -1417,10 +2365,134 @@ function registerIpc(): void {
     }
   })
 
+  registerAudioIpc()
+
   ipcMain.handle('open-report-dir', async () => {
     const reportDir = path.join(dshHome(), 'personal-assistant', 'reports')
     await shell.openPath(reportDir)
     return { ok: true }
+  })
+}
+
+/** 设置页上"常驻与语音"一节的实际状态。 */
+function residencyState(): import('../renderer/types.js').ResidencyState {
+  const prefs = audioPrefs()
+  const platform = platformOf()
+  return {
+    platform,
+    trayResident: loadSettings().trayResident === true,
+    wake: {
+      enabled: prefs.wakeEnabled,
+      engine: prefs.wakeEngine,
+      engines: [...wakeEngines(platform)],
+      listening: audioState.holder === 'wake',
+      problem: prefs.wakeEnabled ? (audioState.wakeUnavailable ? (wakeProblem ?? '唤醒监听不可用') : wakeProblem) : null,
+      kwsVerified: kwsWakeDeviceVerified(platform),
+    },
+    launchAtLogin: { enabled: prefs.launchAtLogin, supported: loginItemSpec(platform, false, { isPackaged: true, execPath: '', appPath: '' }) !== null },
+    bargeIn: { enabled: prefs.bargeIn, problem: prefs.bargeIn ? bargeProblem : null, lastMetrics: bargeMetrics.slice(-10) },
+    holder: audioState.holder,
+  }
+}
+
+/**
+ * 共享采集 / 唤醒 / 插话 / 常驻开关的 IPC（M1-02、M1-03、M1-05）。
+ * 渲染层发来的每一条都先核对来源是舞台窗口：别的窗口（审批卡、阅读视图）不该能喂麦克风数据或改开关。
+ */
+function registerAudioIpc(): void {
+  const fromStage = (event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): boolean => stageSender(event)
+
+  ipcMain.handle('audio-sync', event => (fromStage(event) ? audioGrants() : { dictation: false, bargeIn: false, kws: false, meetingId: null, autoGainControl: true }))
+
+  ipcMain.on('kws-feed', (event, chunk: unknown) => {
+    if (!fromStage(event) || typeof chunk !== 'string' || chunk.length === 0) return
+    if (audioState.holder !== 'wake' || runningWake !== 'kws') return
+    kwsSession?.feed(pcm16Base64ToFloat32(chunk))
+  })
+
+  ipcMain.on('audio-consumer-lost', (event, kind: unknown, reason: unknown) => {
+    if (!fromStage(event)) return
+    const text = typeof reason === 'string' && reason !== '' ? reason : '麦克风采集中断'
+    if (kind === 'kws') {
+      if (audioState.holder === 'wake' && runningWake === 'kws') onWakeLost(text)
+    } else if (kind === 'barge-in') {
+      bargeProblem = text
+      console.log('[dsh-pet] 插话监听中断：', text)
+      if (audioState.holder === 'barge-in') applyAudio({ type: 'barge-in-finished', force: true })
+    }
+  })
+
+  ipcMain.on('tts-playback-receipt', (event, receipt: unknown) => {
+    if (!fromStage(event) || receipt === null || typeof receipt !== 'object') return
+    const value = receipt as RendererReceipt
+    if (typeof value.id !== 'string' || !['started', 'finished', 'cancelled', 'error'].includes(value.kind)) return
+    rendererPlayback.receipt(value)
+  })
+
+  ipcMain.on('barge-in-detected', (event) => {
+    if (!fromStage(event) || audioState.holder !== 'barge-in') return
+    // 渲染层已经在本地止声（不等这里）。这里停掉整段播报（含排队的句子与还在生成的回答），
+    // 把设备留给紧接着的听写；听写迟迟不来就按超时归还，不一直占着麦克风。
+    applyAudio({ type: 'barge-in-detected' })
+    interruptSpeech()
+    if (bargeHandoverTimer) clearTimeout(bargeHandoverTimer)
+    bargeHandoverTimer = setTimeout(() => {
+      bargeHandoverTimer = null
+      // 只在仍处于"检出后等听写"时才强制归还：听写已经接手、又开始了新一句的插话监听，就不该被这个旧定时器掐掉。
+      if (audioState.holder === 'barge-in' && audioState.bargeHandover) applyAudio({ type: 'barge-in-finished', force: true })
+    }, 4000)
+    bargeHandoverTimer.unref()
+  })
+
+  ipcMain.on('barge-in-metrics', (event, metrics: unknown) => {
+    if (!fromStage(event) || metrics === null || typeof metrics !== 'object') return
+    const value = metrics as { onsetToDetectMs?: unknown; detectToSilenceMs?: unknown }
+    if (typeof value.onsetToDetectMs !== 'number') return
+    const entry = { onsetToDetectMs: Math.round(value.onsetToDetectMs), detectToSilenceMs: typeof value.detectToSilenceMs === 'number' ? Math.round(value.detectToSilenceMs) : null }
+    bargeMetrics.push(entry)
+    if (bargeMetrics.length > 50) bargeMetrics.shift()
+    console.log(`[dsh-pet] 插话埋点：开口→检出 ${entry.onsetToDetectMs}ms，检出→静音 ${entry.detectToSilenceMs ?? '—'}ms`)
+  })
+
+  ipcMain.handle('residency-state', event => (fromStage(event) ? residencyState() : null))
+
+  ipcMain.handle('residency-set', (event, raw: unknown) => {
+    if (!fromStage(event)) return { ok: false, error: '设置来源无效' }
+    if (raw === null || typeof raw !== 'object') return { ok: false, error: '设置格式不对' }
+    const patch = raw as Record<string, unknown>
+    try {
+      if (typeof patch.trayResident === 'boolean') host?.setTrayResident(patch.trayResident)
+      audioPrefs()
+      const store = audioPrefsStore!
+      const { previous, next } = store.update(patch)
+      if (previous.wakeEngine !== next.wakeEngine) applyAudio({ type: 'wake-engine-changed' })
+      if (previous.wakeEnabled !== next.wakeEnabled) {
+        if (!next.wakeEnabled) wakeProblem = null
+        applyAudio({ type: 'wake-config', enabled: next.wakeEnabled })
+      }
+      if (patch.retryWake === true) {
+        wakeProblem = null
+        applyAudio({ type: 'wake-retry' })
+      }
+      if (previous.bargeIn !== next.bargeIn) {
+        bargeProblem = null
+        pushAudioGrants()
+        if (!next.bargeIn && audioState.holder === 'barge-in') applyAudio({ type: 'barge-in-finished', force: true })
+      }
+      // 开机自启：只在开关真的变了时碰系统登录项；关着的时候启动、读设置都不会写启动项。
+      const action = loginItemAction(previous.launchAtLogin, next.launchAtLogin)
+      if (action !== 'none') {
+        const spec = loginItemSpec(platformOf(), action === 'enable', { isPackaged: app.isPackaged, execPath: process.execPath, appPath: app.getAppPath() })
+        if (spec === null) {
+          store.update({ launchAtLogin: previous.launchAtLogin })
+          return { ok: false, error: '这个系统上不支持开机自启', state: residencyState() }
+        }
+        app.setLoginItemSettings(spec)
+      }
+      return { ok: true, state: residencyState() }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error), state: residencyState() }
+    }
   })
 }
 
@@ -1480,6 +2552,8 @@ if (!gotLock) {
 
   void app.whenReady().then(() => {
     applyPlatformWindowTweaks()
+    // 会议回环声的桌面采集授权：必须在任何 getDisplayMedia 之前注册（见函数注释）。
+    configureDisplayMedia()
     registerIpc()
     createWindow()
 
@@ -1503,7 +2577,7 @@ if (!gotLock) {
           saveSettings(patch)
         },
       },
-      { mainDir: here, dshHome: dshHome(), instanceId: randomUUID() },
+      { mainDir: here, dshHome: dshHome(), instanceId: randomUUID(), layout },
     )
     host.start()
 
@@ -1523,9 +2597,30 @@ if (!gotLock) {
       })) break
     }
 
-    // 常驻语音唤醒：听到"小潘小潘"就回应并弹出输入框。起不起由仲裁器按当前设置决定，
+    // 常驻语音唤醒：听到"小潘同学"就回应并弹出输入框。起不起由仲裁器按当前设置决定，
     // 之后每一次起停也都从它那里出 —— 设备只有一个主人。
+    // 唤醒开关先落进状态（不产生副作用）：Windows 缺省开（既有行为），macOS 缺省关（开着就是持续采集）。
+    audioState = { ...audioState, wakeEnabled: audioPrefs().wakeEnabled }
     applyAudio({ type: 'boot' })
+    // 启动后把固定话术的音频补齐到缓存（延后几秒，别和启动抢带宽）。
+    // 没有这一步，唤醒应答随机抽到"没缓存过的句子"就要当场联网合成，用户会感觉
+    // "有时候立刻响、有时候要等好几秒"。
+    const warmTimer = setTimeout(() => { void warmGreetingCache(voiceApiStore?.resolve('tts') ?? null) }, 5_000)
+    warmTimer.unref()
+    // 自愈：唤醒是独占麦克风的，任何一次占用（听写/会议/外放插话）归还时漏了恢复，
+    // 用户看到的就是"喊了没反应，而且完全没有提示"。每 8 秒做一次幂等核对，
+    // 发现该听却没在听就拉回来 —— 只在空闲、且设置允许时才动手。
+    const wakeWatchdog = setInterval(() => { ensureWakeRunning() }, 8_000)
+    wakeWatchdog.unref()
+    // 休眠恢复：设备句柄多半失效了。共享采集开着就重开（帧上标缺口）；System.Speech 唤醒在跑就重起一次。
+    // 动态取 powerMonitor：主进程装配测试里的 electron 替身没有它，缺了只是少这一条恢复路径。
+    void import('electron').then(({ powerMonitor }) => powerMonitor?.on('resume', () => {
+      sendToRenderer('capture-resume', null)
+      if (audioState.holder === 'wake' && runningWake === 'system') {
+        stopWakeListener()
+        startWakeListener(onWakeWord, onWakeLost)
+      }
+    })).catch(() => undefined)
 
     // 连接会话桥接：宠物可能先于"召唤"启动，这里持续重试直到桥接出现。
     void bridge.connect({
@@ -1555,7 +2650,11 @@ if (!gotLock) {
         sendToRenderer('team-event', event)
         // 提案被别处决定（或到期）之后，专用窗口里那张卡片要跟着撤：
         // 留着它，用户会去批一条已经不存在的提案，然后收到一句看不懂的失败。
-        if (event.type === 'proposal/decided' && typeof event.id === 'string') approvals.retire(event.id)
+        if (event.type === 'proposal/decided' && typeof event.id === 'string') {
+          approvals.retire(event.id)
+          // 发布或删除被决定后，工作台按新事实重读，不沿用决定前的版本。
+          reportWorkbench?.refresh()
+        }
       },
       // 会话流水（正文 / 思考 / 工具调用 / 输入）：按发生顺序推给界面，
       // 让宠物的对话框和 DSH 会话完全绑定 —— 那边出什么、进来什么，这边同步什么。
@@ -1565,6 +2664,8 @@ if (!gotLock) {
       // 主动提醒（design.md §2.7）：插件侧只推候选与文案，显不显示、怎么回应由这边的
       // 专注/可见状态决定 —— 界面是唯一知道用户此刻在不在会议里的一方。
       onProactive: payload => {
+        // 会议中到达的提醒直接丢弃：评估侧也会因会议状态跳过，这里兜住上报前后的时间差。
+        if (meetingRecorder?.getState().recording === true) return
         sendToRenderer('proactive-remind', payload)
       },
     })
@@ -1588,11 +2689,19 @@ app.on('before-quit', event => {
   globalShortcut.unregisterAll()
   pointerWatcher.dispose()
   stopWakeListener()
+  // KWS 唤醒是进程内的 worker 线程：随进程退出，这里先停掉，退出过程中不再解码。
+  kwsSession?.stop()
+  kwsSession = null
+  runningWake = null
   // 窗口被关这类退出路径不经过 requestPetExit，漏在这儿就是一个杀不掉的合成进程孤儿。
   narrator.dispose()
+  docView.dispose()
+  wpsView.dispose()
+  wpsController?.dispose()
   bridge.dispose()
   // 退出过程中不该再留着一个能签发批准的窗口：IPC 摘掉、卡片关掉。
   approvals.dispose()
+  reportWorkbench?.dispose()
   // 会议库句柄要关：Windows 上文件锁会一直挂着，进程退了目录都删不干净。
   // 放在 host 判空之前 —— 没开助理也得关。
   const closingMeeting = meetingRecorder?.close() ?? Promise.resolve()
@@ -1608,3 +2717,4 @@ app.on('before-quit', event => {
   host = null
   void Promise.allSettled([closing.shutdown(), closingMeeting]).then(() => app.quit())
 })
+

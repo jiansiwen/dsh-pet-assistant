@@ -13,6 +13,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { toUnpackedPath } from './runtime-launch.ts'
 
 // 这里写 `.ts` 而不是惯用的 `.js`：Node 的类型剥离不会把 `.js` 说明符重写成 `.ts`，
 // 而这个文件要被 `node --test` 直接导入（`pet-metrics.ts` 同理）。esbuild 两种都认。
@@ -30,12 +31,17 @@ import {
   type SpokenRecord,
 } from './speech.ts'
 import type { ResolvedVoiceApi } from '../voice-api-types.ts'
+import { fixedPhrases } from './greetings.ts'
+import type { TtsCache } from './tts-cache.ts'
+
+/** 固定话术集合：只对这些句子做缓存，回答正文每次都不同，缓存它没有意义。 */
+const FIXED_PHRASES = new Set(fixedPhrases())
 
 /** 合成进程报回来的事件，一行一个 JSON。协议见 `tts-edge-worker.ts` 头部。 */
 export type TtsWorkerEvent =
   | { readonly ready: true; readonly voice?: string }
   | { readonly started: { readonly id: string } }
-  | { readonly finished: { readonly id: string } }
+  | { readonly finished: { readonly id: string; readonly text?: string; readonly audio?: string } }
   | { readonly cancelled: { readonly id: string } }
   | { readonly ok: false; readonly error: string }
 
@@ -70,6 +76,9 @@ export class Narrator {
   private readonly open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport
   private readonly hooks: NarratorHooks
   private readonly ttsApi: () => ResolvedVoiceApi | null
+  private readonly cache: TtsCache | null
+  /** 本次派发用的音色指纹（缓存键的一半）；由 cachedAudio 顺带记下。 */
+  private cachedVoiceKey: string | null = null
   private state: SpeechState = INITIAL_SPEECH_STATE
   /** 当前这一轮播出的句子。跨轮的完整记录在 reducer 的 `state.spoken` 里。 */
   private roundSpoken: SpokenRecord[] = []
@@ -91,10 +100,13 @@ export class Narrator {
   constructor(open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport, hooks: NarratorHooks = {}, options: {
     /** 当前选中的自定义 TTS 服务；null 走默认合成。派发时才取，用户中途换服务不用重启播放器。 */
     ttsApi?: () => ResolvedVoiceApi | null
+    /** 固定话术的音频缓存；null = 不缓存（默认 edge-tts 路径）。 */
+    cache?: TtsCache | null
   } = {}) {
     this.open = open
     this.hooks = hooks
     this.ttsApi = options.ttsApi ?? (() => null)
+    this.cache = options.cache ?? null
   }
 
   /** 排一段要念的内容。整段回答或整份文档的一次讲话请求就是一个 request。 */
@@ -249,14 +261,37 @@ export class Narrator {
       return
     }
     // 配置随这句传进 worker：用户中途换服务，下一句就走新的；密钥只走 stdin，不上命令行。
+    // 同时捎上"下一句"：worker 会在当前句播放期间预合成它，把句号后的静默压到最小。
+    const next = this.state.queue[1]
+    const nextId = next === undefined ? null : `${next.utteranceId}#${next.index}`
+    const cached = this.cachedAudio(segment.text, api)
     this.transport.write(JSON.stringify({
       speak: {
         id,
         b64: Buffer.from(segment.text, 'utf8').toString('base64'),
         ...(api === null ? {} : { api }),
+        // 命中缓存就把现成音频直接交给 worker，省掉这一整次合成往返。
+        ...(cached === null ? {} : { audio: cached.toString('base64') }),
+        ...(next === undefined ? {} : {
+          next: {
+            id: nextId,
+            b64: Buffer.from(next.text, 'utf8').toString('base64'),
+            ...(api === null ? {} : { api }),
+            ...(this.cachedAudio(next.text, api) === null ? {} : { audio: (this.cachedAudio(next.text, api) as Buffer).toString('base64') }),
+          },
+        }),
       },
     }))
     this.apply({ type: 'dispatched' })
+  }
+
+  /** 查固定话术缓存。只在启用缓存且有自定义语音服务时生效（默认 edge-tts 不缓存，它本身很快）。 */
+  private cachedAudio(text: string, api: ResolvedVoiceApi | null): Buffer | null {
+    if (this.cache === null || api === null) return null
+    if (!FIXED_PHRASES.has(text)) return null
+    const voiceKey = `${api.provider}|${api.endpoint}|${api.model}|${api.voice}`
+    this.cachedVoiceKey = voiceKey
+    return this.cache.get({ voiceKey, text })
   }
 
   private onWorkerEvent(event: TtsWorkerEvent): void {
@@ -272,6 +307,16 @@ export class Narrator {
       // 打断记过半句，这里 apply('spoken') 因为 playing 为空而什么都不做 —— 少报一句只会让
       // 续讲重念一遍，多报一句用户就真的漏听了内容，宁可少报。
       this.awaitingStop = false
+      // 固定话术第一次合成好之后写进缓存：下次唤醒/应答直接复用，不再走一次网络往返。
+      const finished = event.finished
+      if (finished.audio && finished.text && this.cache !== null && this.cachedVoiceKey !== null
+        && FIXED_PHRASES.has(finished.text)) {
+        try {
+          this.cache.put({ voiceKey: this.cachedVoiceKey, text: finished.text }, Buffer.from(finished.audio, 'base64'))
+        } catch {
+          // 写缓存失败不影响播放。
+        }
+      }
       this.apply({ type: 'spoken' })
       this.pump()
       return
@@ -322,10 +367,28 @@ export class Narrator {
  * electron.exe 带 ELECTRON_RUN_AS_NODE 就是纯 node，worker 以它跑而不是再找系统 node：
  * 壳不假设用户机器上有独立安装的 Node。
  */
-export function spawnTtsEdgeWorker(deliver: (event: TtsWorkerEvent) => void): TtsTransport {
-  const workerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tts-edge-worker.js')
+export function spawnTtsEdgeWorker(deliver: (event: TtsWorkerEvent) => void, options: {
+  /**
+   * 只合成、不播放（"外放插话"实验开关，见 `tts-renderer-transport.ts`）：合成好的音频以
+   * `{ audio: { id, b64, mime } }` 事件交回来，由渲染层播放。缺省 false 即原有路径，行为不变。
+   */
+  synthOnly?: boolean
+} = {}): TtsTransport {
+  // 打包后主进程在 app.asar 里，而这个路径要交给以 ELECTRON_RUN_AS_NODE 起的子进程 ——
+  // 那种子进程没有 asar 补丁，拿到 asar 内的路径只会报找不到文件。走解包目录的真实路径。
+  const workerPath = toUnpackedPath(path.join(path.dirname(fileURLToPath(import.meta.url)), 'tts-edge-worker.js'))
+  const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+  // 只认这里的显式选择：外部环境里残留的同名变量不能把默认路径悄悄变成"只合成不出声"。
+  if (options.synthOnly === true) env.DSH_TTS_SYNTH_ONLY = '1'
+  else delete env.DSH_TTS_SYNTH_ONLY
+  // 固定话术清单（JSON 数组）：worker 只对这些句子回传音频供缓存。
+  //
+  // 为什么不用 NUL 分隔：Windows 的环境变量**不允许包含空字节**，spawn 会直接抛
+  // `The property 'options.env[...]' must be a string without null bytes`，
+  // 于是整个合成进程起不来，用户看到的是屏幕底部一条报错。
+  env.DSH_TTS_CACHE_TEXTS = JSON.stringify(fixedPhrases())
   const child: ChildProcess = spawn(process.execPath, [workerPath], {
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    env,
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
   })

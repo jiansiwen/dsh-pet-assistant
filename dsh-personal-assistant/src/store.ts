@@ -119,3 +119,42 @@ export function inTransaction<T>(db: DatabaseSync, body: () => T): T {
     transactionDepth.set(db, nesting)
   }
 }
+
+/**
+ * 在一个**必定回滚**的事务里执行：删除影响预览专用。
+ *
+ * 预览不另写一套"大概会删哪些"的推算——那迟早和真正的传播逻辑对不上，用户看到的影响范围
+ * 就成了一份不可信的说明。这里直接跑真实的删除/传播代码，拿到结果后整体回滚，库里一行不变。
+ * 体内的 inTransaction 视为嵌套，跟着这次回滚一起作废。已在事务里时改用保存点，
+ * 只撤销体内的写入，外层事务照常继续。
+ */
+export function dryRun<T>(db: DatabaseSync, body: () => T): T {
+  const nesting = transactionDepth.get(db) ?? 0
+  const savepoint = `dry_run_${nesting}`
+  transactionDepth.set(db, nesting + 1)
+  db.exec(nesting > 0 ? `SAVEPOINT ${savepoint}` : 'BEGIN')
+  try {
+    return body()
+  } finally {
+    if (nesting > 0) {
+      db.exec(`ROLLBACK TO ${savepoint}`)
+      db.exec(`RELEASE ${savepoint}`)
+    } else {
+      db.exec('ROLLBACK')
+    }
+    transactionDepth.set(db, nesting)
+  }
+}
+
+/** 表是否存在。迁移读删除账本时用：账本表由各自的存储类按需建出，旧库里可能还没有。 */
+export function tableExists(db: DatabaseSync, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined
+}
+
+/** 本机时间的 YYYY-MM-DD HH:mm；回执与覆盖范围说明共用，避免依赖运行环境的区域格式。 */
+export function formatLocalTime(ms: number | null | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '未知时间'
+  const d = new Date(ms)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}

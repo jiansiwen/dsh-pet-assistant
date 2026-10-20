@@ -6,7 +6,7 @@ DeepSeek Harness 的桌面客户端 —— 配合 [dsh-personal-assistant](../ds
 
 **角色与舞台**
 
-- **多角色舞台**：编制里最多五席 —— 唐僧（总助理）、孙悟空、猪八戒、沙僧、白龙马。默认启用三人（一个总助理 + 两位专家），改插件配置里的 `teamSeats` 再重启即可增减
+- **多角色舞台**：编制里最多五席 —— 总助理（总助理）、助理1、助理2、助理3、助理4。默认启用三人（一个总助理 + 两位专家），改插件配置里的 `teamSeats` 再重启即可增减
 - 每个角色可右键「换个形象」，目前有三套占位皮肤（国宝熊猫、眼镜女生 Q 版、眼镜男生 Q 版），选择按角色记住、重启后还在
 - 角色空闲时会自发闲聊；凑够人数还会开四人麻将、五人开黑这类群体场景。任务一派下来，牌桌上的角色立刻站起来回座位
 - 窗口透明置顶、可拖拽、位置记忆，不挡其他窗口的操作
@@ -140,6 +140,23 @@ pnpm run start
 > `ELECTRON_MIRROR="https://cdn.npmmirror.com/binaries/electron/" pnpm install`
 > 若 `pnpm install` 后提示 Electron 未装好，可手动补跑：
 > `ELECTRON_MIRROR="https://cdn.npmmirror.com/binaries/electron/" node node_modules/electron/install.js`
+
+## 语音服务接入（可选：MiMo / OpenAI 兼容）
+
+默认识别走本机 SenseVoice / 流式 Zipformer，合成走微软 edge-tts，都不需要密钥。也可以在
+「宠物设置 → 语音」里添加自定义语音服务，把识别与合成换成小米 MiMo（或任意 OpenAI 兼容接口）：
+
+- 识别（ASR）：提供商选 MiMo，接口地址 `https://api.xiaomimimo.com/v1`，模型 `mimo-v2.5-asr`；
+- 合成（TTS）：提供商选 MiMo，接口地址 `https://api.xiaomimimo.com/v1`，模型 `mimo-v2.5-tts`，
+  音色 ID 填 `冰糖` / `茉莉` / `苏打` / `白桦` 之一（默认音色 `mimo_default`）。
+
+API Key 只在添加配置时填一次，由桌面壳用系统密钥库（Windows DPAPI / macOS safeStorage）加密后
+保存到用户目录（`%APPDATA%\dsh-pet\voice-apis.json`），不进仓库、不进日志。添加后在设置页选中
+该配置即可生效；识别失败会如实报错，不会偷偷换回其他服务。
+
+> 想让「随时说话打断」效果最好：打开「外放插话（实验）」（设置 → 通用 → 常驻与语音）。
+> 打开后朗读改由界面播放，Chromium 的回声消除拿得到参考信号，外放时更容易把你的插话与
+> 助理自己的声音分开；代价是朗读链路多一次界面往返。
 
 ## 开发与验证
 

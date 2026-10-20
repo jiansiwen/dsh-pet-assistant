@@ -225,7 +225,7 @@ function pushHistoryTurn(question: string, answer: string): void {
 }
 
 const agent: BridgeAgent = {
-  session: { events: activeAgentEvents },
+  session: { snapshotEvents: () => activeAgentEvents },
   followup(message: unknown) {
     const raw = message as { id?: string; role?: string; source?: { kind?: string }; content?: Array<{ type: string; text?: string }> }
     injected.push({
@@ -593,7 +593,7 @@ async function main(): Promise<void> {
     await waitFor('task/created', () => eventsOf('task/created', 'req-wukong').length === 1)
     const created = eventsOf('task/created', 'req-wukong')[0]
     assert.equal(created.assistantId, 'member-wukong')
-    assert.equal(created.displayName, '孙悟空')
+    assert.equal(created.displayName, '助理1')
     assert.equal(created.skinId, 'boy-glasses')
     assert.ok(created.taskId)
 
@@ -620,7 +620,7 @@ async function main(): Promise<void> {
   })
 
   await checkAsync('点到未启用的席位照样回绝，不降级给别人', async () => {
-    assert.equal((await request('POST', '/chat', { body: { requestId: 'req-shaseng', text: '去干点活', assistantId: '沙僧' } })).status, 200)
+    assert.equal((await request('POST', '/chat', { body: { requestId: 'req-shaseng', text: '去干点活', assistantId: '助理3' } })).status, 200)
     await waitFor('回绝未启用席位', () => eventsOf('reply', 'req-shaseng').length === 1)
     const reply = eventsOf('reply', 'req-shaseng')[0]
     assert.equal(reply.ok, false)
@@ -728,11 +728,13 @@ async function main(): Promise<void> {
     await waitFor('四个回执全部到达', () => feedback.length >= 4)
     assert.deepEqual(feedback.slice(0, 4), ['accept', 'decline', 'disable', 'enable'])
 
-    // 宠物状态上报：评估输入靠它实现"专注/隐藏不提醒"。
+    // 宠物状态上报：评估输入靠它实现"专注/隐藏/会议中不提醒"。
     assert.equal((await request('POST', '/pet-state', { body: { focus: true, visible: false } })).status, 200)
-    assert.deepEqual(bridge.getPetState(), { focus: true, visible: false })
+    assert.deepEqual(bridge.getPetState(), { focus: true, visible: false, meeting: false })
     assert.equal((await request('POST', '/pet-state', { body: { focus: 1 } })).status, 200, '非布尔字段直接忽略')
-    assert.deepEqual(bridge.getPetState(), { focus: true, visible: false }, '部分更新不覆盖另一字段')
+    assert.deepEqual(bridge.getPetState(), { focus: true, visible: false, meeting: false }, '部分更新不覆盖另一字段')
+    assert.equal((await request('POST', '/pet-state', { body: { meeting: true } })).status, 200)
+    assert.deepEqual(bridge.getPetState(), { focus: true, visible: false, meeting: true }, '会议中如实上报，其余字段不变')
   })
 
   await checkAsync('团队凭据与日报凭据互不通用；关闭团队不丢日报待批，仍能可信拒绝回草稿', async () => {

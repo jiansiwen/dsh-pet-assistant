@@ -13,12 +13,13 @@
 
 import assert from 'node:assert/strict'
 import { afterEach, describe, test } from 'node:test'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
+  bundledCliCommandLine,
   CLOCK_SKEW_MS,
   decideStartAction,
   isSafeProfileName,
@@ -27,8 +28,10 @@ import {
   MAX_BOOT_MS,
   MIN_DSH_VERSION,
   planRuntimeLaunch,
+  resolveAppLayout,
   resolveCli,
   sanitizeOwnership,
+  toUnpackedPath,
   verifyRuntimeContract,
   versionAtLeast,
   type LaunchFailure,
@@ -489,5 +492,321 @@ describe('listLaunchableProfiles：托盘子菜单只列现在真能启动的', 
 
   test('没有 profiles 目录时返回空，不抛异常', () => {
     assert.deepEqual(listLaunchableProfiles(path.join(os.tmpdir(), 'no-such-dsh-home')), [])
+  })
+})
+
+describe('resolveAppLayout：开发态与改造前一致，打包态改走 app.asar.unpacked', () => {
+  // 纯路径计算，不碰磁盘：根目录随便取一个绝对路径即可。
+  const root = path.resolve(os.tmpdir(), 'layout-fixture')
+
+  test('开发态：dist/main 往上两级就是 dsh-pet 目录，与 companion-host 原来的 ../.. 完全相同', () => {
+    const mainDir = path.join(root, 'dsh-pet', 'dist', 'main')
+    const layout = resolveAppLayout({ mainDir, isPackaged: false })
+    assert.equal(layout.packaged, false)
+    assert.equal(layout.appDir, path.resolve(mainDir, '../..'))
+    assert.equal(layout.realAppDir, layout.appDir)
+    assert.equal(layout.scriptDir, mainDir)
+    assert.equal(layout.resourcesDir, layout.appDir)
+  })
+
+  test('开发态不理会 Electron 自己的 resources 目录：那里放的是 Electron 的默认应用，与本应用无关', () => {
+    const mainDir = path.join(root, 'dsh-pet', 'dist', 'main')
+    const electronResources = path.join(root, 'dsh-pet', 'node_modules', 'electron', 'dist', 'resources')
+    const layout = resolveAppLayout({ mainDir, isPackaged: false, resourcesPath: electronResources })
+    assert.equal(layout.appDir, path.join(root, 'dsh-pet'))
+    assert.equal(layout.resourcesDir, path.join(root, 'dsh-pet'))
+  })
+
+  test('打包态：应用根是 app.asar，CLI 查找根与脚本目录都在旁边的 app.asar.unpacked', () => {
+    const resources = path.join(root, 'dsh 桌面助理团', 'resources')
+    const appPath = path.join(resources, 'app.asar')
+    const layout = resolveAppLayout({
+      mainDir: path.join(appPath, 'dist', 'main'),
+      isPackaged: true,
+      appPath,
+      resourcesPath: resources,
+    })
+    assert.equal(layout.packaged, true)
+    assert.equal(layout.appDir, appPath)
+    assert.equal(layout.realAppDir, path.join(resources, 'app.asar.unpacked'))
+    assert.equal(layout.scriptDir, path.join(resources, 'app.asar.unpacked', 'dist', 'main'))
+    assert.equal(layout.resourcesDir, resources)
+  })
+
+  test('打包态没给 appPath / resourcesPath 时，按 mainDir 推出同一套目录', () => {
+    const resources = path.join(root, 'resources')
+    const layout = resolveAppLayout({ mainDir: path.join(resources, 'app.asar', 'dist', 'main'), isPackaged: true })
+    assert.equal(layout.appDir, path.join(resources, 'app.asar'))
+    assert.equal(layout.realAppDir, path.join(resources, 'app.asar.unpacked'))
+    assert.equal(layout.resourcesDir, resources)
+  })
+
+  test('打包时关掉了 asar：应用根 resources/app 本身就是真实目录，不再拼 unpacked', () => {
+    const appPath = path.join(root, 'resources', 'app')
+    const layout = resolveAppLayout({ mainDir: path.join(appPath, 'dist', 'main'), isPackaged: true, appPath })
+    assert.equal(layout.realAppDir, appPath)
+    assert.equal(layout.scriptDir, path.join(appPath, 'dist', 'main'))
+  })
+
+  test('打包态下 build.mjs 拷到 dist/main 的每个 .ps1 都解析到 app.asar.unpacked 里', () => {
+    const resources = path.join(root, 'resources')
+    const layout = resolveAppLayout({ mainDir: path.join(resources, 'app.asar', 'dist', 'main'), isPackaged: true })
+    for (const script of ['wake.ps1', 'wake-grammar.ps1', 'record.ps1', 'play.ps1', 'speak-once.ps1', 'asr-wave.ps1', 'win-uia.ps1']) {
+      const file = path.join(layout.scriptDir, script)
+      assert.equal(file, path.join(resources, 'app.asar.unpacked', 'dist', 'main', script))
+      assert.equal(toUnpackedPath(path.join(resources, 'app.asar', 'dist', 'main', script)), file)
+    }
+  })
+})
+
+describe('toUnpackedPath：交给 PowerShell、worker、子进程的路径必须是真实文件', () => {
+  test('Windows 安装目录里的脚本（带空格与中文）', () => {
+    assert.equal(
+      toUnpackedPath('C:\\Users\\u\\AppData\\Local\\Programs\\dsh 桌面助理团\\resources\\app.asar\\dist\\main\\wake.ps1'),
+      'C:\\Users\\u\\AppData\\Local\\Programs\\dsh 桌面助理团\\resources\\app.asar.unpacked\\dist\\main\\wake.ps1',
+    )
+  })
+
+  test('macOS 应用包里的 worker 入口与原生模块解析基点', () => {
+    const base = '/Applications/dsh 桌面助理团.app/Contents/Resources'
+    assert.equal(toUnpackedPath(`${base}/app.asar/dist/main/doc-pdf-worker.js`), `${base}/app.asar.unpacked/dist/main/doc-pdf-worker.js`)
+    assert.equal(toUnpackedPath(`${base}/app.asar/dist/main/index.js`), `${base}/app.asar.unpacked/dist/main/index.js`)
+  })
+
+  test('开发态路径原样返回：调用方不必区分开发与打包', () => {
+    for (const file of ['D:\\java\\dsh\\dsh-pet\\dist\\main\\wake.ps1', '/Users/me/dsh-pet/dist/main/play.ps1', 'relative/dist/main/x.ps1']) {
+      assert.equal(toUnpackedPath(file), file)
+    }
+  })
+
+  test('已经是 unpacked 的路径不会再加一遍', () => {
+    const file = 'C:\\r\\resources\\app.asar.unpacked\\dist\\main\\play.ps1'
+    assert.equal(toUnpackedPath(file), file)
+    assert.equal(toUnpackedPath(toUnpackedPath('/r/app.asar/x')), '/r/app.asar.unpacked/x')
+  })
+
+  test('名字里带 .asar 但不是 asar 段的路径不动', () => {
+    for (const file of ['/x/app.asar.bak/y', '/x/my.asarx/y', 'D:\\proj\\foo.asar.d\\bar', '/x/asar/y']) {
+      assert.equal(toUnpackedPath(file), file, file)
+    }
+  })
+
+  test('路径正好停在 app.asar 上', () => {
+    assert.equal(toUnpackedPath('/r/resources/app.asar'), '/r/resources/app.asar.unpacked')
+  })
+
+  test('只换第一个 asar 段，与 Electron 认归档的规则一致', () => {
+    assert.equal(toUnpackedPath('/r/app.asar/inner.asar/f'), '/r/app.asar.unpacked/inner.asar/f')
+  })
+
+  test('混用分隔符也能认', () => {
+    assert.equal(toUnpackedPath('C:/r/app.asar\\dist\\main\\play.ps1'), 'C:/r/app.asar.unpacked\\dist\\main\\play.ps1')
+  })
+})
+
+describe('打包态的启动计划：随包 CLI 从 app.asar.unpacked 的真实目录里找', () => {
+  /** 安装后的布局：node_modules 按打包配置解包到 app.asar.unpacked。 */
+  function installedLayout(target: Layout) {
+    const resources = path.join(target.root, 'resources')
+    const appPath = path.join(resources, 'app.asar')
+    const layout = resolveAppLayout({ mainDir: path.join(appPath, 'dist', 'main'), isPackaged: true, appPath, resourcesPath: resources })
+    writeCli(layout.realAppDir)
+    return layout
+  }
+
+  test('CLI 在解包目录里：计划成功，CLI 路径是真实文件，启动方式与开发态相同', () => {
+    const target = fresh()
+    const layout = installedLayout(target)
+    const plan = planRuntimeLaunch({ dshHome: target.dshHome, profile: 'web', appDir: layout.realAppDir, execPath: '/fake/exe', packaged: true })
+    if (!plan.ok) throw new assert.AssertionError({ message: `期望产出启动计划，实际失败在 ${plan.stage}：${plan.message}` })
+    assert.equal(plan.cliPath.startsWith(layout.realAppDir + path.sep), true, plan.cliPath)
+    assert.equal(toUnpackedPath(plan.cliPath), plan.cliPath)
+    assert.deepEqual([...plan.args], [plan.cliPath, '--profile', 'web', '--patch', plan.overlayPath])
+    assert.deepEqual({ ...plan.env }, { ELECTRON_RUN_AS_NODE: '1' })
+  })
+
+  test('拿 asar 内的应用根去找 CLI → locate-cli，提示重新安装，而不是"去 dsh-pet 目录装依赖"', () => {
+    const target = fresh()
+    const layout = installedLayout(target)
+    const plan = planRuntimeLaunch({ dshHome: target.dshHome, profile: 'web', appDir: layout.appDir, execPath: '/fake/exe', packaged: true })
+    assert.equal(plan.ok, false)
+    if (plan.ok) return
+    assert.equal(plan.stage, 'locate-cli')
+    assert.match(plan.message, /重新安装/)
+    assert.doesNotMatch(plan.message, /dsh-pet 目录/)
+  })
+
+  test('profile 里没装插件 → 给出用壳自身可执行文件跑随包 CLI 的完整命令，并说明会改动 profile', () => {
+    const target = fresh()
+    const layout = installedLayout(target)
+    writeProfile(target.profileDir, null)
+    const exe = path.join(target.root, 'dsh 桌面助理团', 'dsh 桌面助理团.exe')
+    const plan = planRuntimeLaunch({ dshHome: target.dshHome, profile: 'web', appDir: layout.realAppDir, execPath: exe, packaged: true })
+    assert.equal(plan.ok, false)
+    if (plan.ok) return
+    assert.equal(plan.stage, 'locate-plugin')
+    assert.match(plan.message, /ELECTRON_RUN_AS_NODE/)
+    assert.equal(plan.message.includes(exe), true, plan.message)
+    assert.equal(plan.message.includes(path.join(layout.realAppDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')), true, plan.message)
+    assert.match(plan.message, /pnpm/)
+    assert.match(plan.message, /改动/)
+  })
+})
+
+describe('bundledCliCommandLine：安装版里 dsh 不在 PATH 上，给用户一行能直接复制的命令', () => {
+  test('Windows：PowerShell 单引号字面量，单引号双写转义，用完删掉环境变量', () => {
+    const line = bundledCliCommandLine(
+      'win32',
+      'C:\\P\\dsh 桌面助理团\\dsh 桌面助理团.exe',
+      'C:\\P\\dsh 桌面助理团\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js',
+      ['plugin', '--profile', 'web', 'add', "D:\\x\\it's.tgz"],
+    )
+    assert.equal(
+      line,
+      "$env:ELECTRON_RUN_AS_NODE='1'; try { & 'C:\\P\\dsh 桌面助理团\\dsh 桌面助理团.exe' "
+        + "'C:\\P\\dsh 桌面助理团\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js' "
+        + "'plugin' '--profile' 'web' 'add' 'D:\\x\\it''s.tgz' } finally { Remove-Item Env:ELECTRON_RUN_AS_NODE }",
+    )
+  })
+
+  test('macOS：环境变量只作用于这一条命令，带空格与中文的路径加单引号', () => {
+    const app = '/Applications/dsh 桌面助理团.app/Contents'
+    const line = bundledCliCommandLine(
+      'darwin',
+      `${app}/MacOS/dsh 桌面助理团`,
+      `${app}/Resources/app.asar.unpacked/node_modules/@deepseek-ai/dsh/lib/bin.js`,
+      ['plugin', '--profile', 'web', 'add', "/tmp/it's.tgz"],
+    )
+    assert.equal(
+      line,
+      `ELECTRON_RUN_AS_NODE=1 '${app}/MacOS/dsh 桌面助理团' '${app}/Resources/app.asar.unpacked/node_modules/@deepseek-ai/dsh/lib/bin.js' `
+        + "plugin --profile web add '/tmp/it'\\''s.tgz'",
+    )
+  })
+})
+
+/**
+ * 打包配置（build/electron-builder.yml）的不变量。electron-builder 还没装、没法真打包，
+ * 这里把"哪些文件必须解包、不签名不发布、权限用途说明不变"钉成测试，改配置时会先撞到它们。
+ */
+describe('打包配置：asarUnpack 覆盖外部读者要读的文件，只出本地测试包', () => {
+  const repo = fileURLToPath(new URL('..', import.meta.url))
+  const yml = readFileSync(path.join(repo, 'build', 'electron-builder.yml'), 'utf8')
+  /** 去掉注释行与行尾注释（本配置的值里没有 #）。 */
+  const lines = yml.split(/\r?\n/).filter(line => !/^\s*#/.test(line)).map(line => line.replace(/\s+#.*$/, ''))
+
+  /** 顶层键下的块（直到下一个顶层键）。 */
+  function block(key: string): string[] {
+    const start = lines.findIndex(line => line === `${key}:` || line.startsWith(`${key}: `))
+    assert.ok(start >= 0, `配置里没有 ${key}`)
+    const body: string[] = []
+    for (const line of lines.slice(start + 1)) {
+      if (/^\S/.test(line)) break
+      body.push(line)
+    }
+    return body
+  }
+  function topValue(key: string): string | undefined {
+    return lines.find(line => line.startsWith(`${key}: `))?.slice(key.length + 2).trim()
+  }
+  function nestedValue(parent: string, key: string): string | undefined {
+    const line = block(parent).find(entry => new RegExp(`^\\s+${key}:\\s`).test(entry))
+    return line?.replace(new RegExp(`^\\s+${key}:\\s*`), '').trim()
+  }
+  const unpack = block('asarUnpack')
+    .map(line => /^\s+-\s+(.+)$/.exec(line)?.[1].trim().replace(/^'(.*)'$/, '$1'))
+    .filter((value): value is string => typeof value === 'string')
+  const globRegex = (pattern: string): RegExp => new RegExp(`^${pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '\u0000')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\u0000/g, '.*')}$`)
+  const unpacked = (file: string): boolean => unpack.some(pattern => globRegex(pattern).test(file))
+
+  test('build.mjs 拷进 dist 的每个 .ps1 都会被解包，src/main 里的每个 .ps1 也都在拷贝清单上', () => {
+    const build = readFileSync(path.join(repo, 'scripts', 'build.mjs'), 'utf8')
+    const copied = [...build.matchAll(/'(dist\/main\/[A-Za-z0-9._-]+\.ps1)'/g)].map(match => match[1])
+    assert.ok(copied.length >= 7, `build.mjs 里只找到 ${copied.length} 个 .ps1 拷贝`)
+    for (const file of copied) assert.equal(unpacked(file), true, `${file} 没有被 asarUnpack 覆盖`)
+    for (const name of readdirSync(path.join(repo, 'src', 'main')).filter(entry => entry.endsWith('.ps1'))) {
+      assert.equal(copied.includes(`dist/main/${name}`), true, `src/main/${name} 没有被 build.mjs 拷进 dist/main`)
+    }
+    // 素材目录整份拷到 dist/assets，其中的 .ps1 交给 PowerShell。
+    for (const name of readdirSync(path.join(repo, 'assets')).filter(entry => entry.endsWith('.ps1'))) {
+      assert.equal(unpacked(`dist/assets/${name}`), true, `dist/assets/${name} 没有被 asarUnpack 覆盖`)
+    }
+  })
+
+  test('原生模块（含平台子包）、PDF.js 资源、worker 入口与随包 dsh CLI 都会被解包', () => {
+    for (const file of [
+      'node_modules/sherpa-onnx-node/sherpa-onnx.js',
+      'node_modules/sherpa-onnx-win-x64/sherpa-onnx.node',
+      'node_modules/sherpa-onnx-win-x64/onnxruntime.dll',
+      'node_modules/sherpa-onnx-darwin-arm64/sherpa-onnx.node',
+      'node_modules/sherpa-onnx-darwin-x64/libonnxruntime.dylib',
+      'node_modules/pdfjs-dist/package.json',
+      'node_modules/pdfjs-dist/legacy/build/pdf.mjs',
+      'node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
+      'node_modules/pdfjs-dist/cmaps/UniGB-UCS2-H.bcmap',
+      'node_modules/pdfjs-dist/standard_fonts/FoxitSans.pfb',
+      'node_modules/@deepseek-ai/dsh/lib/bin.js',
+      'node_modules/@deepseek-ai/dsh/package.json',
+      'dist/main/doc-pdf-worker.js',
+      'dist/main/tts-edge-worker.js',
+    ]) {
+      assert.equal(unpacked(file), true, `${file} 没有被 asarUnpack 覆盖`)
+    }
+  })
+
+  test('本应用自己的页面、主进程与素材仍在 asar 里（只解包外部读者要读的）', () => {
+    for (const file of ['dist/main/index.js', 'dist/renderer/main.js', 'dist/preload/index.cjs', 'dist/assets/pets/panda.png', 'package.json']) {
+      assert.equal(unpacked(file), false, `${file} 不该被解包`)
+    }
+    assert.equal(topValue('asar'), 'true')
+  })
+
+  test('不签名、不公证、不发布；产物名写明未签名的本地测试包', () => {
+    assert.equal(topValue('publish'), 'null')
+    assert.equal(topValue('forceCodeSigning'), 'false')
+    assert.equal(nestedValue('mac', 'identity'), 'null')
+    assert.equal(nestedValue('mac', 'notarize'), 'false')
+    assert.match(topValue('artifactName') ?? '', /unsigned-local/)
+    for (const key of ['cscLink', 'cscKeyPassword', 'certificateFile', 'certificatePassword', 'signtoolOptions', 'azureSignOptions', 'electronFuses']) {
+      assert.equal(lines.some(line => line.includes(`${key}:`)), false, `配置里出现了 ${key}`)
+    }
+  })
+
+  test('原生模块不按 Electron 重编译：全是 N-API 预编译包', () => {
+    assert.equal(topValue('npmRebuild'), 'false')
+  })
+
+  test('macOS 权限用途说明与 entitlements 保持原样', () => {
+    const mac = block('mac').join('\n')
+    assert.equal(mac.includes('NSMicrophoneUsageDescription: 桌面助理需要麦克风来听你说话（语音唤醒与按键听写）。录音只在本机处理，不上传任何音频。'), true)
+    assert.equal(mac.includes('NSCameraUsageDescription: 桌面助理不使用摄像头；这一项仅为满足系统对媒体权限的完整性检查。'), true)
+    assert.equal(mac.includes('NSAppleEventsUsageDescription: 桌面助理需要它来读取前台应用信息，用于生成你的活动记录（仅在你开启「活动记录」后）。'), true)
+    assert.equal(nestedValue('mac', 'LSUIElement'), 'true')
+    assert.equal(nestedValue('mac', 'entitlements'), 'build/entitlements.mac.plist')
+    assert.equal(nestedValue('mac', 'entitlementsInherit'), 'build/entitlements.mac.plist')
+    const plist = readFileSync(path.join(repo, 'build', 'entitlements.mac.plist'), 'utf8')
+    for (const key of [
+      'com.apple.security.device.audio-input',
+      'com.apple.security.cs.allow-jit',
+      'com.apple.security.cs.allow-unsigned-executable-memory',
+      'com.apple.security.cs.disable-library-validation',
+    ]) {
+      assert.match(plist, new RegExp(`<key>${key.replace(/\./g, '\\.')}</key>\\s*<true/>`), key)
+    }
+  })
+
+  test('userData 目录名保持 dsh-pet：打包后的 package.json 不能多出 productName', () => {
+    const pkg = JSON.parse(readFileSync(path.join(repo, 'package.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(pkg.name, 'dsh-pet')
+    assert.equal('productName' in pkg, false)
+    assert.equal(lines.some(line => line.startsWith('extraMetadata:')), false)
+  })
+
+  test('不再把素材整份重复拷进 resources：没有代码读那里', () => {
+    assert.equal(lines.some(line => line.startsWith('extraResources:')), false)
   })
 })

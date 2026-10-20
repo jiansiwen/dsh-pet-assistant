@@ -20,7 +20,7 @@ export type Risk = 'low' | 'medium' | 'high'
  * 都集中在本文件，界面拿到的 `ApprovalCardView` 里不再有可空字段需要各自处理。
  */
 export interface ApprovalProposal {
-  kind?: 'report' | 'team'
+  kind?: 'report' | 'team' | 'assistant'
   reportId?: string
   revision?: number
   digest?: string
@@ -166,7 +166,18 @@ export function ellipsizeMiddle(text: string, max: number): string {
 export interface ApprovalCardView {
   proposalId: string
   report: { reportId: string; revision: number; digest: string; content: string } | null
+  assistant?: { revision: number; digest: string; content: string } | null
+  /** 改动提案的可审阅差异（文件清单、增删行、截断提示）；只有 apply_change 有。 */
+  change?: ChangeReviewView | null
+  /** 验证命令的完整范围（cwd、程序、参数数组、超时、预期副作用）；只有 run_verification 有。 */
+  verification?: VerificationReviewView | null
+  /** unknown 人工复核要写进账本的结论；只有 review_unknown 有。 */
+  review?: UnknownReviewView | null
+  /** 卡片标题：按提案种类给，界面不再自己猜。 */
+  title: string
   tool: string
+  /** 给人看的操作名；可信执行器动作带中文说明，其余就是工具名。 */
+  toolLabel: string
   target: string | null
   summary: string | null
   risk: Risk
@@ -200,6 +211,213 @@ export function formatCountdown(ms: number): string {
   if (ms <= 0) return '已过期'
   const totalSeconds = Math.floor(ms / 1000)
   return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, '0')}`
+}
+
+/**
+ * 由插件可信执行器完成的三种动作。它们不是宿主工具：批准后由执行器应用改动、运行验证命令或写入复核结论，
+ * 所以审批卡必须把「到底会发生什么」完整摊开 —— 差异、命令、结论任何一项缺失或对不上，都不能批。
+ */
+export const TRUSTED_REVIEW_TOOLS = ['apply_change', 'run_verification', 'review_unknown'] as const
+export type TrustedReviewTool = (typeof TRUSTED_REVIEW_TOOLS)[number]
+
+const TRUSTED_TOOL_LABEL: Record<TrustedReviewTool, string> = {
+  apply_change: '应用改动（apply_change）',
+  run_verification: '运行验证命令（run_verification）',
+  review_unknown: '写入人工复核结论（review_unknown）',
+}
+
+export interface DiffLineView {
+  kind: 'hunk' | 'add' | 'del' | 'ctx' | 'meta'
+  text: string
+}
+
+export interface ChangeFileView {
+  path: string
+  action: 'modify' | 'create'
+  actionLabel: string
+  added: number
+  removed: number
+  baseHash: string
+  newHash: string
+  lines: DiffLineView[]
+  truncated: boolean
+}
+
+export interface ChangeReviewView {
+  root: string
+  revision: number
+  digest: string
+  files: ChangeFileView[]
+  totalAdded: number
+  totalRemoved: number
+  truncated: boolean
+  notice: string | null
+}
+
+export interface VerificationReviewView {
+  root: string
+  cwd: string
+  cwdRelative: string
+  program: string
+  requested: string | null
+  args: string[]
+  timeoutMs: number
+  timeoutLabel: string
+  expectedEffects: string
+  env: string
+  afterChange: { revision: number; files: string[] } | null
+  notes: string[]
+  digest: string
+  revision: number
+}
+
+export interface UnknownReviewView {
+  operationId: string
+  kind: string
+  target: string | null
+  startedAt: number | null
+  executedAt: number | null
+  detail: string | null
+  resolution: 'verified-succeeded' | 'verified-failed' | 'abandoned'
+  resolutionLabel: string
+  note: string
+  effect: string
+  digest: string
+}
+
+const HEX64 = /^[a-f0-9]{64}$/
+const MAX_REVIEW_FILES = 20
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function nonEmpty(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function count(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0
+}
+
+function diffLines(diff: string): DiffLineView[] {
+  if (diff.length === 0) return []
+  return diff.split('\n').map((text): DiffLineView => {
+    if (text.startsWith('@@')) return { kind: 'hunk', text }
+    if (text.startsWith('+')) return { kind: 'add', text }
+    if (text.startsWith('-')) return { kind: 'del', text }
+    if (text.startsWith('\\')) return { kind: 'meta', text }
+    return { kind: 'ctx', text }
+  })
+}
+
+/**
+ * 改动审阅文档 → 卡片视图。每一项都核对：文件清单完整、增删行数与总数自洽、
+ * 没截断时显示的差异行数必须等于声明的增删行数、截断时必须带提示。任何一项不符返回 null（不能批）。
+ */
+function parseChangeReview(proposal: ApprovalProposal, document: unknown): ChangeReviewView | null {
+  if (!isRecord(document) || document.format !== 'dsh-change-review@1' || !nonEmpty(document.root)) return null
+  if (document.revision !== proposal.revision || !Array.isArray(document.files)) return null
+  if (document.files.length === 0 || document.files.length > MAX_REVIEW_FILES) return null
+  const files: ChangeFileView[] = []
+  for (const raw of document.files) {
+    if (!isRecord(raw) || !nonEmpty(raw.path) || (raw.action !== 'modify' && raw.action !== 'create')) return null
+    if (!count(raw.added) || !count(raw.removed) || typeof raw.diff !== 'string' || typeof raw.diffTruncated !== 'boolean') return null
+    if (typeof raw.newHash !== 'string' || !HEX64.test(raw.newHash)) return null
+    const baseOk = raw.action === 'create' ? raw.baseHash === 'absent' : typeof raw.baseHash === 'string' && HEX64.test(raw.baseHash)
+    if (!baseOk) return null
+    const lines = diffLines(raw.diff)
+    if (!raw.diffTruncated) {
+      // 显示的差异必须就是全部差异：行数对不上，说明卡片上看到的不是将要写进去的东西。
+      if (lines.filter(line => line.kind === 'add').length !== raw.added) return null
+      if (lines.filter(line => line.kind === 'del').length !== raw.removed) return null
+    }
+    files.push({
+      path: raw.path, action: raw.action, actionLabel: raw.action === 'create' ? '新建' : '修改',
+      added: raw.added, removed: raw.removed, baseHash: raw.baseHash as string, newHash: raw.newHash, lines, truncated: raw.diffTruncated,
+    })
+  }
+  const totalAdded = files.reduce((sum, file) => sum + file.added, 0)
+  const totalRemoved = files.reduce((sum, file) => sum + file.removed, 0)
+  if (document.totalAdded !== totalAdded || document.totalRemoved !== totalRemoved) return null
+  const truncated = files.some(file => file.truncated)
+  if (document.truncated !== truncated) return null
+  if (truncated && !nonEmpty(document.notice)) return null
+  return {
+    root: document.root, revision: proposal.revision as number, digest: proposal.digest as string, files,
+    totalAdded, totalRemoved, truncated, notice: truncated ? (document.notice as string) : null,
+  }
+}
+
+function parseVerificationReview(proposal: ApprovalProposal, document: unknown): VerificationReviewView | null {
+  if (!isRecord(document) || document.format !== 'dsh-verification-review@1') return null
+  if (!nonEmpty(document.root) || !nonEmpty(document.cwd) || !nonEmpty(document.program)) return null
+  if (!Array.isArray(document.args) || !document.args.every(arg => typeof arg === 'string')) return null
+  if (!Number.isInteger(document.timeoutMs) || (document.timeoutMs as number) <= 0) return null
+  if (!nonEmpty(document.expectedEffects) || !nonEmpty(document.env)) return null
+  let afterChange: VerificationReviewView['afterChange'] = null
+  if (document.afterChange !== null && document.afterChange !== undefined) {
+    const after = document.afterChange
+    if (!isRecord(after) || !Number.isInteger(after.revision) || !Array.isArray(after.files)
+      || !after.files.every(file => typeof file === 'string')) return null
+    afterChange = { revision: after.revision as number, files: after.files as string[] }
+  }
+  const notes = Array.isArray(document.notes) ? document.notes.filter((note): note is string => typeof note === 'string') : []
+  const seconds = Math.round((document.timeoutMs as number) / 1000)
+  return {
+    root: document.root, cwd: document.cwd, cwdRelative: typeof document.cwdRelative === 'string' ? document.cwdRelative : document.cwd,
+    program: document.program, requested: typeof document.requested === 'string' ? document.requested : null,
+    args: document.args as string[], timeoutMs: document.timeoutMs as number,
+    timeoutLabel: seconds >= 60 ? `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `${seconds} 秒`,
+    expectedEffects: document.expectedEffects, env: document.env, afterChange, notes,
+    digest: proposal.digest as string, revision: proposal.revision as number,
+  }
+}
+
+const RESOLUTIONS = ['verified-succeeded', 'verified-failed', 'abandoned'] as const
+
+function parseUnknownReview(proposal: ApprovalProposal, document: unknown): UnknownReviewView | null {
+  if (!isRecord(document) || document.format !== 'dsh-unknown-review@1' || !isRecord(document.operation)) return null
+  const operation = document.operation
+  if (!nonEmpty(operation.operationId) || !nonEmpty(operation.kind)) return null
+  if (!(RESOLUTIONS as readonly unknown[]).includes(document.resolution) || !nonEmpty(document.resolutionLabel)) return null
+  if (typeof document.note !== 'string' || !nonEmpty(document.effect)) return null
+  const time = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+  return {
+    operationId: operation.operationId, kind: operation.kind,
+    target: typeof operation.target === 'string' ? operation.target : null,
+    startedAt: time(operation.startedAt), executedAt: time(operation.executedAt),
+    detail: typeof operation.detail === 'string' ? operation.detail : null,
+    resolution: document.resolution as UnknownReviewView['resolution'], resolutionLabel: document.resolutionLabel,
+    note: document.note, effect: document.effect, digest: proposal.digest as string,
+  }
+}
+
+/** 可信执行器动作的审阅内容：解析不出来就返回 null，调用方据此禁止批准。 */
+function trustedReview(proposal: ApprovalProposal): Pick<ApprovalCardView, 'change' | 'verification' | 'review'> | null {
+  if (typeof proposal.digest !== 'string' || !HEX64.test(proposal.digest)) return null
+  if (!Number.isInteger(proposal.revision) || (proposal.revision ?? 0) <= 0) return null
+  if (typeof proposal.content !== 'string' || proposal.content.length === 0) return null
+  let document: unknown
+  try {
+    document = JSON.parse(proposal.content)
+  } catch {
+    return null
+  }
+  if (proposal.tool === 'apply_change') {
+    const change = parseChangeReview(proposal, document)
+    return change ? { change } : null
+  }
+  if (proposal.tool === 'run_verification') {
+    const verification = parseVerificationReview(proposal, document)
+    return verification ? { verification } : null
+  }
+  const review = parseUnknownReview(proposal, document)
+  return review ? { review } : null
+}
+
+function isTrustedReviewTool(tool: unknown): tool is TrustedReviewTool {
+  return typeof tool === 'string' && (TRUSTED_REVIEW_TOOLS as readonly string[]).includes(tool)
 }
 
 /**
@@ -240,13 +458,43 @@ export function cardView(
     ? { reportId: proposal.reportId, revision: proposal.revision!, digest: proposal.digest, content: proposal.content }
     : null
   if (isReport && !report) blockedReason = '日报全文、版本或绑定信息缺失，不能批准，请重新提交'
+  const isAssistant = proposal.kind === 'assistant'
+  const assistant = isAssistant && proposal.state === 'pending'
+    && typeof proposal.tool === 'string' && proposal.tool.trim().length > 0
+    && Number.isInteger(proposal.revision) && (proposal.revision ?? 0) > 0
+    && typeof proposal.digest === 'string' && /^[a-f0-9]{64}$/.test(proposal.digest)
+    && typeof proposal.content === 'string' && proposal.content.trim().length > 0
+    && typeof proposal.epoch === 'string' && proposal.epoch.length > 0
+    && typeof proposal.target === 'string' && proposal.target.length > 0
+    && typeof proposal.expiresAt === 'number' && Number.isFinite(proposal.expiresAt)
+    ? { revision: proposal.revision!, digest: proposal.digest, content: proposal.content } : null
+  if (isAssistant && !assistant) blockedReason = '授权全文、版本或绑定信息缺失，不能批准，请重新提交'
+  // 可信执行器动作只出现在团队提案里；审阅内容缺失、格式不对或前后不自洽都不能批。
+  const isTrusted = (proposal.kind === undefined || proposal.kind === 'team') && isTrustedReviewTool(proposal.tool)
+  const trusted = isTrusted ? trustedReview(proposal) : null
+  if (isTrusted && !trusted) {
+    blockedReason = proposal.tool === 'apply_change' ? '改动差异、版本或绑定信息缺失或对不上，不能批准，请让助理重新提交'
+      : proposal.tool === 'run_verification' ? '验证命令的完整范围缺失或格式不对，不能批准，请让助理重新提交'
+        : '复核结论或被复核的操作信息缺失，不能批准，请让助理重新提交'
+  }
+  const trustedTool = isTrusted ? (proposal.tool as TrustedReviewTool) : null
+  const title = isReport ? '请确认这版日报' : isAssistant ? '请确认助理操作范围'
+    : trustedTool === 'apply_change' ? '请审阅这次改动'
+      : trustedTool === 'run_verification' ? '请确认这条验证命令'
+        : trustedTool === 'review_unknown' ? '请确认人工复核结论' : '有个操作等你点头'
 
   return {
     proposalId: proposal.proposalId,
     report,
+    ...(isAssistant ? { assistant } : {}),
+    ...(trustedTool === 'apply_change' ? { change: trusted?.change ?? null } : {}),
+    ...(trustedTool === 'run_verification' ? { verification: trusted?.verification ?? null } : {}),
+    ...(trustedTool === 'review_unknown' ? { review: trusted?.review ?? null } : {}),
+    title,
     tool: proposal.tool || '未知操作',
+    toolLabel: trustedTool ? TRUSTED_TOOL_LABEL[trustedTool] : proposal.tool || '未知操作',
     // 日报目标必须完整显示，不能把中间的目录截断成省略号。
-    target: isReport ? proposal.target ?? null : ellipsizeMiddle(normalizeTarget(proposal.target) ?? '', 160) || null,
+    target: isReport || isAssistant ? proposal.target ?? null : ellipsizeMiddle(normalizeTarget(proposal.target) ?? '', 160) || null,
     summary: proposal.summary?.trim() || null,
     risk,
     riskLabel: RISK_LABEL[risk],
@@ -285,10 +533,34 @@ export function confirmDialogSpec(
 ): ConfirmDialogSpec {
   const who = requesterName ?? '助理'
   const left = view.expiresAt === null ? null : view.expiresAt - now
+  const change = view.change
+  const verification = view.verification
+  const review = view.review
   const lines = [
-    `操作：${view.tool}`,
+    `操作：${view.toolLabel}`,
     view.target ? `目标：${view.target}` : null,
     view.report ? `日报：${view.report.reportId}，第 ${view.report.revision} 版\n摘要：${view.report.digest}` : null,
+    view.assistant ? `助理提案：第 ${view.assistant.revision} 版\n摘要：${view.assistant.digest}\n完整范围：${view.assistant.content}` : null,
+    change
+      ? [
+          `改动：第 ${change.revision} 版，${change.files.length} 个文件（+${change.totalAdded} −${change.totalRemoved}）`,
+          ...change.files.map(file => `  · ${file.path}（${file.actionLabel}，+${file.added} −${file.removed}）`),
+          change.notice ? `注意：${change.notice}` : null,
+        ].filter((line): line is string => line !== null).join('\n')
+      : null,
+    verification
+      ? [
+          `工作目录：${verification.cwd}`,
+          `程序：${verification.program}`,
+          `参数：${JSON.stringify(verification.args)}`,
+          `超时：${verification.timeoutLabel}`,
+          `预期副作用：${verification.expectedEffects}`,
+          `环境：${verification.env}`,
+        ].join('\n')
+      : null,
+    review
+      ? `复核：把 ${review.kind}${review.target ? `（${review.target}）` : ''} 标记为「${review.resolutionLabel}」${review.note ? `\n备注：${review.note}` : ''}`
+      : null,
     view.summary ? `说明：${view.summary}` : null,
     `提请：${who}`,
     `风险：${view.riskLabel}`,
@@ -297,7 +569,7 @@ export function confirmDialogSpec(
 
   return {
     title: '需要你确认这个操作',
-    message: `${who}请求执行「${view.tool}」，这一步批准后就会真的动手。`,
+    message: `${who}请求执行「${view.toolLabel}」，这一步批准后就会真的动手。`,
     detail: lines.join('\n'),
     approveLabel: '我确认，批准',
     cancelLabel: '先不批准',
