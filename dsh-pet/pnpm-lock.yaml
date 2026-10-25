@@ -20,9 +20,6 @@ importers:
       sherpa-onnx-node:
         specifier: ^1.13.7
         version: 1.13.7
-      sherpa-onnx-win-x64:
-        specifier: ^1.13.7
-        version: 1.13.7
       ws:
         specifier: ^8.21.3
         version: 8.21.3
@@ -54,6 +51,25 @@ importers:
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
+    optionalDependencies:
+      sherpa-onnx-darwin-arm64:
+        specifier: ^1.13.7
+        version: 1.13.7
+      sherpa-onnx-darwin-x64:
+        specifier: ^1.13.7
+        version: 1.13.7
+      sherpa-onnx-linux-arm64:
+        specifier: ^1.13.7
+        version: 1.13.7
+      sherpa-onnx-linux-x64:
+        specifier: ^1.13.7
+        version: 1.13.7
+      sherpa-onnx-win-ia32:
+        specifier: ^1.13.7
+        version: 1.13.7
+      sherpa-onnx-win-x64:
+        specifier: ^1.13.7
+        version: 1.13.7
 
 packages:
 
@@ -8074,7 +8090,8 @@ snapshots:
   sherpa-onnx-win-ia32@1.13.7:
     optional: true
 
-  sherpa-onnx-win-x64@1.13.7: {}
+  sherpa-onnx-win-x64@1.13.7:
+    optional: true
 
   side-channel-list@1.0.1:
     dependencies:

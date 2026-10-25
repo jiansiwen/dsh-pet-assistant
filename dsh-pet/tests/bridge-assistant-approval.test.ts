@@ -7,6 +7,7 @@ import { BridgeClient } from '../src/main/harness.ts'
 
 test('助理审批凭据隔离、专属路由与代次校验', async t => {
   const base = fileURLToPath(new URL('../../generated-videos/moved-from-assets/petsBak/dsh-pet/', import.meta.url))
+  mkdirSync(base, { recursive: true })
   const home = mkdtempSync(path.join(base, 'verify-assistant-approval-credentials-'))
   const previous = process.env.DSH_HOME
   process.env.DSH_HOME = home

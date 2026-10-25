@@ -113,3 +113,42 @@ test('手动模式：记忆仍然只提交待批', async t => {
   assert.equal(pending.remembered, undefined)
   assert.equal(f.rt.memories.list({}, Date.now()).some(item => item.text === '日报不写时长'), false)
 })
+
+test('改写记忆：自动模式直接生效，换的是正文不是编号', async t => {
+  const f = workbenchFixture(t, { approvalMode: 'auto' })
+  await f.rt.bind()
+  const saved = await f.rt.call('remember_preference', { text: '日报不写时长', topic: '日报口径' })
+  assert.equal(saved.remembered, true, JSON.stringify(saved))
+  const id = String(saved.id)
+
+  const edited = await f.rt.call('edit_preference', { id, text: '日报不写时长，也不写时间段' })
+  assert.equal(edited.edited, true, JSON.stringify(edited))
+  assert.equal(edited.mode, 'auto')
+  assert.equal(edited.id, id, '编号必须不变')
+  assert.equal(edited.revision, Number(saved.revision) + 1)
+  const record = f.rt.memories.get(id, Date.now())!
+  assert.equal(record.text, '日报不写时长，也不写时间段')
+  assert.equal(f.rt.memories.list({}, Date.now()).filter(item => item.topic === '日报口径').length, 1, '不是新建一条')
+})
+
+test('改写记忆：手动模式只提交待批；不存在的编号与空正文直接拒绝', async t => {
+  const f = workbenchFixture(t)
+  await f.rt.bind()
+  const pending = await f.rt.call('remember_preference', { text: '日报按项目分组', topic: '日报口径' })
+  assert.equal(pending.pending, true)
+  assert.equal((await f.rt.decide(pending.proposalId)).ok, true)
+  const record = f.rt.memories.list({}, Date.now()).find(item => item.text === '日报按项目分组')!
+
+  const submitted = await f.rt.call('edit_preference', { id: record.id, text: '日报按项目分组，先写主线' })
+  assert.equal(submitted.pending, true, JSON.stringify(submitted))
+  assert.equal(f.rt.memories.get(record.id, Date.now())!.text, '日报按项目分组', '批准前不改')
+  assert.equal((await f.rt.decide(submitted.proposalId)).ok, true)
+  assert.equal(f.rt.memories.get(record.id, Date.now())!.text, '日报按项目分组，先写主线')
+
+  const missing = await f.rt.call('edit_preference', { id: 'mem-不存在', text: '新内容' })
+  assert.equal(missing.pending, false)
+  assert.match(String(missing.error), /找不到/)
+  const empty = await f.rt.call('edit_preference', { id: record.id, text: '  ' })
+  assert.equal(empty.pending, false)
+  assert.match(String(empty.error), /不能是空/)
+})

@@ -112,7 +112,7 @@ describe('打包路径接线：交给外部读者的路径都要经过解包', (
 describe('打包路径：开发态行为不变', () => {
   test('源码目录里没有 .asar 段，解包函数原样返回', () => {
     // 这是"接线不影响开发态"的根本保证：所有接线都靠这一个纯函数。
-    const devMain = path.join('D:', 'work', 'dsh-pet', 'dist', 'main')
+    const devMain = path.join('D:', 'work', 'dsh', 'dsh-pet', 'dist', 'main')
     for (const name of ['wake.ps1', 'asr-wave.ps1', 'tts-edge-worker.js', 'doc-pdf-worker.js', 'win-uia.ps1']) {
       const file = path.join(devMain, name)
       assert.equal(toUnpackedPath(file), file, `${name} 在开发态不该被改写`)

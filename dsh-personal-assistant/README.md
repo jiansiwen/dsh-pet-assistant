@@ -5,6 +5,28 @@ DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里�
 
 宠物那一侧（Electron 外壳、语音、文档讲解）在 [`dsh-pet/`](../dsh-pet/README.md)。
 
+## 安装
+
+前置条件：Node.js ≥ 22、pnpm、dsh `0.2.1-rc.2`（与 peerDependencies 一致）。
+
+从 GitHub 安装：
+
+```bash
+dsh plugin --profile web add "github:jiansiwen/dsh-pet-assistant#path:/dsh-personal-assistant"
+```
+
+从本地源码安装：
+
+```bash
+cd path/to/repo
+dsh plugin --profile web add ./dsh-personal-assistant
+```
+
+安装后重启 dsh web 生效。仓库中已包含构建好的 `dist/`，安装时不需要执行构建脚本。
+
+若想让「召唤宠物」自动拉起桌宠，在本机 profile 的 `cordis.patch.yml` 中为
+`personal-assistant` 配置 `petDir`（指向本机的 dsh-pet 目录，见根 README）。
+
 ## 功能
 
 ### 活动记录与日报
@@ -66,12 +88,12 @@ DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里�
   重启后用 `desktop_team_status` 仍可查。进程停在执行前、执行中、执行后但回执没落库的任一位置，重启对账一律记
   unknown 等人工核查：任务不再被领取、相关审批卡作废、绝不自动重发；模型自报不能把 unknown 改成成功。
   子代理释放失败时门禁与额度先保留，退出只重试释放
-- **预算与费用**：用户 2026-10-17 选择**不设累计 Token 预算**，`defaultBudgetTokens` 默认 0。
+- **预算与费用**：**默认不设累计 Token 预算**，`defaultBudgetTokens` 默认 0。
   后果是**团队任务的模型费用不封顶**：宿主只有单次输出上限（子代理沿用父会话每次请求的 maxTokens），没有累计硬上限；
   仍然生效的只有单次输出上限、墙钟超时（`taskTimeoutMs`，默认 10 分钟）与并发上限（推理 2 / 副作用 1）。
   显式给出非零预算的任务会如实拒启（`budget-unsupported`），不假装能守住
 
-### 主动提醒（design.md §2.7）
+### 主动提醒
 
 - 采样器带**最后键鼠输入**指标（`idleMs`，纯数值，不含任何窗口/应用身份）。
   无输入超过阈值（默认 8 分钟，`proactiveIdleMs` 可调）且角色可见、不在专注模式时，产生候选提醒
@@ -212,11 +234,11 @@ dsh --profile web --patch <插件目录>/cordis.team.patch.yml
         maxConcurrentInference: 2
         maxConcurrentSideEffect: 1  # 必须小于推理上限
         taskTimeoutMs: 600000
-        defaultBudgetTokens: 0      # 0 = 用户选择不设累计预算（费用不封顶）；非零值会因宿主没有累计硬上限而拒启
+        defaultBudgetTokens: 0      # 0 = 不设累计预算（费用不封顶）；非零值会因宿主没有累计硬上限而拒启
         approvalTtlMs: 300000       # 批准有效期；运行时代次变化会让旧批准立即失效
         denyExpertTools: []         # 额外从只读专家手里禁用的工具名
 
-        # 主动提醒（design.md §2.7）
+        # 主动提醒
         proactiveEnabled: true      # 关闭后引擎彻底安静，也省掉评估定时器
         proactiveIdleMs: 480000     # 无输入多久后可以提醒（8 分钟）
         proactiveCooldownMs: 3600000 # 两次提醒的最小间隔（60 分钟）
@@ -289,59 +311,37 @@ dsh --profile web --patch <插件目录>/cordis.team.patch.yml
 这些是当前实现的真实边界，不是待修的 bug：
 
 - **采样只支持 Windows 与 macOS**（Windows：PowerShell + user32；macOS：系统自带 `osascript -l JavaScript`，不加依赖）。
-  其他平台（如 Linux）如实拒绝开启采集。**macOS 版尚未真机验证**，验证步骤交由团队成员在 Mac 上执行，结果到回前保持「待验证」。
+  其他平台（如 Linux）如实拒绝开启采集。**macOS 版尚未真机验证**。
   分类规则仍以 Windows 进程名为主，macOS 应用（如 `Google Chrome`、`Microsoft Word`）多数会归到 other，可用 `customRules` 补
-- **从桌面开始会话依赖宿主的 `ctx.agents`**：真实宿主里 create / resume 的行为（会话 id 格式、`meta.cwd`、
-  恢复需要 `sessionPersistence`）只按类型声明与 agent-loop 源码核对过，尚未在真实 dsh 里跑过；
+- **从桌面开始会话依赖宿主的 `ctx.agents`**：部分宿主没有该服务时会返回 `agents-unavailable`；
   恢复失败时插件新建会话并如实给出原因
-- **`~/.dsh/profiles/headless/cordis.patch.yml` 当前起不来**：它 insert 了 `id: personal-assistant`，
-  与插件自带的 patch 撞同一个 id → `duplicate loader entry id`。修法是删掉 profile 层那几行。
-  `~/.dsh` 在工作区外，改它需要你自己动手。开发与验证走 `web` profile
 - **回复不是流式的**：桥接的 `chat` 一次性返回全文，桌面壳要等整段算完才能开始念
-- **两个 SQLite 库都是明文落盘，没有静态加密**。`design.md` §9.3（第 452 行）把
-  「数据密钥 + Windows DPAPI 保护 + 密钥恢复/丢失提示」写成敏感录音与正文启用前的准入条件，
-  阶段 C 的依赖栏也写着「安全存储准入」——**这道闸目前没有实现**。库里现在存着的敏感内容包括
-  窗口标题（`activity_span` 观察）、日报正文（版本化全文）与记忆原文。
-  没做的原因不是忘了：`node:sqlite` 是裸驱动，加密要么落在驱动层（换 SQLCipher 一类的方案），
-  要么落在字段层（只加密敏感列），两条路都得先决定密钥怎么存、用户换了机器或丢了密钥怎么办，
-  而选错了会把用户已经攒下的记忆锁死。计划原文的要求是「未实现则禁用该类持久采集」，
-  所以严格按计划，日报正文与窗口标题的持久化现在就该是关着的——这是**用户已拍板的偏离**
-  （2026-09-06：暂缓加密），将来要补时，DPAPI + 数据密钥的技术路线已验证可行
-- 团队阶段（编制落库、审批链路、状态机）已在 web profile 真机启动验证过；
-  **桌面壳那一段端到端流程（多角色舞台、语音、文档讲解、群体场景、资源目标）尚未真机验证**，
-  目前只有单测与构建覆盖。**注意：常驻的 dsh web 服务加载的是启动当时的插件构建——
-  升级后必须重启 dsh web 才生效**，重启后跑 `node scripts/verify-restart.mjs` 一键确认
-- 阶段 F 只做了**不被加密准入闸挡住的部分**（空闲提醒与授权执行，§2.7）；分轨录音、转写、
-  纪要被闸挡住暂缓 —— 准入闸（design.md §9.3：敏感录音与正文启用前必须先实现数据密钥 +
-  Windows DPAPI 保护 + 密钥恢复提示，未实现则禁用该类持久采集）留待你日后拍板补加密时再开
+- **两个 SQLite 库都是明文落盘，没有静态加密**：库里存着窗口标题、日报正文与记忆原文。
+  介意的话请勿开启助理模式，或自行加密磁盘
+- 常驻的 dsh web 加载的是启动当时的插件构建：升级插件后必须重启 dsh web 才生效
+- 桌宠的多角色舞台、语音、文档讲解与群体场景目前只有单测与构建覆盖，尚未完成真机验收
+- 会议录音、转写与纪要依赖的静态加密尚未实现，这部分功能暂缓；当前只有空闲提醒等不涉及录音的能力
 
 ## 开发与验证
 
 ```powershell
 pnpm run typecheck   # tsc --noEmit
-pnpm test            # 119 条单测，node --test "tests/**/*.test.ts"
-pnpm run smoke       # 三套件冒烟
+pnpm test            # node --test "tests/**/*.test.ts"
 pnpm run build       # esbuild 打包到 dist/
-
-# 重启 dsh web 之后跑一次：自动确认新构建已生效（schema v2 / 桥接健康 / 采样指标）
-node scripts/verify-restart.mjs
 ```
 
-`pnpm run smoke` 依次跑（前一个失败就短路，避免两份错误输出互相盖住）：
-
-1. **团队存储 / 审批链路 / 任务状态机**（`scripts/smoke-team.ts`）
-2. **会话桥接 HTTP 契约与回复归属**（`scripts/smoke-bridge.ts`）
-3. **插件入口装配**（`scripts/smoke-apply.ts`）：用假宿主跑真 `apply()`，
-   是装配顺序、迁移闸门、保留期、工具接线的唯一覆盖。它刻意不启真采样进程
-
-冒烟要先打成 bundle 再跑，不能 `node` 直接执行 `.ts`：源码里有 TS 参数属性。
-bundle 落在包内 `node_modules/.dsh-smoke` 而不是系统临时目录——桥接运行时要真 import
-`@deepseek-ai/dsh-llm`，external 出来的裸标识符按产物文件位置向上找 node_modules，
-放临时目录会直接 `ERR_MODULE_NOT_FOUND`。
+修改源码后必须重新构建，并把新的 `dist/index-*.js` 与 `package.json` 的 `main` 一起提交；
+从 GitHub 安装的用户直接使用仓库里的构建产物。
 
 单测能直接跑 `.ts` 的前提是**模块不沾 electron、不用参数属性、本地值导入写 `.ts` 后缀**
 （Node 的 strip-only TypeScript 不会把 `.js` 重写成 `.ts`）。新模块一律用显式字段，
 公共口径抽成纯函数模块（`spans.ts` / `time.ts` 是范例）。
+`tsconfig.json` 只对 `src` 做类型检查；`tests` 由 `pnpm test` 直接运行，不参与 `tsc`。
+
+## 许可证
+
+代码采用 MIT，见 [LICENSE](./LICENSE)。桌宠的动画、图片、提示词与源视频素材采用
+[CC BY-NC 4.0](../ASSETS-LICENSE.md)，禁止商业使用。
 
 ## 排障
 
@@ -356,7 +356,7 @@ bundle 落在包内 `node_modules/.dsh-smoke` 而不是系统临时目录——�
 | 批准明明给过却说失效 | 计划摘要变了（目标 / 参数 / 输入修订任一），或运行时代次变了，或超过 `approvalTtlMs` |
 | 副作用任务的调用停住不动 | 在等桌面审批窗口的决定；批准前不会执行，驳回或到期（`approvalTtlMs`）就拒绝 |
 | 任务停在 unknown | 有副作用结果不明（进程中断、工具报错或子代理没能释放），先人工核查真实外部状态；不会自动重发 |
-| 带预算的任务拒启 `budget-unsupported` | 宿主没有累计硬上限，非零累计预算守不住；用户已选择不设累计预算，按 0 提交即可 |
+| 带预算的任务拒启 `budget-unsupported` | 宿主没有累计硬上限，非零累计预算守不住；默认按 0 提交即可 |
 | 宠物说「还没有连上 dsh 会话」（`503`，`code: unbound`） | 桥接已起但没绑定会话：在 dsh 里召唤宠物，或调 `POST /session/start` 从桌面开始。未绑定时对话与审批都不受理，待办留着，绑定后再处理 |
 | `/session/start` 回 `agents-unavailable` | 当前宿主没有 `ctx.agents`（或还没装上）：只能在 dsh 里召唤宠物；插件不会退化成假成功 |
 | 开始会话回 `created` 且带 `resumeError` | 上次自建的会话恢复不了（例如宿主没配会话持久化），已新建并如实给出原因；旧会话记录不会被删 |

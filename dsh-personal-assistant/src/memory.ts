@@ -545,6 +545,33 @@ export class MemoryStore {
     })
   }
 
+  /**
+   * 就地改写一条已有记忆的正文（和可选的分类主题），版本号 +1。
+   *
+   * 为什么是"改写"而不是"删掉再新建一条"：ID 一旦变了，所有引用这条规则的待批提案、
+   * 工作事项来源边和冲突记录全部指向一个已经不存在的东西。就地改这条，历史靠 revision 追溯。
+   *
+   * 只有用户签发才能改（与 put 的 actor 规则一致）：模型自己改规则等于自己换掉约束。
+   * 已过期的记忆不改（改一条已失效的规则没有意义，用户要的是替换）。
+   */
+  revise(id: string, input: { text: string; topic?: string | null; actor: MemoryActor }, now: number): MemoryRecord | null {
+    if (!input.actor.isUser) return null
+    const nextText = input.text.trim()
+    if (nextText === '') return null
+    return inTransaction(this.db, () => {
+      const current = this.get(id, now)
+      if (!current || current.status === 'expired') return null
+      const topic = input.topic === undefined ? current.topic : normalizeTopic(input.topic ?? '')
+      this.db
+        .prepare(
+          `UPDATE memories SET body = ?, topic = ?, revision = revision + 1, updated_at = ?, confirmed_by = ?
+           WHERE memory_id = ?`,
+        )
+        .run(nextText, topic, now, input.actor.id, id)
+      return this.get(id, now)
+    })
+  }
+
   /** 只校验身份已明确指定的目标，不根据文本或主题猜测替换关系。 */
   private replacementTargets(ids: string[], kind: MemoryKind, scope: MemoryScope, now: number): MemoryRecord[] | null {
     const records: MemoryRecord[] = []

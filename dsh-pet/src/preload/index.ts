@@ -155,7 +155,7 @@ contextBridge.exposeInMainWorld('petApi', {
     subscribe('pet-summon', () => callback())
   },
   /**
-   * 语音唤醒词命中（说"小潘小潘"）。第二个参数是这次说了哪句应答；
+   * 语音唤醒词命中（说"小潘同学"）。第二个参数是这次说了哪句应答；
    * 主进程已经用 TTS 念出来了，界面只需要把它显示在气泡里。
    */
   onWake: (callback: (greeting?: string) => void) => {

@@ -1101,6 +1101,58 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
   }))
 
   ctx.tools.register(defineTool({
+    name: 'personal_assistant_edit_preference',
+    description: '改写一条已存在的记忆（偏好/项目事实）的正文或分类主题，编号不变、版本号 +1。用户说"把那条改成…"、"之前说的不对，应该是…"时用这个，不要删了再建（删掉再建会换编号，引用它的待批提案与来源边全部断掉）。已失效的记忆不能改。默认只提交可信待批；auto 模式下直接落库。',
+    parameters: {
+      id: { type: 'string', required: true, description: '要改写的记忆编号（来自 personal_assistant_list_preferences）' },
+      text: { type: 'string', required: true, description: '改写后的完整规则正文，照用户的意思写' },
+      topic: { type: 'string', description: '可选：同时改分类主题；不填则保留原主题' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { id: string; text: string; topic?: string }) {
+      args = structuredClone(args)
+      const now = Date.now()
+      const target = options.memories.get(args.id, now)
+      if (!target) return json({ pending: false, error: '找不到这条记忆，可能已被删除' })
+      if (target.status === 'expired') return json({ pending: false, error: '这条记忆已经失效，不能改写；要沿用请让用户重新说一遍' })
+      if (!args.text.trim()) return json({ pending: false, error: '改写后的内容不能是空的；要撤销请用删除' })
+      if (!memoryScopeReadable(target)) {
+        return json({ pending: false, error: '这条规则所属项目的帮助授权已撤销或实际路径已改指，不能改写' })
+      }
+      const scopeStillValid = () => {
+        const record = options.memories.get(args.id, now)
+        return record !== null && record.status !== 'expired' && memoryScopeReadable(record)
+      }
+      const before = preferenceSnapshot({ id: args.id })
+      const write = (): string => {
+        const record = options.memories.revise(args.id,
+          { text: args.text, ...(args.topic === undefined ? {} : { topic: args.topic }), actor: TRUSTED_ACTOR }, Date.now())
+        if (!record) throw new Error('改写失败：这条记忆已不存在或已失效')
+        return json({
+          edited: true, id: record.id, scope: scopeLabel(record.scope, {}),
+          text: record.text, topic: record.topic, revision: record.revision,
+        })
+      }
+      if (options.approvalMode?.() === 'auto') {
+        try {
+          const saved = JSON.parse(write()) as Record<string, unknown>
+          return json({ ...saved, mode: 'auto', pending: false,
+            message: '设置里开着"自动记录"：这条记忆已直接改写，不需审批' })
+        } catch (error) {
+          return json({ pending: false, mode: 'auto', edited: false, error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+      return propose({ subject: 'memories', tool: 'personal_assistant_edit_preference',
+        summary: `改写记忆「${target.text.slice(0, 30)}」：编号不变，只替换正文与分类，版本号 +1。批准后立即影响当前及未来会话的模型提示词，发送给对应模型服务商。`,
+        target: target.scope.kind === 'project' ? `项目 ${target.scope.id} 的记忆` : '本机全局记忆与未来会话模型',
+        risk: 'high', snapshot: { args, before: target, memories: before },
+        validate: () => scopeStillValid() && snapshotDigest(before) === snapshotDigest(preferenceSnapshot({ id: args.id })),
+        execute: write,
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'personal_assistant_list_preferences',
     description: '列出记忆（偏好、项目事实等）及其状态和适用范围，用于向用户展示或核对。全局记忆已自动注入系统提示词，生成日报时无需调用本工具读取；项目范围记忆只列出帮助授权仍有效的项目，授权撤销或路径改指的只报告隐藏条数。',
     parameters: {},

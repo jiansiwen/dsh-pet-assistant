@@ -60,6 +60,25 @@ export interface WorkbenchApprovals {
   notifyApprovalSnapshot?(): void
 }
 
+/**
+ * 工作台改写记忆时用的可信提案能力。
+ *
+ * 工作台和模型工具一样**不能自己签批**：它只能把"这一条改成什么"提交成待批卡片，
+ * 由用户在专用审批窗口看到新旧全文后点头。所以这里要的是 submitAssistant 而不是直接写库。
+ */
+export interface WorkbenchMemoryWrites {
+  /** 记忆写入方式：auto 时工作台直接改写并如实回报，不需要审批卡。 */
+  approvalMode(): 'manual' | 'auto'
+  /** 提交一条"改写记忆"的可信提案；返回提案编号。 */
+  proposeMemoryEdit(input: {
+    memoryId: string
+    text: string
+    topic?: string
+    before: { text: string; topic: string }
+    scopeLabel: string
+  }): string
+}
+
 export interface WorkbenchTracker extends DeletionTracker {
   readonly active?: boolean
   readonly capturing?: boolean
@@ -79,6 +98,11 @@ export interface ReportWorkbenchDeps {
   legacyCopiesRetained: boolean
   now?: () => number
   unlinkFile?: (file: string) => Promise<void>
+  /**
+   * 记忆改写入口；未装配时工作台只读（不提供编辑按钮的服务端实现）。
+   * 与删除一样：写操作必须经可信审批，工作台自己签不了。
+   */
+  memoryWrites?: WorkbenchMemoryWrites
 }
 
 class InputError extends Error {}
@@ -220,6 +244,7 @@ export class ReportWorkbench implements WorkbenchHandler {
       if (method === 'POST' && route === '/report/publish-request') return this.publishRequest(object(body))
       if (method === 'POST' && route === '/materials/import') return this.importMaterial(object(body))
       if (method === 'POST' && route === '/materials/share-request') return this.shareRequest(object(body))
+      if (method === 'POST' && route === '/memories/edit') return this.editMemory(object(body))
       if (method === 'POST' && route === '/deletion/preview') return this.deletionPreview(object(body))
       // await：异步路由里的输入错误也要落到下面的 catch，回 400 而不是 500。
       if (method === 'POST' && route === '/deletion/request') return await this.deletionRequest(object(body))
@@ -493,6 +518,69 @@ export class ReportWorkbench implements WorkbenchHandler {
       proposalId: proposal.proposalId, revision: proposal.revision, digest: proposal.digest, target: proposal.target,
       expiresAt: proposal.expiresAt,
       message: '已提交可信审批：请在桌面专用审批窗口核对全文、版本与保存位置后批准；尚未写入文件',
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // 记忆改写
+  // -------------------------------------------------------------------------
+
+  /**
+   * 工作台改写一条长期记忆。
+   *
+   * 与删除同一条纪律：工作台自己不能改，只能把"改成什么"提交成可信待批，由用户在
+   * 专用审批窗口看到新旧全文后点头。auto 模式下按用户的配置直接改写并如实回报。
+   *
+   * 为什么不删掉再新建：记忆的 id 被待批提案、工作事项来源边和冲突记录引用着，
+   * 换 id 等于让这些引用指向一个不存在的东西。就地改正文、版本号 +1，历史靠 revision 追溯。
+   */
+  private editMemory(input: Record<string, unknown>) {
+    const memoryId = optionalText(input.memoryId, '记忆编号', 200)
+    if (!memoryId) throw new InputError('没有指定要改写的记忆')
+    const text = typeof input.text === 'string' ? input.text.trim() : ''
+    if (!text) throw new InputError('改写后的内容不能为空；要撤销这条记忆请用删除')
+    if (text.length > MAX_TEXT) throw new InputError('改写后的内容太长')
+    const topic = input.topic === undefined ? undefined : optionalText(input.topic, '分类主题', 120) ?? ''
+    const now = this.now()
+    const record = this.deps.memories.get(memoryId, now)
+    if (!record) return fail(404, 'not_found', '找不到这条记忆，可能已被删除')
+    if (record.status === 'expired') return fail(409, 'expired', '这条记忆已失效，不能改写')
+    // 项目范围记忆须授权仍有效，否则用户看到的是"别人项目里的规则"，不该在这里改。
+    const visible = new Set((this.deps.helpContexts?.list() ?? [])
+      .map(item => this.deps.helpContexts?.authorizedScope(item.projectDir)?.projectDir)
+      .filter((dir): dir is string => !!dir))
+    if (record.scope.kind === 'project' && !visible.has(record.scope.id)) {
+      return fail(403, 'scope_unavailable', '这条记忆所属项目的帮助授权已撤销或实际路径已改指，暂不能改写；重新授权该目录后可见')
+    }
+    const label = scopeLabel(record.scope, {})
+    if (text === record.text && (topic === undefined || topic === record.topic)) {
+      return ok({ saved: false, message: '内容和分类都没有变化，没有提交' })
+    }
+    const writes = this.deps.memoryWrites
+    if (!writes) return fail(404, 'not_wired', '记忆改写未装配；当前版本的工作台只能查看与删除记忆')
+
+    if (writes.approvalMode() === 'auto') {
+      const updated = this.deps.memories.revise(memoryId,
+        { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'auto-publish', isUser: true } }, this.now())
+      if (!updated) return fail(409, 'revise_failed', '改写失败：这条记忆已不存在或已失效')
+      return ok({
+        saved: true, mode: 'auto', id: updated.id, text: updated.text, topic: updated.topic, revision: updated.revision,
+        message: '设置里开着"自动记录"：这条记忆已直接改写',
+      })
+    }
+
+    let proposalId: string
+    try {
+      proposalId = writes.proposeMemoryEdit({
+        memoryId, text, ...(topic === undefined ? {} : { topic }),
+        before: { text: record.text, topic: record.topic }, scopeLabel: label,
+      })
+    } catch (error) {
+      return fail(409, 'submit_failed', error instanceof Error ? error.message : String(error))
+    }
+    return ok({
+      saved: false, pending: true, proposalId, mode: 'manual', id: memoryId,
+      message: '已提交可信审批：请在桌面专用审批窗口核对新旧全文后批准；尚未改动',
     })
   }
 

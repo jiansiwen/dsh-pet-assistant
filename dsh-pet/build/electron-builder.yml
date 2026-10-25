@@ -1,9 +1,7 @@
 # dsh 桌面助理团的打包配置（electron-builder 26.x；字段按 26.17.0 的 schema 核对过）。
 #
-# electron-builder 尚未安装（package.json 的 devDependencies 里没有它）：安装依赖需要用户授权，
-# 所以这份配置当前**只是备好**，没有跑过真实打包。授权后的产包与验证步骤见
-# petsBak/dsh-pet/packaging-checklist.md。
-#
+# electron-builder 不在 devDependencies 里，需要打包时先安装：
+#   pnpm add -D electron-builder
 # 用法（在 dsh-pet 目录，构建前先清空 dist，免得把旧产物和 *.stale 帧带进包里）：
 #   npx electron-builder --win --config build/electron-builder.yml --publish never
 #   npx electron-builder --mac --config build/electron-builder.yml --publish never
@@ -60,8 +58,10 @@ asar: true
 files:
   - dist/**/*
   - package.json
+  - LICENSE
+  - ASSETS-LICENSE.md
   - '!**/*.map'
-  # tools/matting/sync-frames.py 把多余的旧帧改名成 *.stale：引擎探测不到，也不该占安装包。
+  # 构建前清空 dist，避免把旧帧与 *.stale 产物带进安装包。
   - '!**/*.stale'
   # 生产依赖（dependencies + 已装的 optionalDependencies）由 electron-builder 自动带上；
   # devDependencies（electron、esbuild、react 等）不进包 —— 渲染层的 react 已被 esbuild 打进 bundle。

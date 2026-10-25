@@ -22,6 +22,27 @@
   user-select: none;
   -webkit-user-drag: none;
 }
+
+/* 24fps 透明 WebM：与序列帧同样的锚点和尺寸 */
+.pet-video {
+  display: block;
+  height: 150px;
+  width: auto;
+  object-fit: contain;
+  background: transparent;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* 抓取素材比 idle 小约 7%；drop 站起后小约 17%，按每一层自己的姿态补回来。 */
+.pose-layer[data-pose-action='grab'] .pet-video {
+  transform: scale(1.08);
+  transform-origin: 50% 100%;
+}
+.pose-layer[data-pose-action='drop'] .pet-video {
+  transform: scale(1.20);
+  transform-origin: 50% 100%;
+}
 .action-idle .pet-img { animation: pa-imgbreathe 2.6s ease-in-out infinite; }
 .action-walk .pet-img { animation: pa-bob 0.45s linear infinite; }
 
@@ -45,10 +66,14 @@
   flex: none;
 }
 .pose-in {
-  animation: pa-posein 0.16s linear;
+  animation: pa-posein 0.22s linear;
 }
 .pose-out {
-  animation: pa-poseout 0.16s linear forwards;
+  animation: pa-poseout 0.22s linear forwards;
+}
+/* 视频自己等 canplay 后再做透明度淡入，避免新层先透明再突然出画。 */
+.pose-layer.pose-video.pose-in {
+  animation: none;
 }
 @keyframes pa-posein {
   from { opacity: 0; }

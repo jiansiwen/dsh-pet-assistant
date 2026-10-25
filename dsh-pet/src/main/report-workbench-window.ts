@@ -31,6 +31,7 @@ export const REPORT_WORKBENCH_CHANNELS = {
   requestDeletion: 'report-workbench:request-deletion',
   importMaterial: 'report-workbench:import-material',
   requestShare: 'report-workbench:request-share',
+  editMemory: 'report-workbench:edit-memory',
 } as const
 
 /** 主进程推给工作台的"该刷新了"。 */
@@ -192,6 +193,21 @@ export function sanitizeImportMeta(raw: unknown): Record<string, unknown> | null
   return meta
 }
 
+/**
+ * 改写记忆的请求体：只收编号、正文与可选分类，多余字段一律丢掉。
+ * 页面说不出记忆的作用范围（全局/项目）、也说不出旧正文——那些由插件按编号读出来核对。
+ */
+export function sanitizeMemoryEdit(raw: unknown): { memoryId: string; text: string; topic?: string } | null {
+  const input = plain(raw)
+  if (!input) return null
+  const memoryId = str(input.memoryId, 200)
+  const text = typeof input.text === 'string' ? input.text.trim() : ''
+  if (!memoryId || !text || text.length > MAX_TEXT) return null
+  if (input.topic === undefined) return { memoryId, text }
+  const topic = str(input.topic, 120)
+  return topic === null ? null : { memoryId, text, topic: topic.trim() }
+}
+
 function decodeText(bytes: Buffer): string | null {
   try {
     if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le', { fatal: true }).decode(bytes.subarray(2))
@@ -324,6 +340,16 @@ export function registerReportWorkbench(options: ReportWorkbenchOptions): Report
     const id = str(materialId, 200)
     if (!id) return rejected('没有指定资料')
     const result = await client.shareRequest({ materialId: id })
+    if (!result.ok || typeof result.data?.proposalId !== 'string') return result
+    return { ...result, approvalWindow: await openApproval(result.data.proposalId) }
+  })
+
+  ipcMain.handle(REPORT_WORKBENCH_CHANNELS.editMemory, async (event, raw: unknown) => {
+    if (!allowed(event)) return denied
+    const body = sanitizeMemoryEdit(raw)
+    if (!body) return rejected('改写记忆必须带上记忆编号与非空正文')
+    // 与请求发布同一条路：插件生成待批提案，这里只打开专用审批窗口，不直接写库。
+    const result = await client.editMemory(body)
     if (!result.ok || typeof result.data?.proposalId !== 'string') return result
     return { ...result, approvalWindow: await openApproval(result.data.proposalId) }
   })

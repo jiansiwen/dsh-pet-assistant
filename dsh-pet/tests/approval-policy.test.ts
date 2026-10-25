@@ -200,11 +200,11 @@ describe('ellipsizeMiddle：首尾都要留着，中间省略', () => {
   })
 
   it('超长时首尾各留一半，中间一个省略号', () => {
-    const long = 'D:/work/dsh-personal-assistant/dist/index-0905192905.js'
+    const long = 'D:/work/dsh/dsh-personal-assistant/dist/index-0905192905.js'
     const shown = ellipsizeMiddle(long, 32)
     assert.ok(shown.length <= 32, `结果长度 ${shown.length} 不该超过 32`)
     assert.ok(shown.includes('…'))
-    assert.ok(shown.startsWith('D:/java/'), '盘符和起始目录必须看得见')
+    assert.ok(shown.startsWith('D:/work/'), '盘符和起始目录必须看得见')
     // 尾部留出的那一半要能看见文件名主体，否则截断把最该判断的部分切掉了。
     assert.ok(shown.endsWith('-0905192905.js'), `尾部应当留着文件名，实际是：${shown}`)
   })
@@ -297,11 +297,11 @@ describe('cardView：把原始提案投影成卡片内容', () => {
   })
 
   it('目标先规范化：反斜杠统一成正斜杠', () => {
-    const long = 'D:\\work\\dsh-personal-assistant\\dist\\index-0905192905.js'
+    const long = 'D:\\work\\dsh\\dsh-personal-assistant\\dist\\index-0905192905.js'
     const view = cardView(proposal({ target: long }), '助理1', 0)
     // 先收窄类型：给了目标就该有目标，而 assert.ok 是断言函数，后面两条不必再写可选链。
     assert.ok(typeof view.target === 'string', '给了目标就该有目标')
-    assert.ok(view.target.startsWith('D:/java/'), '反斜杠应当已经统一')
+    assert.ok(view.target.startsWith('D:/work/'), '反斜杠应当已经统一')
     assert.equal(view.target.length, long.length, '这个长度还不该触发截断')
   })
 

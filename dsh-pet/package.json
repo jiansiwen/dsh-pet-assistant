@@ -2,6 +2,10 @@
   "name": "dsh-pet",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "DeepSeek Harness desktop pet: a cute assistant that tracks your day and writes your daily report",
   "type": "module",
   "main": "dist/main/index.js",
@@ -10,7 +14,6 @@
     "start": "node scripts/build.mjs && node scripts/launch-electron.mjs",
     "dev": "node scripts/build.mjs --watch",
     "test": "node --test --experimental-test-module-mocks \"tests/**/*.test.ts\"",
-    "verify:pet": "node scripts/verify-pet-renderer.mjs",
     "typecheck": "tsc --noEmit",
     "pack:mac": "electron-builder --mac --config build/electron-builder.yml",
     "pack:win": "electron-builder --win --config build/electron-builder.yml"

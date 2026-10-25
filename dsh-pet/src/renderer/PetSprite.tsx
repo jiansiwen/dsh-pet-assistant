@@ -4,18 +4,21 @@
  * 通过 skin 切换形象：小熊猫 / 眼镜女生 / 眼镜男生。
  */
 
-import { useEffect, useRef, useState } from 'react'
-import type { SkinImages, SkinImageKey } from './usePetImage.js'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { SkinImages, SkinImageKey, SkinVideos } from './usePetImage.js'
 import { nextFrame, oneShot } from './pet-interaction.js'
 
 export type PetSkin = 'panda' | 'girl-glasses' | 'boy-glasses'
 
 type Pose =
-  | { id: string; kind: 'walk'; src: string }
-  | { id: string; kind: 'img'; src: string }
-  | { id: string; kind: 'frames'; frames: string[]; fps: number; once: boolean }
+  | { id: string; kind: 'walk'; src: string; action?: string }
+  | { id: string; kind: 'img'; src: string; action?: string }
+  | { id: string; kind: 'frames'; frames: string[]; fps: number; once: boolean; action?: string }
+  | { id: string; kind: 'video'; src: string; loop: boolean; action?: string }
 
 const DEFAULT_FPS = 10
+/** 这些动作由环境调度整段播放一次，播完就切；循环会在结尾回绕成第一帧，视觉上闪一下。 */
+const ONE_CYCLE_ACTIONS = new Set(['play', 'read', 'wave', 'jump'])
 
 /** 完成事件在计时器中发出，不在 React 状态更新器内发出，避免严格模式重复通知。 */
 function FrameSequence({ frames, fps, once, active, onComplete }: {
@@ -42,7 +45,75 @@ function FrameSequence({ frames, fps, once, active, onComplete }: {
   return <img className="pet-img pet-frame" src={frames[Math.min(idx, frames.length - 1)]} alt="" draggable={false} />
 }
 
-function renderPose(pose: Pose, active: boolean, onComplete?: () => void) {
+/**
+ * 24fps 透明 WebM。旧层在淡出期间继续播放，不再冻结在最后一帧；
+ * 一次性动作由 ended 驱动，循环动作交给 video 的 loop。
+ */
+function VideoSequence({ src, loop, active, onComplete, onReady }: {
+  src: string; loop: boolean; active: boolean; onComplete?: () => void; onReady?: () => void
+}) {
+  const ref = useRef<HTMLVideoElement>(null)
+  const completed = useRef(false)
+  const callback = useRef(onComplete)
+  const readyCallback = useRef(onReady)
+  const readySent = useRef(false)
+  const [ready, setReady] = useState(false)
+  callback.current = onComplete
+  readyCallback.current = onReady
+  const markReady = () => {
+    if (readySent.current) return
+    readySent.current = true
+    // 先让新层以 opacity 0 挂一帧，再开始 220ms 淡入；否则会瞬间满亮，看起来像闪一下。
+    window.setTimeout(() => {
+      setReady(true)
+      readyCallback.current?.()
+    }, 80)
+  }
+  useEffect(() => {
+    completed.current = false
+    readySent.current = false
+    setReady(false)
+    const el = ref.current
+    if (!el) return
+    el.currentTime = 0
+    void el.play().catch(() => undefined)
+    return () => el.pause()
+  }, [src])
+  useEffect(() => {
+    if (!active) return
+    const el = ref.current
+    if (el) void el.play().catch(() => undefined)
+  }, [active])
+  return (
+    <video
+      ref={ref}
+      className="pet-video"
+      src={src}
+      muted
+      playsInline
+      preload="auto"
+      loop={loop}
+      style={{ opacity: ready ? 1 : 0, transition: 'opacity 0.22s linear' }}
+      onLoadedData={markReady}
+      onPlaying={markReady}
+      onCanPlay={() => {
+        markReady()
+        const el = ref.current
+        if (el) void el.play().catch(() => undefined)
+      }}
+      onEnded={() => {
+        if (loop || !active || completed.current) return
+        completed.current = true
+        callback.current?.()
+      }}
+    />
+  )
+}
+
+function renderPose(pose: Pose, active: boolean, onComplete?: () => void, onReady?: () => void) {
+  if (pose.kind === 'video') {
+    return <VideoSequence src={pose.src} loop={pose.loop} active={active} onComplete={onComplete} onReady={onReady} />
+  }
   if (pose.kind === 'walk') {
     return <div className="pet-walk-frame"><img className="pet-walk-strip" src={pose.src} alt="" draggable={false} /></div>
   }
@@ -52,25 +123,44 @@ function renderPose(pose: Pose, active: boolean, onComplete?: () => void) {
   return <img className="pet-img" src={pose.src} alt="" draggable={false} />
 }
 
-/** 旧层保留原组件及其帧位置，只冻结淡出；它永远不能发出完成事件。 */
+/** 新视频真正显示后才淡出旧层；避免切换时中间出现透明空档。 */
 function AnimatedPose({ pose, onComplete }: { pose: Pose; onComplete?: () => void }) {
   const [curr, setCurr] = useState(pose)
   const [prev, setPrev] = useState<Pose | null>(null)
+  const [currReady, setCurrReady] = useState(true)
   const timer = useRef<number>(0)
+  const readyRef = useRef(true)
   useEffect(() => {
     if (pose.id === curr.id) return
     setPrev(curr)
     setCurr(pose)
+    const ready = pose.kind !== 'video'
+    readyRef.current = ready
+    setCurrReady(ready)
     window.clearTimeout(timer.current)
-    timer.current = window.setTimeout(() => setPrev(null), 300)
   }, [pose, curr])
+  const markReady = useCallback(() => {
+    if (readyRef.current) return
+    readyRef.current = true
+    setCurrReady(true)
+  }, [])
+  useEffect(() => {
+    if (!prev || !currReady) return
+    window.clearTimeout(timer.current)
+    timer.current = window.setTimeout(() => setPrev(null), 380)
+    return () => window.clearTimeout(timer.current)
+  }, [prev, currReady])
   useEffect(() => () => window.clearTimeout(timer.current), [])
   return (
     <div className="pose-stack">
       {[...(prev ? [prev] : []), curr].map(layer => {
-        const active = layer.id === pose.id
-        return <div key={layer.id} className={layer === curr ? `pose-layer pose-in${prev ? ' pose-over' : ''}` : 'pose-layer pose-out'}>
-          {renderPose(layer, active, active ? onComplete : undefined)}
+        const isCurr = layer.id === pose.id
+        const video = layer.kind === 'video'
+        const className = isCurr
+          ? `pose-layer pose-in${prev ? ' pose-over' : ''}${video ? ' pose-video' : ''}`
+          : `pose-layer${currReady ? ' pose-out' : ''}${video ? ' pose-video' : ''}`
+        return <div key={layer.id} className={className} data-pose-action={layer.action ?? ''}>
+          {renderPose(layer, isCurr, isCurr ? onComplete : undefined, isCurr ? markReady : undefined)}
         </div>
       })}
     </div>
@@ -123,11 +213,12 @@ const joint = (ox: string, oy: string) => ({
 })
 
 export default function PetSprite({
-  skin, images, frames = {}, action, dragging = false, animationVersion = 0, onComplete,
+  skin, images, frames = {}, videos = {}, action, dragging = false, animationVersion = 0, onComplete,
 }: {
   skin: PetSkin
   images: SkinImages
   frames?: Partial<Record<string, string[]>>
+  videos?: SkinVideos
   action?: string
   dragging?: boolean
   animationVersion?: number
@@ -135,18 +226,22 @@ export default function PetSprite({
 }) {
   const p = PALETTES[skin]
   const isPanda = skin === 'panda'
-  const effective = dragging && frames['grab']?.length ? 'grab' : action
+  const canGrab = Boolean(videos['grab'] || frames['grab']?.length)
+  const effective = dragging && canGrab ? 'grab' : action
   const frameList = effective ? frames[effective] : undefined
+  const videoSrc = effective ? videos[effective] : undefined
   const callback = useRef(onComplete)
   callback.current = onComplete
   // 没有该动作素材的备用皮肤沿用静态降级，但不能让交互状态永远卡住。
   useEffect(() => {
-    if (dragging || frameList?.length || !action || (!oneShot(action) && action !== 'write')) return
+    if (dragging || frameList?.length || videoSrc || !action || (!oneShot(action) && action !== 'write')) return
     const durations: Record<string, number> = { drop: 3900, lie: 5000, 'laptop-in': 3500, 'laptop-out': 2300, write: 1600, 'walk-stop': 300 }
     const timer = window.setInterval(() => callback.current?.(action, animationVersion), durations[action])
     return () => window.clearInterval(timer)
-  }, [action, animationVersion, dragging, frameList])
-  const pose: Pose | null = frameList?.length
+  }, [action, animationVersion, dragging, frameList, videoSrc])
+  const pose: Pose | null = videoSrc
+    ? { id: `video:${skin}:${effective}:${animationVersion}:${videoSrc}`, kind: 'video', src: videoSrc, loop: !oneShot(effective) && !(effective !== undefined && ONE_CYCLE_ACTIONS.has(effective)), action: effective }
+    : frameList?.length
     ? { id: `frames:${skin}:${effective}:${animationVersion}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS, once: oneShot(effective) }
     : effective === 'walk' && images.walk
       ? { id: `walk:${images.walk}`, kind: 'walk', src: images.walk }

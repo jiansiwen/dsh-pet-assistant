@@ -403,6 +403,36 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   mountReportWorkbench(bridge, {
     db, tracker, reports, memories, observations, workItems, materials, helpContexts, reportDir,
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
+    // 记忆改写：工作台自己不能改，只能把"改成什么"提成可信待批，由用户在审批窗口看新旧全文后点头。
+    memoryWrites: {
+      approvalMode: () => config.approvalMode,
+      proposeMemoryEdit: ({ memoryId, text, topic, before, scopeLabel: label }) => {
+        const snapshot = { memoryId, before, after: { text, topic: topic ?? before.topic }, scope: label }
+        const digest = snapshotDigest(snapshot)
+        const reload = () => memories.get(memoryId, Date.now())
+        const proposal = bridge.submitAssistant({
+          subject: 'memories',
+          tool: 'personal_assistant_edit_preference',
+          summary: `把记忆「${before.text.slice(0, 30)}」改写为「${text.slice(0, 30)}」：编号不变，版本号 +1。批准后立即影响当前及未来会话的模型提示词。`,
+          target: label === '全局' ? '本机全局记忆与未来会话模型' : `${label} 的记忆`,
+          risk: 'high',
+          snapshot,
+          // 期间记忆被删、被改或换了状态，这张卡就作废：批的必须是用户看到的那一份。
+          validate: () => {
+            const current = reload()
+            return current !== null && current.status !== 'expired'
+              && current.text === before.text && current.topic === before.topic
+              && snapshotDigest(snapshot) === digest
+          },
+          execute: () => {
+            const updated = memories.revise(memoryId, { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'desktop-shell', isUser: true } }, Date.now())
+            if (!updated) throw new Error('改写失败：这条记忆已不存在或已失效')
+            return { edited: true, id: updated.id, text: updated.text, topic: updated.topic, revision: updated.revision }
+          },
+        })
+        return proposal.proposalId
+      },
+    },
   })
   // 主动帮助的候选与选定：选定的读取范围只经桌面可信审批生效，模型自报的范围无效。
   ctx.effect(() => registerHelpEpisodeTools(ctx as never, {

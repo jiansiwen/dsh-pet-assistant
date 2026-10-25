@@ -99,6 +99,8 @@ function App() {
   const [waiting, setWaiting] = useState(false)
   const [importMeta, setImportMeta] = useState({ kind: 'chat_excerpt', objectLabel: '', from: '', to: '' })
   const [range, setRange] = useState({ from: '', to: '', reason: '' })
+  /** 正在改写的那条记忆：id → 编辑中的正文与分类。null 表示没有在改。 */
+  const [memoryEdit, setMemoryEdit] = useState<{ id: string; text: string; topic: string; original: string } | null>(null)
   const knownReceipt = useRef<string | null>(null)
 
   const load = useCallback(async (wanted?: string | null) => {
@@ -239,6 +241,31 @@ function App() {
       setWaiting(true)
       setNotice({ tone: 'info', text: '已打开专用审批窗口：请在那里核对将发送给模型的全文后决定；批准前正文不会发送。' })
     }
+  }
+
+  /**
+   * 改写一条长期记忆。
+   *
+   * 页面只说"这一条改成什么"：编号、新旧正文都由插件从库里读出来核对。
+   * 手动模式下结果是"已提交待批"，此时什么都没改——提示语必须照实说，不能让人以为已生效。
+   */
+  const saveMemoryEdit = async () => {
+    if (!memoryEdit) return
+    const text = memoryEdit.text.trim()
+    if (!text) { setNotice({ tone: 'warn', text: '改写后的内容不能为空；要撤销这条记忆请用"删除…"' }); return }
+    const result = await reply(api.editMemory({
+      memoryId: memoryEdit.id, text,
+      ...(memoryEdit.topic.trim() ? { topic: memoryEdit.topic.trim() } : {}),
+    }))
+    if (!result.ok) return
+    setMemoryEdit(null)
+    setWaiting(result.data?.pending === true)
+    setNotice(result.data?.mode === 'auto'
+      ? { tone: 'ok', text: String(result.data?.message ?? '已直接改写') }
+      : result.approvalWindow?.ok === false
+        ? { tone: 'warn', text: `改写待批已提交，但审批窗口没能打开：${result.approvalWindow.error ?? '未知原因'}；可以从宠物的待办里打开` }
+        : { tone: 'info', text: '已提交可信审批：请在那里核对新旧全文后批准；批准前这条记忆没有改动。' })
+    await load(view?.date)
   }
 
   if (!view) {
@@ -480,13 +507,28 @@ function App() {
           </div>
 
           <h2>长期记忆</h2>
+          <p className="wb-hint">改写是就地改这一条：编号不变、版本号 +1，引用它的待批与事项不会断。手动的批准在专用审批窗口完成，这里改不了生效时间。</p>
           {view.memories.items.length === 0 && <p className="wb-hint">没有可管理的记忆。</p>}
           {view.memories.items.map(memory => (
             <div key={memory.id} className="wb-memory">
               <span className="chip">{memory.scope}</span>
               <span className="chip">{memory.status === 'confirmed' ? '已确认' : memory.status === 'candidate' ? '候选' : memory.status}</span>
-              <span>{memory.topic ? `「${memory.topic}」` : ''}{memory.text}</span>
-              <button className="wb-btn quiet" disabled={busy} onClick={() => openDeletion('memory', `删除记忆「${memory.text.slice(0, 20)}」`, { memoryId: memory.id })}>删除…</button>
+              {memoryEdit?.id === memory.id ? (
+                <div className="wb-memory-edit">
+                  {memory.topic && <label>分类<input value={memoryEdit.topic} onChange={event => setMemoryEdit({ ...memoryEdit, topic: event.target.value })} /></label>}
+                  <textarea rows={3} value={memoryEdit.text} onChange={event => setMemoryEdit({ ...memoryEdit, text: event.target.value })} />
+                  <div className="wb-actions">
+                    <button className="wb-btn primary" disabled={busy || memoryEdit.text.trim() === memoryEdit.original.trim()} onClick={() => void saveMemoryEdit()}>提交改写</button>
+                    <button className="wb-btn quiet" disabled={busy} onClick={() => setMemoryEdit(null)}>取消</button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <span>{memory.topic ? `「${memory.topic}」` : ''}{memory.text}</span>
+                  <button className="wb-btn quiet" disabled={busy} onClick={() => setMemoryEdit({ id: memory.id, text: memory.text, topic: memory.topic, original: memory.text })}>改写…</button>
+                  <button className="wb-btn quiet" disabled={busy} onClick={() => openDeletion('memory', `删除记忆「${memory.text.slice(0, 20)}」`, { memoryId: memory.id })}>删除…</button>
+                </>
+              )}
             </div>
           ))}
           {view.memories.hiddenProjectMemories > 0 && <p className="wb-hint">另有 {view.memories.hiddenProjectMemories} 条项目记忆所属的帮助授权已失效，暂不显示。</p>}

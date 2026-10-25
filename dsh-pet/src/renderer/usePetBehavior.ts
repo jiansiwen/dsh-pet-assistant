@@ -90,6 +90,8 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   const targetRef = useRef<{ x: number; y: number } | null>(null)
   const bubbleTimer = useRef<number>(0)
   const holdTimer = useRef<number>(0)
+  /** 环境动作的最小占用时间：防止随机调度把只演了一半的动作切走。 */
+  const busyUntilRef = useRef(0)
 
   const dispatch = useCallback((event: InteractionEvent) => {
     if (frozenRef.current) return
@@ -100,6 +102,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
     setInteraction(next)
     if (next.version !== previous.version) {
       window.clearTimeout(holdTimer.current)
+      busyUntilRef.current = 0
       targetRef.current = null
       const nextAction = next.phase === 'drag' ? 'idle' : next.phase
       actionRef.current = nextAction
@@ -145,13 +148,16 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   }, [clampX, clampY])
   const startActivity = useCallback((act: PetAction, minMs = 4500, maxMs = 9000) => {
     if (frozenRef.current || interactionProtected(interactionRef.current)) return
+    const holdMs = minMs + Math.random() * (maxMs - minMs)
+    busyUntilRef.current = Date.now() + holdMs
     setAction(act)
     window.clearTimeout(holdTimer.current)
     holdTimer.current = window.setTimeout(() => {
+      busyUntilRef.current = 0
       if (!frozenRef.current && !interactionProtected(interactionRef.current)) setAction(c => c === act ? 'idle' : c)
-    }, minMs + Math.random() * (maxMs - minMs))
+    }, holdMs)
   }, [])
-  const doWrite = useCallback(() => startActivity('write', 3000, 4200), [startActivity])
+  const doWrite = useCallback(() => startActivity('write', 3000, 3000), [startActivity])
 
   useEffect(() => subscribeTick(() => {
     if (frozenRef.current || interactionProtected(interactionRef.current) || actionRef.current !== 'walk') return
@@ -163,15 +169,9 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
       setX(target.x)
       setY(target.y)
       targetRef.current = null
-      // 走到目标不直接切 idle —— 先演「收步」把走姿收成站姿，再回 idle。
-      // 直接切会让两套素材的姿势硬碰：走路时有一脚在前，idle 是双脚并立。
-      // walk-stop 是 3 帧（0.3 秒）。这里不检查素材是否存在：
-      // 没有该素材的皮肤由 PetSprite 降级成静态图，300ms 后照样回 idle。
-      setAction('walk-stop')
-      window.clearTimeout(holdTimer.current)
-      holdTimer.current = window.setTimeout(() => {
-        setAction(c => (c === 'walk-stop' ? 'idle' : c))
-      }, 300)
+      // 走到目标直接淡回 idle。以前这里插 3 帧 walk-stop 站姿，
+      // 但那段素材和 walk 的比例/姿势不一致，看起来像突然闪回初始形态。
+      setAction('idle')
       return
     }
     if (Math.abs(dx) > speed) {
@@ -197,14 +197,26 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
     const schedule = () => {
       timer = window.setTimeout(() => {
         if (!alive || frozenRef.current) return
+        // 当前动作还没演完一轮：把这一拍让过去，等素材自己结束。
+        if (Date.now() < busyUntilRef.current) {
+          schedule()
+          return
+        }
         const cur = actionRef.current
         const inActivity = cur === 'sit' || cur === 'read' || cur === 'play' || cur === 'write'
+        // 走到一半不能被随机调度截断：目标还在就先把这一步走完。
+        const walking = cur === 'walk' && targetRef.current !== null
         // happy / drop / walk-stop 都是**一次性演出**，各自带回落定时器，
         // 演出期间不能被这一拍换掉 —— 否则「摔到一半突然开始走路」。
         const oneShotPlaying = cur === 'happy' || cur === 'drop' || cur === 'walk-stop'
-        if (!interactionProtected(interactionRef.current) && !optionsRef.current.sceneBound && !inActivity && !oneShotPlaying) {
+        if (!interactionProtected(interactionRef.current) && !optionsRef.current.sceneBound && !inActivity && !walking && !oneShotPlaying) {
           if (optionsRef.current.working) {
-            startActivity(pick(['write', 'read'] as PetAction[]), 4000, 8000)
+            const act = pick(['write', 'read'] as PetAction[])
+            if (act === 'read') startActivity('read', 6400, 6400)
+            else {
+              const writeMs = Math.random() < 0.5 ? 3000 : 4500
+              startActivity('write', writeMs, writeMs)
+            }
             if (Math.random() < 0.3) chatter(pick(lines.work))
           } else {
             const r = Math.random()
@@ -215,12 +227,16 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
               const hi = Math.min(max, homeRef.current.x + WANDER_RADIUS)
               targetRef.current = { x: Math.round(lo + Math.random() * (hi - lo)), y: yRef.current }
               setAction('walk')
-            } else if (r < 0.60) setAction('jump')
+            } else if (r < 0.60) startActivity('jump', 5000, 5000)
             else if (r < 0.66) {
-              setAction('wave')
+              startActivity('wave', 5700, 5700)
               if (Math.random() < 0.5) chatter(pick(lines.greet))
             } else {
-              startActivity(pick(['sit', 'read', 'play'] as PetAction[]))
+              // sit 的素材是“坐下面对电脑”的静态图，属于对话里的 laptop-in 弧线，
+              // 不适合当随机环境活动；这里只用 read/play 这类自洽的循环动作。
+              const act = pick(['read', 'play'] as PetAction[])
+              if (act === 'read') startActivity('read', 6400, 6400)
+              else startActivity('play', 6600, 6600)
               if (Math.random() < 0.3) chatter(pick(lines.activity))
             }
             if (Math.random() < 0.22) chatter(pick(assistantActive ? lines.work : lines.idle))
@@ -253,11 +269,13 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
     draggingRef.current = false
     setDragging(false)
     targetRef.current = null
+    busyUntilRef.current = 0
     window.clearTimeout(holdTimer.current)
     window.clearTimeout(bubbleTimer.current)
   }, [])
   const force = useCallback((act: PetAction) => {
     if (!frozenRef.current && interactionProtected(interactionRef.current)) return
+    busyUntilRef.current = 0
     window.clearTimeout(holdTimer.current)
     setAction(act)
   }, [])

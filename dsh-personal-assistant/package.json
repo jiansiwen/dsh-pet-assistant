@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "description": "Personal computer assistant plugin for DeepSeek Harness: tracks daily computer activity, answers what the user did today, and generates daily reports with long-term preference memory",
   "type": "module",
-  "main": "dist/index-1020173819.js",
+  "main": "dist/index-1023084858.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "files": [
     "dist",
     "assets",
@@ -19,7 +23,6 @@
     "build": "node scripts/build.mjs",
     "clean": "node -e \"const fs=require('fs'),p=require('./package.json');const keep=p.main;for(const f of fs.readdirSync('dist')){if(f.endsWith('.js')&&'dist/'+f!==keep){try{fs.renameSync('dist/'+f,'dist/'+f+'.stale');console.log('archived',f)}catch(e){console.log('skip',f,e.code)}}}\"",
     "dev": "node scripts/build.mjs --watch",
-    "smoke": "node scripts/smoke.mjs",
     "test": "node --test --disable-warning=ExperimentalWarning \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },

@@ -40,7 +40,7 @@ export default function PetSettingsPanel({ page, onPage, onClose, children }: Pr
  *
  * 每个开关各管一件事、各自授权：
  * - 托盘常驻：隐藏角色后壳与唤醒还留着（壳层 trayResident）。
- * - 唤醒："小潘小潘"。Windows 缺省开（System.Speech，自带设备）；macOS 缺省关 —— 开着就是持续采集，
+ * - 唤醒："小潘同学"。Windows 缺省开（System.Speech，自带设备）；macOS 缺省关 —— 开着就是持续采集，
  *   菜单栏会一直亮着麦克风占用标识。引擎与不可用原因如实显示，不循环重试刷错。
  * - 活动记录：只显示状态并跳到会话里由用户自己发起；授权走插件的可信审批，这里不能直接开。
  * - 开机自启：缺省关，关着绝不写系统启动项；打开才写，关掉即移除。
@@ -110,7 +110,7 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
       <label className="management-voice">
         <input type="checkbox" checked={wake.enabled} disabled={saving || wake.engines.length === 0}
           onChange={event => void apply({ wakeEnabled: event.target.checked }, '唤醒设置未保存')} />
-        语音唤醒“小潘小潘”
+        语音唤醒“小潘同学”
         {state.platform === 'darwin' && '（开启后持续采集麦克风，菜单栏会一直显示麦克风占用标识）'}
       </label>
       <p className="management-hint" role="status">唤醒状态：{wakeStatus}</p>

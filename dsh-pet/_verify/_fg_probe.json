@@ -1,6 +1,0 @@
-﻿{
-    "exitCode":  0,
-    "rawLines":  "DSH:eyJtZXNzYWdlIjoi6L+Z5Liq56qX5Y+j5rKh5pyJ6YCa6L+HIFVJIEF1dG9tYXRpb24g5pq06Zyy5q2j5paH5paH5a2XIiwiaWQiOiJwcm9iZS0xIiwiZWxhcHNlZE1zIjo1MDQsIm9rIjpmYWxzZSwiY29kZSI6InVuc3VwcG9ydGVkIiwiZGV0YWlsIjoibm8tdGV4dC1wYXR0ZXJuIn0=",
-    "request":  "{\"op\":\"read-foreground-text\",\"authorized\":true,\"id\":\"probe-1\",\"ownerPid\":45964,\"maxChars\":400}",
-    "decoded":  "{\"message\":\"这个窗口没有通过 UI Automation 暴露正文文字\",\"id\":\"probe-1\",\"elapsedMs\":504,\"ok\":false,\"code\":\"unsupported\",\"detail\":\"no-text-pattern\"}"
-}

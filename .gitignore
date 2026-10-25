@@ -1,8 +1,21 @@
-# 仓库根即 dsh 工作目录，仅纳入以下两个项目，其余内容全部忽略
-/*
-!/.gitignore
-!/dsh-pet/
-!/dsh-personal-assistant/
+# 依赖与构建产物
+node_modules/
+dsh-pet/dist/
+dsh-pet/release/
+dist/*.stale
 
-# 抠图候选素材属中间产物，不入库
-/dsh-pet/tools/matting/candidates/
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地验证产物
+.tmp-pack/
+.tmp-dsh-home/
+generated-videos/
+
+# 内部文档（比赛材料、会议纪要、设计过程稿，不进发布仓库）
+docs/
+
+# 本地工具产物
+spark-output/

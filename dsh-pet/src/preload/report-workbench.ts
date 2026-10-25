@@ -21,6 +21,7 @@ export const REPORT_WORKBENCH_PRELOAD_CHANNELS = {
   requestDeletion: 'report-workbench:request-deletion',
   importMaterial: 'report-workbench:import-material',
   requestShare: 'report-workbench:request-share',
+  editMemory: 'report-workbench:edit-memory',
   changed: 'report-workbench:changed',
 } as const
 
@@ -51,6 +52,13 @@ export type ReportWorkbenchApi = {
   requestDeletion(payload: { category: string; params: Record<string, unknown>; previewDigest: string }): Promise<WorkbenchReply>
   importMaterial(meta: { kind: 'chat_excerpt' | 'import_text' | 'note'; objectLabel?: string; coveredFrom?: number; coveredTo?: number; date?: string }): Promise<WorkbenchReply>
   requestShare(materialId: string): Promise<WorkbenchReply>
+  /**
+   * 改写一条长期记忆的正文或分类。
+   *
+   * 与"请求发布"同一性质：页面只说"这一条改成什么"，插件那边生成待批提案，
+   * 主进程随后打开专用审批窗口。这里没有直接写库的接口。
+   */
+  editMemory(payload: { memoryId: string; text: string; topic?: string }): Promise<WorkbenchReply>
   onChanged(callback: () => void): void
 }
 
@@ -64,6 +72,7 @@ contextBridge.exposeInMainWorld('reportWorkbench', {
   requestDeletion: payload => ipcRenderer.invoke(channels.requestDeletion, payload),
   importMaterial: meta => ipcRenderer.invoke(channels.importMaterial, meta),
   requestShare: materialId => ipcRenderer.invoke(channels.requestShare, materialId),
+  editMemory: payload => ipcRenderer.invoke(channels.editMemory, payload),
   onChanged: callback => {
     ipcRenderer.removeAllListeners(channels.changed)
     ipcRenderer.on(channels.changed, () => callback())

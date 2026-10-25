@@ -126,6 +126,33 @@ function openRuntime(dir: string, tracker: FakeTracker, options: FixtureOptions)
   const workbench: ReportWorkbench = mountReportWorkbench(bridge, {
     db, tracker, reports, memories, observations, workItems, materials, helpContexts, reportDir,
     legacyCopiesRetained: false, unlinkFile: options.unlinkFile,
+    // 与插件装配同一套逻辑：手动模式提成待批卡，auto 模式直接改写。
+    memoryWrites: {
+      approvalMode: () => options.approvalMode ?? 'manual',
+      proposeMemoryEdit: ({ memoryId, text, topic, before, scopeLabel: label }) => {
+        const snapshot = { memoryId, before, after: { text, topic: topic ?? before.topic }, scope: label }
+        const proposal = bridge.submitAssistant({
+          subject: 'memories',
+          tool: 'personal_assistant_edit_preference',
+          summary: `把记忆「${before.text.slice(0, 30)}」改写为「${text.slice(0, 30)}」`,
+          target: label === '全局' ? '本机全局记忆与未来会话模型' : `${label} 的记忆`,
+          risk: 'high',
+          snapshot,
+          validate: () => {
+            const current = memories.get(memoryId, Date.now())
+            return current !== null && current.status !== 'expired'
+              && current.text === before.text && current.topic === before.topic
+          },
+          execute: () => {
+            const updated = memories.revise(memoryId,
+              { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'desktop-shell', isUser: true } }, Date.now())
+            if (!updated) throw new Error('改写失败：这条记忆已不存在或已失效')
+            return { edited: true, id: updated.id, revision: updated.revision }
+          },
+        })
+        return proposal.proposalId
+      },
+    },
   })
   let port = 0
   let token = ''
@@ -183,6 +210,10 @@ function openRuntime(dir: string, tracker: FakeTracker, options: FixtureOptions)
       const pending = await runtime.call('help_context', { projectDir })
       assert.equal(pending.pending, true, JSON.stringify(pending))
       assert.equal((await runtime.decide(pending.proposalId)).ok, true)
+    },
+    /** 工作台改写一条记忆：页面只说"这一条改成什么"。 */
+    editMemory(memoryId: string, text: string, topic?: string) {
+      return runtime.http('POST', '/workbench/memories/edit', { memoryId, text, ...(topic === undefined ? {} : { topic }) })
     },
     close() {
       bridge.dispose()

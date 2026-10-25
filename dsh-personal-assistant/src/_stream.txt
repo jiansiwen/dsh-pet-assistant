@@ -1,9 +1,0 @@
-const STREAM_TICK_MS = 120
-}, STREAM_TICK_MS)
-
-=== session 相关 ===
-   13  * onAgentIdle 时在 agent.session.events 里按 id 定位本消息进入的那个轮次（entered），只有该轮次的
-   36  session: {
-  554  const outcome = settleFromEvents(this.agent.session.events, pending)
-  593  const events = agent.session?.events ?? []
-  860  const events = await new Promise<BridgeEvent[]>(resolve => {

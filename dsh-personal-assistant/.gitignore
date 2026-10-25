@@ -1,3 +1,4 @@
 node_modules/
-dist/
 *.log
+# 发布包需要带上构建后的 dist；只忽略构建脚本归档的旧产物
+dist/*.stale

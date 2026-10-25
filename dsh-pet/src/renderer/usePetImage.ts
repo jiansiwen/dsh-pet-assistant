@@ -132,9 +132,11 @@ const frameUrl = (skin: string, action: string, n: number) =>
   `../assets/pets/frames/${skin}/${action}/f${String(n).padStart(3, '0')}.png`
 
 export type SkinFrames = Partial<Record<string, string[]>>
+export type SkinVideos = Partial<Record<string, string>>
 
 const imagesCache = new Map<string, Promise<SkinImages>>()
 const framesCache = new Map<string, Promise<SkinFrames>>()
+const videosCache = new Map<string, Promise<SkinVideos>>()
 
 /**
  * 共享素材缓存：按皮肤缓存 **Promise**，不是缓存结果。
@@ -190,13 +192,89 @@ export function loadSkinFrames(skin: string): Promise<SkinFrames> {
 }
 
 /** 缓存条目数。舞台测试用它断言"N 个同皮肤角色只加载一份素材"。 */
-export function petAssetCacheStats(): { images: number; frames: number } {
-  return { images: imagesCache.size, frames: framesCache.size }
+export function petAssetCacheStats(): { images: number; frames: number; videos: number } {
+  return { images: imagesCache.size, frames: framesCache.size, videos: videosCache.size }
 }
 
 export function clearPetAssetCache(): void {
   imagesCache.clear()
   framesCache.clear()
+  videosCache.clear()
+}
+
+const videoUrl = (skin: string, action: string) =>
+  `../assets/pets/webm/${skin}/${action}.webm`
+
+/** 目前只有熊猫有 24fps 视频；其他皮肤继续走静态图/序列帧。 */
+const VIDEO_SKINS = new Set(['panda'])
+
+/** 只读元数据探测：不下载整段视频，播放时再由 video 自己缓冲。 */
+function probeVideo(url: string): Promise<string | null> {
+  if (typeof document === 'undefined') return Promise.resolve(null)
+  return new Promise(resolve => {
+    const video = document.createElement('video')
+    video.preload = 'metadata'
+    video.muted = true
+    let settled = false
+    const timer = window.setTimeout(() => done(null), 4000)
+    function done(value: string | null) {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timer)
+      video.onloadedmetadata = null
+      video.onerror = null
+      video.removeAttribute('src')
+      video.load()
+      resolve(value)
+    }
+    video.onloadedmetadata = () => done(url)
+    video.onerror = () => done(null)
+    video.src = url
+  })
+}
+
+/**
+ * 探测 24fps 透明 WebM。缺失的动作返回空条目，由 PetSprite 回退到序列帧/静态图。
+ * 与 frames 一样缓存 Promise，避免多个角色同时探测同一套视频。
+ */
+export function loadSkinVideos(skin: string): Promise<SkinVideos> {
+  const cached = videosCache.get(skin)
+  if (cached) return cached
+  if (!VIDEO_SKINS.has(skin)) {
+    const empty = Promise.resolve({})
+    videosCache.set(skin, empty)
+    return empty
+  }
+  const task = Promise.all(
+    FRAME_ACTIONS.map(async (action) => {
+      const src = await probeVideo(videoUrl(skin, action))
+      return src ? ([action, src] as const) : null
+    }),
+  ).then((entries) => {
+    const map: SkinVideos = {}
+    for (const entry of entries) if (entry) map[entry[0]] = entry[1]
+    return map
+  })
+  videosCache.set(skin, task)
+  void task.catch(() => videosCache.delete(skin))
+  return task
+}
+
+export function usePetVideos(skin: string): SkinVideos {
+  const [videos, setVideos] = useState<SkinVideos>({})
+
+  useEffect(() => {
+    let cancelled = false
+    setVideos({})
+    void loadSkinVideos(skin).then((result) => {
+      if (!cancelled) setVideos(result)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [skin])
+
+  return videos
 }
 
 /** 加载某皮肤的全套素材（主形象 + 行走 + 居家活动），缺少的键不出现在结果里。 */

@@ -1,0 +1,20 @@
+# 默认保持 LF，避免 Windows 提交时把 shell/JS 脚本转成 CRLF
+* text=auto eol=lf
+
+# PowerShell 与批处理保持 Windows 换行
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制素材不做文本转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp3 binary
+*.wav binary
+*.onnx binary
+*.webm binary
+*.mp4 binary
+*.mov binary

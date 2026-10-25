@@ -105,7 +105,7 @@ function fakeClient() {
     client: {
       report: respond('report'), edit: respond('edit'), publishRequest: respond('publishRequest'),
       deletionPreview: respond('deletionPreview'), deletionRequest: respond('deletionRequest'),
-      importMaterial: respond('importMaterial'), shareRequest: respond('shareRequest'),
+      importMaterial: respond('importMaterial'), shareRequest: respond('shareRequest'), editMemory: respond('editMemory'),
     } as never,
   }
 }
@@ -177,7 +177,7 @@ test('没有任何批准通道：主进程注册的通道与 preload 暴露的�
   for (const channel of registered) assert.doesNotMatch(channel, /decide|approve|approval-card|grant/i)
   await import('../src/preload/report-workbench.ts')
   const api = exposed.get('reportWorkbench')!
-  assert.deepEqual(Object.keys(api).sort(), ['deletionPreview', 'edit', 'importMaterial', 'load', 'onChanged', 'requestDeletion', 'requestPublish', 'requestShare'])
+  assert.deepEqual(Object.keys(api).sort(), ['deletionPreview', 'edit', 'editMemory', 'importMaterial', 'load', 'onChanged', 'requestDeletion', 'requestPublish', 'requestShare'])
   for (const name of Object.keys(api)) assert.doesNotMatch(name, /decide|approve|grant/i)
   for (const [name, fn] of Object.entries(api)) if (name !== 'onChanged') await fn({})
   assert.deepEqual(invoked.map(item => item.channel).sort(), registered.sort(), 'preload 只调用主进程登记过的工作台通道')
@@ -208,6 +208,37 @@ test('删除请求：需要可信审批的只打开审批窗口；草稿条目�
   f.replies.shareRequest = { ok: true, status: 200, data: { ok: true, proposalId: '发送待批-1' } }
   assert.equal((await f.invoke(REPORT_WORKBENCH_CHANNELS.requestShare, f.win.event(), 'mat-1')).ok, true)
   assert.deepEqual(f.approvals, ['删除待批-1', '发送待批-1'])
+})
+
+test('改写记忆：只收编号与正文；提案提交成功才打开审批窗口；空正文与超长正文不转交', async t => {
+  const f = setup(t)
+  await new Promise(resolve => setImmediate(resolve))
+  f.replies.editMemory = { ok: true, status: 200, data: { ok: true, saved: false, pending: true, proposalId: '改写待批-1' } }
+  const reply = await f.invoke(REPORT_WORKBENCH_CHANNELS.editMemory, f.win.event(), {
+    memoryId: 'mem-1', text: '日报不要写时长', topic: '日报口径',
+    // 渲染层多说的一律丢掉：作用范围与旧正文只能由插件从库里读。
+    scope: 'project', before: { text: '伪造的旧正文' },
+  })
+  assert.equal(reply.ok, true)
+  assert.deepEqual(f.approvals, ['改写待批-1'], '提案存在才开审批窗口')
+  assert.deepEqual(f.calls.at(-1), { method: 'editMemory', body: { memoryId: 'mem-1', text: '日报不要写时长', topic: '日报口径' } })
+
+  const before = f.calls.length
+  assert.equal((await f.invoke(REPORT_WORKBENCH_CHANNELS.editMemory, f.win.event(), { memoryId: 'mem-1', text: '   ' })).ok, false, '空正文不转交')
+  assert.equal((await f.invoke(REPORT_WORKBENCH_CHANNELS.editMemory, f.win.event(), { text: '没有编号' })).ok, false)
+  assert.equal((await f.invoke(REPORT_WORKBENCH_CHANNELS.editMemory, f.win.event(), { memoryId: 'mem-1', text: 'x'.repeat(2001) })).ok, false)
+  assert.equal(f.calls.length, before, '不合规的改写请求不转交')
+
+  // 插件拒绝（例如记忆已被删除）时同样不开审批窗口。
+  f.replies.editMemory = { ok: false, status: 404, code: 'not_found', error: '找不到这条记忆', data: null }
+  const missing = await f.invoke(REPORT_WORKBENCH_CHANNELS.editMemory, f.win.event(), { memoryId: 'mem-9', text: '新内容' })
+  assert.equal(missing.ok, false)
+  assert.deepEqual(f.approvals, ['改写待批-1'], '插件拒绝时不开审批窗口')
+  // 自动模式返回的是 saved 而不是 proposalId：同样不开审批窗口，把结果原样交回页面。
+  f.replies.editMemory = { ok: true, status: 200, data: { ok: true, saved: true, mode: 'auto', revision: 3 } }
+  const auto = await f.invoke(REPORT_WORKBENCH_CHANNELS.editMemory, f.win.event(), { memoryId: 'mem-1', text: '新内容' })
+  assert.equal(auto.data.mode, 'auto')
+  assert.deepEqual(f.approvals, ['改写待批-1'])
 })
 
 test('导入文件由主进程选择与读取：渲染层给的路径与正文无效；二进制、超限拒绝；UTF-16 与 BOM 正确解码', async t => {

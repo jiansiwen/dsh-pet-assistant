@@ -10,7 +10,7 @@ import { PET_WIDTH } from './pet-metrics.js'
 import { proactiveButtons } from './proactive-ui.js'
 import { useGroupScene } from './useGroupScene.js'
 import { usePetBehavior, type PetAction, type PetBehavior } from './usePetBehavior.js'
-import { usePetFrames, usePetSkinImages } from './usePetImage.js'
+import { usePetFrames, usePetSkinImages, usePetVideos } from './usePetImage.js'
 import {
   actionForStatus, characterHitbox, clampToViewport, isWorking, needsAttention, proactiveHitboxExtra,
   registerCharacterHitbox, seatPositions, unregisterCharacterHitbox,
@@ -58,6 +58,7 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
     sceneBound: scene.bound, quiet, idleSleepMinutes, sleepMinutes, onPersist })
   const images = usePetSkinImages(manifest.skin)
   const frames = usePetFrames(manifest.skin)
+  const videos = usePetVideos(manifest.skin)
   useLayoutEffect(() => {
     onBehavior(behavior)
   }, [behavior, onBehavior])
@@ -146,7 +147,7 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
       {attention ? <div className="character-alert" title="有事等你处理">!</div>
         : assistantActive && <div className="pet-badge" title="个人助理模式运行中" />}
       {exitStage !== 'gone' && (
-        <PetSprite skin={manifest.skin} images={images} frames={frames} action={behavior.action}
+        <PetSprite skin={manifest.skin} images={images} frames={frames} videos={videos} action={behavior.action}
           dragging={behavior.dragging} animationVersion={behavior.animationVersion} onComplete={behavior.completeAnimation} />
       )}
     </div>

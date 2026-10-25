@@ -2,6 +2,13 @@
 
 DeepSeek Harness 的桌面客户端 —— 配合 [dsh-personal-assistant](../dsh-personal-assistant/README.md) 插件，把一支专家助理团放到桌面上：能说话、能听唤醒词、能讲解你授权的文档，也把任务和审批画在你看得见的地方。
 
+> 这是独立的 Electron 应用，**不是 dsh 插件**，不能通过 `dsh plugin add` 安装。
+> 先安装 `dsh-personal-assistant` 插件，再按本文档运行桌宠。
+>
+> **素材许可**：`assets/` 下的动画帧、角色图片、生成提示词与源视频采用 CC BY-NC 4.0：
+> 允许非商业使用、修改与分发，**禁止商业使用**，需署名。全文见 [ASSETS-LICENSE.md](./ASSETS-LICENSE.md)。
+> 代码（`src/`、`scripts/` 等）采用 MIT。
+
 ## 功能
 
 **角色与舞台**
@@ -14,7 +21,7 @@ DeepSeek Harness 的桌面客户端 —— 配合 [dsh-personal-assistant](../ds
 
 **说话与听**
 
-- **语音唤醒**：喊「小潘小潘」把角色唤回来并弹出输入框，角色隐藏时也管用（纯本地，不上传）。
+- **语音唤醒**：喊「小潘同学」把角色唤回来并弹出输入框，角色隐藏时也管用（纯本地，不上传）。
   喊两遍是刻意的 —— 单个「小潘」只有两个音节，日常对话里太容易误触发；
   四个音节既能明显降低误触发，说起来也不费劲。**仅 Windows**（用 `System.Speech` 离线识别器）；
   macOS/Linux 上用快捷键或点角色代替
@@ -70,6 +77,13 @@ dsh-pet (Electron)
 
 桥接消失（web 服务停止 / 会话被销毁）时，角色播完退场动画后自动退出。
 
+## 动画素材与播放
+
+- 动作动画为 **24fps 透明 WebM**（VP9 alpha），放在 `assets/pets/webm/panda/`；动作切换由双 `<video>` 交叉淡入完成。
+- 逐帧 PNG 只保留 `walk-stop` 的三帧作为 0.3 秒收步过渡；其余动作不再逐帧加载，素材体积从约 128MB 降到约 11MB。
+- 循环动作交给 `video.loop`；一次性动作（`drop`、`sleep-in/out`、`laptop-in/out`、`walk-stop`）由 `ended` 事件驱动状态机。
+- 素材许可见 [ASSETS-LICENSE.md](./ASSETS-LICENSE.md)（CC BY-NC 4.0，禁止商业使用）。
+
 ## 前置条件
 
 1. 已安装 Node.js ≥ 22
@@ -91,7 +105,7 @@ dsh-pet (Electron)
 | 麦克风听写（按键说话） | ✅ | ✅ 需授权 | ✅ 需授权 |
 | 本地语音识别（离线） | ✅ | ✅ | ✅ |
 | 回答朗读 | ✅ | ✅ 走 `say` / `afplay` | ❌ 未实现 |
-| 语音唤醒「小潘小潘」 | ✅ | ❌ 系统无对应能力 | ❌ |
+| 语音唤醒「小潘同学」 | ✅ | ❌ 系统无对应能力 | ❌ |
 | 会议录音 + 加密落盘 | ✅ DPAPI | ✅ 钥匙串 | ✅ libsecret |
 | 「点面板外面自动收起」 | ✅ | ❌ | ❌ |
 | 前台活动记录（插件侧） | ✅ | ❌ | ❌ |
@@ -118,6 +132,7 @@ pnpm run start
 打包成独立 `.app`：
 
 ```bash
+pnpm add -D electron-builder   # 首次打包前安装
 pnpm run pack:mac    # 用 build/electron-builder.yml，含 Info.plist 权限声明
 ```
 
@@ -129,7 +144,7 @@ pnpm run pack:mac    # 用 build/electron-builder.yml，含 Info.plist 权限声
 ## 运行
 
 ```powershell
-cd D:\work\dsh-pet
+cd dsh-pet
 pnpm install
 pnpm run start
 ```
@@ -162,7 +177,7 @@ API Key 只在添加配置时填一次，由桌面壳用系统密钥库（Window
 
 ```powershell
 pnpm run typecheck    # tsc --noEmit
-pnpm test             # 474 条，node --test --experimental-test-module-mocks "tests/**/*.test.ts"
+pnpm test             # node --test --experimental-test-module-mocks "tests/**/*.test.ts"
 pnpm run build        # esbuild 打包到 dist/
 ```
 
@@ -187,10 +202,10 @@ pnpm run build        # esbuild 打包到 dist/
 ## 排障
 
 - **麦克风只有一个主人**：唤醒词常驻监听，按键说话时唤醒先让出设备、说完自动收回。两者同时收音的话，后起的那个只会拿到静音流 —— 界面上一切正常，说了却没反应
-- 语音没反应先跑探针，它会报出这台机器上装了哪些中文识别器与合成音色、默认设备是什么：
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/probe-audio.ps1`
+- 语音没反应先检查系统默认输入设备与中文语音包（Windows：设置 → 时间和语言 → 语音），
+  确认默认输入不是虚拟音频设备，输出设备也正常
 - **听写不准/没装本地模型**：看 `%APPDATA%\dsh-pet\local-asr` 里有没有 `bin\sherpa-onnx-offline.exe` 与 `model\model.int8.onnx`。没有就走的是旧引擎兜底，准确率有限；跑 `scripts\setup-local-asr.ps1` 安装（GitHub 不通时加 `-Mirror "https://gh-proxy.com/"`）
 - **朗读没声音**：edge-tts 走微软服务，断网或被拦截时自动回退本机合成（音色变机械但能出声）。两者都失败才报错
-- 探针若报出 **NVIDIA Virtual Audio Device (Wave Extensible)**，去「设置 → 系统 → 声音 → 输入」确认默认设备是真麦克风。默认输入被虚拟设备占走时，识别器会初始化成功却拿到静音流，表现和仲裁器修的那个故障一模一样但原因不同
+- 如果默认输入是 **NVIDIA Virtual Audio Device (Wave Extensible)**，去「设置 → 系统 → 声音 → 输入」确认默认设备是真麦克风。默认输入被虚拟设备占走时，识别器会初始化成功却拿到静音流，表现和仲裁器修的那个故障一模一样但原因不同
 - 唤醒监听初始化失败后**不会自动重试**（否则每三秒刷一条错误日志，用户看到的是一只一直在报错的宠物），修好设备后从托盘「重新监听唤醒词」叫回来
 - 朗读失败会弹一句人话提示。这是个听不见的故障：界面上不报一句，用户只会觉得"它没反应"

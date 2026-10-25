@@ -287,7 +287,7 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir', 'doc-open', 'doc-explain', 'doc-ask',
     'doc-view-session', 'doc-view-bytes', 'doc-view-page', 'doc-view-resource',
     // 日报工作台窗口的通道在 report-workbench-window 里注册并核对发送方；舞台侧只有打开入口。
-    'report-workbench-open', 'report-workbench:load', 'report-workbench:edit', 'report-workbench:request-publish',
+    'report-workbench-open', 'report-workbench:load', 'report-workbench:edit', 'report-workbench:edit-memory', 'report-workbench:request-publish',
     'report-workbench:deletion-preview', 'report-workbench:request-deletion', 'report-workbench:import-material',
     'report-workbench:request-share',
     'team-get', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
