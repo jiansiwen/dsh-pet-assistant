@@ -19,6 +19,13 @@ type Pose =
 const DEFAULT_FPS = 10
 /** 这些动作由环境调度整段播放一次，播完就切；循环会在结尾回绕成第一帧，视觉上闪一下。 */
 const ONE_CYCLE_ACTIONS = new Set(['play', 'read', 'wave', 'jump'])
+/**
+ * 姿态差异大的切换（拖拽、落地、走停）用更短的过渡。
+ * 两个不同姿势同时可见的时间越长越像残影，90ms 内人眼只读到“换姿势”。
+ */
+const FAST_SWITCH_ACTIONS = new Set(['grab', 'drop', 'walk'])
+const FADE_MS = 140
+const FAST_FADE_MS = 90
 
 /** 完成事件在计时器中发出，不在 React 状态更新器内发出，避免严格模式重复通知。 */
 function FrameSequence({ frames, fps, once, active, onComplete }: {
@@ -46,11 +53,12 @@ function FrameSequence({ frames, fps, once, active, onComplete }: {
 }
 
 /**
- * 24fps 透明 WebM。旧层在淡出期间继续播放，不再冻结在最后一帧；
+ * 24fps 透明 WebM。旧层在淡出期间暂停在当前帧：
+ * 继续播放会让淡出的残影自己动起来，比静止残影明显得多。
  * 一次性动作由 ended 驱动，循环动作交给 video 的 loop。
  */
-function VideoSequence({ src, loop, active, onComplete, onReady }: {
-  src: string; loop: boolean; active: boolean; onComplete?: () => void; onReady?: () => void
+function VideoSequence({ src, loop, active, fadeMs, onComplete, onReady }: {
+  src: string; loop: boolean; active: boolean; fadeMs: number; onComplete?: () => void; onReady?: () => void
 }) {
   const ref = useRef<HTMLVideoElement>(null)
   const completed = useRef(false)
@@ -63,11 +71,11 @@ function VideoSequence({ src, loop, active, onComplete, onReady }: {
   const markReady = () => {
     if (readySent.current) return
     readySent.current = true
-    // 先让新层以 opacity 0 挂一帧，再开始 220ms 淡入；否则会瞬间满亮，看起来像闪一下。
+    // 先让新层以 opacity 0 挂一帧，再开始淡入；否则会瞬间满亮，看起来像闪一下。
     window.setTimeout(() => {
       setReady(true)
       readyCallback.current?.()
-    }, 80)
+    }, 40)
   }
   useEffect(() => {
     completed.current = false
@@ -80,9 +88,10 @@ function VideoSequence({ src, loop, active, onComplete, onReady }: {
     return () => el.pause()
   }, [src])
   useEffect(() => {
-    if (!active) return
     const el = ref.current
-    if (el) void el.play().catch(() => undefined)
+    if (!el) return
+    if (active) void el.play().catch(() => undefined)
+    else el.pause()
   }, [active])
   return (
     <video
@@ -93,7 +102,7 @@ function VideoSequence({ src, loop, active, onComplete, onReady }: {
       playsInline
       preload="auto"
       loop={loop}
-      style={{ opacity: ready ? 1 : 0, transition: 'opacity 0.22s linear' }}
+      style={{ opacity: ready ? 1 : 0, transition: `opacity ${fadeMs}ms linear` }}
       onLoadedData={markReady}
       onPlaying={markReady}
       onCanPlay={() => {
@@ -110,9 +119,9 @@ function VideoSequence({ src, loop, active, onComplete, onReady }: {
   )
 }
 
-function renderPose(pose: Pose, active: boolean, onComplete?: () => void, onReady?: () => void) {
+function renderPose(pose: Pose, active: boolean, fadeMs: number, onComplete?: () => void, onReady?: () => void) {
   if (pose.kind === 'video') {
-    return <VideoSequence src={pose.src} loop={pose.loop} active={active} onComplete={onComplete} onReady={onReady} />
+    return <VideoSequence src={pose.src} loop={pose.loop} active={active} fadeMs={fadeMs} onComplete={onComplete} onReady={onReady} />
   }
   if (pose.kind === 'walk') {
     return <div className="pet-walk-frame"><img className="pet-walk-strip" src={pose.src} alt="" draggable={false} /></div>
@@ -123,13 +132,20 @@ function renderPose(pose: Pose, active: boolean, onComplete?: () => void, onRead
   return <img className="pet-img" src={pose.src} alt="" draggable={false} />
 }
 
-/** 新视频真正显示后才淡出旧层；避免切换时中间出现透明空档。 */
+/** 新层真正显示后才淡出旧层；避免切换时中间出现透明空档。 */
 function AnimatedPose({ pose, onComplete }: { pose: Pose; onComplete?: () => void }) {
   const [curr, setCurr] = useState(pose)
   const [prev, setPrev] = useState<Pose | null>(null)
   const [currReady, setCurrReady] = useState(true)
   const timer = useRef<number>(0)
   const readyRef = useRef(true)
+  const isFast = FAST_SWITCH_ACTIONS.has(pose.action ?? '')
+  const fadeMs = isFast || FAST_SWITCH_ACTIONS.has((prev ?? curr).action ?? '') ? FAST_FADE_MS : FADE_MS
+  /**
+   * 松手落地是物理切换：grab 悬空挣扎与 drop 趴地的轮廓完全不重合，
+   * 任何交叉淡化都会留下两个身影。等新层就绪后直接换层，不留叠加。
+   */
+  const cut = prev?.action === 'grab' && pose.action === 'drop'
   useEffect(() => {
     if (pose.id === curr.id) return
     setPrev(curr)
@@ -147,20 +163,23 @@ function AnimatedPose({ pose, onComplete }: { pose: Pose; onComplete?: () => voi
   useEffect(() => {
     if (!prev || !currReady) return
     window.clearTimeout(timer.current)
-    timer.current = window.setTimeout(() => setPrev(null), 380)
+    if (cut) { setPrev(null); return }
+    timer.current = window.setTimeout(() => setPrev(null), fadeMs + 60)
     return () => window.clearTimeout(timer.current)
-  }, [prev, currReady])
+  }, [prev, currReady, fadeMs, cut])
   useEffect(() => () => window.clearTimeout(timer.current), [])
+  const layers = [...(prev && !(cut && currReady) ? [prev] : []), curr]
   return (
     <div className="pose-stack">
-      {[...(prev ? [prev] : []), curr].map(layer => {
+      {layers.map(layer => {
         const isCurr = layer.id === pose.id
         const video = layer.kind === 'video'
         const className = isCurr
-          ? `pose-layer pose-in${prev ? ' pose-over' : ''}${video ? ' pose-video' : ''}`
+          ? `pose-layer pose-in${video ? ' pose-video' : ''}`
           : `pose-layer${currReady ? ' pose-out' : ''}${video ? ' pose-video' : ''}`
-        return <div key={layer.id} className={className} data-pose-action={layer.action ?? ''}>
-          {renderPose(layer, isCurr, isCurr ? onComplete : undefined, isCurr ? markReady : undefined)}
+        return <div key={layer.id} className={className} data-pose-action={layer.action ?? ''}
+          style={{ animationDuration: `${cut ? 0 : fadeMs}ms` }}>
+          {renderPose(layer, isCurr, cut ? 0 : fadeMs, isCurr ? onComplete : undefined, isCurr ? markReady : undefined)}
         </div>
       })}
     </div>
