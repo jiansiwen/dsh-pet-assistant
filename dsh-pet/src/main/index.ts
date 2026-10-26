@@ -235,26 +235,52 @@ function configureDisplayMedia(): void {
 /**
  * 所有显示器拼成的桌面范围。窗口必须覆盖全部屏幕，宠物才能被拖到任意一块屏上；
  * 只建在主屏时，渲染层按窗口尺寸 clamp，拖到边缘就停住了。
+ *
+ * 用 workArea 而不是 bounds：Windows 11 的 DWM 对覆盖任务栏的置顶透明窗口更敏感，
+ * 也避免宠物走到任务栏上挡住系统按钮。
  */
 function stageBounds(): { x: number; y: number; width: number; height: number } {
-  // 测试宿主只 mock 了 getPrimaryDisplay；真实 Electron 用所有显示器的并集。
-  const displays = typeof screen.getAllDisplays === 'function' ? screen.getAllDisplays() : []
-  const areas = displays.length > 0
-    ? displays.map(display => display.bounds)
-    : [screen.getPrimaryDisplay().workArea]
-  const left = Math.min(...areas.map(area => area.x))
-  const top = Math.min(...areas.map(area => area.y))
-  const right = Math.max(...areas.map(area => area.x + area.width))
-  const bottom = Math.max(...areas.map(area => area.y + area.height))
-  return { x: left, y: top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) }
+  try {
+    // 测试宿主只 mock 了 getPrimaryDisplay；真实 Electron 用所有显示器的并集。
+    const displays = typeof screen.getAllDisplays === 'function' ? screen.getAllDisplays() : []
+    const areas = displays.length > 0
+      ? displays.map(display => display.workArea)
+      : [screen.getPrimaryDisplay().workArea]
+    const left = Math.min(...areas.map(area => area.x))
+    const top = Math.min(...areas.map(area => area.y))
+    const right = Math.max(...areas.map(area => area.x + area.width))
+    const bottom = Math.max(...areas.map(area => area.y + area.height))
+    // 异常 DPI / 虚拟显示器配置可能给出大得不合理的并集；夹住上限，避免创建超大透明窗口。
+    return {
+      x: left,
+      y: top,
+      width: Math.min(16384, Math.max(1, right - left)),
+      height: Math.min(16384, Math.max(1, bottom - top)),
+    }
+  } catch (error) {
+    console.error('[dsh-pet] stageBounds failed, using primary workArea', error)
+    const area = screen.getPrimaryDisplay().workArea
+    return { x: area.x, y: area.y, width: area.width, height: area.height }
+  }
 }
 
 let screenEventsBound = false
 
-function createWindow(): void {
-  const bounds = stageBounds()
+process.on('uncaughtException', error => {
+  // 透明置顶窗口在个别显卡/系统组合上会直接抛主进程异常；退出前留下可读的日志。
+  console.error('[dsh-pet] uncaughtException', error)
+  app.exit(1)
+})
+process.on('unhandledRejection', reason => {
+  console.error('[dsh-pet] unhandledRejection', reason)
+})
+app.on('child-process-gone', (_event, details) => {
+  // Windows 11 上透明置顶窗口偶发 GPU 进程崩溃；不记录的话表现就是一召唤就闪退。
+  console.error('[dsh-pet] child process gone', details)
+})
 
-  win = new BrowserWindow({
+function createStageWindow(bounds: { x: number; y: number; width: number; height: number }): BrowserWindow {
+  return new BrowserWindow({
     x: bounds.x,
     y: bounds.y,
     width: bounds.width,
@@ -273,8 +299,21 @@ function createWindow(): void {
       sandbox: true,
     },
   })
-  win.setAlwaysOnTop(true, 'screen-saver')
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+}
+
+function createWindow(): void {
+  try {
+    win = createStageWindow(stageBounds())
+  } catch (error) {
+    // 多屏并集在某些 Windows 11 显卡/缩放组合上会创建失败；退回主屏也要让宠物能出来。
+    console.error('[dsh-pet] createWindow failed, falling back to primary workArea', error)
+    const area = screen.getPrimaryDisplay().workArea
+    win = createStageWindow({ x: area.x, y: area.y, width: area.width, height: area.height })
+  }
+  try { win.setAlwaysOnTop(true, 'screen-saver') } catch (error) { console.error('[dsh-pet] setAlwaysOnTop failed', error) }
+  try { win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }) } catch (error) {
+    console.error('[dsh-pet] setVisibleOnAllWorkspaces failed', error)
+  }
   win.setIgnoreMouseEvents(true, { forward: true })
   // 插拔显示器或改分辨率后重新铺满桌面；只绑一次，避免窗口自愈重建时重复注册。
   // 测试宿主只 mock 了 getPrimaryDisplay，没有 screen.on。

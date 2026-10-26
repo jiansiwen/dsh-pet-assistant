@@ -35,7 +35,7 @@
  */
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -1029,36 +1029,56 @@ export class SessionBridge {
    * `cmd /c` 是 Windows 专有的：macOS/Linux 上没有 `cmd`，spawn 会以 ENOENT 失败，
    * 而失败被吞成一句日志，用户看到的是"召唤了但宠物不出现"。所以这里按平台挑：
    * POSIX 上直接跑 `pnpm`（它是个 shell 脚本，可执行位由安装时设好）。
+   *
+   * 输出不再丢掉：召唤没有终端，闪退时日志是唯一线索，统一落到 <DSH_HOME>/dsh-pet/launch.log。
    */
   launchPet(): boolean {
     const petDir = this.options.petDir
     if (!petDir) return false
+    // 依赖没装时 pnpm start 会在构建阶段直接失败，用户只会看到"一闪就没"。
+    if (!existsSync(path.join(petDir, 'node_modules', 'electron'))) {
+      this.options.logger?.info(`launch pet skipped: ${petDir} 还没安装依赖，请先在该目录运行 pnpm install`)
+      return false
+    }
     // DSH 桌面端会给自己的子进程注入 ELECTRON_RUN_AS_NODE=1（它的 CLI 需要以 Node 模式跑）。
     // 这个变量一旦被桌宠启动器继承，Electron 就会以 Node 模式加载主进程，
     // 首屏直接 SyntaxError（electron 模块没有 BrowserWindow 导出）然后静默退出。
     // 桌宠是真正的 GUI 应用，所以启动时把该变量从子进程环境里删掉。
     const env = { ...process.env }
     delete env.ELECTRON_RUN_AS_NODE
+    const logPath = path.join(this.options.dshHome, 'dsh-pet', 'launch.log')
+    const appendLog = (text: string): void => {
+      try {
+        mkdirSync(path.dirname(logPath), { recursive: true })
+        appendFileSync(logPath, text)
+      } catch {
+        // 日志写不了不影响启动。
+      }
+    }
+    appendLog(`\n===== ${new Date().toISOString()} summon =====\n`)
     try {
       const child = process.platform === 'win32'
         ? spawn('cmd', ['/c', 'pnpm', 'start'], {
             cwd: petDir,
             windowsHide: true,
-            stdio: 'ignore',
+            stdio: ['ignore', 'pipe', 'pipe'],
             detached: false,
             env,
           })
         : spawn('pnpm', ['start'], {
             cwd: petDir,
-            stdio: 'ignore',
+            stdio: ['ignore', 'pipe', 'pipe'],
             detached: false,
             env,
           })
+      child.stdout?.on('data', chunk => appendLog(String(chunk)))
+      child.stderr?.on('data', chunk => appendLog(String(chunk)))
       child.on('error', (error) => {
-        this.options.logger?.info(`launch pet failed: ${String(error)}`)
+        appendLog(`[dsh-personal-assistant] spawn error: ${String(error)}\n`)
       })
       return true
-    } catch {
+    } catch (error) {
+      appendLog(`[dsh-personal-assistant] spawn threw: ${String(error)}\n`)
       return false
     }
   }

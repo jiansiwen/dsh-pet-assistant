@@ -359,7 +359,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
           : launched
             ? '桌面宠物已召唤并绑定到本会话'
             : petDir
-              ? `会话已绑定到桥接，但拉不起桌面宠物（${petDir}）：请手动在该目录运行 pnpm start，启动后会自动接入桥接`
+              ? `会话已绑定到桥接，但拉不起桌面宠物（${petDir}）：请在该目录运行 pnpm install && pnpm start；启动日志在 ~/.dsh/dsh-pet/launch.log`
               : '会话已绑定到桥接，但没有找到 dsh-pet：把 dsh-pet 目录放在插件同级（与 dsh-personal-assistant 并排），或在 profile 里给 personal-assistant 配置 config.petDir，或手动在 dsh-pet 目录运行 pnpm start（启动后会自动接入桥接）',
       })
     },

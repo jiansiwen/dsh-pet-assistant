@@ -171,7 +171,7 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
               ? `会话已绑定（桥接端口 ${port}）；团队模式的桌面角色由桌面壳负责`
               : launched
                 ? '桌面宠物已召唤并绑定到当前会话'
-                : `会话已绑定（桥接端口 ${port}），但没能拉起桌宠；请在 dsh-pet 目录运行 pnpm start`,
+                : `会话已绑定（桥接端口 ${port}），但没能拉起桌宠；请在 dsh-pet 目录运行 pnpm install && pnpm start（日志：~/.dsh/dsh-pet/launch.log）`,
           }
         } catch (error) {
           return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
