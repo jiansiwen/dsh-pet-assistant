@@ -274,6 +274,12 @@ process.on('uncaughtException', error => {
 process.on('unhandledRejection', reason => {
   console.error('[dsh-pet] unhandledRejection', reason)
 })
+// 个别 Win11 显卡驱动在透明置顶窗口上会让 GPU 进程崩溃（表现为一召唤就闪退）。
+// 这类机器可以设 DSH_PET_DISABLE_GPU=1 强制软件渲染；默认仍走 GPU 以保证动画流畅。
+if (process.env.DSH_PET_DISABLE_GPU === '1') {
+  app.disableHardwareAcceleration()
+  console.error('[dsh-pet] hardware acceleration disabled by DSH_PET_DISABLE_GPU')
+}
 app.on('child-process-gone', (_event, details) => {
   // Windows 11 上透明置顶窗口偶发 GPU 进程崩溃；不记录的话表现就是一召唤就闪退。
   console.error('[dsh-pet] child process gone', details)
