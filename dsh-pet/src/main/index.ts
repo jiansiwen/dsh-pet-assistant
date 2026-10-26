@@ -237,11 +237,15 @@ function configureDisplayMedia(): void {
  * 只建在主屏时，渲染层按窗口尺寸 clamp，拖到边缘就停住了。
  */
 function stageBounds(): { x: number; y: number; width: number; height: number } {
-  const displays = screen.getAllDisplays()
-  const left = Math.min(...displays.map(display => display.bounds.x))
-  const top = Math.min(...displays.map(display => display.bounds.y))
-  const right = Math.max(...displays.map(display => display.bounds.x + display.bounds.width))
-  const bottom = Math.max(...displays.map(display => display.bounds.y + display.bounds.height))
+  // 测试宿主只 mock 了 getPrimaryDisplay；真实 Electron 用所有显示器的并集。
+  const displays = typeof screen.getAllDisplays === 'function' ? screen.getAllDisplays() : []
+  const areas = displays.length > 0
+    ? displays.map(display => display.bounds)
+    : [screen.getPrimaryDisplay().workArea]
+  const left = Math.min(...areas.map(area => area.x))
+  const top = Math.min(...areas.map(area => area.y))
+  const right = Math.max(...areas.map(area => area.x + area.width))
+  const bottom = Math.max(...areas.map(area => area.y + area.height))
   return { x: left, y: top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) }
 }
 
@@ -249,7 +253,6 @@ let screenEventsBound = false
 
 function createWindow(): void {
   const bounds = stageBounds()
-  console.log('[dsh-pet] stage bounds', bounds, 'displays', screen.getAllDisplays().map(display => display.bounds))
 
   win = new BrowserWindow({
     x: bounds.x,
@@ -274,7 +277,8 @@ function createWindow(): void {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   win.setIgnoreMouseEvents(true, { forward: true })
   // 插拔显示器或改分辨率后重新铺满桌面；只绑一次，避免窗口自愈重建时重复注册。
-  if (!screenEventsBound) {
+  // 测试宿主只 mock 了 getPrimaryDisplay，没有 screen.on。
+  if (!screenEventsBound && typeof screen.on === 'function') {
     screenEventsBound = true
     const syncBounds = (): void => {
       if (!win || win.isDestroyed()) return
@@ -1989,18 +1993,24 @@ function registerIpc(): void {
       layoutVersion: settings.layoutVersion,
       idleSleepMinutes: settings.idleSleepMinutes,
       sleepMinutes: settings.sleepMinutes,
+      chatDock: settings.chatDock ?? 'top',
+      chatSize: settings.chatSize,
     }
   })
 
   ipcMain.handle(
     'save-settings',
-    (_event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; idleSleepMinutes?: number; sleepMinutes?: number }) => {
+    (_event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number } }) => {
       if (!patch || typeof patch !== 'object') return { ok: false }
       // 设置只接受明确的整数分钟；不让无效输入被默默保存成默认值。
       for (const key of ['idleSleepMinutes', 'sleepMinutes'] as const) {
         if (!(key in patch)) continue
         const value = patch[key]
         if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 120) return { ok: false }
+      }
+      const chatSize = patch.chatSize
+      if (chatSize !== undefined && (!chatSize || !Number.isFinite(chatSize.width) || !Number.isFinite(chatSize.height))) {
+        return { ok: false }
       }
       saveSettings({
         ...(patch.bounds ? { bounds: patch.bounds } : {}),
@@ -2010,6 +2020,8 @@ function registerIpc(): void {
         ...(typeof patch.readReplies === 'boolean' ? { readReplies: patch.readReplies } : {}),
         ...(patch.idleSleepMinutes !== undefined ? { idleSleepMinutes: patch.idleSleepMinutes } : {}),
         ...(patch.sleepMinutes !== undefined ? { sleepMinutes: patch.sleepMinutes } : {}),
+        ...(patch.chatDock === 'top' || patch.chatDock === 'auto' ? { chatDock: patch.chatDock } : {}),
+        ...(chatSize ? { chatSize } : {}),
       })
       if (patch.voiceConversation === false || patch.continuousVoice === false) {
         sendToRenderer('voice-conversation-stop', null)

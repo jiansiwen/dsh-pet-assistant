@@ -17,8 +17,68 @@ export function mergeSession(previous: SessionSnapshot | null, update: SessionUp
   }
 }
 
-export function overlayPosition(x: number, y: number, width: number, height: number, petWidth: number) {
-  return { x: x + petWidth / 2 - width / 2, y: y - height - 8 }
+/** 会话框停靠方式：top = 固定头顶；auto = 按屏幕剩余空间在上/下/左/右里选。 */
+export type ChatDock = 'top' | 'auto'
+
+export interface OverlaySize {
+  width: number
+  height: number
+}
+
+export interface OverlayViewport {
+  width: number
+  height: number
+}
+
+const OVERLAY_GAP = 8
+const OVERLAY_MARGIN = 8
+
+/**
+ * 会话框相对宠物锚点的落位。
+ *
+ * top：始终在头顶，但夹回可视区 —— 宠物贴着屏幕上沿时也不能让框被裁掉。
+ * auto：依次尝试上、下、左、右，优先完全可见的那个；四个方向都放不下时取溢出最少的方向，
+ * 再整体夹回可视区，保证框至少整体在屏幕内。
+ */
+export function overlayPosition(
+  anchor: { x: number; y: number },
+  size: OverlaySize,
+  petWidth: number,
+  viewport: OverlayViewport,
+  dock: ChatDock = 'top',
+): { x: number; y: number } {
+  const maxX = Math.max(OVERLAY_MARGIN, viewport.width - size.width - OVERLAY_MARGIN)
+  const maxY = Math.max(OVERLAY_MARGIN, viewport.height - size.height - OVERLAY_MARGIN)
+  const clamp = (value: number, max: number) => Math.min(Math.max(value, OVERLAY_MARGIN), max)
+  const centerX = anchor.x + petWidth / 2
+  const centerY = anchor.y + petWidth / 2
+  const above = { x: centerX - size.width / 2, y: anchor.y - size.height - OVERLAY_GAP }
+  if (dock === 'top') return { x: clamp(above.x, maxX), y: clamp(above.y, maxY) }
+
+  const candidates = [
+    above,
+    { x: centerX - size.width / 2, y: anchor.y + petWidth + OVERLAY_GAP },
+    { x: anchor.x - size.width - OVERLAY_GAP, y: centerY - size.height / 2 },
+    { x: anchor.x + petWidth + OVERLAY_GAP, y: centerY - size.height / 2 },
+  ]
+  for (const candidate of candidates) {
+    if (candidate.x >= OVERLAY_MARGIN && candidate.y >= OVERLAY_MARGIN
+      && candidate.x + size.width <= viewport.width - OVERLAY_MARGIN
+      && candidate.y + size.height <= viewport.height - OVERLAY_MARGIN) return candidate
+  }
+  let best = candidates[0]
+  let bestOverflow = Number.POSITIVE_INFINITY
+  for (const candidate of candidates) {
+    const overflow = Math.max(0, OVERLAY_MARGIN - candidate.x)
+      + Math.max(0, OVERLAY_MARGIN - candidate.y)
+      + Math.max(0, candidate.x + size.width - (viewport.width - OVERLAY_MARGIN))
+      + Math.max(0, candidate.y + size.height - (viewport.height - OVERLAY_MARGIN))
+    if (overflow < bestOverflow) {
+      bestOverflow = overflow
+      best = candidate
+    }
+  }
+  return { x: clamp(best.x, maxX), y: clamp(best.y, maxY) }
 }
 
 /**

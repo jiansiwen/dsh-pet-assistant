@@ -1,4 +1,4 @@
-/* 会话定位仅由实时锚点驱动，不夹边；正文与工具过程各自保持可读。 */
+/* 会话定位由实时锚点 + 停靠策略驱动，尺寸由用户拖拽决定。 */
 .chat-hud {
   --hud-bg: rgba(16, 35, 51, 0.78);
   --hud-edge: #75cae8;
@@ -9,9 +9,8 @@
   left: 0;
   top: 0;
   z-index: 80;
-  width: 440px;
   max-width: calc(100vw - 16px);
-  max-height: 560px;
+  max-height: calc(100vh - 16px);
   display: flex;
   flex-direction: column;
   color: var(--hud-text);
@@ -22,6 +21,25 @@
   font: 13px/1.65 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
   color-scheme: dark;
   user-select: text;
+}
+
+/* 右下角拖拽缩放：只改尺寸，落位仍由锚点与停靠策略驱动。 */
+.hud-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  touch-action: none;
+  border-bottom-right-radius: 12px;
+  background:
+    linear-gradient(135deg,
+      transparent 0 52%,
+      rgba(117, 202, 232, 0.5) 52% 60%,
+      transparent 60% 70%,
+      rgba(117, 202, 232, 0.5) 70% 78%,
+      transparent 78%);
 }
 
 .chat-hud :is(button, select, textarea) {

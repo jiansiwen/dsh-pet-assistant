@@ -37,6 +37,10 @@ interface Props {
    * 演示期间新产生的消息照常可见，用户正在演示它们。
    */
   readonly hiddenThroughSeq?: number | null
+  /** top = 固定头顶；auto = 按屏幕空间自动换到上/下/左/右。 */
+  dock: 'top' | 'auto'
+  size: { width: number; height: number }
+  onResize(size: { width: number; height: number }): void
 }
 
 /** 停止按钮的语义提示：两种停止分开写清楚，界面不替用户猜它会停掉谁。 */
@@ -68,6 +72,10 @@ export default function ChatOverlay(props: Props) {
   const followBottom = useRef(true)
   const [changing, setChanging] = useState(false)
   const [showLatest, setShowLatest] = useState(false)
+  const [liveSize, setLiveSize] = useState(props.size)
+  const dockRef = useRef(props.dock)
+  dockRef.current = props.dock
+  useEffect(() => { setLiveSize(props.size) }, [props.size.width, props.size.height])
   /** 最近一次「停止生成」的回执：state 为 null 表示原生 cancel（没有定向回执）。 */
   const [stopNote, setStopNote] = useState<{ state: CancelReceipt['state'] | null; text: string } | null>(null)
   const running = session?.status === 'running' || session?.status === 'waiting'
@@ -78,7 +86,13 @@ export default function ChatOverlay(props: Props) {
     const place = () => {
       const anchor = stageRef.current?.anchorPosition()
       if (!anchor) return
-      const position = overlayPosition(anchor.x, anchor.y, element.offsetWidth, element.offsetHeight, PET_WIDTH)
+      const position = overlayPosition(
+        anchor,
+        { width: element.offsetWidth, height: element.offsetHeight },
+        PET_WIDTH,
+        { width: innerWidth, height: innerHeight },
+        dockRef.current,
+      )
       element.style.transform = `translate3d(${position.x}px, ${position.y}px, 0)`
       const rect = element.getBoundingClientRect()
       const box = { x1: Math.max(0, rect.left), y1: Math.max(0, rect.top), x2: Math.min(innerWidth, rect.right), y2: Math.min(innerHeight, rect.bottom) }
@@ -90,12 +104,39 @@ export default function ChatOverlay(props: Props) {
     observer.observe(element)
     window.addEventListener('resize', place)
     return () => { stop?.(); observer.disconnect(); window.removeEventListener('resize', place); registerPanelHitbox(null) }
-  }, [stageRef])
+  }, [stageRef, props.dock])
 
   useEffect(() => {
     const element = list.current
     if (element && followBottom.current) element.scrollTop = element.scrollHeight
   }, [session?.entries])
+
+  /** 右下角拖拽改尺寸：拖动过程只改本地尺寸，松手才落盘。 */
+  const startResize = (event: React.PointerEvent<HTMLDivElement>): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    const startX = event.clientX
+    const startY = event.clientY
+    const startWidth = liveSize.width
+    const startHeight = liveSize.height
+    let next = { width: startWidth, height: startHeight }
+    const move = (ev: PointerEvent): void => {
+      const maxWidth = Math.max(280, innerWidth - 16)
+      const maxHeight = Math.max(200, innerHeight - 16)
+      next = {
+        width: Math.round(Math.min(maxWidth, Math.max(280, startWidth + ev.clientX - startX))),
+        height: Math.round(Math.min(maxHeight, Math.max(200, startHeight + ev.clientY - startY))),
+      }
+      setLiveSize(next)
+    }
+    const up = (): void => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      props.onResize(next)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
 
   const older = async () => {
     const element = list.current
@@ -140,7 +181,8 @@ export default function ChatOverlay(props: Props) {
   const { visible: visibleEntries, hidden: hiddenCount } = entriesForPresentation(session?.entries ?? [], props.hiddenThroughSeq ?? null)
 
   return (
-    <section ref={panel} className="chat-hud" data-interactive aria-label="宠物会话">
+    <section ref={panel} className="chat-hud" data-interactive aria-label="宠物会话"
+      style={{ width: liveSize.width, height: liveSize.height }}>
       <header className="hud-header">
         <span className={`hud-indicator${running ? ' active' : ''}`} aria-hidden />
         <span className="hud-title" title={session?.title}>{session?.title || '原生 dsh 会话'}</span>
@@ -218,6 +260,7 @@ export default function ChatOverlay(props: Props) {
         </div>
       </div>
       <span className="hud-anchor" aria-hidden />
+      <div className="hud-resize" role="separator" aria-label="调整会话框大小" onPointerDown={startResize} />
     </section>
   )
 }

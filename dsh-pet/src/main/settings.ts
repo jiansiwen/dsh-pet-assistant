@@ -63,9 +63,13 @@ export interface PetSettings {
    * 镜像只负责转发，不能因为它"看起来是自家的"就跳过校验。
    */
   modelMirror?: string
+  /** 会话框固定挂在头顶；auto = 按屏幕剩余空间自动选上/下/左/右。 */
+  chatDock?: 'top' | 'auto'
+  /** 会话框尺寸（CSS 像素），由右下角拖拽调整后保存。 */
+  chatSize?: { width: number; height: number }
 }
 
-const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false }
+const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false, chatDock: 'top' }
 
 let cache: PetSettings | null = null
 
@@ -115,6 +119,17 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.docRecentDirs = (sanitizeDirs(merged.docRecentDirs) ?? []).slice(0, MAX_RECENT_DIRS)
 
   merged.layoutVersion = LAYOUT_VERSION
+  // 会话框停靠与尺寸：设置文件可手改，越界的值退回安全范围，别让面板一开就整块跑到屏幕外。
+  if (merged.chatDock !== 'auto') merged.chatDock = 'top'
+  const chatSize = merged.chatSize
+  if (!chatSize || !Number.isFinite(chatSize.width) || !Number.isFinite(chatSize.height)) {
+    merged.chatSize = undefined
+  } else {
+    merged.chatSize = {
+      width: Math.min(2000, Math.max(280, Math.round(chatSize.width))),
+      height: Math.min(2000, Math.max(200, Math.round(chatSize.height))),
+    }
+  }
   return merged
 }
 

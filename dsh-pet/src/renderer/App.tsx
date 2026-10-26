@@ -124,6 +124,9 @@ export default function App() {
   const [voiceConversation, setVoiceConversation] = useState(false)
   const [continuousVoice, setContinuousVoice] = useState(false)
   const [readReplies, setReadReplies] = useState(false)
+  /** 会话框停靠方式与尺寸；默认固定在头顶，尺寸 440×560。 */
+  const [chatDock, setChatDock] = useState<'top' | 'auto'>('top')
+  const [chatSize, setChatSize] = useState<{ width: number; height: number }>({ width: 440, height: 560 })
   const conversation = useRef(new VoiceConversation()).current
   const [continuousActive, setContinuousActive] = useState(false)
   const dictationGeneration = useRef(0)
@@ -289,6 +292,10 @@ export default function App() {
       setVoiceConversation(state.voiceConversation === true)
       setContinuousVoice(state.continuousVoice === true)
       setReadReplies(state.readReplies === true)
+      setChatDock(state.chatDock === 'auto' ? 'auto' : 'top')
+      if (state.chatSize && Number.isFinite(state.chatSize.width) && Number.isFinite(state.chatSize.height)) {
+        setChatSize({ width: state.chatSize.width, height: state.chatSize.height })
+      }
       setCharacters(state.characters ?? {})
       setSleepSettings({ idleSleepMinutes: state.idleSleepMinutes ?? 2, sleepMinutes: state.sleepMinutes ?? 20 })
       if (state.positions && Object.keys(state.positions).length > 0) {
@@ -1190,6 +1197,12 @@ export default function App() {
           setInput={value => { voiceRoundRef.current = false; setInput(value) }}
           onSend={() => void send(input)}
           onClose={() => setPanelOpen(false)}
+          dock={chatDock}
+          size={chatSize}
+          onResize={size => {
+            setChatSize(size)
+            void window.petApi.saveSettings({ chatSize: size })
+          }}
           onCommand={command => {
             if (command.kind === 'cancel') stopContinuous(false)
             return mirror.command(command)
@@ -1284,6 +1297,19 @@ export default function App() {
                       } catch { showToast('朗读回复设置未保存') }
                     }} />
                   朗读回复：打字发出的消息也把回答念出来（语音发起的那一轮本来就会念）
+                </label>
+                <label className="management-voice">
+                  <input type="checkbox" checked={chatDock === 'top'}
+                    onChange={async event => {
+                      const pinned = event.target.checked
+                      const next = pinned ? 'top' : 'auto'
+                      try {
+                        const result = await window.petApi.saveSettings({ chatDock: next })
+                        if (result.ok) setChatDock(next)
+                        else showToast('会话框设置未保存')
+                      } catch { showToast('会话框设置未保存') }
+                    }} />
+                  会话框固定在宠物头顶（关闭后按屏幕空间自动换到上/下/左/右）
                 </label>
               </section>
               <ResidencySettings

@@ -19,9 +19,27 @@ test('内部区域、菜单或管理交互不自动收起；隐藏状态不重�
   assert.equal(shouldDismissOverlay({ ...visible, blocked: true }, outside), false)
   assert.equal(shouldDismissOverlay({ ...visible, open: false }, outside), false)
 })
-test('头顶框允许负坐标，不改变宠物的位置或翻转到下方', () => {
-  assert.deepEqual(overlayPosition(100, 8, 440, 400, 150), { x: -45, y: -400 })
-  assert.deepEqual(overlayPosition(500, 700, 440, 400, 150), { x: 355, y: 292 })
+test('固定头顶：正常位置居中，贴边时夹回可视区而不是画到屏幕外', () => {
+  const viewport = { width: 1536, height: 864 }
+  const size = { width: 440, height: 400 }
+  assert.deepEqual(overlayPosition({ x: 500, y: 700 }, size, 150, viewport, 'top'), { x: 355, y: 292 })
+  assert.deepEqual(overlayPosition({ x: 100, y: 8 }, size, 150, viewport, 'top'), { x: 8, y: 8 })
+})
+test('自适应：上方放不下时换到下方，左右也不够时换到侧面', () => {
+  const viewport = { width: 1536, height: 864 }
+  const size = { width: 440, height: 400 }
+  assert.deepEqual(overlayPosition({ x: 700, y: 8 }, size, 150, viewport, 'auto'), { x: 555, y: 166 })
+  assert.deepEqual(overlayPosition({ x: 0, y: 400 }, size, 150, viewport, 'auto'), { x: 158, y: 275 })
+})
+test('自适应：四个方向都放不下时选溢出最少的并整体夹回视口', () => {
+  const positioned = overlayPosition(
+    { x: 100, y: 100 },
+    { width: 200, height: 200 },
+    150,
+    { width: 300, height: 300 },
+    'auto',
+  )
+  assert.deepEqual(positioned, { x: 75, y: 8 })
 })
 test('屏幕命中区域与命令只接受有效边界输入', () => {
   assert.equal(validBoxes([box]), true)

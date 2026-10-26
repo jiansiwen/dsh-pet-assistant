@@ -73,6 +73,8 @@ export interface PetState {
   readReplies?: boolean
   idleSleepMinutes?: number
   sleepMinutes?: number
+  chatDock?: 'top' | 'auto'
+  chatSize?: { width: number; height: number }
   /** 旧单宠物时代的位置，升级后由渲染层映射到对应角色。 */
   bounds?: PetPosition
   /** 各角色座位，键是 assistantId。 */
@@ -90,6 +92,8 @@ export interface PetSettingsPatch {
   sleepMinutes?: number
   bounds?: PetPosition
   positions?: Record<string, PetPosition>
+  chatDock?: 'top' | 'auto'
+  chatSize?: { width: number; height: number }
 }
 
 /**
