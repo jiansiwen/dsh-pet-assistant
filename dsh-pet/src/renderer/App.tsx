@@ -53,6 +53,12 @@ import './hud.css'
 const QUICK_COMMANDS = ['开启个人助理模式', '我今天干了啥？', '总结今日工作内容']
 
 /**
+ * 提醒气泡在屏幕上停留的上限，与插件侧 OFFER_TTL_MS（30 分钟）对齐。
+ * 插件端的 offer 过期后不会再生成候选，气泡继续挂着只会让用户点了没反应。
+ */
+const PROACTIVE_BUBBLE_TTL_MS = 30 * 60_000
+
+/**
  * 宠物界面的构建标识，显示在通用设置的诊断区。
  *
  * 有个说不清的显示问题时，第一件要排除的事就是「跑的是不是这个构建」——
@@ -171,6 +177,7 @@ export default function App() {
   const [stageVisible, setStageVisible] = useState(true)
   /** 主动提醒的候选（§2.7）。null = 没有 待回应的气泡。 */
   const [proactive, setProactive] = useState<{ message: string; suggestDisable: boolean } | null>(null)
+  const proactiveTimer = useRef(0)
   /**
    * 演示隐私模式的历史分界（M5-05）。
    *
@@ -555,9 +562,18 @@ export default function App() {
   /** 主动提醒气泡上的点选（§2.7）：先撤气泡再回执，「好」把用户带进帮助流程。 */
   const handleProactive = useCallback((kind: 'accept' | 'decline' | 'disable') => {
     setProactive(null)
+    window.clearTimeout(proactiveTimer.current)
     window.petApi.respondProactive(kind)
-    if (kind === 'accept') { voiceRoundRef.current = false; void send(PROACTIVE_ACCEPT_MESSAGE) }
-  }, [send])
+    if (kind !== 'accept') return
+    voiceRoundRef.current = false
+    // 点「好」必须立刻有可见反应：先打开对话框，助理在忙也要说清楚，不能静默丢掉。
+    setPanelOpen(true)
+    if (busyRef.current) {
+      showToast('助理正在处理上一条，等它说完再一起看')
+      return
+    }
+    void send(PROACTIVE_ACCEPT_MESSAGE)
+  }, [send, showToast])
 
   /**
    * 请主进程打开专用审批窗口。
@@ -990,7 +1006,10 @@ export default function App() {
   useEffect(() => {
     window.petApi.onProactive((payload) => {
       setProactive({ message: payload.message, suggestDisable: payload.suggestDisable === true })
+      window.clearTimeout(proactiveTimer.current)
+      proactiveTimer.current = window.setTimeout(() => setProactive(null), PROACTIVE_BUBBLE_TTL_MS)
     })
+    return () => window.clearTimeout(proactiveTimer.current)
   }, [])
 
   /**

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Personal computer assistant plugin for DeepSeek Harness: tracks daily computer activity, answers what the user did today, and generates daily reports with long-term preference memory",
   "type": "module",
-  "main": "dist/index-1023084858.js",
+  "main": "dist/index-1025152729.js",
   "license": "MIT",
   "engines": {
     "node": ">=22"
@@ -17,6 +17,20 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
     }
   },
   "scripts": {
@@ -47,5 +61,10 @@
     "esbuild": "^0.27.7",
     "typescript": "^5.6.0",
     "zod": "4.4.3"
+  },
+  "exports": {
+    ".": "./dist/index-1025152729.js",
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
   }
 }

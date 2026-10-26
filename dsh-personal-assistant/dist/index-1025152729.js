@@ -14664,6 +14664,106 @@ function hostAgents(ctx) {
   if (!value || typeof value.create !== "function" || typeof value.resume !== "function") return void 0;
   return value;
 }
+function hostCommands(ctx) {
+  if (typeof ctx.get !== "function") return void 0;
+  const value = ctx.get("commands");
+  if (!value || typeof value.register !== "function") return void 0;
+  return value;
+}
+function registerUserCommands(ctx, deps) {
+  if (mountUserCommands(ctx, deps)) return;
+  if (typeof ctx.inject !== "function") return;
+  ctx.inject(["commands"], (scope) => {
+    if (!mountUserCommands(scope, deps)) {
+      deps.log?.("commands \u670D\u52A1\u5DF2\u51FA\u73B0\uFF0C\u4F46\u4ECD\u62FF\u4E0D\u5230\u6CE8\u518C\u8868\uFF0C\u4E00\u952E\u547D\u4EE4\u672A\u6302\u8F7D");
+    }
+  });
+}
+function mountUserCommands(ctx, deps) {
+  const commands = hostCommands(ctx);
+  if (!commands) return false;
+  const { bridge, tracker } = deps;
+  ctx.effect(() => {
+    const disposers = [];
+    const register = (definition) => {
+      disposers.push(commands.register(definition));
+    };
+    register({
+      name: "summon-pet",
+      description: "\u53EC\u5524\u684C\u9762\u5BA0\u7269\u5E76\u7ED1\u5B9A\u5230\u5F53\u524D\u4F1A\u8BDD",
+      recordInput: false,
+      async handler(invocation) {
+        const agent = invocation.agent;
+        if (!agent) {
+          const launched = bridge.teamEnabled ? false : bridge.launchPet();
+          return launched ? { kind: "success", text: "\u684C\u9762\u5BA0\u7269\u5DF2\u542F\u52A8\uFF1B\u6253\u5F00\u4E00\u4E2A\u4F1A\u8BDD\u540E\u518D\u70B9\u4E00\u6B21\u5373\u53EF\u7ED1\u5B9A" } : { kind: "error", text: "\u6CA1\u6709\u53EF\u7ED1\u5B9A\u7684\u4F1A\u8BDD\uFF0C\u4E5F\u6CA1\u80FD\u542F\u52A8\u684C\u5BA0\uFF1B\u8BF7\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm start" };
+        }
+        try {
+          const { port } = await bridge.bind(agent);
+          const launched = bridge.teamEnabled ? false : bridge.launchPet();
+          return {
+            kind: "success",
+            text: bridge.teamEnabled ? `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09\uFF1B\u56E2\u961F\u6A21\u5F0F\u7684\u684C\u9762\u89D2\u8272\u7531\u684C\u9762\u58F3\u8D1F\u8D23` : launched ? "\u684C\u9762\u5BA0\u7269\u5DF2\u53EC\u5524\u5E76\u7ED1\u5B9A\u5230\u5F53\u524D\u4F1A\u8BDD" : `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09\uFF0C\u4F46\u6CA1\u80FD\u62C9\u8D77\u684C\u5BA0\uFF1B\u8BF7\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm start`
+          };
+        } catch (error) {
+          return { kind: "error", text: error instanceof Error ? error.message : String(error) };
+        }
+      }
+    });
+    register({
+      name: "bind-pet",
+      description: "\u628A\u684C\u9762\u5BA0\u7269\u7ED1\u5B9A\u5230\u5F53\u524D\u4F1A\u8BDD\uFF08\u4E0D\u542F\u52A8\u5BA0\u7269\uFF09",
+      recordInput: false,
+      async handler(invocation) {
+        const agent = invocation.agent;
+        if (!agent) return { kind: "error", text: "\u5F53\u524D\u547D\u4EE4\u6CA1\u6709\u53EF\u7ED1\u5B9A\u7684\u4F1A\u8BDD" };
+        try {
+          const { port } = await bridge.bind(agent);
+          return { kind: "success", text: `\u5F53\u524D\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u684C\u9762\u5BA0\u7269\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09` };
+        } catch (error) {
+          return { kind: "error", text: error instanceof Error ? error.message : String(error) };
+        }
+      }
+    });
+    register({
+      name: "assistant-on",
+      description: "\u5F00\u542F\u4E2A\u4EBA\u52A9\u7406\u6A21\u5F0F\uFF0C\u5F00\u59CB\u8BB0\u5F55\u7535\u8111\u6D3B\u52A8",
+      recordInput: false,
+      async handler() {
+        const blocked = deps.captureBlockedReason();
+        if (blocked) return { kind: "error", text: `\u672A\u5F00\u542F\u6D3B\u52A8\u8BB0\u5F55\uFF1A${blocked}` };
+        if (!deps.captureScopeAuthorized()) {
+          return { kind: "error", text: "\u91C7\u96C6\u8303\u56F4\u8FD8\u6CA1\u786E\u8BA4\uFF1A\u5148\u5728\u5BF9\u8BDD\u91CC\u8BF4\u4E00\u6B21\u300C\u5F00\u542F\u4E2A\u4EBA\u52A9\u7406\u6A21\u5F0F\u300D\u5B8C\u6210\u786E\u8BA4" };
+        }
+        if (tracker.capturing) return { kind: "success", text: "\u4E2A\u4EBA\u52A9\u7406\u6A21\u5F0F\u5DF2\u7ECF\u5728\u8FD0\u884C" };
+        try {
+          await tracker.start();
+          return { kind: "success", text: "\u4E2A\u4EBA\u52A9\u7406\u6A21\u5F0F\u5DF2\u5F00\u542F\uFF0C\u5F00\u59CB\u8BB0\u5F55\u7535\u8111\u6D3B\u52A8" };
+        } catch (error) {
+          return { kind: "error", text: error instanceof Error ? error.message : String(error) };
+        }
+      }
+    });
+    register({
+      name: "assistant-off",
+      description: "\u5173\u95ED\u4E2A\u4EBA\u52A9\u7406\u6A21\u5F0F\uFF0C\u505C\u6B62\u8BB0\u5F55\u7535\u8111\u6D3B\u52A8",
+      recordInput: false,
+      async handler() {
+        try {
+          await tracker.stop();
+          return { kind: "success", text: "\u4E2A\u4EBA\u52A9\u7406\u6A21\u5F0F\u5DF2\u5173\u95ED\uFF0C\u5DF2\u505C\u6B62\u8BB0\u5F55" };
+        } catch (error) {
+          return { kind: "error", text: error instanceof Error ? error.message : String(error) };
+        }
+      }
+    });
+    return () => {
+      for (const dispose of disposers.splice(0)) dispose();
+    };
+  }, "personal-assistant:commands");
+  deps.log?.("\u4E00\u952E\u547D\u4EE4\u5DF2\u6CE8\u518C\uFF1Asummon-pet / assistant-on / assistant-off");
+  return true;
+}
 async function apply(ctx, config) {
   const home = dshHome();
   const logger = ctx.logger?.("personal-assistant");
@@ -14916,6 +15016,13 @@ async function apply(ctx, config) {
     disableTeamMode,
     approvalMode: () => config.approvalMode
   });
+  registerUserCommands(ctx, {
+    bridge,
+    tracker,
+    captureBlockedReason,
+    captureScopeAuthorized: () => captureScopeAuthorized(tracker.captureTitles),
+    log
+  });
   mountReportWorkbench(bridge, {
     db,
     tracker,
@@ -15087,5 +15194,6 @@ export {
   Config,
   apply,
   inject,
-  name
+  name,
+  registerUserCommands
 };

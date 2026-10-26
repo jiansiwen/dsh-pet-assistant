@@ -69,6 +69,8 @@ interface PluginContext {
   logger?(name: string): PluginLogger
   /** cordis 的「不经 inject 读服务」：没有提供时返回 undefined。假宿主可能连这个方法都没有。 */
   get?(name: string): unknown
+  /** cordis 的动态依赖：服务可用后再执行回调。无 UI 宿主可能没有这个方法。 */
+  inject?(deps: string[], callback: (scope: PluginContext) => void): unknown
 }
 
 /**
@@ -81,6 +83,158 @@ function hostAgents(ctx: PluginContext): HostAgents | undefined {
   const value = ctx.get('agents') as Partial<HostAgents> | undefined
   if (!value || typeof value.create !== 'function' || typeof value.resume !== 'function') return undefined
   return value as HostAgents
+}
+
+/** 宿主命令面：交互式 UI 才有；headless/ACP 宿主没有这个服务。 */
+interface HostCommandInvocation {
+  agent?: unknown
+  rawInput?: string
+}
+
+interface HostCommandResult {
+  kind: 'success' | 'error'
+  text: string
+}
+
+interface HostCommands {
+  register(definition: {
+    name: string
+    description: string
+    /** 面板按钮触发的命令不该在会话里留下重复输入。 */
+    recordInput?: boolean
+    handler: (invocation: HostCommandInvocation) => Promise<HostCommandResult> | HostCommandResult
+  }): () => void
+}
+
+function hostCommands(ctx: PluginContext): HostCommands | undefined {
+  if (typeof ctx.get !== 'function') return undefined
+  const value = ctx.get('commands') as Partial<HostCommands> | undefined
+  if (!value || typeof value.register !== 'function') return undefined
+  return value as HostCommands
+}
+
+export interface UserCommandDeps {
+  bridge: SessionBridge
+  tracker: ActivityTracker
+  captureBlockedReason: () => string | null
+  captureScopeAuthorized: () => boolean
+  log?: (message: string) => void
+}
+
+/**
+ * 用户在聊天框里直接点到的一键入口（输入框 + 菜单 / 斜杠命令）。
+ *
+ * 与工具调用的区别只在入口：召唤仍走同一条 bind，开关仍走同一个 tracker，
+ * 不经模型、不产生消息，点一下就执行。宿主没有 commands 服务时静默跳过。
+ */
+export function registerUserCommands(ctx: PluginContext, deps: UserCommandDeps): void {
+  if (mountUserCommands(ctx, deps)) return
+  // commands 由 dsh-base 提供，但插件激活顺序不保证它已经就绪；
+  // 直接放弃会让命令在部分启动顺序下静默消失，所以等它出现再挂。
+  if (typeof ctx.inject !== 'function') return
+  ctx.inject(['commands'], scope => {
+    if (!mountUserCommands(scope, deps)) {
+      deps.log?.('commands 服务已出现，但仍拿不到注册表，一键命令未挂载')
+    }
+  })
+}
+
+function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
+  const commands = hostCommands(ctx)
+  if (!commands) return false
+  const { bridge, tracker } = deps
+  ctx.effect(() => {
+    const disposers: Array<() => void> = []
+    const register = (definition: Parameters<HostCommands['register']>[0]): void => {
+      disposers.push(commands.register(definition))
+    }
+
+    register({
+      name: 'summon-pet',
+      description: '召唤桌面宠物并绑定到当前会话',
+      recordInput: false,
+      async handler(invocation) {
+        const agent = invocation.agent
+        if (!agent) {
+          // 没有会话也能先把宠物叫出来；绑定留到用户打开会话后的下一次点击。
+          const launched = bridge.teamEnabled ? false : bridge.launchPet()
+          return launched
+            ? { kind: 'success', text: '桌面宠物已启动；打开一个会话后再点一次即可绑定' }
+            : { kind: 'error', text: '没有可绑定的会话，也没能启动桌宠；请在 dsh-pet 目录运行 pnpm start' }
+        }
+        try {
+          const { port } = await bridge.bind(agent as Parameters<SessionBridge['bind']>[0])
+          const launched = bridge.teamEnabled ? false : bridge.launchPet()
+          return {
+            kind: 'success',
+            text: bridge.teamEnabled
+              ? `会话已绑定（桥接端口 ${port}）；团队模式的桌面角色由桌面壳负责`
+              : launched
+                ? '桌面宠物已召唤并绑定到当前会话'
+                : `会话已绑定（桥接端口 ${port}），但没能拉起桌宠；请在 dsh-pet 目录运行 pnpm start`,
+          }
+        } catch (error) {
+          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    })
+
+    register({
+      name: 'bind-pet',
+      description: '把桌面宠物绑定到当前会话（不启动宠物）',
+      recordInput: false,
+      async handler(invocation) {
+        const agent = invocation.agent
+        if (!agent) return { kind: 'error', text: '当前命令没有可绑定的会话' }
+        try {
+          const { port } = await bridge.bind(agent as Parameters<SessionBridge['bind']>[0])
+          return { kind: 'success', text: `当前会话已绑定到桌面宠物（桥接端口 ${port}）` }
+        } catch (error) {
+          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    })
+
+    register({
+      name: 'assistant-on',
+      description: '开启个人助理模式，开始记录电脑活动',
+      recordInput: false,
+      async handler() {
+        const blocked = deps.captureBlockedReason()
+        if (blocked) return { kind: 'error', text: `未开启活动记录：${blocked}` }
+        if (!deps.captureScopeAuthorized()) {
+          return { kind: 'error', text: '采集范围还没确认：先在对话里说一次「开启个人助理模式」完成确认' }
+        }
+        if (tracker.capturing) return { kind: 'success', text: '个人助理模式已经在运行' }
+        try {
+          await tracker.start()
+          return { kind: 'success', text: '个人助理模式已开启，开始记录电脑活动' }
+        } catch (error) {
+          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    })
+
+    register({
+      name: 'assistant-off',
+      description: '关闭个人助理模式，停止记录电脑活动',
+      recordInput: false,
+      async handler() {
+        try {
+          await tracker.stop()
+          return { kind: 'success', text: '个人助理模式已关闭，已停止记录' }
+        } catch (error) {
+          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    })
+
+    return () => {
+      for (const dispose of disposers.splice(0)) dispose()
+    }
+  }, 'personal-assistant:commands')
+  deps.log?.('一键命令已注册：summon-pet / assistant-on / assistant-off')
+  return true
 }
 
 export async function apply(ctx: PluginContext, config: ConfigType): Promise<void> {
@@ -398,6 +552,14 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     enableTeamMode,
     disableTeamMode,
     approvalMode: () => config.approvalMode,
+  })
+  // 一键入口：输入框「+ → 指令」里的召唤与开关，不经过模型、不产生消息。
+  registerUserCommands(ctx, {
+    bridge,
+    tracker,
+    captureBlockedReason,
+    captureScopeAuthorized: () => captureScopeAuthorized(tracker.captureTitles),
+    log,
   })
   // 日报工作台：桌面逐条修订、按看到的那一版请求发布、分类删除。发布与删除只经桌面可信审批生效。
   mountReportWorkbench(bridge, {

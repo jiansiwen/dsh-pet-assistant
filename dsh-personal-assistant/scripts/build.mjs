@@ -39,8 +39,47 @@ const pkgPath = path.join(root, 'package.json')
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
 const previous = typeof pkg.main === 'string' ? pkg.main : ''
 pkg.main = `dist/${outfile}`
+// 客户端入口也要能按包名解析；exports 与 main 必须指向同一个产物。
+pkg.exports = {
+  '.': `./dist/${outfile}`,
+  './client': './dist/client.js',
+  './package.json': './package.json',
+}
 writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8')
 console.log(`[dsh-personal-assistant] built dist/${outfile}, main updated`)
+
+// 客户端插件：DSH 客户端加载器要求 window.__ModuleLoader__.load({ id, factory }) 包装，
+// 而不是普通 ESM；React 与宿主包由模块表提供，其余全部打进产物。
+{
+  const { build } = await import('esbuild')
+  const result = await build({
+    entryPoints: [path.join(root, 'src/client/index.tsx')],
+    bundle: true,
+    write: false,
+    format: 'cjs',
+    platform: 'browser',
+    target: 'es2022',
+    jsx: 'automatic',
+    external: ['react', 'react/jsx-runtime', 'react-dom', '@deepseek-ai/*'],
+    define: { 'process.env.NODE_ENV': '"production"' },
+    logLevel: 'silent',
+  })
+  const body = result.outputFiles[0].text
+  const wrapped = [
+    'window.__ModuleLoader__.load({',
+    `  id: ${JSON.stringify(pkg.name)},`,
+    '  factory: (require) => {',
+    '    var module = { exports: {} };',
+    '    var exports = module.exports;',
+    body,
+    '    return module.exports;',
+    '  },',
+    '});',
+    '',
+  ].join('\n')
+  writeFileSync(path.join(dist, 'client.js'), wrapped, 'utf8')
+  console.log('[dsh-personal-assistant] built dist/client.js')
+}
 
 // 旧产物改名归档（保留 main 现指向的文件与本次构建产物）。
 // 用 rename 而不是 unlink：见文件头那条约束的来由。
