@@ -232,14 +232,30 @@ function configureDisplayMedia(): void {
   })
 }
 
+/**
+ * 所有显示器拼成的桌面范围。窗口必须覆盖全部屏幕，宠物才能被拖到任意一块屏上；
+ * 只建在主屏时，渲染层按窗口尺寸 clamp，拖到边缘就停住了。
+ */
+function stageBounds(): { x: number; y: number; width: number; height: number } {
+  const displays = screen.getAllDisplays()
+  const left = Math.min(...displays.map(display => display.bounds.x))
+  const top = Math.min(...displays.map(display => display.bounds.y))
+  const right = Math.max(...displays.map(display => display.bounds.x + display.bounds.width))
+  const bottom = Math.max(...displays.map(display => display.bounds.y + display.bounds.height))
+  return { x: left, y: top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) }
+}
+
+let screenEventsBound = false
+
 function createWindow(): void {
-  const display = screen.getPrimaryDisplay().workArea
+  const bounds = stageBounds()
+  console.log('[dsh-pet] stage bounds', bounds, 'displays', screen.getAllDisplays().map(display => display.bounds))
 
   win = new BrowserWindow({
-    width: display.width,
-    height: display.height,
-    x: display.x,
-    y: display.y,
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
     transparent: true,
     frame: false,
     resizable: false,
@@ -257,6 +273,17 @@ function createWindow(): void {
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   win.setIgnoreMouseEvents(true, { forward: true })
+  // 插拔显示器或改分辨率后重新铺满桌面；只绑一次，避免窗口自愈重建时重复注册。
+  if (!screenEventsBound) {
+    screenEventsBound = true
+    const syncBounds = (): void => {
+      if (!win || win.isDestroyed()) return
+      win.setBounds(stageBounds())
+    }
+    screen.on('display-added', syncBounds)
+    screen.on('display-removed', syncBounds)
+    screen.on('display-metrics-changed', syncBounds)
+  }
   win.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url)
     return { action: 'deny' }
