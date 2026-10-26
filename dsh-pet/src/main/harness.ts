@@ -206,6 +206,7 @@ export class BridgeClient {
   private sessionNeedsBaseline = false
   private readonly retiredBindings = new Set<string>()
   private readonly lifetime = new AbortController()
+  private watching = false
 
   /**
    * 建立连接：先轮询等待桥接出现（宠物可能比召唤先启动），
@@ -213,6 +214,10 @@ export class BridgeClient {
    */
   async connect(callbacks: BridgeCallbacks): Promise<void> {
     this.callbacks = callbacks
+    if (!this.watching) {
+      this.watching = true
+      this.watchBridgeFile()
+    }
     while (!this.stopped) {
       const info = readBridgeInfo()
       if (info && await this.healthy(info)) {
@@ -652,6 +657,23 @@ export class BridgeClient {
     const snapshot = await this.getTeam()
     if (!snapshot) return
     this.callbacks?.onEvent({ type: 'team/snapshot', payload: snapshot })
+  }
+
+  /**
+   * 低频盯住 bridge.json：dsh 重启后端口、令牌、代次都会换，而旧连接可能只是挂起、
+   * 不会立刻报错。只靠长轮询失败重连，最长要等一次超时；这里几秒内就能发现并切过去。
+   */
+  private watchBridgeFile(): void {
+    const timer = setInterval(() => {
+      if (this.stopped) return
+      const disk = readBridgeInfo()
+      if (!disk) return
+      const current = this.info
+      if (!current) return // connect()/reconnect() 已经在轮询发现
+      if (current.port === disk.port && current.token === disk.token && current.epoch === disk.epoch) return
+      this.resetForNewEpoch()
+    }, 5_000)
+    this.lifetime.signal.addEventListener('abort', () => clearInterval(timer), { once: true })
   }
 
   /**
