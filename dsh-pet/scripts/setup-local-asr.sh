@@ -30,7 +30,7 @@ MIRROR="${MIRROR:-}"
 
 SHERPA_VER="v1.13.7"
 MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
-STREAM_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16.tar.bz2"
+STREAM_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.tar.bz2"
 # 会议按音色分人：pyannote 分段（MIT）+ 3D-Speaker 声纹嵌入（上游 Apache-2.0），本地推理，不上传音频。
 SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
 EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
@@ -49,7 +49,7 @@ if [ -n "$MIRROR" ]; then
 fi
 
 MODEL_DIR="$DEST/model"
-STREAM_DIR="$DEST/streaming"
+STREAM_DIR="$DEST/streaming-zh-14m"
 DIAR_DIR="$DEST/diarization"
 KWS_DIR="$DEST/kws"
 
@@ -116,7 +116,7 @@ if [ ! -f "$STREAM_DIR/encoder.int8.onnx" ] || [ ! -f "$STREAM_DIR/decoder.int8.
     [ -n "$SRC" ] || { echo "压缩包里没找到 $name 模型" >&2; exit 1; }
     cp "$SRC" "$STREAM_DIR/$name.int8.onnx"
   done
-  STREAM_TOKENS="$(find "$TMP" -path '*streaming*' -name 'tokens.txt' -type f | head -1)"
+  STREAM_TOKENS="$(find "$TMP" -path '*zipformer-zh-14M*' -name 'tokens.txt' -type f | head -1)"
   [ -n "$STREAM_TOKENS" ] || STREAM_TOKENS="$(find "$TMP" -name 'tokens.txt' -type f | head -1)"
   [ -n "$STREAM_TOKENS" ] || { echo "压缩包里没找到流式 tokens.txt" >&2; exit 1; }
   cp "$STREAM_TOKENS" "$STREAM_DIR/tokens.txt"

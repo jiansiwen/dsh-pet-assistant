@@ -23,20 +23,33 @@ DeepSeek Harness 的桌面客户端 —— 配合 [dsh-personal-assistant](../ds
 
 - **语音唤醒**：喊「小潘同学」把角色唤回来并弹出输入框，角色隐藏时也管用（纯本地，不上传）。
   喊两遍是刻意的 —— 单个「小潘」只有两个音节，日常对话里太容易误触发；
-  四个音节既能明显降低误触发，说起来也不费劲。**仅 Windows**（用 `System.Speech` 离线识别器）；
-  macOS/Linux 上用快捷键或点角色代替
+  四个音节既能明显降低误触发，说起来也不费劲。
+  - Windows：默认用系统 `System.Speech`，也可在设置里切换为 sherpa KWS；
+  - macOS：只能使用 sherpa KWS。默认**关闭**（开启后会持续占用麦克风），且目前属于**实验性**能力，
+    未做 Mac 真机和噪声环境验收；需要先用 `bash scripts/setup-local-asr.sh` 安装唤醒模型，
+    再到「右键宠物 → 宠物设置 → 常驻与语音」开启；
+  - Linux：暂不提供唤醒，使用快捷键或点角色代替
 - **按键听写**：说话录音在窗口里完成，说完自动停。识别走**进程内**解码（不 spawn 任何外部程序），
   所以模型装好后三个平台都能用：
   - Windows：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-local-asr.ps1`
   - macOS / Linux：`bash scripts/setup-local-asr.sh`
-  - 模型约 700MB，落在 `%APPDATA%\dsh-pet\local-asr`（macOS 为 `~/Library/Application Support/dsh-pet/local-asr`），之后**完全离线**
-  - Windows 上没装模型时还会回退系统自带的 `System.Speech` 引擎（能用但准确率有限）；其他系统没有这个兜底
-  - 录音只在本机处理，不上传任何音频
+  - 模型落到 `%APPDATA%\dsh-pet\local-asr`（macOS 为 `~/Library/Application Support/dsh-pet/local-asr`），
+    新装约 300—350MB；若保留旧的 `streaming` 目录会更多。装好后识别**完全离线**
+  - 实时上屏用纯中文 14M Zipformer（`streaming-zh-14m`），整句精修用 SenseVoice；旧安装里的
+    `streaming` 目录仍兼容作过渡回退，但重跑安装脚本会安装准确率更高的 `streaming-zh-14m`
+  - Zipformer 是真正的增量流式模型；SenseVoice 是整句模型，负责录音结束后的高准确率精修，
+    不是实时识别器
+  - Windows 上没装模型时还会回退系统自带的 `System.Speech` 引擎（能用但准确率有限）；
+    macOS/Linux 没有这个兜底，模型缺失时听写不可用
+  - 录音与识别只在本机处理，不上传任何音频
 - **回答朗读**：语音发起的那一轮会把回答念出来；打字问的**不出声**（突然出声是用户没要求过的行为）。
   声音是微软 edge-tts 神经语音（默认「晓晓」，免费无需密钥）；**断网时自动回退本机合成**（音色机械但照常说话）。
   - Windows 用 PowerShell 的 MCI 播放，macOS 用系统自带的 `afplay` / `say`；**Linux 未实现**
   - 这一步会把要念的**文字**发到微软的合成服务；不接受的话拔网线用，回退路径不联网
-- **打断**：朗读时界面出现「正在朗读」横条，点停止立刻闭嘴，排队的句子一起丢掉。打断后再问，交给模型的上下文只包含**实际念出来的那一半**
+- **打断**：朗读时界面出现「正在朗读」横条，点停止立刻闭嘴，排队的句子一起丢掉。打断后再问，交给模型的上下文只包含**实际念出来的那一半**。
+  另有实验开关「外放插话」：打开后朗读改由界面 WebAudio 播放以取得回声参考，用户说
+  「停一下 / 等等 / 打断一下」等明确口令时停止播报；当前仍是指令词式，不是任意开口即断，
+  真实会场外放仍需实测
 
 **面板（三页）**
 
@@ -105,7 +118,7 @@ dsh-pet (Electron)
 | 麦克风听写（按键说话） | ✅ | ✅ 需授权 | ✅ 需授权 |
 | 本地语音识别（离线） | ✅ | ✅ | ✅ |
 | 回答朗读 | ✅ | ✅ 走 `say` / `afplay` | ❌ 未实现 |
-| 语音唤醒「小潘同学」 | ✅ | ❌ 系统无对应能力 | ❌ |
+| 语音唤醒「小潘同学」 | ✅ 默认系统语音，可选 KWS | ⚠️ KWS，实验性、默认关闭 | ❌ |
 | 会议录音 + 加密落盘 | ✅ DPAPI | ✅ 钥匙串 | ✅ libsecret |
 | 「点面板外面自动收起」 | ✅ | ❌ | ❌ |
 | 前台活动记录（插件侧） | ✅ | ❌ | ❌ |
@@ -113,10 +126,13 @@ dsh-pet (Electron)
 **macOS 上比 Windows 多一件事**：`setVisibleOnAllWorkspaces` 在 Windows 上是空操作，
 只有 macOS/Linux 才真正生效 —— 所以 Mac 上宠物能跟着你切换桌面、能浮在全屏应用之上。
 
-**macOS 上少三件事**，都是系统层面没有对应实现，不是没做：
+**macOS 上的差异**：
 
-- **语音唤醒**：Windows 用的是 `System.Speech` 离线识别器，macOS 没有等价物。
-  替代入口：全局快捷键 `Cmd+Option+P`，或直接点角色。
+- **语音唤醒**：只能使用 sherpa KWS，默认关闭并标为实验性。需要先运行
+  `bash scripts/setup-local-asr.sh` 安装唤醒模型（`local-asr/kws/`），再到
+  「右键宠物 → 宠物设置 → 常驻与语音」开启。开启后菜单栏会持续显示麦克风占用；
+  Mac 真机和真实噪声环境尚未验收。没有 KWS 时仍可用快捷键 `Cmd+Option+P` 或点角色。
+- **没有系统语音兜底**：Windows 缺本地模型时可回退 `System.Speech`；macOS 缺模型时听写明确不可用。
 - **点面板外面收起**：需要全局鼠标钩子 + 辅助功能授权。替代入口：按 `Esc`，或点角色本身。
 - **活动记录**（插件侧）：采样器读的是 Windows 前台窗口 API。
 
@@ -125,7 +141,7 @@ dsh-pet (Electron)
 ```bash
 cd dsh-pet
 pnpm install                                    # 必须重新装，不能拷 Windows 的 node_modules
-bash scripts/setup-local-asr.sh                 # 装识别模型（约 700MB，只需一次）
+bash scripts/setup-local-asr.sh                 # 装识别与KWS模型（新装约 300—350MB，只需一次）
 pnpm run start
 ```
 
@@ -191,10 +207,14 @@ pnpm run build        # esbuild 打包到 dist/
 
 这些不是待修的 bug，是当前实现的真实边界，界面上也照实写了：
 
-- **文档讲解只支持 Markdown 与纯文本**（`.md .markdown .txt .log .csv .tsv .json`）。PDF、Word、Excel、PPT 与图片只能用系统关联**打开给你看**，讲不了 —— 结构化提取、OCR、加密文档解锁都还没实现
+- **文档讲解支持 Markdown、纯文本和可提取文本层的 PDF**（`.md .markdown .txt .log .csv .tsv .json .pdf`）。
+  Word、Excel、PPT 与图片只能用系统关联**打开给你看**，讲不了；扫描版 PDF、OCR、加密文档解锁都还没实现
 - **能用系统关联打开的是一份白名单**，不是黑名单。`.docm .xlsm .pptm` 不在里面（计划明确"不执行文档宏"，而打开就可能触发），`.exe .bat .cmd .ps1 .vbs .lnk .reg .msi` 也不在（那已经不是打开文档而是执行程序）
-- **回答不是流式的**。桥接的 `chat` 一次性返回完整回复，所以"分句合成"只能在整段回答到手之后开始播：你会等全文算完才听到第一句
-- **扬声器外放时喊话打断不了朗读**。系统回声消除让麦克风拾不到自己播出的声音，戴耳机时同样拾不到。普通模式下打断靠按键（「正在朗读」横条上的停止），这符合设计里"普通模式可先支持按键打断"，但和"耳机先验收再扬声器"的验收口径有差距
+- **流式回答取决于宿主模型**。桥接已有文字增量和分句 TTS，宿主吐 `text-delta` 时可以边收边念；
+  模型只吐思考增量或整个回复一次到达时，第一句仍会晚。界面不伪造逐字流式。
+- **自然语音打断仍是实验能力**。普通模式用「正在朗读」横条停止；打开「外放插话」后使用
+  明确的打断口令，不是任意开口即断。外置音箱、回声消除和误触发必须在真实会场验收，
+  不能拿单测或按键打断成功代替
 - **授权目录只能由原生对话框添加**。界面上没有任何通道能把一个路径字符串塞进授权列表；撤销则可以直接点（那是把权限交回去）。用户手加的目录和"打开文档时自动记下的最近目录"是两块，两块都能撤
 - **角色形象是二维占位皮肤**，不是每个角色一套原创美术
 - 日报保存在 `~/.dsh/personal-assistant/reports/YYYY-MM-DD.md`（面板 📁 按钮可直接打开）
@@ -202,10 +222,19 @@ pnpm run build        # esbuild 打包到 dist/
 ## 排障
 
 - **麦克风只有一个主人**：唤醒词常驻监听，按键说话时唤醒先让出设备、说完自动收回。两者同时收音的话，后起的那个只会拿到静音流 —— 界面上一切正常，说了却没反应
-- 语音没反应先检查系统默认输入设备与中文语音包（Windows：设置 → 时间和语言 → 语音），
-  确认默认输入不是虚拟音频设备，输出设备也正常
-- **听写不准/没装本地模型**：看 `%APPDATA%\dsh-pet\local-asr` 里有没有 `bin\sherpa-onnx-offline.exe` 与 `model\model.int8.onnx`。没有就走的是旧引擎兜底，准确率有限；跑 `scripts\setup-local-asr.ps1` 安装（GitHub 不通时加 `-Mirror "https://gh-proxy.com/"`）
+- 语音没反应先检查系统默认输入设备；确认默认输入不是虚拟音频设备，输出设备也正常。
+  只有使用 Windows `System.Speech` 时才依赖系统中文语音包（设置 → 时间和语言 → 语音）；
+  sherpa 本地流式识别和 KWS 都是应用内的 ONNX 模型，不依赖系统语音包
+- **听写不准/没装本地模型**：检查 `%APPDATA%\dsh-pet\local-asr` 下的
+  `streaming-zh-14m/`（或旧 `streaming/`）、`model/model.int8.onnx` 和 `tokens.txt`。
+  Windows 缺模型会回退 `System.Speech`，准确率有限；macOS 缺模型则听写不可用。
+  重跑 `scripts\setup-local-asr.ps1` 安装（GitHub 不通时加 `-Mirror "https://gh-proxy.com/"`）。
+  macOS 使用 `bash scripts/setup-local-asr.sh`。
+- **唤醒不工作**：macOS 默认关闭且需要 KWS 模型，这不是“系统完全不支持唤醒”。确认
+  已运行安装脚本、已在「宠物设置 → 常驻与语音」开启、麦克风权限已允许，并查看是否出现
+  “本地唤醒模型已加载”。KWS 目前未做 Mac 真机与噪声环境验收。
 - **朗读没声音**：edge-tts 走微软服务，断网或被拦截时自动回退本机合成（音色变机械但能出声）。两者都失败才报错
 - 如果默认输入是 **NVIDIA Virtual Audio Device (Wave Extensible)**，去「设置 → 系统 → 声音 → 输入」确认默认设备是真麦克风。默认输入被虚拟设备占走时，识别器会初始化成功却拿到静音流，表现和仲裁器修的那个故障一模一样但原因不同
-- 唤醒监听初始化失败后**不会自动重试**（否则每三秒刷一条错误日志，用户看到的是一只一直在报错的宠物），修好设备后从托盘「重新监听唤醒词」叫回来
+- 唤醒监听初始化失败后不会高频重试；主进程每隔约 20 秒做一次幂等恢复。修好设备或模型后，
+  也可从托盘「重新监听唤醒词」立即重试
 - 朗读失败会弹一句人话提示。这是个听不见的故障：界面上不报一句，用户只会觉得"它没反应"

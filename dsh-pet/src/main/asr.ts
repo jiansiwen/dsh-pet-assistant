@@ -18,7 +18,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import sherpa, { type OfflineRecognizerInstance } from 'sherpa-onnx-node'
+import sherpa, { type OfflineRecognizerInstance, type OnlineRecognizerInstance } from 'sherpa-onnx-node'
 import { toUnpackedPath } from './runtime-launch.ts'
 
 export interface AsrResult {
@@ -58,9 +58,15 @@ export function localAsrAvailable(userDataDir: string): boolean {
   )
 }
 
-/** 流式模型目录与可用性。 */
-export function streamingAvailable(userDataDir: string): boolean {
-  const dir = path.join(localAsrDir(userDataDir), 'streaming')
+/** 当前推荐的纯中文流式模型目录。旧的 small bilingual 只保留为升级过渡回退。 */
+export const STREAMING_MODEL_DIR = 'streaming-zh-14m'
+
+function streamingDirs(userDataDir: string): string[] {
+  const root = localAsrDir(userDataDir)
+  return [path.join(root, STREAMING_MODEL_DIR), path.join(root, 'streaming')]
+}
+
+function streamingReady(dir: string): boolean {
   return (
     existsSync(path.join(dir, 'tokens.txt'))
     && existsSync(path.join(dir, 'encoder.int8.onnx'))
@@ -69,15 +75,27 @@ export function streamingAvailable(userDataDir: string): boolean {
   )
 }
 
+/** 流式模型目录与可用性。优先 2025 推荐的 14M 中文模型，没有时兼容旧安装。 */
+export function streamingAvailable(userDataDir: string): boolean {
+  return streamingDirs(userDataDir).some(streamingReady)
+}
+
 /** 一场流式听写：feed 逐块喂 PCM（16kHz Float32），返回当前累积文本；finalize 收尾取全文。 */
 export interface StreamingSession {
   feed(pcm16k: Float32Array): string
   finalize(): string
 }
 
-/** 创建一场流式识别。模型加载约 1–2 秒，调用方（asr-begin）在录音开始前完成它。 */
-export function createStreamingSession(userDataDir: string): StreamingSession {
-  const dir = path.join(localAsrDir(userDataDir), 'streaming')
+/**
+ * 流式识别器加载模型很慢（本机实测约 2.5 秒），但每场听写只需要一条新 stream。
+ * 缓存 recognizer，避免每按一次语音按钮都把 43MB 模型重新加载一遍。
+ */
+let streamingEngine: { dir: string; recognizer: OnlineRecognizerInstance } | null = null
+
+function streamingRecognizer(userDataDir: string): OnlineRecognizerInstance {
+  const dir = streamingDirs(userDataDir).find(streamingReady)
+  if (dir === undefined) throw new Error('本地流式识别模型未安装')
+  if (streamingEngine !== null && streamingEngine.dir === dir) return streamingEngine.recognizer
   const recognizer = new sherpa.OnlineRecognizer({
     modelConfig: {
       transducer: {
@@ -90,6 +108,27 @@ export function createStreamingSession(userDataDir: string): StreamingSession {
     },
     decodingMethod: 'greedy_search',
   })
+  streamingEngine = { dir, recognizer }
+  return recognizer
+}
+
+/** 预热流式模型。只在模型文件齐全时执行；失败返回 false，由调用方记录真实原因。 */
+export function warmStreamingAsr(userDataDir: string): boolean {
+  if (!streamingAvailable(userDataDir)) return false
+  streamingRecognizer(userDataDir)
+  return true
+}
+
+/** 预热整句模型，避免第一次精修还要等约 3 秒加载。 */
+export function warmSenseVoiceAsr(userDataDir: string): boolean {
+  if (!localAsrAvailable(userDataDir)) return false
+  senseVoiceRecognizer(userDataDir)
+  return true
+}
+
+/** 创建一场流式识别。模型由模块缓存，这里只新建 stream。 */
+export function createStreamingSession(userDataDir: string): StreamingSession {
+  const recognizer = streamingRecognizer(userDataDir)
   const stream = recognizer.createStream()
   return {
     feed(pcm16k: Float32Array): string {
@@ -189,7 +228,9 @@ function wavChunk(wav: Buffer): { data: Buffer; sampleRate: number; bitsPerSampl
   const sampleRate = wav.readUInt32LE(24)
   const bitsPerSample = wav.readUInt16LE(34)
   const channels = wav.readUInt16LE(22)
-  let offset = 36
+  // 从第一个子块开始按长度跳，不能假设固定 44 字节头：Windows SAPI 的 WAV
+  // 常见 18 字节 fmt 扩展，data 块因此从 38 开始，写死 36 会永远找不到它。
+  let offset = 12
   while (offset + 8 <= wav.length) {
     const id = wav.toString('ascii', offset, offset + 4)
     const size = wav.readUInt32LE(offset + 4)
@@ -354,7 +395,10 @@ export function legacyEngineAvailable(platform: string = process.platform): bool
 export async function transcribeWav(wav: ArrayBuffer, userDataDir: string): Promise<AsrResult> {
   const buffer = Buffer.from(wav)
   const trimmed = trimSilence(buffer)
-  const effective = trimmed.length > 0 ? trimmed : buffer
+  // 整段静音不能交给模型。实测 SenseVoice 会对静音稳定幻觉出韩文 "그."；
+  // 这是“没听到”，不是一条待提交的识别结果。
+  if (trimmed.length === 0) return { ok: false, error: ERROR_MESSAGES['timeout-empty'] }
+  const effective = trimmed
   // 本地模型那条路全程在内存里，不落临时文件 —— 少一次写盘、少一处清理。
   if (localAsrAvailable(userDataDir)) return transcribeWithSenseVoice(effective, userDataDir)
   // 没装模型时：Windows 还有系统自带的旧引擎，别的系统上就只能如实说没装。

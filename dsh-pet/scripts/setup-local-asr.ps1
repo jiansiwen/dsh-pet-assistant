@@ -1,6 +1,6 @@
 # Download & install the local SenseVoice ASR stack (fully offline dictation).
 #   bin\sherpa-onnx-offline.exe   from sherpa-onnx win-x64 static release
-#   model\model.int8.onnx         SenseVoice int8 (zh/en/ja/ko/yue), ~230 MB download
+#   streaming-zh-14m\             Zipformer 14M Chinese streaming model (int8)
 #   model\tokens.txt
 #
 # Usage:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-local-asr.ps1
@@ -19,7 +19,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $sherpaUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.7/sherpa-onnx-v1.13.7-win-x64-static-MD-Release-no-tts.tar.bz2'
 $modelUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2'
-$streamUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16.tar.bz2'
+$streamUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.tar.bz2'
 # Speaker diarization for meetings (pyannote segmentation + 3D-Speaker embedding); runs locally, audio never uploaded.
 $segUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2'
 $embUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx'
@@ -41,7 +41,7 @@ if ($Mirror -ne '') {
 $exe = Join-Path $Dest 'bin\sherpa-onnx-offline.exe'
 $onnx = Join-Path $Dest 'model\model.int8.onnx'
 $tokens = Join-Path $Dest 'model\tokens.txt'
-$streamDir = Join-Path $Dest 'streaming'
+$streamDir = Join-Path $Dest 'streaming-zh-14m'
 $streamFiles = @('encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt')
 $diarDir = Join-Path $Dest 'diarization'
 $segOnnx = Join-Path $diarDir 'segmentation.onnx'
@@ -116,7 +116,7 @@ try {
         Copy-Item $foundTokens.FullName $tokens -Force
     }
 
-    # 流式模型（边说边出字）：缺哪个文件就重下整包，约 458MB。
+    # 流式模型（边说边出字）：纯中文 14M，缺哪个文件就重下整包，约 74MB。
     $streamMissing = $streamFiles | Where-Object { -not (Test-Path (Join-Path $streamDir $_)) }
     if ($streamMissing.Count -gt 0) {
         $pack = Join-Path $tmp 'streaming.tar.bz2'
@@ -124,9 +124,10 @@ try {
         Write-Output 'extracting streaming model ...'
         & $tarExe @tarArgs -xjf $pack -C $tmp
         New-Item -ItemType Directory -Force -Path $streamDir | Out-Null
-        Copy-Item (Join-Path $tmp 'sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16\tokens.txt') (Join-Path $streamDir 'tokens.txt') -Force
+        $streamRoot = 'sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23'
+        Copy-Item (Join-Path $tmp "$streamRoot\tokens.txt") (Join-Path $streamDir 'tokens.txt') -Force
         foreach ($name in @('encoder', 'decoder', 'joiner')) {
-            $src = Get-ChildItem -Path $tmp -Recurse -Filter "$name-epoch-99-avg-1.int8.onnx" | Select-Object -First 1
+            $src = Get-ChildItem -Path (Join-Path $tmp $streamRoot) -Filter "$name-epoch-99-avg-1.int8.onnx" | Select-Object -First 1
             if ($null -eq $src) { throw "streaming $name model not found" }
             Copy-Item $src.FullName (Join-Path $streamDir "$name.int8.onnx") -Force
         }

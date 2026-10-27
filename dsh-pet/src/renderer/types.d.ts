@@ -499,6 +499,8 @@ export interface PetApi {
   onSummon(callback: () => void): void
   /** 语音唤醒词命中（说"小潘同学"）：宠物回应并弹出输入框。参数是这次说了哪句应答（已由主进程朗读）。 */
   onWake(callback: (greeting?: string) => void): void
+  /** 唤醒应答真正播放结束：界面据此开麦，不能按字数估算。 */
+  onWakeGreetingFinished(callback: () => void): void
   /** 桥接事件：成员/任务/提案变化都从这里来，界面只是投影。 */
   onTeamEvent(callback: (event: BridgeEventPayload) => void): void
   /** 壳的生命周期状态：启动握手的阶段、失败原因、角色可见性、专注模式。 */

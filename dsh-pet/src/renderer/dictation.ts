@@ -23,11 +23,16 @@ export function speechThreshold(baselineRms: number): number {
 /** 采样噪声基线的帧数（≈0.7 秒），供静音判定的自适应阈值用。 */
 export const BASELINE_FRAMES = 10
 
-/** 说完之后的收尾静音：短于它的停顿不当成说完。 */
-export const END_SILENCE_MS = 700
+/**
+ * 说完之后的收尾静音：短于它的停顿不当成说完。
+ *
+ * 自然说话经常在两句之间停 0.8—1 秒。700ms 会把“第一句……第二句”截成只有第一句；
+ * 这里宁可多等半秒，也不替用户判定没说完的话已经结束。手动点停止仍然立即收尾。
+ */
+export const END_SILENCE_MS = 1200
 
-/** 单次听写上限，防失控录音。 */
-export const MAX_DURATION_MS = 20000
+/** 单次听写上限，防失控录音。长任务描述不应在 20 秒处被硬切。 */
+export const MAX_DURATION_MS = 60000
 
 /** 逐帧 RMS（线性幅度），给 VAD 与测试用。 */
 export function frameRms(chunk: Float32Array): number {

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { ApprovalWindow } from './approval-window.ts'
 import { registerReportWorkbench, type ReportWorkbenchHandle } from './report-workbench-window.ts'
-import { createStreamingSession, pcm16Base64ToFloat32, streamingAvailable, transcribeWav, type StreamingSession } from './asr.ts'
+import { createStreamingSession, pcm16Base64ToFloat32, streamingAvailable, transcribeWav, warmSenseVoiceAsr, warmStreamingAsr, type StreamingSession } from './asr.ts'
 import { INITIAL_AUDIO_STATE, nextAudio, type AudioEvent, type AudioState, type AudioTransition } from './audio.ts'
 import { AudioPrefsStore, loginItemAction, type AudioPrefs } from './audio-prefs.ts'
 import { kwsModelProblem, startKws, type KwsSession } from './kws.ts'
@@ -547,13 +547,18 @@ async function speakWakeGreeting(text: string): Promise<void> {
     const startedAt = Date.now()
     const audio = cached ?? await synthesizeOneShot(text, api)
     if (cached === null && key !== null) ttsCache.put(key, audio)
-    playOneShot(audio)
     // 把耗时打进日志：用户体感"喊完要等好几秒"时，这一行能直接分出是合成慢还是播放慢。
-    console.log(`[dsh-pet] 唤醒应答已出声（${cached === null ? '新合成' : '缓存命中'}，${Date.now() - startedAt}ms）：「${text}」`)
+    console.log(`[dsh-pet] 唤醒应答开始播放（${cached === null ? '新合成' : '缓存命中'}，${Date.now() - startedAt}ms）：「${text}」`)
+    // 等系统播放器真正结束再通知界面开麦。按字数估时会在短问候语上过早/过晚，
+    // 用户听到"我在呢"立刻说话时，开头会被截掉。
+    await playOneShot(audio)
     // 合成过的句子顺手补齐其余固定话术：下次抽到任何一句都能立刻出声。
     if (cached === null) void warmGreetingCache(api)
   } catch (error) {
     console.log('[dsh-pet] 唤醒应答没能出声：', error instanceof Error ? error.message : String(error))
+  } finally {
+    // 成功、失败、播放器不可用都要解锁界面，否则唤醒后永远不开始听。
+    sendToRenderer('wake-greeting-finished', null)
   }
 }
 
@@ -600,17 +605,26 @@ async function warmGreetingCache(api: ResolvedVoiceApi | null): Promise<void> {
  * 渲染层播放要先有音频上下文、还可能因为没有用户手势被自动播放策略挂起 ——
  * 唤醒应答必须"喊了就响"，不能赌这些条件。
  */
-function playOneShot(audio: Buffer): void {
+function playOneShot(audio: Buffer): Promise<boolean> {
   const mime = sniffAudioMime(audio)
   const ext = mime === 'audio/wav' ? '.wav' : mime === 'audio/ogg' ? '.ogg' : '.mp3'
   const dir = mkdtempSync(path.join(tmpdir(), 'dsh-wake-'))
   const file = path.join(dir, `wake${ext}`)
   writeFileSync(file, audio)
   const spec = playAudioSpec(platformOf(), layout.scriptDir, file)
-  if (spec === null) { rmSync(dir, { recursive: true, force: true }); return }
-  const child = spawn(spec.command, [...spec.args], { windowsHide: true, stdio: 'ignore' })
-  child.once('close', () => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* 稍后清理 */ } })
-  child.once('error', () => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* 同上 */ } })
+  if (spec === null) { rmSync(dir, { recursive: true, force: true }); return Promise.resolve(false) }
+  return new Promise(resolve => {
+    let settled = false
+    const finish = (played: boolean): void => {
+      if (settled) return
+      settled = true
+      try { rmSync(dir, { recursive: true, force: true }) } catch { /* 稍后清理 */ }
+      resolve(played)
+    }
+    const child = spawn(spec.command, [...spec.args], { windowsHide: true, stdio: 'ignore' })
+    child.once('close', code => finish(code === 0))
+    child.once('error', () => finish(false))
+  })
 }
 
 function onWakeLost(reason: string): void {
@@ -2325,6 +2339,54 @@ function registerIpc(): void {
 
   /** 本场流式听写的识别会话；null = 整句模式或未开始。 */
   let streamSession: StreamingSession | null = null
+  /** 流式模型尚未就绪时先收下的音频。模型加载不阻塞录音，就绪后按序补喂。 */
+  let pendingStreamFrames: Buffer[] = []
+  let pendingStreamBytes = 0
+  let streamInit: 'idle' | 'pending' | 'failed' = 'idle'
+  let streamEpoch = 0
+  /** 60 秒 16kHz PCM16，略留余量；超出的帧不会再被本场识别采用。 */
+  const MAX_PENDING_STREAM_BYTES = 2 * 1024 * 1024
+
+  const resetStreamState = (): void => {
+    streamEpoch += 1
+    streamSession = null
+    pendingStreamFrames = []
+    pendingStreamBytes = 0
+    streamInit = 'idle'
+  }
+
+  const ensureStreamSession = (): StreamingSession | null => {
+    if (streamSession !== null) return streamSession
+    try {
+      streamSession = createStreamingSession(app.getPath('userData'))
+      streamInit = 'idle'
+      for (const frame of pendingStreamFrames) streamSession.feed(pcm16Base64ToFloat32(frame.toString('base64')))
+      pendingStreamFrames = []
+      pendingStreamBytes = 0
+      return streamSession
+    } catch (error) {
+      streamInit = 'failed'
+      pendingStreamFrames = []
+      pendingStreamBytes = 0
+      console.log('[dsh-pet] 流式识别器创建失败，改用整句识别：', error instanceof Error ? error.message : String(error))
+      return null
+    }
+  }
+
+  /**
+   * 模型首次创建会阻塞约 2.5 秒。先让这次 IPC 返回、渲染层开始录音，再在下一拍加载模型；
+   * 期间收到的音频暂存，不能因为初始化把用户开口弄丢。
+   */
+  const scheduleStreamSession = (): void => {
+    if (streamInit !== 'idle') return
+    streamInit = 'pending'
+    const epoch = streamEpoch
+    setTimeout(() => {
+      // 这期间用户已经停止：不要再为一场不存在的听写建 stream。
+      if (epoch !== streamEpoch) return
+      ensureStreamSession()
+    }, 0).unref()
+  }
 
   /**
    * 听写转写：用户挑了自定义识别服务就把这段音频送到那里，没挑走本地识别。
@@ -2354,24 +2416,25 @@ function registerIpc(): void {
       disarmDictationSafety()
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
     }
-    // 流式模型装了就开一场会话：渲染层逐帧送 PCM，识别文本实时回显输入框。
-    let streaming = false
-    try {
-      if (apiAsr === null && streamingAvailable(app.getPath('userData'))) {
-        streamSession = createStreamingSession(app.getPath('userData'))
-        streaming = true
-      }
-    } catch (error) {
-      console.log('[dsh-pet] 流式识别器创建失败，退回整句识别：', error instanceof Error ? error.message : error)
-      streamSession = null
-      streaming = false
-    }
-    return { ok: true, streaming }
+    // 流式模型装了就承诺流式链路；模型在“第一次喂音频”时再创建。这样本次 IPC 先返回，
+    // 渲染层能立刻开始录音，模型加载的快慢不再决定用户开头的话能不能被采到。
+    resetStreamState()
+    return { ok: true, streaming: apiAsr === null && streamingAvailable(app.getPath('userData')) }
   })
 
   /** 流式喂数：帧 PCM 进识别器，返回当前累积文本（渲染层实时回显）。 */
   ipcMain.handle('asr-stream-feed', (_event, chunkB64: unknown) => {
-    if (!streamSession || typeof chunkB64 !== 'string' || chunkB64.length === 0) return { text: '' }
+    if (typeof chunkB64 !== 'string' || chunkB64.length === 0) return { text: '' }
+    if (streamSession === null) {
+      if (streamInit === 'failed') return { text: '' }
+      const frame = Buffer.from(chunkB64, 'base64')
+      if (pendingStreamBytes + frame.length <= MAX_PENDING_STREAM_BYTES) {
+        pendingStreamFrames.push(frame)
+        pendingStreamBytes += frame.length
+      }
+      scheduleStreamSession()
+      return { text: '' }
+    }
     try {
       return { text: streamSession.feed(pcm16Base64ToFloat32(chunkB64)) }
     } catch (error) {
@@ -2381,8 +2444,9 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('asr-stream-stop', () => {
-    const session = streamSession
-    streamSession = null
+    // 若模型还在排队，这里要同步等它建好并补喂已缓存的音频；录音已经结束，只是识别收尾。
+    const session = streamSession ?? (streamInit === 'pending' ? ensureStreamSession() : null)
+    resetStreamState()
     disarmDictationSafety()
     applyAudio({ type: 'dictation-finished' })
     if (!session) return { ok: false, text: '' }
@@ -2691,6 +2755,32 @@ if (!gotLock) {
     // "有时候立刻响、有时候要等好几秒"。
     const warmTimer = setTimeout(() => { void warmGreetingCache(voiceApiStore?.resolve('tts') ?? null) }, 5_000)
     warmTimer.unref()
+    // 本地识别模型首次加载分别是秒级。延后到启动稳定后各预热一次，避免第一轮听写既丢开头又慢半拍。
+    // 自定义云端 ASR 不走这两套本地模型，选了就跳过。
+    const warmAsrTimer = setTimeout(() => {
+      try {
+        if (voiceApiStore?.resolve('asr') ?? null) return
+        const userData = app.getPath('userData')
+        const started = Date.now()
+        if (warmStreamingAsr(userData)) {
+          console.log(`[dsh-pet] 流式识别模型已预热：${Date.now() - started}ms`)
+        }
+        const senseTimer = setTimeout(() => {
+          const senseStarted = Date.now()
+          try {
+            if (warmSenseVoiceAsr(userData)) {
+              console.log(`[dsh-pet] 整句识别模型已预热：${Date.now() - senseStarted}ms`)
+            }
+          } catch (error) {
+            console.log('[dsh-pet] 整句识别模型预热失败：', error instanceof Error ? error.message : String(error))
+          }
+        }, 2_000)
+        senseTimer.unref()
+      } catch (error) {
+        console.log('[dsh-pet] 流式识别模型预热失败：', error instanceof Error ? error.message : String(error))
+      }
+    }, 5_000)
+    warmAsrTimer.unref()
     // 自愈：唤醒是独占麦克风的，任何一次占用（听写/会议/外放插话）归还时漏了恢复，
     // 用户看到的就是"喊了没反应，而且完全没有提示"。每 8 秒做一次幂等核对，
     // 发现该听却没在听就拉回来 —— 只在空闲、且设置允许时才动手。

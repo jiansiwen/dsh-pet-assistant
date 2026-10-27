@@ -161,6 +161,10 @@ contextBridge.exposeInMainWorld('petApi', {
   onWake: (callback: (greeting?: string) => void) => {
     subscribe('wake-triggered', (payload) => callback(typeof payload === 'string' ? payload : undefined))
   },
+  /** 唤醒应答真正播放结束（播放器关闭）：界面收到后才开麦，不能按字数估算。 */
+  onWakeGreetingFinished: (callback: () => void) => {
+    subscribe('wake-greeting-finished', () => callback())
+  },
   /** 桥接事件：成员、任务、提案的变化都从这里来，界面只是投影。 */
   onTeamEvent: (callback: (event: BridgeEventPayload) => void) => {
     subscribe('team-event', event => callback(event as BridgeEventPayload))

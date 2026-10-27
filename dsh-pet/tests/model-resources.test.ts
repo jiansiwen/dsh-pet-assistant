@@ -121,7 +121,7 @@ describe('清单：与读模型的代码、setup 脚本说的是同一套东西'
       for (const file of spec.files) {
         assert.match(file.sha256, /^[0-9a-f]{64}$/, file.path)
         assert.ok(Number.isInteger(file.bytes) && file.bytes > 0, file.path)
-        assert.match(file.path, /^(model|streaming|diarization)\/[A-Za-z0-9._-]+$/, file.path)
+        assert.match(file.path, /^(model|streaming|streaming-zh-14m|diarization)\/[A-Za-z0-9._-]+$/, file.path)
       }
       if (spec.source.kind === 'file') {
         assert.equal(spec.files.length, 1, '单文件下载只能对应一个落点文件')

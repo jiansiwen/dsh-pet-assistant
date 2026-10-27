@@ -136,6 +136,9 @@ export default function App() {
   const continuousTimer = useRef<ReturnType<typeof setTimeout>>()
   /** 回复播完后的静默窗定时器：到点没听到开口就关麦，开一次口就作废。 */
   const idleTimer = useRef<ReturnType<typeof setTimeout>>()
+  /** 唤醒应答播完后的开麦回调；由主进程的“实际播放结束”触发，字数估算只做超时兜底。 */
+  const wakeListenPending = useRef<(() => void) | null>(null)
+  const wakeListenTimer = useRef<ReturnType<typeof setTimeout>>()
   const listeningRef = useRef(false)
   const busyRef = useRef(false)
   /** 角色是不是正在念回答。念的时候面板上要给一个能让它闭嘴的按钮。 */
@@ -683,9 +686,20 @@ export default function App() {
         const again = pickLocalGreeting()
         const who = selectedId ?? cast[0]?.assistantId
         if (who) stageRef.current?.sayTo(who, again, 2600)
+        rememberSelfSpeech(again)
+        // 继续听，不算一轮对话。和首次唤醒一样等应答真正播完，不按字数猜。
+        let resumed = false
+        const resume = (): void => {
+          if (resumed || exitingRef.current) return
+          resumed = true
+          wakeListenPending.current = null
+          clearTimeout(wakeListenTimer.current)
+          void startListen(true, continuous)
+        }
+        wakeListenPending.current = resume
+        clearTimeout(wakeListenTimer.current)
+        wakeListenTimer.current = setTimeout(resume, 15_000)
         window.petApi.speakLocal(again)
-        // 继续听，不算一轮对话。
-        window.setTimeout(() => { void startListen(true, continuous) }, 1200)
         return
       }
       if (continuous) {
@@ -946,6 +960,17 @@ export default function App() {
     }
   }, [stageVisible, reportOverlay])
 
+  // 唤醒应答真正播完才开麦。主进程用系统播放器的关闭事件回报，比按字数估时可靠。
+  useEffect(() => {
+    window.petApi.onWakeGreetingFinished(() => {
+      const begin = wakeListenPending.current
+      if (begin === null) return
+      wakeListenPending.current = null
+      clearTimeout(wakeListenTimer.current)
+      begin()
+    })
+  }, [])
+
   // 快捷键 / 语音唤醒只展开会话，不切换独立管理页。
   useEffect(() => {
     const summon = () => {
@@ -983,8 +1008,12 @@ export default function App() {
       // （现场现象：对话里凭空多出一句「我在这。」）。
       // 先等应答播完再开麦；同时把这句话记进自回声过滤表，双保险。
       rememberSelfSpeech(line)
+      let started = false
       const beginListen = (): void => {
-        if (exitingRef.current) return
+        if (started || exitingRef.current) return
+        started = true
+        wakeListenPending.current = null
+        clearTimeout(wakeListenTimer.current)
         if (continuousVoice && binding && conversation.start(binding, voiceConversation, continuousVoice)) {
           setContinuousActive(true)
           armContinuousDeadline()
@@ -994,9 +1023,11 @@ export default function App() {
           void startListen(true)
         }
       }
-      // 应答大约按字数走：中文每秒约 4–5 字，再加一点启动余量；至少留 900ms。
-      const waitMs = Math.min(6000, Math.max(900, Math.round((line.length / 4.5) * 1000) + 500))
-      window.setTimeout(beginListen, waitMs)
+      // 正常由主进程在应答真正播完后触发；播放器异常或事件丢失时保底开麦。
+      // 不再按字数估算：短问候语会估得比实际播放久，用户听到后立刻说话就被截掉开头。
+      wakeListenPending.current = beginListen
+      clearTimeout(wakeListenTimer.current)
+      wakeListenTimer.current = setTimeout(beginListen, 15_000)
     })
   }, [selectedId, cast, voiceConversation, continuousVoice, startListen, conversation, armContinuousDeadline, armIdleDeadline])
 

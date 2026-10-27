@@ -3,10 +3,12 @@
  * 不出网、不开音频设备 —— 网络与真声的验证归真机。
  */
 import assert from 'node:assert/strict'
+import path from 'node:path'
+import { tmpdir } from 'node:os'
 import { test } from 'node:test'
 
 import { buildSsml, generateSecMsGec, synthesizeSpeech, type WebSocketFactory, type WebSocketLike } from '../src/main/edge-tts.ts'
-import { cleanSenseVoiceText, trimSilence } from '../src/main/asr.ts'
+import { cleanSenseVoiceText, transcribeWav, trimSilence } from '../src/main/asr.ts'
 import { encodeWav, frameRms, noiseBaseline, pcm16Base64, resampleTo16k, speechThreshold, arrayBufferToBase64, BASELINE_FRAMES } from '../src/renderer/dictation.ts'
 
 // ── edge-tts 协议 ──
@@ -178,9 +180,32 @@ test('裁静音：头部与尾部的沉默被裁掉，中间一句不碰', () =>
   assert.ok(dataLength < 16000 * 2 * 1.6, `几乎没裁：${dataLength} 字节`)
 })
 
-test('裁静音：全程静音返回空，调用方据此回退到原样识别', () => {
+test('裁静音：全程静音返回空，调用方据此报没听到', () => {
   const wav = makeWav([{ ms: 800, level: 0 }])
   assert.equal(trimSilence(wav).length, 0)
+})
+
+test('整段静音在调用模型前就被拒绝，不产生幻觉文本', async () => {
+  const wav = makeWav([{ ms: 800, level: 0 }])
+  const result = await transcribeWav(
+    wav.buffer.slice(wav.byteOffset, wav.byteOffset + wav.byteLength) as ArrayBuffer,
+    path.join(tmpdir(), 'dsh-no-such-asr-models'),
+  )
+  assert.deepEqual(result, { ok: false, error: '没有听到说话内容' })
+})
+
+test('裁静音：Windows 扩展 fmt（18字节）也能找到 data 块', () => {
+  const wav = makeWav([{ ms: 300, level: 0 }, { ms: 500, level: 0.5 }, { ms: 300, level: 0 }])
+  const extended = Buffer.concat([
+    wav.subarray(0, 36),
+    Buffer.alloc(2),
+    wav.subarray(36),
+  ])
+  extended.writeUInt32LE(18, 16)
+  extended.writeUInt32LE(extended.length - 8, 4)
+  const trimmed = trimSilence(extended, { threshold: 300 })
+  assert.ok(trimmed.length > 0)
+  assert.ok(trimmed.length < extended.length, '扩展 fmt 头下仍应裁掉首尾静音')
 })
 
 test('裁静音：8bit mono（MCI 回退录音的格式）裁剪并转成 16bit', () => {
