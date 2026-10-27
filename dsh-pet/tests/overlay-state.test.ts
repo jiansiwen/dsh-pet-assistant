@@ -19,11 +19,11 @@ test('内部区域、菜单或管理交互不自动收起；隐藏状态不重�
   assert.equal(shouldDismissOverlay({ ...visible, blocked: true }, outside), false)
   assert.equal(shouldDismissOverlay({ ...visible, open: false }, outside), false)
 })
-test('固定头顶：正常位置居中，贴边时夹回可视区而不是画到屏幕外', () => {
+test('固定头顶：始终挂在头顶，宠物贴边时允许超出屏幕', () => {
   const viewport = { width: 1536, height: 864 }
   const size = { width: 440, height: 400 }
   assert.deepEqual(overlayPosition({ x: 500, y: 700 }, size, 150, viewport, 'top'), { x: 355, y: 292 })
-  assert.deepEqual(overlayPosition({ x: 100, y: 8 }, size, 150, viewport, 'top'), { x: 8, y: 8 })
+  assert.deepEqual(overlayPosition({ x: 100, y: 8 }, size, 150, viewport, 'top'), { x: -45, y: -400 })
 })
 test('自适应：上方放不下时换到下方，左右也不够时换到侧面', () => {
   const viewport = { width: 1536, height: 864 }

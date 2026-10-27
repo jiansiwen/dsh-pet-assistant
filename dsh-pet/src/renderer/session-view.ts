@@ -36,7 +36,7 @@ const OVERLAY_MARGIN = 8
 /**
  * 会话框相对宠物锚点的落位。
  *
- * top：始终在头顶，但夹回可视区 —— 宠物贴着屏幕上沿时也不能让框被裁掉。
+ * top：始终挂在头顶，不做夹紧 —— 用户明确选择固定位置，宠物贴边时宁可超出屏幕也不挪位。
  * auto：依次尝试上、下、左、右，优先完全可见的那个；四个方向都放不下时取溢出最少的方向，
  * 再整体夹回可视区，保证框至少整体在屏幕内。
  */
@@ -53,7 +53,7 @@ export function overlayPosition(
   const centerX = anchor.x + petWidth / 2
   const centerY = anchor.y + petWidth / 2
   const above = { x: centerX - size.width / 2, y: anchor.y - size.height - OVERLAY_GAP }
-  if (dock === 'top') return { x: clamp(above.x, maxX), y: clamp(above.y, maxY) }
+  if (dock === 'top') return above
 
   const candidates = [
     above,
