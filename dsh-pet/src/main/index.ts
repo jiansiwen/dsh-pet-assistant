@@ -70,6 +70,7 @@ import { createMeetingRecorder, markAssistantSpeech, registerMeetingIpc, type Me
 import { splitIntoSegments } from './speech.ts'
 import { startWakeListener, stopWakeListener } from './wake.ts'
 import { PointerWatcher } from './pointer-watch.ts'
+import { PlayHost } from './play-host.ts'
 import { kwsWakeDeviceVerified, loginItemSpec, loopbackCapability, platformOf, playAudioSpec, recordAudioSpec, supportsGlobalPointerWatch, supportsWakeWord, supportsWpsControl, wakeEngines } from './platform.ts'
 import { resolveAppLayout } from './runtime-launch.ts'
 import { isSessionCommand, shouldDismissOverlay, validBoxes, type OverlayBox } from './overlay-state.ts'
@@ -525,9 +526,34 @@ function onWakeWord(): void {
   // 这句话走**独立的合成与播放**，不经过 Narrator 的会话播报队列：
   // 那个队列一次只吃一句、还要等 worker ready，任何一次状态残留都会让唤醒"听得见我叫它、
   // 却听不见它回我"。唤醒应答只是"我听见了"的信号，值得用一条不共享状态的短路径。
-  const greeting = pickPhrase(WAKE_GREETINGS)
-  if (greeting.length > 0) void speakWakeGreeting(greeting)
+  // 合成服务只解析一次：选句（要查哪些句子已有缓存）和播放必须用同一个音色指纹。
+  const api = voiceApiStore?.resolve('tts') ?? null
+  const greeting = pickGreeting(api)
+  if (greeting.length > 0) void speakWakeGreeting(greeting, api)
   sendToRenderer('wake-triggered', greeting)
+}
+
+/** 缓存键：自定义服务按服务+模型+音色，默认 edge-tts 也要有稳定的键，否则永远不预热。 */
+function greetingVoiceKey(api: ResolvedVoiceApi | null): string {
+  if (api === null) {
+    return voiceFingerprint({ provider: 'edge-tts', model: 'edge-tts', voice: DEFAULT_TTS_VOICE })
+  }
+  return voiceFingerprint({
+    provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
+  })
+}
+
+/**
+ * 优先挑一句**已经有本地音频**的应答。
+ *
+ * 预热没跑完（或刚换了音色）时，随机抽到未缓存的句子就要当场等一次云端合成，
+ * 用户听到的是"喊完一两秒才回话"。缓存里有哪句就先说哪句，全部没缓存时才退回随机 ——
+ * "喊了就响"优先于"每次都换着说"；预热完成后所有句子都在缓存里，随机性自然恢复。
+ */
+function pickGreeting(api: ResolvedVoiceApi | null): string {
+  const voiceKey = greetingVoiceKey(api)
+  const cached = WAKE_GREETINGS.filter(text => ttsCache.has({ voiceKey, text }))
+  return pickPhrase(cached.length > 0 ? cached : WAKE_GREETINGS)
 }
 
 /**
@@ -536,22 +562,21 @@ function onWakeWord(): void {
  * 独立于 Narrator：一来不会被会话播报的"一次一句 / awaitingStop"卡住，二来它失败也只影响
  * 这一句，不该把正在进行的讲解或回答队列带崩。命中固定话术缓存时直接播本地音频。
  */
-async function speakWakeGreeting(text: string): Promise<void> {
+async function speakWakeGreeting(text: string, resolvedApi?: ResolvedVoiceApi | null): Promise<void> {
   try {
-    const api = voiceApiStore?.resolve('tts') ?? null
-    const voiceKey = api === null ? null : voiceFingerprint({
-      provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
-    })
-    const key = voiceKey === null ? null : { voiceKey, text }
-    const cached = key === null ? null : ttsCache.get(key)
+    const api = resolvedApi === undefined ? voiceApiStore?.resolve('tts') ?? null : resolvedApi
+    const voiceKey = greetingVoiceKey(api)
+    const key = { voiceKey, text }
+    const cached = ttsCache.get(key)
     const startedAt = Date.now()
     const audio = cached ?? await synthesizeOneShot(text, api)
-    if (cached === null && key !== null) ttsCache.put(key, audio)
-    // 把耗时打进日志：用户体感"喊完要等好几秒"时，这一行能直接分出是合成慢还是播放慢。
-    console.log(`[dsh-pet] 唤醒应答开始播放（${cached === null ? '新合成' : '缓存命中'}，${Date.now() - startedAt}ms）：「${text}」`)
+    if (cached === null) ttsCache.put(key, audio)
+    // 把耗时打进日志：用户体感"喊完要等好几秒"时，这两行能直接分出是合成、播放还是开麦慢。
+    console.log(`[dsh-pet] 唤醒应答开始播放（${cached === null ? '新合成' : '缓存命中'}，准备 ${Date.now() - startedAt}ms）：「${text}」`)
     // 等系统播放器真正结束再通知界面开麦。按字数估时会在短问候语上过早/过晚，
     // 用户听到"我在呢"立刻说话时，开头会被截掉。
     await playOneShot(audio)
+    console.log(`[dsh-pet] 唤醒应答播放结束（共 ${Date.now() - startedAt}ms），开始听写`)
     // 合成过的句子顺手补齐其余固定话术：下次抽到任何一句都能立刻出声。
     if (cached === null) void warmGreetingCache(api)
   } catch (error) {
@@ -568,6 +593,10 @@ async function synthesizeOneShot(text: string, api: ResolvedVoiceApi | null): Pr
   return synthesizeSpeech({ text, voice: DEFAULT_TTS_VOICE, rate: '+0%', pitch: '+0Hz' })
 }
 
+/** 同一次预热不重复跑；换成同一音色且已完成时直接跳过。 */
+let warmGreetingTask: { voiceKey: string; promise: Promise<void> } | null = null
+let warmedGreetingVoice: string | null = null
+
 /**
  * 把全部固定话术的音频补齐到缓存。
  *
@@ -575,24 +604,39 @@ async function synthesizeOneShot(text: string, api: ResolvedVoiceApi | null): Pr
  * 于是用户会感觉"有时候很快、有时候要等好几秒"。启动后和首次合成后各补齐一次，
  * 之后每句话都命中缓存，唤醒应答就是本地的、立刻出声。
  *
- * 串行是为了不和服务启动抢带宽；失败只记日志，下次启动再补。
+ * 三路并发：串行合成 18 句在云端服务上要十几秒，这段时间里唤醒仍可能抽到没缓存的句子。
+ * 并发数刻意压得低，不和正在进行的会话播报抢带宽。失败只记日志，下次启动再补。
  */
-async function warmGreetingCache(api: ResolvedVoiceApi | null): Promise<void> {
+function warmGreetingCache(api: ResolvedVoiceApi | null): Promise<void> {
+  const voiceKey = greetingVoiceKey(api)
+  if (warmedGreetingVoice === voiceKey) return Promise.resolve()
+  if (warmGreetingTask?.voiceKey === voiceKey) return warmGreetingTask.promise
+  const promise = runWarmGreetingCache(api, voiceKey).finally(() => {
+    if (warmGreetingTask?.promise === promise) warmGreetingTask = null
+  })
+  warmGreetingTask = { voiceKey, promise }
+  return promise
+}
+
+async function runWarmGreetingCache(api: ResolvedVoiceApi | null, voiceKey: string): Promise<void> {
   try {
-    const voiceKey = api === null ? null : voiceFingerprint({
-      provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
-    })
-    if (voiceKey === null) return
-    for (const text of fixedPhrases()) {
-      if (ttsCache.get({ voiceKey, text }) !== null) continue
-      try {
-        const audio = await synthesizeOneShot(text, api)
-        ttsCache.put({ voiceKey, text }, audio)
-      } catch {
-        // 单句失败不影响其余句子；下次启动会再试。
+    const pending = fixedPhrases().filter(text => !ttsCache.has({ voiceKey, text }))
+    let next = 0
+    const worker = async (): Promise<void> => {
+      while (next < pending.length) {
+        const text = pending[next++]
+        if (text === undefined) return
+        try {
+          const audio = await synthesizeOneShot(text, api)
+          ttsCache.put({ voiceKey, text }, audio)
+        } catch {
+          // 单句失败不影响其余句子；下次启动会再试。
+        }
       }
     }
-    console.log('[dsh-pet] 唤醒应答音频已预热完成')
+    await Promise.all(Array.from({ length: Math.min(3, pending.length) }, () => worker()))
+    if (pending.length > 0) warmedGreetingVoice = voiceKey
+    console.log(`[dsh-pet] 唤醒应答音频已预热完成（新合成 ${pending.length} 句）`)
   } catch (error) {
     console.log('[dsh-pet] 预热唤醒应答失败：', error instanceof Error ? error.message : String(error))
   }
@@ -601,24 +645,36 @@ async function warmGreetingCache(api: ResolvedVoiceApi | null): Promise<void> {
 /**
  * 直接播放一段音频字节。
  *
- * 用系统播放器（Windows 走 play.ps1 的 MCI、macOS 走 afplay），不经过渲染层：
+ * 用系统播放器（Windows 走 MCI、macOS 走 afplay），不经过渲染层：
  * 渲染层播放要先有音频上下文、还可能因为没有用户手势被自动播放策略挂起 ——
  * 唤醒应答必须"喊了就响"，不能赌这些条件。
+ *
+ * Windows 上优先走常驻的 play-host.ps1：省掉每次 2 秒以上的 PowerShell 冷启动与
+ * Add-Type 编译。常驻进程没预热好或已退出时，回退到一次性 spawn 的 play.ps1。
  */
-function playOneShot(audio: Buffer): Promise<boolean> {
+async function playOneShot(audio: Buffer): Promise<boolean> {
   const mime = sniffAudioMime(audio)
   const ext = mime === 'audio/wav' ? '.wav' : mime === 'audio/ogg' ? '.ogg' : '.mp3'
   const dir = mkdtempSync(path.join(tmpdir(), 'dsh-wake-'))
   const file = path.join(dir, `wake${ext}`)
   writeFileSync(file, audio)
+  const cleanup = (): void => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* 稍后清理 */ } }
+
+  // 启动后头几秒就可能被唤醒：常驻进程还在编译，给它一个短暂窗口再决定回退。
+  // 窗口比一次性脚本的 2.5 秒短，等到就赚，等不到也只是多 1.5 秒。
+  if (!playHost.isReady()) await playHost.waitReady(1_500)
+  const shared = playHost.play(file)
+  if (shared !== null) return shared.finally(cleanup)
+
+  console.log('[dsh-pet] 常驻播放器未就绪，这次回退一次性 play.ps1（会慢约 2 秒）')
   const spec = playAudioSpec(platformOf(), layout.scriptDir, file)
-  if (spec === null) { rmSync(dir, { recursive: true, force: true }); return Promise.resolve(false) }
+  if (spec === null) { cleanup(); return Promise.resolve(false) }
   return new Promise(resolve => {
     let settled = false
     const finish = (played: boolean): void => {
       if (settled) return
       settled = true
-      try { rmSync(dir, { recursive: true, force: true }) } catch { /* 稍后清理 */ }
+      cleanup()
       resolve(played)
     }
     const child = spawn(spec.command, [...spec.args], { windowsHide: true, stdio: 'ignore' })
@@ -1425,6 +1481,14 @@ function docRootsPayload(): { roots: string[]; recent: string[] } {
  */
 /** 固定话术的语音缓存（唤醒应答等）：合成一次，之后按音色复用。 */
 const ttsCache = new TtsCache(app.getPath('userData'))
+
+/**
+ * 唤醒应答的常驻播放进程（Windows）。
+ *
+ * 每次新起 PowerShell 的播放路径实测要 2.5 秒才出声，而唤醒应答只有两三秒长 ——
+ * 用户听到的"喊完等一两秒才回话"主要就是它。启动时预热，之后每句只剩 MCI 命令。
+ */
+const playHost = new PlayHost({ scriptDir: layout.scriptDir, platform: platformOf() })
 
 const rendererPlayback = new RendererPlayback(
   deliver => spawnTtsEdgeWorker(deliver as (event: TtsWorkerEvent) => void, { synthOnly: true }),  {
@@ -2700,6 +2764,12 @@ if (!gotLock) {
 
   void app.whenReady().then(() => {
     applyPlatformWindowTweaks()
+    // 唤醒应答的常驻播放进程：把 PowerShell 冷启动与 Add-Type 编译挪到启动阶段。
+    // 不 await：预热在后台跑，失败时 playOneShot 会回退到一次性脚本。
+    const playHostStartedAt = Date.now()
+    void playHost.start().then(ready => {
+      console.log(`[dsh-pet] 常驻播放器${ready ? '已就绪' : '不可用'}（${Date.now() - playHostStartedAt}ms）`)
+    })
     // 会议回环声的桌面采集授权：必须在任何 getDisplayMedia 之前注册（见函数注释）。
     configureDisplayMedia()
     registerIpc()
@@ -2750,13 +2820,14 @@ if (!gotLock) {
     // 唤醒开关先落进状态（不产生副作用）：Windows 缺省开（既有行为），macOS 缺省关（开着就是持续采集）。
     audioState = { ...audioState, wakeEnabled: audioPrefs().wakeEnabled }
     applyAudio({ type: 'boot' })
-    // 启动后把固定话术的音频补齐到缓存（延后几秒，别和启动抢带宽）。
+    // 启动后把固定话术的音频补齐到缓存（稍等一下，别和启动抢带宽）。
     // 没有这一步，唤醒应答随机抽到"没缓存过的句子"就要当场联网合成，用户会感觉
-    // "有时候立刻响、有时候要等好几秒"。
-    const warmTimer = setTimeout(() => { void warmGreetingCache(voiceApiStore?.resolve('tts') ?? null) }, 5_000)
+    // "有时候立刻响、有时候要等好几秒"。放到 1.5 秒：用户重启后往往很快就喊第一声。
+    const warmTimer = setTimeout(() => { void warmGreetingCache(voiceApiStore?.resolve('tts') ?? null) }, 1_500)
     warmTimer.unref()
-    // 本地识别模型首次加载分别是秒级。延后到启动稳定后各预热一次，避免第一轮听写既丢开头又慢半拍。
-    // 自定义云端 ASR 不走这两套本地模型，选了就跳过。
+    // 本地识别模型首次加载分别是秒级，而且是**同步**加载：预热期间主线程被占住，
+    // 唤醒动画与播放也会跟着停顿。所以延后到用户通常已经喊过第一声之后（12 秒起），
+    // 不和唤醒抢那几秒。自定义云端 ASR 不走这两套本地模型，选了就跳过。
     const warmAsrTimer = setTimeout(() => {
       try {
         if (voiceApiStore?.resolve('asr') ?? null) return
@@ -2779,7 +2850,7 @@ if (!gotLock) {
       } catch (error) {
         console.log('[dsh-pet] 流式识别模型预热失败：', error instanceof Error ? error.message : String(error))
       }
-    }, 5_000)
+    }, 12_000)
     warmAsrTimer.unref()
     // 自愈：唤醒是独占麦克风的，任何一次占用（听写/会议/外放插话）归还时漏了恢复，
     // 用户看到的就是"喊了没反应，而且完全没有提示"。每 8 秒做一次幂等核对，
@@ -2869,6 +2940,8 @@ app.on('before-quit', event => {
   runningWake = null
   // 窗口被关这类退出路径不经过 requestPetExit，漏在这儿就是一个杀不掉的合成进程孤儿。
   narrator.dispose()
+  // 常驻播放进程同理：不主动收尾就会在系统里留下一个空闲的 PowerShell。
+  playHost.stop()
   docView.dispose()
   wpsView.dispose()
   wpsController?.dispose()

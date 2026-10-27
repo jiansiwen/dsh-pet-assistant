@@ -72,6 +72,40 @@ mock.module('../src/main/tts.ts', {
   },
 })
 
+/**
+ * 默认 edge-tts 的替身：沙盒里没有 voice-apis.json，唤醒话术预热会走默认合成。
+ * 不挡住就是一个真实的微软 WebSocket 请求 —— 测试既不该联网，也不该为它等几秒。
+ */
+mock.module('../src/main/edge-tts.ts', {
+  namedExports: {
+    DEFAULT_TTS_VOICE: 'zh-CN-XiaoxiaoNeural',
+    synthesizeSpeech: async () => Buffer.from('ID3-fake-audio'),
+  },
+})
+
+/**
+ * 常驻播放进程的替身：装配时启动并不真的 spawn PowerShell（那第三个真进程边界
+ * 同样归真机验证）。记录调用次数，确认装配路径确实做了预热与收尾。
+ */
+const playHostCalls = { starts: 0, stops: 0, plays: 0 }
+mock.module('../src/main/play-host.ts', {
+  namedExports: {
+    PlayHost: class {
+      start(): Promise<boolean> {
+        playHostCalls.starts += 1
+        return Promise.resolve(true)
+      }
+      play(): null {
+        playHostCalls.plays += 1
+        return null
+      }
+      stop(): void {
+        playHostCalls.stops += 1
+      }
+    },
+  },
+})
+
 // ── electron 替身：记录而非模拟。窗口、托盘、快捷键只存"发生过什么"。 ──
 const ipcHandlers = new Map<string, (...args: unknown[]) => unknown>()
 const ipcListeners = new Map<string, (...args: unknown[]) => void>()
@@ -269,6 +303,7 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
   assert.deepEqual(registeredShortcuts, ['CommandOrControl+Alt+P'],
     '主选注册成功就停手；备选 Ctrl+Alt+Space 只在主选被占用时兜底')
   assert.equal(wakeStarts.length, 1, 'boot 后唤醒监听被仲裁器拉起一次（mock 的，没起真 PowerShell）')
+  assert.equal(playHostCalls.starts, 1, '唤醒应答的常驻播放进程在装配时预热一次')
 })
 
 test('通道清单：舞台侧注册的每一条都该在，一条不多', () => {
@@ -432,6 +467,7 @@ test('before-quit：第一次挡下退出收尾，收尾完放行第二次；资
   assert.equal(shortcutsCleared, 1, '全局快捷键先摘掉')
   assert.equal(wakeStops > 0, true, '唤醒监听已停')
   assert.equal(narrator.disposed, 1, '合成器释放一次')
+  assert.equal(playHostCalls.stops >= 1, true, '常驻播放进程随退出收尾，不留空闲 PowerShell')
   assert.ok(ipcRemoved.some(item => item.channel === 'approval-open'), '审批通道已摘：退出过程中不该留能签发批准的窗口')
   assert.ok(tray.destroyed, '托盘已销毁')
 

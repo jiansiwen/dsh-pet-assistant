@@ -90,8 +90,8 @@ function New-Object {
   return { audioPath, ...JSON.parse(result.stdout.trim()) as { code: number; commands: string[]; synthesis: string[] } }
 }
 
-test('两个脚本保留 UTF-8 BOM，PowerShell 5.1 不会误读中文', () => {
-  for (const name of ['play.ps1', 'speak-once.ps1']) {
+test('播放与合成脚本保留 UTF-8 BOM，PowerShell 5.1 不会误读中文', () => {
+  for (const name of ['play.ps1', 'play-host.ps1', 'speak-once.ps1']) {
     assert.deepEqual(readFileSync(path.join(scriptDir, name)).subarray(0, 3), Buffer.from([0xef, 0xbb, 0xbf]))
   }
 })

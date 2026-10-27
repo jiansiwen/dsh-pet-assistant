@@ -61,6 +61,20 @@ export class TtsCache {
     this.ready = true
   }
 
+  /**
+   * 只判断有没有，不读内容。
+   *
+   * 唤醒时要在一组固定话术里挑"已经有音频"的那几句，逐条 readFileSync 会把几十 KB
+   * 读进主线程再丢掉；这里只做一次存在性检查。
+   */
+  has(key: TtsCacheKey): boolean {
+    try {
+      return existsSync(path.join(this.dir, `${digestOf(key)}.bin`))
+    } catch {
+      return false
+    }
+  }
+
   /** 命中就返回音频字节；没有（或读不出来）返回 null，调用方照常去合成。 */
   get(key: TtsCacheKey): Buffer | null {
     const file = path.join(this.dir, `${digestOf(key)}.bin`)

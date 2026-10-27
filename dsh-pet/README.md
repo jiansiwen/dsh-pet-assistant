@@ -29,6 +29,9 @@ DeepSeek Harness 的桌面客户端 —— 配合 [dsh-personal-assistant](../ds
     未做 Mac 真机和噪声环境验收；需要先用 `bash scripts/setup-local-asr.sh` 安装唤醒模型，
     再到「右键宠物 → 宠物设置 → 常驻与语音」开启；
   - Linux：暂不提供唤醒，使用快捷键或点角色代替
+  - 唤醒应答走**本地缓存 + 常驻播放进程**：启动时预热固定话术，喊完立即出声。
+    Windows 上常驻进程只在启动时编译一次 MCI，不必每次唤醒都等 PowerShell 冷启动（约 2.5 秒）；
+    缓存未命中时才临时合成，常驻进程不可用时自动回退到一次性播放
 - **按键听写**：说话录音在窗口里完成，说完自动停。识别走**进程内**解码（不 spawn 任何外部程序），
   所以模型装好后三个平台都能用：
   - Windows：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-local-asr.ps1`

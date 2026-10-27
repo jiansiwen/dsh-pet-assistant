@@ -144,6 +144,8 @@ function copyStatic() {
   cpSync(path.join(root, 'src/main/wake-grammar.ps1'), path.join(root, 'dist/main/wake-grammar.ps1'))
   cpSync(path.join(root, 'src/main/record.ps1'), path.join(root, 'dist/main/record.ps1'))
   cpSync(path.join(root, 'src/main/play.ps1'), path.join(root, 'dist/main/play.ps1'))
+  // 常驻播放进程：唤醒应答走它，省掉每次 2 秒以上的 PowerShell 冷启动。
+  cpSync(path.join(root, 'src/main/play-host.ps1'), path.join(root, 'dist/main/play-host.ps1'))
   cpSync(path.join(root, 'src/main/speak-once.ps1'), path.join(root, 'dist/main/speak-once.ps1'))
   cpSync(path.join(root, 'src/main/asr-wave.ps1'), path.join(root, 'dist/main/asr-wave.ps1'))
   // 桌面动作（窗口识别 / WPS 翻页）的 UI Automation 辅助脚本，由 win-actions.ts 常驻启动。

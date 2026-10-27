@@ -551,7 +551,7 @@ describe('resolveAppLayout：开发态与改造前一致，打包态改走 app.a
   test('打包态下 build.mjs 拷到 dist/main 的每个 .ps1 都解析到 app.asar.unpacked 里', () => {
     const resources = path.join(root, 'resources')
     const layout = resolveAppLayout({ mainDir: path.join(resources, 'app.asar', 'dist', 'main'), isPackaged: true })
-    for (const script of ['wake.ps1', 'wake-grammar.ps1', 'record.ps1', 'play.ps1', 'speak-once.ps1', 'asr-wave.ps1', 'win-uia.ps1']) {
+    for (const script of ['wake.ps1', 'wake-grammar.ps1', 'record.ps1', 'play.ps1', 'play-host.ps1', 'speak-once.ps1', 'asr-wave.ps1', 'win-uia.ps1']) {
       const file = path.join(layout.scriptDir, script)
       assert.equal(file, path.join(resources, 'app.asar.unpacked', 'dist', 'main', script))
       assert.equal(toUnpackedPath(path.join(resources, 'app.asar', 'dist', 'main', script)), file)
