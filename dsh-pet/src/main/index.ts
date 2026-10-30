@@ -6,15 +6,19 @@
  * - 壳层（`companion-host.ts`）：托盘、启动 dsh 团队运行时的分阶段握手、运行时所有权。
  * 壳层活着不代表角色可见，角色可见也不代表运行时连上了 —— 这两件事各自有各自的状态。
  */
-import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, net, safeStorage, screen, session, shell, systemPreferences, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, net, Notification, safeStorage, screen, session, shell, systemPreferences, type MenuItemConstructorOptions } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os, { tmpdir } from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { ApprovalWindow } from './approval-window.ts'
 import { registerReportWorkbench, type ReportWorkbenchHandle } from './report-workbench-window.ts'
+import { registerCompanionTasks, type CompanionTasksHandle } from './companion-task-window.ts'
+import { registerAssistantSettings } from './assistant-settings.ts'
+import { registerMemberManagement } from './member-management.ts'
+import { MemberEditorWindow } from './member-editor-window.ts'
 import { createStreamingSession, pcm16Base64ToFloat32, streamingAvailable, transcribeWav, warmSenseVoiceAsr, warmStreamingAsr, type StreamingSession } from './asr.ts'
 import { INITIAL_AUDIO_STATE, nextAudio, type AudioEvent, type AudioState, type AudioTransition } from './audio.ts'
 import { AudioPrefsStore, loginItemAction, type AudioPrefs } from './audio-prefs.ts'
@@ -26,6 +30,8 @@ import { CompanionHost } from './companion-host.ts'
 import { createDocFileSystem } from './doc-fs.ts'
 import { createPlaybackTap } from './doc-presenter.ts'
 import { createDocViewController, type DocViewController, type DocViewHostEvent } from './doc-view-window.ts'
+import { OfficeViewWindow } from './office-view-window.ts'
+import { exportPptxSlides } from './office-export.ts'
 import { createWpsController, type WpsController } from './wps-control.ts'
 import { WpsViewTarget } from './wps-view-target.ts'
 import {
@@ -33,6 +39,7 @@ import {
   describeOutline,
   detectDocIntent,
   DocumentLibrary,
+  extensionOf,
   explainPrompt,
   isPdfName,
   MAX_DOC_BYTES,
@@ -67,6 +74,7 @@ import { DEFAULT_TTS_VOICE, synthesizeSpeech } from './edge-tts.ts'
 import { VoiceApiStore, synthesizeApi, transcribeApi } from './voice-api.ts'
 import type { VoiceApiKind, VoiceApiResult, VoiceApiState, ResolvedVoiceApi } from '../voice-api-types.ts'
 import { createMeetingRecorder, markAssistantSpeech, registerMeetingIpc, type MeetingRecorder } from './meeting-recorder.ts'
+import type { MeetingConsentInput } from './meeting-store.ts'
 import { splitIntoSegments } from './speech.ts'
 import { startWakeListener, stopWakeListener } from './wake.ts'
 import { PointerWatcher } from './pointer-watch.ts'
@@ -189,6 +197,41 @@ function stageSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent)
 const approvals = new ApprovalWindow(bridge)
 /** 日报工作台：只能请求打开专用审批窗口，自己不批准任何东西。 */
 let reportWorkbench: ReportWorkbenchHandle | null = null
+/** 普通任务与提醒窗口：读取走聊天令牌，创建/回应只在原生确认后用本机凭据。 */
+let companionTasks: CompanionTasksHandle | null = null
+let reminderTimer: NodeJS.Timeout | null = null
+let reminderInFlight = false
+
+/**
+ * 领取一条到期的桌面提醒：先 claim（保证只投递一次），再显示系统通知并回执。
+ * 关机、退出或领不到时什么都不做；不在这里调用模型。
+ */
+async function deliverRemindersOnce(): Promise<void> {
+  if (reminderInFlight) return
+  reminderInFlight = true
+  try {
+    const delivery = await bridge.nextDesktopReminder()
+    if (!delivery || !(await bridge.claimDesktopReminder(delivery.deliveryId))) return
+    const shown = await new Promise<boolean>(resolve => {
+      try {
+        const notification = new Notification({ title: delivery.title || '小潘提醒', body: delivery.message })
+        notification.on('click', () => companionTasks?.open())
+        notification.on('failed', () => resolve(false))
+        notification.show()
+        resolve(true)
+      } catch {
+        resolve(false)
+      }
+    })
+    await bridge.receiptDesktopReminder(
+      delivery.deliveryId,
+      shown ? 'succeeded' : 'failed-before-effect',
+      shown ? [`notification:${delivery.deliveryId}`] : [],
+    )
+  } finally {
+    reminderInFlight = false
+  }
+}
 /** 壳层。app ready 之后才建（要用 userData 目录），所以这里是延迟赋值。 */
 let host: CompanionHost | null = null
 /**
@@ -778,6 +821,154 @@ async function summarizeMeetingByVoice(): Promise<ChatReply> {
   return { ok: true, reply: `已按《${target.name}》的转写生成会议纪要，可以在会议页查看、逐条修改。` }
 }
 
+/** 桌面命令回执：只经 owner 凭据回传，失败只记日志，不反向影响本地操作。 */
+async function replyDesktopCommand(id: string, ok: boolean, result?: unknown, error?: string): Promise<void> {
+  try {
+    const response = await bridge.companionRequest('POST', '/companion/v1/desktop/result',
+      { id, ok, ...(ok ? { result } : { error: error ?? '桌面操作失败' }) }, 'owner')
+    if (response.status !== 200) console.error(`[dsh-pet] desktop command result rejected: ${response.status}`)
+  } catch (cause) {
+    console.error('[dsh-pet] desktop command result failed:', cause instanceof Error ? cause.message : String(cause))
+  }
+}
+
+function meetingStatusView(): Record<string, unknown> | null {
+  const state = meetingRecorder?.getState()
+  if (!state) return null
+  return { recording: state.recording, stopping: state.stopping, meetingId: state.meetingId, name: state.name,
+    sources: state.sources, startedAt: state.startedAt, missingTracks: state.missingTracks,
+    transcribe: state.transcribe, lastMeetingId: state.lastMeetingId,
+    recent: state.recent.slice(0, 5).map(item => ({ id: item.id, name: item.name, startedAt: item.startedAt, state: item.state })) }
+}
+
+async function startMeetingFromDesktop(id: string, payload: Record<string, unknown>): Promise<void> {
+  const recorder = meetingRecorder
+  if (!recorder) throw new Error('会议记录还没准备好')
+  if (!win) throw new Error('舞台窗口不可用，不能打开会议页')
+  const state = recorder.getState()
+  if (state.recording || state.stopping) throw new Error('已有会议正在录制')
+  const name = typeof payload.name === 'string' ? payload.name.trim() : ''
+  if (!name || name.length > 80) throw new Error('会议名称需为 1-80 字')
+  const sources = payload.sources === 'mic' ? 'mic' : 'mic+loopback'
+  const retentionDays = typeof payload.retentionDays === 'number' && Number.isSafeInteger(payload.retentionDays) ? payload.retentionDays : 30
+  if (retentionDays < 1 || retentionDays > 3650) throw new Error('录音保留天数必须是 1-3650 的整数')
+  if (pendingMeetingStart) throw new Error('已有一条会议启动请求正在等待桌面处理')
+  const consent: MeetingConsentInput = { name, sources, retentionDays, consented: true,
+    consentText: `本人于 ${new Date().toLocaleString('zh-CN')} 通过桌面指令要求开始本场会议录音；录音加密保存在本机，参会者应知情。` }
+  const timer = setTimeout(() => {
+    if (pendingMeetingStart?.id !== id) return
+    pendingMeetingStart = null
+    void replyDesktopCommand(id, false, undefined, '会议页没有在时限内开始录音')
+  }, 15_000)
+  timer.unref?.()
+  pendingMeetingStart = { id, consent, timer }
+  openSettings('meeting')
+  sendToRenderer('meeting-command', { requestId: id, consent })
+}
+
+async function stopMeetingFromDesktop(id: string, payload: Record<string, unknown>): Promise<void> {
+  const recorder = meetingRecorder
+  if (!recorder) throw new Error('会议记录还没准备好')
+  const state = recorder.getState()
+  const target = typeof payload.meetingId === 'string' && payload.meetingId ? payload.meetingId : state.meetingId
+  if (!target) throw new Error('没有正在录制的会议')
+  if (!state.recording && !state.stopping) throw new Error('这场会议已经停止')
+  const result = recorder.requestStop(target)
+  if (!result.ok) throw new Error(result.error)
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 250))
+    const next = recorder.getState()
+    if (!next.recording && !next.stopping) {
+      await replyDesktopCommand(id, true, { meetingId: target, transcribe: next.transcribe })
+      return
+    }
+  }
+  throw new Error('已请求停止，但桌面没有在 30 秒内完成冲刷；请在会议页核对')
+}
+
+async function minutesFromDesktop(id: string, payload: Record<string, unknown>): Promise<void> {
+  const recorder = meetingRecorder
+  if (!recorder) throw new Error('会议记录还没准备好')
+  const state = recorder.getState()
+  if (state.recording || state.stopping) throw new Error('会议还在录制中，结束后才能生成纪要')
+  const target = typeof payload.meetingId === 'string' && payload.meetingId ? payload.meetingId : state.lastMeetingId
+  if (!target) throw new Error('还没有可整理纪要的会议记录')
+  const result = await recorder.generateModelMinutes(target, { userInitiated: true })
+  if (!result.ok) { await replyDesktopCommand(id, false, undefined, result.error); return }
+  await replyDesktopCommand(id, true, { meetingId: target, ...result })
+}
+
+async function documentListFromDesktop(id: string): Promise<void> {
+  const files = await documents.candidates()
+  await replyDesktopCommand(id, true, { roots: await documents.authorizedRoots(),
+    files: files.slice(0, 100).map(file => ({ name: file.name, path: file.path, size: file.size, mtimeMs: file.mtimeMs })) })
+}
+
+async function documentReadFromDesktop(id: string, payload: Record<string, unknown>): Promise<void> {
+  const name = typeof payload.name === 'string' ? payload.name.trim() : ''
+  const explicitPath = typeof payload.path === 'string' ? payload.path.trim() : ''
+  const target = explicitPath || name || docTalk?.path || ''
+  if (!target) throw new Error('请给出文档名，或先在文档面板打开一份文档')
+  let path = target
+  if (!explicitPath && name) {
+    const search = await documents.search(name)
+    if (search.kind === 'found') path = search.hit.path
+    else if (search.kind === 'ambiguous') throw new Error(`找到 ${search.hits.length} 份名字相近的文档；请先在文档面板选定一份`)
+    else if (search.kind === 'denied') throw new Error('这份文档不在授权目录里，不能读取')
+    else throw new Error('授权目录里没找到这份文档')
+  }
+  const opened = await documents.open(path)
+  if (opened.kind === 'denied') throw new Error('这份文档不在授权目录里，不能读取')
+  if (opened.kind === 'missing') throw new Error('文档已不在原来的位置')
+  if (opened.kind === 'too-big') throw new Error('文档超过解析上限，不能读取')
+  if (opened.kind === 'unreadable') throw new Error(`文档读不出来：${opened.reason}`)
+  if (opened.doc.parsed.kind !== 'outline') throw new Error(`《${opened.doc.name}》没有可讲解的文字：${opened.doc.parsed.kind === 'empty' ? '内容为空' : '格式不支持或解析失败'}`)
+  const outline = opened.doc.parsed.outline
+  const section = typeof payload.section === 'number' && Number.isInteger(payload.section) ? payload.section : null
+  if (section !== null && (section < 0 || section >= outline.sections.length)) throw new Error(`段号 ${section} 不存在；本文共 ${outline.sections.length} 段`)
+  const maxChars = typeof payload.maxChars === 'number' && Number.isSafeInteger(payload.maxChars) ? Math.min(Math.max(payload.maxChars, 500), 20_000) : 12_000
+  const selected = section === null ? outline.sections : [outline.sections[section]]
+  const sections: Array<{ index: number; heading: string | null; pageNumber: number | null; hasCode: boolean; text: string }> = []
+  let remaining = maxChars
+  for (const item of selected) {
+    const text = item.text.slice(0, Math.max(0, remaining))
+    sections.push({ index: item.index, heading: item.heading, pageNumber: item.pageNumber ?? null, hasCode: item.hasCode, text })
+    remaining -= text.length
+    if (remaining <= 0) break
+  }
+  await replyDesktopCommand(id, true, { name: opened.doc.name, title: outline.title, path: opened.doc.path,
+    fingerprint: opened.doc.fingerprint, charCount: outline.charCount, estMinutes: outline.estMinutes,
+    truncated: outline.truncated || remaining <= 0, sections })
+}
+
+async function handleDesktopCommand(raw: unknown): Promise<void> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
+  const value = raw as { id?: unknown; command?: unknown; payload?: unknown; expiresAt?: unknown }
+  if (typeof value.id !== 'string' || typeof value.command !== 'string') return
+  if (typeof value.expiresAt !== 'number' || value.expiresAt < Date.now()) return
+  const payload = value.payload !== null && typeof value.payload === 'object' && !Array.isArray(value.payload)
+    ? value.payload as Record<string, unknown> : {}
+  try {
+    switch (value.command) {
+      case 'meeting.start': await startMeetingFromDesktop(value.id, payload); return
+      case 'meeting.stop': await stopMeetingFromDesktop(value.id, payload); return
+      case 'meeting.minutes': await minutesFromDesktop(value.id, payload); return
+      case 'meeting.status': {
+        const status = meetingStatusView()
+        if (!status) throw new Error('会议记录还没准备好')
+        await replyDesktopCommand(value.id, true, status)
+        return
+      }
+      case 'document.list': await documentListFromDesktop(value.id); return
+      case 'document.read': await documentReadFromDesktop(value.id, payload); return
+      default: await replyDesktopCommand(value.id, false, undefined, '不支持的桌面命令')
+    }
+  } catch (error) {
+    await replyDesktopCommand(value.id, false, undefined, error instanceof Error ? error.message : String(error))
+  }
+}
+
 async function sendChatReply(text: string, bindingId: string, spoken: boolean, assistantId?: string,
   voiceTurn?: import('../session-types.ts').VoiceTurn): Promise<ChatReply> {
   interruptSpeech()
@@ -903,6 +1094,42 @@ let interruptedChat = false
  * 授权目录每次现取：用户随时可能在面板上增删，缓存一份就等于撤销不生效。
  */
 const documents = new DocumentLibrary(createDocFileSystem(), docSearchRoots)
+const officeView = new OfficeViewWindow({
+  open: async target => {
+    const opened = await documents.open(target)
+    if (opened.kind === 'denied') return { ok: false, error: '这份文档不在授权目录里，不能逐页阅读' }
+    if (opened.kind === 'missing') return { ok: false, error: '文档已不在原来的位置' }
+    if (opened.kind === 'too-big') return { ok: false, error: '文档超过 8MB 解析上限，不能逐页阅读' }
+    if (opened.kind === 'unreadable') return { ok: false, error: `文档读不出来：${opened.reason}` }
+    if (opened.doc.parsed.kind !== 'outline') return { ok: false, error: '文档里没有可阅读的文字' }
+    const extension = extensionOf(opened.doc.name)
+    if (extension !== '.docx' && extension !== '.pptx') return { ok: false, error: '逐页阅读目前只支持 docx 和 pptx' }
+    const sections = opened.doc.parsed.outline.sections.map(section => ({ index: section.index, heading: section.heading,
+      text: section.text.slice(0, 200), pageNumber: section.pageNumber ?? null }))
+    if (extension === '.pptx') {
+      try {
+        const exported = await exportPptxSlides(opened.doc.path)
+        return { ok: true, doc: { path: opened.doc.path, name: opened.doc.name, fingerprint: opened.doc.fingerprint,
+          format: 'pptx', mode: 'images', images: exported.images, sections, pageCount: exported.images.length } }
+      } catch (error) {
+        // 没有 PowerPoint 或导出失败时退回前端库；若库也渲染不了，阅读窗口会如实报错。
+        console.log('[dsh-pet] PowerPoint 导出失败，退回本地预览:', error instanceof Error ? error.message : String(error))
+      }
+    }
+    return { ok: true, doc: { path: opened.doc.path, name: opened.doc.name, fingerprint: opened.doc.fingerprint,
+      format: extension === '.docx' ? 'docx' : 'pptx', mode: 'library', sections,
+      pageCount: extension === '.pptx' ? opened.doc.parsed.outline.sections.length : null } }
+  },
+  read: async doc => {
+    const snapshot = await documents.snapshot(doc.path, doc.fingerprint)
+    if (snapshot.kind !== 'snapshot') throw new Error('文档已变化或授权已撤销，请重新打开')
+    return snapshot.bytes
+  },
+  check: async doc => {
+    const snapshot = await documents.snapshot(doc.path, doc.fingerprint)
+    return snapshot.kind === 'snapshot' ? { ok: true } : { ok: false, error: '文档已变化或授权已撤销，请重新打开' }
+  },
+})
 /** 合成进程的 started/finished/cancelled 原样旁路给阅读视图：翻页只跟实际播放走，不跟生成速度。 */
 const playbackTap = createPlaybackTap<TtsWorkerEvent>()
 const docView = createDocViewController({ library: documents, subscribePlayback: playbackTap.subscribe, onHostEvent: event => onDocViewEvent(event) })
@@ -916,6 +1143,10 @@ const wpsView = createDocViewController({
 /** 阅读视图当前展示的是哪一条讲解链、经哪个视图；暂停/停止只作用于它，换文档时不误停新打开的视图。 */
 let presentedSessionId: string | null = null
 let presentedView: DocViewController | null = null
+/** 当前讲解链同步到的 Office 逐页窗口；与 PDF/WPS 的 presentedSessionId 互斥使用。 */
+let presentedOfficeSessionId: string | null = null
+const OFFICE_DOC_EXTENSIONS = new Set(['.docx', '.pptx'])
+const isOfficeDoc = (name: string): boolean => OFFICE_DOC_EXTENSIONS.has(extensionOf(name))
 
 /**
  * 正在逐段讲解的那一份文档。打字或语音问一句普通问题是 null。
@@ -963,6 +1194,7 @@ let docRevision = 0
 let docRequest: AbortController | null = null
 let meetingRecorder: MeetingRecorder | null = null
 let assistantSpeechStartedAt: number | null = null
+let pendingMeetingStart: { id: string; consent: MeetingConsentInput; timer: NodeJS.Timeout } | null = null
 
 function pauseDocTalk(): void {
   docRevision += 1
@@ -978,7 +1210,16 @@ function stopDocTalk(): void {
     presentedView?.stop('user')
     presentedSessionId = null
   }
+  if (docTalk !== null && docTalk.sessionId === presentedOfficeSessionId) presentedOfficeSessionId = null
   docTalk = null
+}
+
+/** 讲解链换段时同步 Office 窗口；PPTX 用幻灯片页码，DOCX 由窗口按段落文字找页。 */
+function syncOfficeSection(talk: DocTalk, index: number): void {
+  if (presentedOfficeSessionId !== talk.sessionId || !officeView.isOpen()) return
+  const section = talk.outline.sections[index]
+  if (!section) return
+  officeView.gotoSection(index, section.pageNumber ?? null)
 }
 
 /** 视图报上来的事：用户脱离/选择，或推进已停止。由这里决定讲解怎么办，不静默继续。 */
@@ -1025,6 +1266,22 @@ function onDocViewEvent(event: DocViewHostEvent): void {
  * 由调用方停下来问用户，不能静默换成阅读视图后报 WPS 成功。
  */
 async function presentDocView(talk: DocTalk): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (isOfficeDoc(talk.path)) {
+    const section = talk.outline.sections[talk.next]
+    const start = { index: talk.next, pageNumber: section?.pageNumber ?? null }
+    if (officeView.isShowing(talk.path, talk.fingerprint)) {
+      officeView.gotoSection(start.index, start.pageNumber)
+    } else {
+      const shown = await officeView.show(talk.path, start)
+      if (!shown.ok) {
+        sendToRenderer('doc-notice', `逐页阅读没能打开（${shown.error ?? '未知原因'}），讲解继续`)
+        return { ok: true }
+      }
+    }
+    presentedOfficeSessionId = talk.sessionId
+    presentedSessionId = null
+    return { ok: true }
+  }
   if (!talk.spoken || !isPdfName(talk.path)) {
     return talk.via === 'wps' && talk.spoken ? { ok: false, error: 'WPS 同步讲解目前只支持 PDF' } : { ok: true }
   }
@@ -1139,6 +1396,7 @@ async function advanceDocTalk(): Promise<void> {
       }
       const utteranceId = docUtteranceId(talk, index)
       if (talk.sessionId === presentedSessionId) presentedView?.explanation(index, explanation, talk.sessionId)
+      syncOfficeSection(talk, index)
       narrator.beginRound()
       narrator.speak({
         utteranceId,
@@ -1156,6 +1414,7 @@ async function advanceDocTalk(): Promise<void> {
     if (docTalk === talk && !talk.stopped) {
       sendToRenderer('doc-notice', `《${talk.outline.title}》讲完了`)
       if (talk.sessionId === presentedSessionId) { presentedView?.stop('completed'); presentedSessionId = null }
+      if (talk.sessionId === presentedOfficeSessionId) presentedOfficeSessionId = null
       stopDocTalk()
       pushDocState()
     }
@@ -1316,10 +1575,11 @@ async function explainDocByPath(
     stopped: false,
   }
   // 视图先装上新讲解计划再装链：装链会停掉旧链，停的只能是旧视图会话（见 presentedSessionId）。
-  if (speak) {
+  if (speak || isOfficeDoc(talk.path)) {
     const shown = await presentDocView(talk)
     if (bindingId !== sessionState?.bindingId || revision !== docRevision) {
       if (presentedSessionId === talk.sessionId) { presentedView?.stop('replaced'); presentedSessionId = null }
+      if (presentedOfficeSessionId === talk.sessionId) presentedOfficeSessionId = null
       return { ok: false, error: '会话已改变或讲解已停止，未开始原文档讲解' }
     }
     if (!shown.ok) return { ok: false, error: shown.error }
@@ -1377,7 +1637,11 @@ async function resumeDocTalk(spoken: boolean): Promise<ChatReply> {
   if (!talk.spoken) return explainDocByPath(talk.path, talk.next, true, talk.assistantId, false, talk.via)
   talk.stopped = false
   // 视图还开着就接着推进；用户关过视图则重新打开到当前段，不静默只出声。
-  if (talk.sessionId === presentedSessionId) presentedView?.resume()
+  if (isOfficeDoc(talk.path)) {
+    // 追问打断后页面保持原段；这里重新对齐到未讲完的段，再继续推进。
+    const shown = await presentDocView(talk)
+    if (!shown.ok) { talk.stopped = true; return { ok: false, error: shown.error } }
+  } else if (talk.sessionId === presentedSessionId) presentedView?.resume()
   else {
     const shown = await presentDocView(talk)
     if (!shown.ok) { talk.stopped = true; return { ok: false, error: shown.error } }
@@ -1701,6 +1965,7 @@ function buildContextMenu(target: MenuTarget | null): Menu {
     { label: '团队管理', click: () => openSettings('team') },
     { label: '文档管理', click: () => openSettings('doc') },
     { label: '会议', click: () => openSettings('meeting') },
+    { label: '任务与提醒', click: () => companionTasks?.open() },
     { label: '日报工作台', click: () => reportWorkbench?.open() },
     { label: '日报文件夹', click: () => { void shell.openPath(path.join(dshHome(), 'personal-assistant', 'reports')) } },
     { type: 'separator' },
@@ -1858,7 +2123,17 @@ function registerIpc(): void {
     },
     egressTarget: '当前 dsh 会话所用的模型服务商',
   })
-  registerMeetingIpc({ ipc: ipcMain, recorder: meetingRecorder })
+  registerMeetingIpc({ ipc: ipcMain, recorder: meetingRecorder, onStarted: (meetingId, consent) => {
+    const pending = pendingMeetingStart
+    if (!pending) return
+    pendingMeetingStart = null
+    clearTimeout(pending.timer)
+    void replyDesktopCommand(pending.id, true, { meetingId, name: consent.name, sources: consent.sources, startedAt: Date.now() })
+  } })
+  ipcMain.handle('meeting-take-command', event => {
+    if (!stageSender(event)) return null
+    return pendingMeetingStart ? { requestId: pendingMeetingStart.id, consent: pendingMeetingStart.consent } : null
+  })
 
   /**
    * 系统音频（会议里的"对方的声音"）现在能不能采。
@@ -2305,6 +2580,12 @@ function registerIpc(): void {
     return openDocByPath(target)
   })
 
+  ipcMain.handle('office-open', async (event, target: unknown) => {
+    if (!stageSender(event)) return { ok: false, error: '请求来源无效' }
+    if (typeof target !== 'string' || target === '') return { ok: false, error: '没有指定文档' }
+    return officeView.show(target)
+  })
+
   ipcMain.handle('doc-explain', async (_event, target: unknown, from: unknown, speak: unknown, assistantId: unknown) => {
     if (typeof target !== 'string' || target === '') return { ok: false, error: '没有指定文档' }
     const who = typeof assistantId === 'string' && assistantId ? assistantId : undefined
@@ -2340,14 +2621,49 @@ function registerIpc(): void {
   // 都在 ApprovalWindow 里注册，回执核验也在那边（checkSender）。
   approvals.registerIpc()
   reportWorkbench = registerReportWorkbench({ openApproval: id => approvals.request(id) })
+  companionTasks = registerCompanionTasks({
+    request: (method, pathname, body, subject) => bridge.companionRequest(method, pathname, body, subject),
+    openApproval: id => approvals.request(id),
+  })
+  registerAssistantSettings({
+    getStageWindow: () => win,
+    pagePath: path.join(here, '../renderer/index.html'),
+    request: (method, pathname, body) => bridge.companionRequest(method, pathname, body, 'owner'),
+  })
+  const memberEditor = new MemberEditorWindow()
+  memberEditor.registerIpc()
+  registerMemberManagement({
+    getStageWindow: () => win,
+    pagePath: path.join(here, '../renderer/index.html'),
+    request: (method, pathname, body) => bridge.companionRequest(method, pathname, body, 'owner'),
+    allowWindow: event => memberEditor.allowed(event),
+    parentOf: event => BrowserWindow.fromWebContents(event.sender) ?? win,
+    changed: () => {
+      if (win && !win.isDestroyed()) win.webContents.send('members-changed')
+      memberEditor.notifyChanged()
+    },
+  })
+  ipcMain.handle('member-editor-open', (event, id: unknown) => {
+    const stagePage = pathToFileURL(path.join(here, '../renderer/index.html')).href
+    if (!stageSender(event) || event.senderFrame?.url !== stagePage) return { ok: false }
+    if (id !== null && (typeof id !== 'string' || !id.trim() || id.length > 256)) return { ok: false }
+    memberEditor.open({ memberId: id as string | null })
+    return { ok: true }
+  })
   ipcMain.handle('report-workbench-open', event => {
     if (!stageSender(event)) return { ok: false }
     reportWorkbench?.open()
     return { ok: true }
   })
+  ipcMain.handle('companion-tasks-open', event => {
+    if (!stageSender(event)) return { ok: false }
+    companionTasks?.open()
+    return { ok: true }
+  })
   // 阅读视图的五条通道（会话/字节/页许可/资源/回报）都在控制器里注册并核对发送方。
   docView.registerIpc()
   wpsView.registerIpc()
+  officeView.registerIpc()
 
   ipcMain.handle('runtime-start', async (_event, profile?: unknown) => {
     if (!host) return { ok: false }
@@ -2763,6 +3079,8 @@ if (!gotLock) {
   })
 
   void app.whenReady().then(() => {
+    // Windows 的通知必须挂在稳定的应用标识上；开发态不设会让提醒静默不显示。
+    if (process.platform === 'win32') app.setAppUserModelId('com.dsh.pet')
     applyPlatformWindowTweaks()
     // 唤醒应答的常驻播放进程：把 PowerShell 冷启动与 Add-Type 编译挪到启动阶段。
     // 不 await：预热在后台跑，失败时 playOneShot 会回退到一次性脚本。
@@ -2798,6 +3116,9 @@ if (!gotLock) {
       { mainDir: here, dshHome: dshHome(), instanceId: randomUUID(), layout },
     )
     host.start()
+
+    reminderTimer = setInterval(() => { void deliverRemindersOnce() }, 3_000)
+    reminderTimer.unref?.()
 
     // 全局快捷键：任何时候按下都唤起输入框。
     //
@@ -2888,6 +3209,28 @@ if (!gotLock) {
       },
       // 事件逐条转发：界面是团队状态的投影，不是自己猜出来的。
       onEvent: event => {
+        if (event.type === 'desktop/command') {
+          void handleDesktopCommand(event.payload)
+          return
+        }
+        if (event.type === 'notice') {
+          const payload = (event.payload ?? {}) as { kind?: unknown; text?: unknown; memberId?: unknown; at?: unknown }
+          // 断线重连会重放事件环里的旧通知；超过一小时的不再弹。
+          if (typeof payload.at === 'number' && Date.now() - payload.at > 3_600_000) return
+          const text = typeof payload.text === 'string'
+            ? payload.text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, ' ').slice(0, 800) : ''
+          if (!text) return
+          const kind = payload.kind === 'mail' ? 'mail' : 'member'
+          sendToRenderer('member-notice', { kind, text, ...(typeof payload.memberId === 'string' ? { memberId: payload.memberId } : {}) })
+          try {
+            if (Notification.isSupported()) {
+              const notification = new Notification({ title: kind === 'mail' ? '邮件值守' : '成员通知', body: text.slice(0, 500) })
+              notification.on('click', () => openSettings('team'))
+              notification.show()
+            }
+          } catch (error) { console.error('[dsh-pet] member notice failed:', error) }
+          return
+        }
         if (event.type === 'session/update') {
           acceptSession(event.payload as SessionUpdate)
           return
@@ -2944,11 +3287,17 @@ app.on('before-quit', event => {
   playHost.stop()
   docView.dispose()
   wpsView.dispose()
+  officeView.close()
   wpsController?.dispose()
   bridge.dispose()
   // 退出过程中不该再留着一个能签发批准的窗口：IPC 摘掉、卡片关掉。
   approvals.dispose()
   reportWorkbench?.dispose()
+  companionTasks?.dispose()
+  if (reminderTimer) {
+    clearInterval(reminderTimer)
+    reminderTimer = null
+  }
   // 会议库句柄要关：Windows 上文件锁会一直挂着，进程退了目录都删不干净。
   // 放在 host 判空之前 —— 没开助理也得关。
   const closingMeeting = meetingRecorder?.close() ?? Promise.resolve()

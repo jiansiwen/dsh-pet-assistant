@@ -1,0 +1,66 @@
+:root { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; }
+body {
+  background: #14161a;
+  color: #e8edf2;
+  font: 13px/1.5 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  overflow: hidden;
+}
+
+.office-shell { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; }
+
+.office-toolbar {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  height: 46px; padding: 0 14px; border-bottom: 1px solid #2b3138;
+  background: #181c21;
+}
+.office-title { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; color: #d8e1e8; }
+.office-page { flex: none; color: #9fb0bd; font-variant-numeric: tabular-nums; }
+.office-btn {
+  flex: none; padding: 5px 11px; border: 1px solid #3c4650; border-radius: 6px;
+  background: #20262d; color: #d8e1e8; font: inherit; cursor: pointer;
+}
+.office-btn:hover:not(:disabled) { background: #2b343d; }
+.office-btn:disabled { opacity: .4; cursor: not-allowed; }
+.office-btn.ghost { border-color: transparent; background: transparent; color: #9fb0bd; }
+
+.office-stage {
+  flex: 1 1 auto; min-height: 0; overflow: auto; padding: 24px;
+  display: flex; align-items: flex-start; justify-content: center;
+  background: radial-gradient(circle at 50% 0, #262c33 0, #14161a 62%);
+}
+.office-stage.is-fullscreen { padding: 8px; }
+
+/* docx-preview 生成的页面：一次只显示一页，zoom 由脚本按窗口大小计算。 */
+.office-stage .docx-wrapper { background: transparent !important; padding: 0 !important; display: contents; }
+.office-stage section.docx {
+  display: none; margin: 0 auto !important; background: #fff !important;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .45); transform-origin: top center;
+}
+.office-stage section.docx:first-of-type { display: block; }
+
+/* pptx-preview 自己带翻页控件；窗口工具栏已有同一组按钮，隐藏重复控件。 */
+.office-stage .pptx-preview-wrapper-pagination,
+.office-stage .pptx-preview-wrapper-next { display: none !important; }
+.office-stage .pptx-preview-wrapper { margin: 0 auto; background: #fff; box-shadow: 0 8px 30px rgba(0, 0, 0, .45); }
+
+.office-image {
+  display: block; margin: auto; max-width: 100%; max-height: calc(100vh - 110px);
+  object-fit: contain; background: #fff; box-shadow: 0 8px 30px rgba(0, 0, 0, .45);
+  user-select: none;
+}
+
+.office-state {
+  position: absolute; inset: 46px 0 0; display: flex; align-items: center; justify-content: center;
+  gap: 12px; color: #b8c6d1; background: rgba(20, 22, 26, .76); z-index: 2;
+}
+.office-error { color: #ffb8ae; }
+.office-shell:fullscreen .office-state { inset: 46px 0 0; }
+
+@media (max-width: 720px) {
+  .office-toolbar { gap: 5px; padding: 0 8px; }
+  .office-btn { padding: 5px 8px; }
+  .office-page { display: none; }
+}

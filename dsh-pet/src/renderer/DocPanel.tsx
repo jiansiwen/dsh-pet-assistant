@@ -10,7 +10,7 @@
  * （§2.11：不能伪造 UI 批准）。撤销可以直接传路径 —— 那是把权限交回去，方向是安全的。
  */
 import { useCallback, useEffect, useState } from 'react'
-import { OUTLINE_EXTENSIONS } from '../main/doc-formats.js'
+import { OFFICE_EXTENSIONS, OUTLINE_EXTENSIONS } from '../main/doc-formats.js'
 import { formatDate, formatSize, progressLabel, sectionLabel, shortenDir } from './doc-panel.js'
 import type { DocRoots, DocState } from './types.js'
 import './doc.css'
@@ -26,6 +26,7 @@ interface DocPanelProps {
   /** 正在出声。停止按钮只在有声可停的时候才有意义。 */
   readonly speaking: boolean
   readonly onOpen: (path: string) => void
+  readonly onRead: (path: string) => void
   readonly onExplain: (path: string, from: number) => void
   readonly onAsk: (index: number, question: string) => void
   readonly onStop: () => void
@@ -40,6 +41,7 @@ export default function DocPanel({
   busy,
   speaking,
   onOpen,
+  onRead,
   onExplain,
   onAsk,
   onStop,
@@ -92,6 +94,9 @@ export default function DocPanel({
                     <button type="button" className="doc-btn" disabled={busy} onClick={() => onOpen(hit.path)}>
                       打开
                     </button>
+                    {OFFICE_EXTENSIONS.some(extension => hit.path.toLowerCase().endsWith(extension)) && (
+                      <button type="button" className="doc-btn" disabled={busy} onClick={() => onRead(hit.path)}>逐页阅读</button>
+                    )}
                     <button
                       type="button"
                       className="doc-btn primary"
@@ -161,6 +166,9 @@ export default function DocPanel({
             <button type="button" className="doc-btn" disabled={busy} onClick={() => onOpen(outline.path)}>
               用系统关联打开
             </button>
+            {OFFICE_EXTENSIONS.some(extension => outline.path.toLowerCase().endsWith(extension)) && (
+              <button type="button" className="doc-btn" disabled={busy} onClick={() => onRead(outline.path)}>逐页阅读 / 演示</button>
+            )}
             {/* 没在出声的时候不摆一个按了也没反应的停止键。 */}
             {speaking && (
               <button type="button" className="doc-btn danger" onClick={onStop}>
@@ -251,11 +259,11 @@ export default function DocPanel({
           东西坏了；提前写明只有 Markdown 和纯文本能讲，他就知道该换一份还是该等着。
         */}
         <p className="doc-hint">
-          能逐段讲解：Markdown、纯文本（{OUTLINE_EXTENSIONS.join(' ')}）。
+          能逐段讲解：Markdown、纯文本、可提取文字的 PDF、Word .docx、PowerPoint .pptx（{OUTLINE_EXTENSIONS.join(' ')}）。
+          docx/pptx 可以逐页阅读，pptx 还支持全屏演示；PPTX 会优先用本机 PowerPoint 只读导出每页画面。
+          讲解时会自动翻到对应页/幻灯片；追问打断后页面保留，继续讲解会重新对齐。
           <br />
-          只能用系统关联打开、讲不了：PDF、Word、Excel、PPT、图片 —— 这些的结构化解析还没做。
-          <br />
-          带宏的文档（.docm .xlsm .pptm）和可执行文件一律不开。
+          只能用系统关联打开、讲不了：旧版 .doc / .ppt、Excel、图片；带宏的文档（.docm .xlsm .pptm）和可执行文件一律不开。
         </p>
       </section>
     </div>

@@ -673,6 +673,15 @@
   cursor: pointer;
 }
 
+.pet-management .management-button.danger {
+  border-color: #d9a6a1;
+  color: #a63c35;
+}
+
+.pet-management .management-button.danger:hover:not(:disabled) {
+  background: #fdf0ef;
+}
+
 .pet-management .management-sleep,
 .pet-management .management-voice {
   display: flex;

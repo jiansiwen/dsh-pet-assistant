@@ -140,12 +140,12 @@ function openRuntime(dir: string, tracker: FakeTracker, options: FixtureOptions)
           snapshot,
           validate: () => {
             const current = memories.get(memoryId, Date.now())
-            return current !== null && current.status !== 'expired'
+            return current !== null && current.status !== 'expired' && current.revision === before.revision
               && current.text === before.text && current.topic === before.topic
           },
           execute: () => {
             const updated = memories.revise(memoryId,
-              { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'desktop-shell', isUser: true } }, Date.now())
+              { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'desktop-shell', isUser: true }, expectedRevision: before.revision }, Date.now())
             if (!updated) throw new Error('改写失败：这条记忆已不存在或已失效')
             return { edited: true, id: updated.id, revision: updated.revision }
           },

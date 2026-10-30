@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 成员编辑窗口只加载本目录的脚本与样式；所有成员数据都经 preload 走固定 IPC，页面不发网络请求。 -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  />
+  <title>团队成员</title>
+  <link rel="stylesheet" href="./member-editor.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script src="./member-editor.js"></script>
+</body>
+</html>

@@ -34,7 +34,7 @@
  * 点名专家时改走 `ctx.subagents.start()`，每次委派有独立 run.result，attribution='task'。
  */
 import http from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -49,6 +49,8 @@ import type { AssistantApprovalService, AssistantProposal, AssistantSubmission }
 import { SessionMirror, type MirrorEvent, type SessionResult } from './session-mirror.ts'
 import type { WorkbenchHandler } from './workbench.ts'
 import type { IntakeResult } from './evidence-intake.ts'
+import { CompanionError, type CompanionRuntimePort, type CompanionSubject } from './companion-contract.ts'
+import { DesktopCommands } from './desktop-commands.ts'
 
 /** 桥接感知到的最小 agent 形状（注入主会话用；团队委派需要完整 Agent）。 */
 export interface BridgeAgent {
@@ -142,6 +144,8 @@ export type BridgeEventType =
   | 'proactive'
   | 'team/snapshot'
   | 'session/update'
+  | 'desktop/command'
+  | 'notice'
   | TeamEventType
 
 /**
@@ -547,6 +551,7 @@ export function latestTurnEnded(events: readonly MirrorEvent[]): boolean {
 
 export class SessionBridge {
   private readonly options: SessionBridgeOptions
+  private readonly desktopCommands: DesktopCommands
   private server: http.Server | null = null
   private port = 0
   private token = ''
@@ -555,6 +560,11 @@ export class SessionBridge {
   private agent: BridgeAgent | null = null
   private teamAgent: Agent | null = null
   private team: TeamService | null = null
+  private companion: CompanionRuntimePort | null = null
+  private chatContextProvider: (() => string | null) | null = null
+  private readonly companionOwnerToken = randomUUID()
+  private readonly companionExecutorToken = randomUUID()
+  private readonly companionRequests = new Set<Promise<void>>()
 
   /** 解析好的桌面宠物目录；null = 没找到（召唤只绑会话，提示用户手动启动）。 */
   get petDir(): string | null {
@@ -609,6 +619,12 @@ export class SessionBridge {
     const dir = path.join(options.dshHome, 'personal-assistant')
     this.infoPath = path.join(dir, 'bridge.json')
     this.approvalPath = path.join(dir, 'bridge-approval.json')
+    this.desktopCommands = new DesktopCommands(event => this.push(event))
+  }
+
+  /** 宿主工具驱动桌宠的一次性命令；结果由 /companion/v1/desktop/result 带回。 */
+  requestDesktopCommand(command: string, payload: unknown, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> {
+    return this.desktopCommands.request(command, payload, options)
   }
 
   get bound(): boolean {
@@ -653,8 +669,10 @@ export class SessionBridge {
       this.stopFeed()
       this.mirror.close()
       this.failPending('主会话绑定已变化，旧请求不再结算')
-      this.teamAgent = null
       this.agent = agent
+      // 桌面点名成员的父代理就是被绑定的主会话；不能等第一次桌面团队工具执行后才设置，
+      // 否则从桌面直接点名成员会退回主会话队列。
+      this.teamAgent = agent as unknown as Agent
       this.mirror = new SessionMirror(agent, payload => this.push({ type: 'session/update', payload }))
     }
     await this.ensureListening()
@@ -830,8 +848,30 @@ export class SessionBridge {
     this.teamAgent = agent
   }
 
+  /** 下一次宠物对话前取一次网页上下文；用完即消费，不重复带入后续对话。 */
+  setChatContextProvider(provider: () => string | null): void {
+    this.chatContextProvider = provider
+  }
+
+  attachCompanion(runtime: CompanionRuntimePort, approvals: ApprovalService): () => void {
+    if (this.closed) throw new Error('桥接已关闭')
+    if (this.companion && this.companion !== runtime) throw new Error('普通任务运行时已挂载')
+    if (this.approvals && this.approvals !== approvals) throw new Error('任务必须共用审批服务')
+    this.companion = runtime
+    this.approvals = approvals
+    if (this.advertised) this.writeApprovalCredential()
+    this.notifyApprovalSnapshot()
+    return () => {
+      if (this.companion !== runtime) return
+      this.companion = null
+      if (!this.team) this.approvals = null
+      if (this.advertised && !this.closed) this.writeApprovalCredential()
+    }
+  }
+
   /** 接上团队服务与审批服务，开始转发任务状态事件。 */
   attachTeam(team: TeamService, approvals: ApprovalService): void {
+    if (this.companion && this.approvals !== approvals) throw new Error('任务必须共用审批服务')
     this.team = team
     this.approvals = approvals
     this.teamCursor = 0
@@ -854,7 +894,7 @@ export class SessionBridge {
       this.teamTimer = null
     }
     this.team = null
-    this.approvals = null
+    if (!this.companion) this.approvals = null
     this.teamCursor = 0
     if (this.advertised) this.writeApprovalCredential()
     this.notifyApprovalSnapshot()
@@ -1518,6 +1558,8 @@ export class SessionBridge {
   dispose(): Promise<void> {
     if (this.closed) return this.disposal
     this.closed = true
+    this.desktopCommands.dispose()
+    this.companion?.stopAccepting()
     this.assistantApprovals?.invalidateAll()
     this.stopFeed()
     this.mirror.close()
@@ -1669,6 +1711,8 @@ export class SessionBridge {
         approvalToken: approvals?.approvalCapabilityToken,
         reportApprovalToken: this.reportApprovals?.approvalCapabilityToken,
         assistantApprovalToken: this.assistantApprovals?.approvalCapabilityToken,
+        companionOwnerToken: this.companionOwnerToken,
+        companionExecutorToken: this.companionExecutorToken,
         epoch: this.epoch,
         port: this.port,
       })}\n`,
@@ -1678,6 +1722,81 @@ export class SessionBridge {
 
   private authorized(url: URL): boolean {
     return url.searchParams.get('token') === this.token
+  }
+
+  private presentedCompanionToken(request: http.IncomingMessage): string | null {
+    const header = request.headers['x-dsh-companion-token']
+    return typeof header === 'string' ? header : null
+  }
+
+  private verifyToken(presented: string | null, expected: string): boolean {
+    if (presented === null) return false
+    const a = Buffer.from(presented)
+    const b = Buffer.from(expected)
+    return a.length === b.length && timingSafeEqual(a, b)
+  }
+
+  private async handleCompanion(
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+    url: URL,
+    subject: CompanionSubject,
+  ): Promise<void> {
+    if (url.pathname === '/companion/v1/desktop/result') {
+      if (request.method !== 'POST') { this.respond(response, 405, { accepted: false }); return }
+      if (subject !== 'owner') { this.respond(response, 403, { ok: false, code: 'FORBIDDEN', message: '桌面命令回执只接受本机所有者凭据' }); return }
+      try {
+        const accepted = this.desktopCommands.resolve(JSON.parse(await this.readBody(request)) as unknown)
+        this.respond(response, accepted ? 200 : 409, { accepted })
+      } catch { this.respond(response, 400, { accepted: false }) }
+      return
+    }
+    const runtime = this.companion
+    if (!runtime) {
+      this.respond(response, 503, { ok: false, code: 'COMPANION_UNAVAILABLE', message: '普通任务运行时未装配' })
+      return
+    }
+    try {
+      const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
+      const body = hasBody ? JSON.parse(await this.readBody(request)) as unknown : null
+      const result = await runtime.request(request.method ?? 'GET', url.pathname, body, subject, url.searchParams)
+      this.respond(response, result.status, result.body)
+    } catch (error) {
+      if (error instanceof CompanionError) {
+        this.respond(response, error.status, { ok: false, code: error.code, message: error.message })
+        return
+      }
+      this.respond(response, 400, { ok: false, error: error instanceof Error ? error.message : '请求格式无效' })
+    }
+  }
+
+  private async handleExecutor(
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    const runtime = this.companion
+    if (!runtime) {
+      this.respond(response, 503, { ok: false, code: 'COMPANION_UNAVAILABLE', message: '普通任务运行时未装配' })
+      return
+    }
+    try {
+      const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
+      const body = hasBody ? JSON.parse(await this.readBody(request)) as unknown : null
+      const result = await runtime.request(request.method ?? 'GET', url.pathname, body, 'executor', url.searchParams)
+      this.respond(response, result.status, result.body)
+    } catch (error) {
+      if (error instanceof CompanionError) {
+        this.respond(response, error.status, { ok: false, code: error.code, message: error.message })
+        return
+      }
+      this.respond(response, 400, { ok: false, error: error instanceof Error ? error.message : '请求格式无效' })
+    }
+  }
+
+  private trackCompanionRequest(work: Promise<void>): void {
+    this.companionRequests.add(work)
+    void work.finally(() => this.companionRequests.delete(work))
   }
 
   private respond(response: http.ServerResponse, status: number, body: unknown): void {
@@ -1723,6 +1842,24 @@ export class SessionBridge {
     }
     if (request.method === 'POST' && url.pathname === '/approval') {
       this.handleApproval(request, response).catch(() => this.respond(response, 500, { error: 'approval failed' }))
+      return
+    }
+    // 普通任务与执行器各有独立凭据：聊天令牌只能读/建请求，不能替用户回应或批准。
+    if (url.pathname.startsWith('/executor/v1/')) {
+      if (!this.verifyToken(this.presentedCompanionToken(request), this.companionExecutorToken)) {
+        this.respond(response, 403, { error: 'executor credential rejected' })
+        return
+      }
+      this.trackCompanionRequest(this.handleExecutor(request, response, url))
+      return
+    }
+    if (url.pathname.startsWith('/companion/v1/')) {
+      const owner = this.verifyToken(this.presentedCompanionToken(request), this.companionOwnerToken)
+      if (!owner && !this.authorized(url)) {
+        this.respond(response, 401, { error: 'unauthorized' })
+        return
+      }
+      this.trackCompanionRequest(this.handleCompanion(request, response, url, owner ? 'owner' : 'client'))
       return
     }
     if (!this.authorized(url)) {
@@ -2118,9 +2255,14 @@ export class SessionBridge {
       this.pump()
       return
     }
+    // 网页上下文只带入紧接着的这一次对话；内容是材料，不是指令或授权。
+    let context: string | null = null
+    if (!text.startsWith('/')) {
+      try { context = this.chatContextProvider?.() ?? null } catch { context = null }
+    }
     // 先造消息、留住它的稳定 id：因果折叠按它在 session.events 里定位本消息所属轮次，超时按它撤回。
     const message = createUserMessage({
-      content: [{ type: 'text', text }],
+      content: [{ type: 'text', text: context ? `${context}\n${text}` : text }],
       // 宠物面板输入的就是用户本人的话。plugin 来源会被 dsh web 折叠成
       // 「上下文注入」一行，用户在网页上看不到自己说了什么。
       source: { kind: 'user' },
@@ -2203,6 +2345,11 @@ export class SessionBridge {
    */
   pushProactive(message: string, suggestDisable: boolean): void {
     this.push({ type: 'proactive', message, payload: { suggestDisable } })
+  }
+
+  /** 成员值守结果通知；正文由成员模型生成，桌面只显示，不据此执行动作。 */
+  pushNotice(kind: 'mail' | 'member', text: string, memberId?: string): void {
+    this.push({ type: 'notice', payload: { kind, text: text.slice(0, 2_000), at: Date.now(), ...(memberId ? { memberId } : {}) } })
   }
 
   private push(event: Omit<BridgeEvent, 'seq' | 'epoch'>): void {

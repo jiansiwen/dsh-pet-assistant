@@ -33,8 +33,12 @@ import type { EvidenceIntakeOutcome } from '../evidence-types.js'
 import type { FirstRunReport, FirstRunStep } from '../main/first-run.js'
 import type { SessionCommand, SessionResult, SessionUpdate } from '../session-types.js'
 import type { Box } from './stage-layout.js'
+import type { AssistantSettingsPage, AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
+import type { MemberAction, MemberApi, MemberCommandInputs, MemberDraft, MemberEditorContext, MemberResult } from '../member-types.js'
 
-export type SettingsPage = 'general' | 'team' | 'doc' | 'meeting'
+export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?: string }
+
+export type SettingsPage = 'general' | 'team' | 'doc' | 'meeting' | Exclude<AssistantSettingsPage, 'agent'>
 
 export type { CompanionState, MeetingConsentInput, MeetingRuntimeState, MinutesRecord, SkinOverrides, TranscriptSegment }
 
@@ -406,7 +410,22 @@ export interface MeetingMinutesEditResult {
   readonly digest?: string
 }
 
-export interface PetApi {
+export interface MemberEditorApi {
+  context(): Promise<MemberEditorContext | null>
+  close(): Promise<{ ok: boolean }>
+  membersState(): Promise<MemberResult>
+  memberCommand<A extends MemberAction>(action: A, input: MemberCommandInputs[A]): Promise<MemberResult>
+  memberAssist(input: { request: string; current?: MemberDraft }): Promise<MemberResult>
+  onContext(callback: (context: MemberEditorContext) => void): () => void
+  onChanged(callback: () => void): () => void
+}
+
+export interface PetApi extends MemberApi {
+  /** 用主助理模型把一句话需求转成成员草稿；只返回候选，不保存。 */
+  memberAssist(input: { request: string; current?: MemberDraft }): Promise<MemberResult>
+  /** 打开独立的成员编辑窗口；null 表示新建。 */
+  openMemberEditor(memberId?: string | null): Promise<{ ok: boolean }>
+  onMembersChanged(callback: () => void): () => void
   getState(includeOperations?: boolean): Promise<PetState>
   getSession(beforeSeq?: number, bindingId?: string): Promise<SessionResult>
   sessionCommand(command: SessionCommand): Promise<SessionResult>
@@ -419,6 +438,10 @@ export interface PetApi {
   onOverlayError(callback: (message: string) => void): () => void
   overlayState(open: boolean, boxes: Box[], settingsOpen: boolean): void
   saveSettings(patch: PetSettingsPatch): Promise<{ ok: boolean }>
+  assistantSettingsState(): Promise<AssistantSettingsResult>
+  assistantSettingsSave(section: AssistantSettingsSection, input: unknown): Promise<AssistantSettingsResult>
+  /** 打开已有任务与提醒窗口；各项操作仍沿用窗口内的确认与审批。 */
+  openCompanionTasks(): Promise<{ ok: boolean }>
   voiceApiState(): Promise<VoiceApiResult>
   voiceApiSave(input: VoiceApiInput): Promise<VoiceApiResult>
   voiceApiRemove(id: string): Promise<VoiceApiResult>
@@ -503,6 +526,8 @@ export interface PetApi {
   onWakeGreetingFinished(callback: () => void): void
   /** 桥接事件：成员/任务/提案变化都从这里来，界面只是投影。 */
   onTeamEvent(callback: (event: BridgeEventPayload) => void): void
+  /** 成员值守结果（邮件分析等）的桌面提示；点击系统通知会打开团队页。 */
+  onMemberNotice(callback: (notice: MemberNotice) => void): () => void
   /** 壳的生命周期状态：启动握手的阶段、失败原因、角色可见性、专注模式。 */
   onCompanionState(callback: (state: CompanionState) => void): void
   /** 角色该不该显示。false 时界面把整个舞台卸掉，场景时钟随之停下。 */
@@ -542,6 +567,8 @@ export interface PetApi {
   explainDoc(path: string, from?: number, speak?: boolean, assistantId?: string): Promise<DocReplyResult>
   /** 就某一段追问。段号来自界面上点的那一条，不从消息里猜。 */
   askDoc(path: string, index: number, question: string, assistantId?: string): Promise<DocReplyResult>
+  /** 打开 docx/pptx 的逐页阅读/演示窗口；路径仍由主进程重新授权。 */
+  officeOpen(path: string): Promise<{ ok: boolean; error?: string }>
   docRoots(): Promise<DocRoots>
   /** 弹原生目录选择框加一个授权目录。目录只能由用户亲手挑，不能由参数指定。 */
   addDocRoot(): Promise<DocRoots>
@@ -561,6 +588,9 @@ export interface PetApi {
   meetingStart(consent: MeetingConsentInput): Promise<MeetingStartResult>
   /** 请求停止当前会议：主进程先让渲染层停流冲刷，再结算转写。 */
   meetingStop(meetingId?: string): Promise<SimpleOkResult>
+  /** 子助理发起的会议启动参数；面板挂载时取一次，同一 requestId 只处理一次。 */
+  meetingTakeCommand(): Promise<{ requestId: string; consent: MeetingConsentInput } | null>
+  onMeetingCommand(callback: (command: { requestId: string; consent: MeetingConsentInput }) => void): () => void
   /**
    * 推一块 base64 PCM（16kHz mono Int16）。主进程收到立即加密落盘。
    * meta 是分轨时间轴（音轨、轨内序号、起点、原始采样率、16k 帧数）；不带就按旧协议当麦克风块。
@@ -624,6 +654,7 @@ export interface PetApi {
 declare global {
   interface Window {
     petApi: PetApi
+    memberEditorApi: MemberEditorApi
   }
 }
 

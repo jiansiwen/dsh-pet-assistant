@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRun, SubagentStartRequest, SubagentResult } from '@deepseek-ai/dsh-subagent'
+import type { SubagentActivation, SubagentActivationSpec, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import type { ToolGuard } from '@deepseek-ai/dsh-tools'
 import { ApprovalService } from '../src/approval.ts'
 import { Config } from '../src/config.ts'
@@ -23,20 +23,21 @@ function fixture(t: TestContext, options: Partial<TeamOptions> = {}) {
   const approvals = new ApprovalService(store, { ttlMs: 60_000, runtimeEpoch: 'test' })
   const startupGuards: ToolGuard[] = []
   const childGuards: ToolGuard[] = []
-  const requests: SubagentStartRequest[] = []
+  const requests: SubagentActivationSpec[] = []
   const parent = { id: 'parent' } as Agent
   const child = { id: 'child' } as Agent
   const childCtx = { agent: child, tools: { guard: (guard: ToolGuard) => { childGuards.push(guard); return () => undefined } } }
   Object.assign(child, { ctx: childCtx })
   let disposed = 0
-  const run: SubagentRun = { id: child.id, localAgent: child, result: Promise.resolve(completed), async dispose() { disposed += 1 } }
-  let start: (request: SubagentStartRequest) => Promise<SubagentRun> = async () => run
+  const run: SubagentActivation = { childId: child.id, messageId: 'test-message' as never, result: Promise.resolve(completed), async dispose() { disposed += 1 } }
+  let start: (request: SubagentActivationSpec) => Promise<SubagentActivation> = async () => run
   const host = {
     tools: {
       get: (name: string, scope: unknown) => scope === parent && ['read', 'grep', 'personal_assistant_set_team_mode', 'desktop_team_assign', 'bash'].includes(name),
       guard: (guard: ToolGuard) => { startupGuards.push(guard); return () => { startupGuards.splice(startupGuards.indexOf(guard), 1) } },
     },
-    subagents: { start: async (_provider: string, request: SubagentStartRequest) => { requests.push(request); return start(request) } },
+    agents: { get: (id: string) => id === child.id ? child : undefined },
+    subagents: { startActivation: async (request: SubagentActivationSpec) => { requests.push(request); return start(request) } },
   }
   const team = new TeamService(host as never, store, {
     teamId: 'test', provider: 'spawn', maxConcurrentInference: 1, maxConcurrentSideEffect: 1,
@@ -49,11 +50,12 @@ function fixture(t: TestContext, options: Partial<TeamOptions> = {}) {
     setStart: (fn: typeof start) => { start = fn }, disposed: () => disposed }
 }
 
-test('总助理的只读任务使用父作用域允许集合，不继承插件写工具和再委派', async t => {
+test('总助理的只读任务使用独立运行与只读守卫，不放行插件写工具和再委派', async t => {
   const f = fixture(t)
   const task = f.team.submitTask({ goal: '只读分析', ownerId: 'member-tangseng', toolScope: 'read-only' })
   const outcome = await f.team.runTask(task.taskId, f.parent, signal())
-  assert.deepEqual(f.requests[0]?.toolFilter, { allow: ['read', 'grep'] })
+  assert.equal(f.requests[0]?.delivery, 'caller')
+  assert.equal(f.requests[0]?.request.parent, f.parent)
   assert.equal(outcome?.task.status, 'review')
   assert.equal(f.startupGuards.length, 0)
   assert.equal(f.disposed(), 1)
@@ -118,7 +120,7 @@ test('非零累计预算、副作用及未核实 provider 明确拒绝启动', a
 
 test('启动中即计入并发额度，同任务不能重复领取', async t => {
   const f = fixture(t)
-  const start = deferred<SubagentRun>()
+  const start = deferred<SubagentActivation>()
   f.setStart(() => start.promise)
   const task = f.team.submitTask({ goal: '任务一' })
   const pending = f.team.runTask(task.taskId, f.parent, signal())
@@ -195,7 +197,7 @@ test('启动失败和结果基础设施异常都结算运行', async t => {
 
 test('取消与正常完成竞争时仅有一条取消终态，退出等待启动阶段收尾', async t => {
   const f = fixture(t)
-  const start = deferred<SubagentRun>()
+  const start = deferred<SubagentActivation>()
   f.setStart(() => start.promise)
   const task = f.team.submitTask({ goal: '取消竞争' })
   const pending = f.team.runTask(task.taskId, f.parent, signal())
@@ -230,11 +232,12 @@ test('恢复只对账，不重发中断任务或未知副作用，且重复恢�
   assert.equal(f.requests.length, 0)
 })
 
-test('成员只读权限不能被任务扩大，额外禁令也进入允许集合过滤', async t => {
+test('成员只读权限不能被任务扩大，额外禁令也进入守卫过滤', async t => {
   const f = fixture(t, { denyExpertTools: ['grep'] })
   const task = f.team.submitTask({ goal: '范围交集', ownerId: 'member-wukong', toolScope: 'side-effect' })
   assert.equal((await f.team.runTask(task.taskId, f.parent, signal()))?.task.status, 'review')
-  assert.deepEqual(f.requests[0]?.toolFilter, { allow: ['read'] })
+  assert.ok(f.childGuards[0]!({ agent: f.child, name: 'grep', signal: signal() } as never))
+  assert.equal(f.childGuards[0]!({ agent: f.child, name: 'read', signal: signal() } as never), undefined)
 })
 
 test('提供者主动返回 aborted 映射为取消而不是失败', async t => {
@@ -284,7 +287,7 @@ test('默认配置不设累计预算：未指定预算的任务直接启动；�
   assert.equal(f.requests.length, 1)
   assert.equal(started?.task.budgetTokens, 0)
   assert.equal(started?.task.status, 'review')
-  assert.equal(f.requests[0]?.agentOptions, undefined, '不覆盖子代理的单次输出上限，沿用父会话')
+  assert.equal(f.requests[0]?.request.agentOptions, undefined, '不覆盖子代理的单次输出上限，沿用父会话')
   const refused = await f.team.runTask(f.team.submitTask({ goal: '显式预算', budgetTokens: 5000 }).taskId, f.parent, signal())
   assert.equal(refused?.task.status, 'review')
   assert.equal(refused?.stopReason, 'budget-unsupported')
@@ -303,5 +306,70 @@ test('只读子代理能用宿主自身层的 structured_output 交回报告，r
   })
   await f.team.runTask(f.team.submitTask({ goal: '交回结构化结论' }).taskId, f.parent, signal())
   assert.equal(f.childGuards[0]!({ agent: f.child, name: 'structured_output', signal: signal() } as never), undefined)
-  for (const name of ['report', 'structured_output']) assert.equal(f.requests[0]?.toolFilter?.allow?.includes(name), false, name)
+  assert.ok(f.requests[0]?.request.outputSchema)
+})
+
+test('专家查询、事件、领取和取消都隔离同团队同成员的普通任务', async t => {
+  const f = fixture(t)
+  const expert = f.team.submitTask({ goal: '旧任务没有运行域元数据' })
+  const companion = { ...expert, taskId: 'companion-task', goal: '同库普通任务' }
+  f.store.insertTask(companion)
+  f.store.saveCompanionMeta({ taskId: companion.taskId, runtimeScope: 'companion', principalId: 'owner', deviceId: 'device',
+    parentTaskId: null, kind: 'agent', inputRef: 'input', blocker: null })
+  f.store.insertRun({ runId: 'companion-run', taskId: companion.taskId, assistantId: companion.ownerId, childSessionId: null,
+    messageId: null, state: 'succeeded', stopReason: 'completed', outputDigest: null, startedAt: 1, endedAt: 2 })
+  for (let index = 0; index < 205; index += 1) {
+    f.store.appendEvent('task/updated', { index }, { taskId: companion.taskId })
+  }
+  const last = f.store.appendEvent('task/updated', { taskId: expert.taskId }, { taskId: expert.taskId })
+  assert.equal(f.store.getTaskRuntimeScope(expert.taskId), 'team')
+  assert.equal(f.team.getTask(companion.taskId), null)
+  assert.deepEqual(f.team.listTasks().map(task => task.taskId), [expert.taskId])
+  assert.deepEqual(f.team.listTasks({ teamId: 'test', status: 'created' }).map(task => task.taskId), [expert.taskId])
+  assert.deepEqual(f.team.listRuns(companion.taskId), [])
+  assert.deepEqual(f.team.eventsSince(0, 2).map(event => event.seq), [1, last])
+  assert.equal(await f.team.runTask(companion.taskId, f.parent, signal()), null)
+  assert.equal(await f.team.cancelTask(companion.taskId), null)
+  assert.equal(await f.team.cancelWithReceipt(companion.taskId), null)
+  assert.throws(() => f.team.submitTask({ goal: '不允许跨运行域依赖', dependsOn: [companion.taskId] }))
+  assert.deepEqual((await f.team.runReady(f.parent, signal())).map(outcome => outcome.task.taskId), [expert.taskId])
+  assert.equal(f.requests.length, 1)
+  assert.deepEqual(f.store.getTask(companion.taskId), companion)
+  assert.equal(f.store.listRuns(companion.taskId)[0]?.state, 'succeeded')
+})
+
+test('重复释放共用进行中的 Promise，失败向上传递且能明确重试，不重新启动任务', async t => {
+  const f = fixture(t)
+  const release = deferred<void>()
+  let attempts = 0
+  f.setStart(async () => ({ ...f.run, async dispose() {
+    attempts += 1
+    if (attempts === 1) throw new Error('首次收尾释放失败')
+    if (attempts === 2) { await release.promise; throw new Error('退出释放失败') }
+  } }))
+  const task = f.team.submitTask({ goal: '释放重试' })
+  await f.team.runTask(task.taskId, f.parent, signal())
+  const first = f.team.dispose()
+  const second = f.team.dispose()
+  assert.equal(first, second)
+  assert.throws(() => f.team.submitTask({ goal: '释放中不能提交' }), /已经停止/)
+  await assert.rejects(f.team.runTask(task.taskId, f.parent, signal()), /已经停止/)
+  await assert.rejects(f.team.runReady(f.parent, signal()), /已经停止/)
+  assert.throws(() => f.team.help.openTask({ projectDir: 'unused', goal: '释放中不能开帮助任务' }), /已经停止/)
+  release.resolve()
+  await assert.rejects(first, AggregateError)
+  assert.equal(attempts, 2)
+  assert.equal(f.team.runningCount(), 1)
+  assert.equal(f.startupGuards.length, 1)
+  const retry = f.team.dispose()
+  assert.notEqual(retry, first)
+  assert.equal(f.team.dispose(), retry)
+  await retry
+  assert.equal(attempts, 3)
+  assert.equal(f.team.runningCount(), 0)
+  assert.equal(f.startupGuards.length, 0)
+  assert.equal(f.store.getTask(task.taskId)?.status, 'unknown')
+  assert.equal(f.requests.length, 1)
+  assert.equal(f.store.eventsSince(0).filter(event => event.type === 'run/ended').length, 1)
+  assert.equal(f.team.dispose(), retry)
 })

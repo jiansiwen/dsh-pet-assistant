@@ -7,16 +7,130 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import type { CompanionBlocker, CompanionCommand, CompanionHttpResult, CompanionInput, CompanionTaskKind, DesktopReminderDelivery, ReminderSchedule } from './companion-contract.ts'
+import { MemberDirectory, migrateMemberDirectory } from './member-directory.ts'
+
+export interface CompanionTaskMeta {
+  taskId: string
+  runtimeScope: 'team' | 'companion'
+  principalId: string
+  deviceId: string
+  parentTaskId: string | null
+  kind: CompanionTaskKind
+  inputRef: string
+  blocker: CompanionBlocker
+}
+
+export interface CompanionInputRecord {
+  inputRef: string
+  principalId: string
+  input: CompanionInput
+  digest: string
+  createdAt: number
+}
+
+export interface CompanionCommandRecord {
+  commandId: string
+  principalId: string
+  digest: string
+  pathname: string
+  command: CompanionCommand
+  epoch: string
+  taskId: string
+  proposalId: string
+  state: 'pending' | 'applied' | 'rejected'
+  result: CompanionHttpResult
+}
+
+export interface CompanionScheduleRecord {
+  scheduleId: string
+  taskId: string
+  revision: number
+  spec: ReminderSchedule
+  nextRunAt: number | null
+  enabled: boolean
+  schedulerOwner: string
+  generation: number
+  missedPolicy: 'coalesce'
+  grantRef: string
+}
+
+export interface ReminderGrantRecord {
+  grantRef: string
+  taskId: string
+  principalId: string
+  deviceId: string
+  operationId: string
+  taskRevision: number
+  generation: number
+  scopeDigest: string
+  enabled: boolean
+}
+
+export interface ReminderCycleRecord {
+  cycleId: string
+  scheduleId: string
+  generation: number
+  triggerAt: number
+  childTaskId: string
+  relatedBusinessTaskId: string | null
+  state: 'scheduled' | 'awaiting-response' | 'acknowledged' | 'snoozed' | 'cancelled' | 'unknown'
+  repeatIntervalMs: number
+  nextNagAt: number | null
+  snoozedUntil: number | null
+  ackActorId: string | null
+  ackAt: number | null
+  revision: number
+  grantRef: string
+}
+
+export interface ReminderDeliveryRecord extends DesktopReminderDelivery {
+  generation: number
+  grantRef: string
+  state: 'pending' | 'sending' | 'accepted' | 'failed-before-send' | 'unknown' | 'cancelled' | 'partial'
+  attemptCount: number
+  submittedAt: number | null
+  acceptedAt: number | null
+  receiptDigest: string | null
+  evidenceRefs: string[]
+}
+
+interface CompanionRecords {
+  task_meta: CompanionTaskMeta
+  companion_inputs: CompanionInputRecord
+  task_commands: CompanionCommandRecord
+  schedules: CompanionScheduleRecord
+  reminder_grants: ReminderGrantRecord
+  reminder_cycles: ReminderCycleRecord
+  deliveries: ReminderDeliveryRecord
+  companion_contexts: CompanionContextRecord
+}
+
+export interface CompanionContextRecord {
+  contextId: string
+  principalId: string
+  deviceId: string
+  url: string
+  title: string
+  selection: string
+  text: string
+  truncated: boolean
+  capturedAt: number
+  expiresAt: number
+  usedAt: number | null
+}
 
 /**
  * 业务库 schema 版本，单调递增；不兼容变更必须新增迁移步骤而不是原地改表。
  * v4：操作账本补成员、规范化目标、输入摘要、运行、执行开始时间与结果说明，重启后可直接定位复核。
  * v5：帮助任务（授权项目绑定）、改动提案（基线哈希与修订）、验证命令、unknown 人工复核；
  *     提案补基线哈希与审阅内容，操作账本补验收证据与人工复核结论。
+ * v9：通用成员扩展配置、独立用量、额度申请与重置基线账本。
  */
-export const TEAM_SCHEMA_VERSION = 5
+export const TEAM_SCHEMA_VERSION = 9
 
-export const ROLE_IDS = ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma'] as const
+export const ROLE_IDS = ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma', 'custom'] as const
 export type RoleId = (typeof ROLE_IDS)[number]
 
 /**
@@ -324,6 +438,11 @@ export const TEAM_EVENT_TYPES = [
   'operation/updated',
   'reply/delta',
   'reply/done',
+  'task.changed',
+  'task.artifact',
+  'approval.requested',
+  'approval.resolved',
+  'reminder.changed',
 ] as const
 export type TeamEventType = (typeof TEAM_EVENT_TYPES)[number]
 
@@ -513,6 +632,7 @@ function parseList(raw: string | null): string[] {
 /** 团队业务库。所有写操作都在这里，读取用只读投影方法。 */
 export class TeamStore {
   private readonly db: DatabaseSync
+  readonly directory: MemberDirectory
   /** 事务嵌套深度：内层调用跟随外层一起提交或回滚（SQLite 对嵌套 BEGIN 直接报错）。 */
   private transactionDepth = 0
 
@@ -521,7 +641,13 @@ export class TeamStore {
     this.db = new DatabaseSync(dbPath)
     this.db.exec('PRAGMA journal_mode = WAL')
     this.db.exec('PRAGMA foreign_keys = ON')
-    this.migrate()
+    try {
+      this.transaction(() => this.migrate())
+      this.directory = new MemberDirectory(this.db, body => this.transaction(body))
+    } catch (error) {
+      this.db.close()
+      throw error
+    }
   }
 
   /** 从库内建表；已存在的库按 user_version 逐步升级，失败即抛出，不启动采集与自动执行。 */
@@ -532,6 +658,13 @@ export class TeamStore {
       throw new Error(`team store schema ${current} is newer than supported ${TEAM_SCHEMA_VERSION}`)
     }
     if (current === TEAM_SCHEMA_VERSION) return
+    // v10：首版示例角色名（唐僧/孙悟空…）只是种子占位，未改过的一律换成通用名称。
+    if (current > 0 && current < 10) {
+      this.db.exec(`UPDATE assistants SET display_name = CASE role_id
+        WHEN 'tangseng' THEN '总助理' WHEN 'wukong' THEN '助理1' WHEN 'bajie' THEN '助理2'
+        WHEN 'shaseng' THEN '助理3' WHEN 'bailongma' THEN '助理4' ELSE display_name END
+        WHERE revision = 1 AND display_name IN ('唐僧','孙悟空','猪八戒','沙僧','白龙马')`)
+    }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS assistants (
@@ -755,6 +888,88 @@ export class TeamStore {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications (task_id, created_at)`)
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_operation ON operation_reviews (operation_id, created_at)`)
 
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS companion_identity (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        principal_id TEXT NOT NULL UNIQUE,
+        device_id TEXT NOT NULL UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS task_meta (
+        id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+        data TEXT NOT NULL CHECK(json_valid(data)),
+        runtime_scope TEXT GENERATED ALWAYS AS (json_extract(data, '$.runtimeScope')) STORED,
+        principal_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.principalId')) STORED,
+        parent_task_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.parentTaskId')) STORED,
+        CHECK(runtime_scope IN ('team', 'companion'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_meta_owner ON task_meta(principal_id, runtime_scope);
+      CREATE TABLE IF NOT EXISTS companion_inputs (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
+      CREATE TABLE IF NOT EXISTS task_commands (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data)),
+        proposal_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.proposalId')) STORED UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS schedules (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data)),
+        task_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.taskId')) STORED UNIQUE REFERENCES tasks(task_id),
+        enabled INTEGER GENERATED ALWAYS AS (json_extract(data, '$.enabled')) STORED,
+        next_run_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.nextRunAt')) STORED
+      );
+      CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
+      CREATE TABLE IF NOT EXISTS reminder_grants (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
+      CREATE TABLE IF NOT EXISTS reminder_cycles (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data)),
+        schedule_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.scheduleId')) STORED REFERENCES schedules(id),
+        generation INTEGER GENERATED ALWAYS AS (json_extract(data, '$.generation')) STORED,
+        trigger_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.triggerAt')) STORED,
+        state TEXT GENERATED ALWAYS AS (json_extract(data, '$.state')) STORED,
+        next_nag_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.nextNagAt')) STORED,
+        UNIQUE(schedule_id, generation, trigger_at)
+      );
+      CREATE INDEX IF NOT EXISTS idx_cycles_due ON reminder_cycles(state, next_nag_at);
+      CREATE TABLE IF NOT EXISTS deliveries (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data)),
+        cycle_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.cycleId')) STORED REFERENCES reminder_cycles(id),
+        occurrence_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.occurrenceId')) STORED,
+        channel TEXT GENERATED ALWAYS AS (json_extract(data, '$.channel')) STORED,
+        recipient_ref TEXT GENERATED ALWAYS AS (json_extract(data, '$.recipientRef')) STORED,
+        state TEXT GENERATED ALWAYS AS (json_extract(data, '$.state')) STORED,
+        UNIQUE(occurrence_id, channel, recipient_ref)
+      );
+      CREATE INDEX IF NOT EXISTS idx_deliveries_state ON deliveries(state);
+      CREATE TABLE IF NOT EXISTS companion_contexts (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data)),
+        principal_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.principalId')) STORED,
+        captured_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.capturedAt')) STORED,
+        expires_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.expiresAt')) STORED,
+        used_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.usedAt')) STORED
+      );
+      CREATE INDEX IF NOT EXISTS idx_contexts_owner ON companion_contexts(principal_id, captured_at);
+      CREATE TABLE IF NOT EXISTS channel_messages (
+        channel TEXT NOT NULL,
+        msgid TEXT NOT NULL,
+        received_at INTEGER NOT NULL,
+        PRIMARY KEY (channel, msgid)
+      );
+      CREATE TABLE IF NOT EXISTS artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+        evidence TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    `)
+    migrateMemberDirectory(this.db)
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
       .prepare('INSERT OR IGNORE INTO migrations (version, applied_at) VALUES (?, ?)')
@@ -821,6 +1036,14 @@ export class TeamStore {
     return rows.map((row) => this.toMember(row))
   }
 
+  /** 未结束的团队任务会继续尝试找成员；删除前必须先处理完。 */
+  activeTaskCount(assistantId: string): number {
+    const marks = TERMINAL_TASK_STATUSES.map(() => '?').join(', ')
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE owner_id = ? AND status NOT IN (${marks})`)
+      .get(assistantId, ...TERMINAL_TASK_STATUSES) as Row | undefined
+    return Number(row?.n ?? 0)
+  }
+
   getMember(assistantId: string): MemberConfig | null {
     const row = this.db.prepare('SELECT * FROM assistants WHERE assistant_id = ?').get(assistantId) as
       | Row
@@ -882,9 +1105,19 @@ export class TeamStore {
     return row ? this.toTask(row) : null
   }
 
-  listTasks(filter?: { status?: TaskStatus; teamId?: string }): Task[] {
+  getTaskRuntimeScope(taskId: string): 'team' | 'companion' | null {
+    const row = this.db.prepare(`SELECT COALESCE(m.runtime_scope, 'team') AS scope
+      FROM tasks t LEFT JOIN task_meta m ON m.id = t.task_id WHERE t.task_id = ?`).get(taskId) as Row | undefined
+    return row ? row.scope as 'team' | 'companion' : null
+  }
+
+  listTasks(filter?: { status?: TaskStatus; teamId?: string; runtimeScope?: 'team' | 'companion' }): Task[] {
     const clauses: string[] = []
     const params: (string | number)[] = []
+    if (filter?.runtimeScope) {
+      clauses.push(`COALESCE((SELECT runtime_scope FROM task_meta WHERE id = tasks.task_id), 'team') = ?`)
+      params.push(filter.runtimeScope)
+    }
     if (filter?.status) {
       clauses.push('status = ?')
       params.push(filter.status)
@@ -1562,8 +1795,93 @@ export class TeamStore {
   /** 只清理本应用拥有的过期事件，保留窗口按毫秒配置。 */
   pruneEvents(retentionMs: number): number {
     const cutoff = Date.now() - retentionMs
-    const result = this.db.prepare('DELETE FROM events_outbox WHERE created_at < ?').run(cutoff)
+    const result = this.db.prepare(`DELETE FROM events_outbox WHERE created_at < ?
+      AND NOT EXISTS (SELECT 1 FROM task_meta WHERE id = events_outbox.task_id AND runtime_scope = 'companion')`).run(cutoff)
     return Number(result.changes)
+  }
+
+  /** 记录一条已处理的渠道消息；重复的厂商 msgid 返回 false。 */
+  claimChannelMessage(channel: string, msgid: string, at: number): boolean {
+    return Number(this.db.prepare('INSERT OR IGNORE INTO channel_messages(channel, msgid, received_at) VALUES (?, ?, ?)')
+      .run(channel, msgid, at).changes) === 1
+  }
+
+  pruneChannelMessages(before: number): number {
+    return Number(this.db.prepare('DELETE FROM channel_messages WHERE received_at < ?').run(before).changes)
+  }
+
+  companionIdentity(): { principalId: string; deviceId: string } {
+    this.db.prepare('INSERT OR IGNORE INTO companion_identity VALUES (1, ?, ?)').run(randomUUID(), randomUUID())
+    const row = this.db.prepare('SELECT * FROM companion_identity WHERE singleton = 1').get() as Row
+    return { principalId: String(row.principal_id), deviceId: String(row.device_id) }
+  }
+
+  private companionRecord<K extends keyof CompanionRecords>(table: K, id: string): CompanionRecords[K] | null {
+    const row = this.db.prepare(`SELECT data FROM ${table} WHERE id = ?`).get(id) as Row | undefined
+    return row ? JSON.parse(String(row.data)) as CompanionRecords[K] : null
+  }
+
+  private companionRecords<K extends keyof CompanionRecords>(table: K): CompanionRecords[K][] {
+    return (this.db.prepare(`SELECT data FROM ${table} ORDER BY rowid`).all() as Row[])
+      .map(row => JSON.parse(String(row.data)) as CompanionRecords[K])
+  }
+
+  private saveCompanionRecord<K extends keyof CompanionRecords>(table: K, id: string, value: CompanionRecords[K]): void {
+    this.db.prepare(`INSERT INTO ${table}(id, data) VALUES (?, ?)
+      ON CONFLICT(id) DO UPDATE SET data = excluded.data`).run(id, json(value))
+  }
+
+  getCompanionMeta(taskId: string): CompanionTaskMeta | null { return this.companionRecord('task_meta', taskId) }
+  saveCompanionMeta(meta: CompanionTaskMeta): void { this.saveCompanionRecord('task_meta', meta.taskId, meta) }
+  getCompanionInput(inputRef: string): CompanionInputRecord | null { return this.companionRecord('companion_inputs', inputRef) }
+  insertCompanionInput(input: CompanionInputRecord): void {
+    this.db.prepare('INSERT INTO companion_inputs(id, data) VALUES (?, ?)').run(input.inputRef, json(input))
+  }
+  getCompanionCommand(commandId: string): CompanionCommandRecord | null { return this.companionRecord('task_commands', commandId) }
+  saveCompanionCommand(command: CompanionCommandRecord): void { this.saveCompanionRecord('task_commands', command.commandId, command) }
+  companionCommandForProposal(proposalId: string): CompanionCommandRecord | null {
+    const row = this.db.prepare('SELECT data FROM task_commands WHERE proposal_id = ?').get(proposalId) as Row | undefined
+    return row ? JSON.parse(String(row.data)) as CompanionCommandRecord : null
+  }
+  listCompanionCommands(): CompanionCommandRecord[] { return this.companionRecords('task_commands') }
+  getCompanionSchedule(scheduleId: string): CompanionScheduleRecord | null { return this.companionRecord('schedules', scheduleId) }
+  listCompanionSchedules(): CompanionScheduleRecord[] { return this.companionRecords('schedules') }
+  saveCompanionSchedule(schedule: CompanionScheduleRecord): void { this.saveCompanionRecord('schedules', schedule.scheduleId, schedule) }
+  getReminderGrant(grantRef: string): ReminderGrantRecord | null { return this.companionRecord('reminder_grants', grantRef) }
+  saveReminderGrant(grant: ReminderGrantRecord): void { this.saveCompanionRecord('reminder_grants', grant.grantRef, grant) }
+  getReminderCycle(cycleId: string): ReminderCycleRecord | null { return this.companionRecord('reminder_cycles', cycleId) }
+  listReminderCycles(): ReminderCycleRecord[] { return this.companionRecords('reminder_cycles') }
+  saveReminderCycle(cycle: ReminderCycleRecord): void { this.saveCompanionRecord('reminder_cycles', cycle.cycleId, cycle) }
+  getReminderDelivery(deliveryId: string): ReminderDeliveryRecord | null { return this.companionRecord('deliveries', deliveryId) }
+  listReminderDeliveries(): ReminderDeliveryRecord[] { return this.companionRecords('deliveries') }
+  saveReminderDelivery(delivery: ReminderDeliveryRecord): void { this.saveCompanionRecord('deliveries', delivery.deliveryId, delivery) }
+  listCompanionContexts(): CompanionContextRecord[] { return this.companionRecords('companion_contexts') }
+  saveCompanionContext(context: CompanionContextRecord): void { this.saveCompanionRecord('companion_contexts', context.contextId, context) }
+  pruneCompanionContexts(cutoff: number): number {
+    return Number(this.db.prepare('DELETE FROM companion_contexts WHERE expires_at < ?').run(cutoff).changes)
+  }
+
+  insertCompanionArtifact(taskId: string, operationId: string, evidence: unknown, at: number): string {
+    const artifactId = randomUUID()
+    this.db.prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?)').run(artifactId, taskId, operationId, json(evidence), at)
+    return artifactId
+  }
+
+  companionEventCursor(principalId: string): number {
+    const row = this.db.prepare(`SELECT MAX(e.seq) AS cursor FROM events_outbox e
+      JOIN task_meta m ON m.id = e.task_id WHERE m.principal_id = ? AND m.runtime_scope = 'companion'
+      AND e.type IN ('task.changed', 'task.artifact', 'approval.requested', 'approval.resolved', 'reminder.changed')`)
+      .get(principalId) as Row
+    return Number(row.cursor ?? 0)
+  }
+
+  companionEventsSince(principalId: string, after: number, limit = 200): TeamEvent[] {
+    const rows = this.db.prepare(`SELECT e.* FROM events_outbox e JOIN task_meta m ON m.id = e.task_id
+      WHERE e.seq > ? AND m.principal_id = ? AND m.runtime_scope = 'companion'
+      AND e.type IN ('task.changed', 'task.artifact', 'approval.requested', 'approval.resolved', 'reminder.changed')
+      ORDER BY e.seq LIMIT ?`).all(after, principalId, limit) as Row[]
+    return rows.map(row => ({ seq: Number(row.seq), type: row.type as TeamEventType, taskId: String(row.task_id),
+      assistantId: null, payload: JSON.parse(String(row.payload)), createdAt: Number(row.created_at) }))
   }
 
   close(): void {

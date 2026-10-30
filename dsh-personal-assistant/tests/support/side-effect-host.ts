@@ -122,15 +122,22 @@ export async function sideEffectHost(t: TestContext, options: HostOptions = {}) 
   let onStart: (request: SubagentStartRequest) => Promise<void> | void = () => undefined
   let disposeImpl: () => Promise<void> = async () => undefined
   let disposed = 0
+  const start = async (_provider: string, request: SubagentStartRequest): Promise<SubagentRun> => {
+    requests.push(request)
+    // 宿主在子代理首个回合里写下持久描述符；定向门禁靠它认出这次委派。
+    child.events.push({ type: 'subagent/descriptor', data: { label: request.label } })
+    await onStart(request)
+    return { id: child.agent.id, localAgent: child.agent, result: result.promise, dispose: async () => { disposed += 1; await disposeImpl() } }
+  }
   const teamHost = {
     tools: ctx.tools,
+    agents: { get: (id: string) => id === child.agent.id ? child.agent : undefined },
     subagents: {
-      start: async (_provider: string, request: SubagentStartRequest): Promise<SubagentRun> => {
-        requests.push(request)
-        // 宿主在子代理首个回合里写下持久描述符；定向门禁靠它认出这次委派。
-        child.events.push({ type: 'subagent/descriptor', data: { label: request.label } })
-        await onStart(request)
-        return { id: child.agent.id, localAgent: child.agent, result: result.promise, dispose: async () => { disposed += 1; await disposeImpl() } }
+      start,
+      startActivation: async (input: { provider: string; request: SubagentStartRequest }) => {
+        const run = await start(input.provider, input.request)
+        return { id: child.agent.id, childId: child.agent.id, messageId: `message-${requests.length}`,
+          result: run.result, dispose: run.dispose }
       },
     },
   }

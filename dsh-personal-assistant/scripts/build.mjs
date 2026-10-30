@@ -30,7 +30,8 @@ execFileSync(
     path.join(root, 'node_modules', '.pnpm', 'esbuild@0.27.7', 'node_modules', 'esbuild', 'bin', 'esbuild'),
     'src/index.ts', '--bundle', '--format=esm', '--platform=node', '--target=node22',
     `--outfile=dist/${outfile}`,
-    '--external:@deepseek-ai/*', '--external:zod', '--external:node:*',
+    '--external:@deepseek-ai/*', '--external:@wecom/*', '--external:zod', '--external:node:*', '--external:nodemailer',
+    '--external:imapflow', '--external:mailparser',
   ],
   { stdio: 'inherit', cwd: root },
 )

@@ -492,9 +492,11 @@ describe('结构化提取', () => {
     for (const extension of OUTLINE_EXTENSIONS) {
       assert.equal(canOutline(`文件${extension}`), true, `${extension} 在名单里却讲不了`)
     }
-    for (const extension of ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.png', '.docm']) {
+    for (const extension of ['.doc', '.xls', '.xlsx', '.ppt', '.png', '.docm']) {
       assert.equal(canOutline(`文件${extension}`), false, `${extension} 不该讲得了`)
     }
+    assert.equal(canOutline('文件.docx'), true, 'docx 走授权后的二进制解析')
+    assert.equal(canOutline('文件.pptx'), true, 'pptx 走授权后的二进制解析')
   })
 
   test('超过字数上限时截断并明说', () => {

@@ -71,7 +71,10 @@ test('待批期间记忆被改过：这张卡作废，不会把看到的旧内�
     execute: () => ({ edited: true }),
   })
   // 模拟期间记忆被别处改掉
-  f.rt.memories.revise(id, { text: '被别处改过了', actor: { id: 'desktop-shell', isUser: true } }, Date.now())
+  f.rt.memories.revise(id, {
+    text: '被别处改过了', actor: { id: 'desktop-shell', isUser: true },
+    expectedRevision: f.rt.memories.get(id, Date.now())!.revision,
+  }, Date.now())
   const decided = await f.rt.decide(proposal.proposalId)
   assert.equal(decided.ok, false, '内容对不上就不能批准')
   assert.equal(f.rt.memories.get(id, Date.now())!.text, '被别处改过了', '别处的改动没有被覆盖')

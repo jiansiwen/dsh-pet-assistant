@@ -19,8 +19,13 @@ export const PLAINTEXT_EXTENSIONS: readonly string[] = ['.txt', '.log', '.csv', 
 /** 通过本地二进制解析、按物理页讲解；扫描件和加密文件不保证可提取。 */
 export const PDF_EXTENSIONS: readonly string[] = ['.pdf']
 
+/** Office 2007+ 的 ZIP 容器；旧版二进制 .doc/.ppt 不在此列。 */
+export const DOCX_EXTENSIONS: readonly string[] = ['.docx']
+export const PPTX_EXTENSIONS: readonly string[] = ['.pptx']
+export const OFFICE_EXTENSIONS: readonly string[] = [...DOCX_EXTENSIONS, ...PPTX_EXTENSIONS]
+
 /** 能逐段讲解的。界面上直接念这一份，不要另抄一遍。 */
-export const OUTLINE_EXTENSIONS: readonly string[] = [...MARKDOWN_EXTENSIONS, ...PLAINTEXT_EXTENSIONS, ...PDF_EXTENSIONS]
+export const OUTLINE_EXTENSIONS: readonly string[] = [...MARKDOWN_EXTENSIONS, ...PLAINTEXT_EXTENSIONS, ...PDF_EXTENSIONS, ...OFFICE_EXTENSIONS]
 
 /**
  * 允许用系统关联打开的扩展名。

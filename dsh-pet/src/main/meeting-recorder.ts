@@ -1567,6 +1567,8 @@ export interface MeetingIpcMain {
 export interface MeetingIpcDeps {
   readonly ipc: MeetingIpcMain
   readonly recorder: MeetingRecorder
+  /** 会议真正由 recorder 接受后回调；主进程据此结算桌面命令。 */
+  readonly onStarted?: (meetingId: string, consent: MeetingConsentInput) => void
 }
 
 function asString(value: unknown): string | null {
@@ -1591,7 +1593,9 @@ export function registerMeetingIpc(deps: MeetingIpcDeps): void {
   const { ipc, recorder } = deps
 
   ipc.handle('meeting-start', (_event, consent: unknown) => {
-    return recorder.startMeeting(consent as MeetingConsentInput)
+    const result = recorder.startMeeting(consent as MeetingConsentInput)
+    if (result.ok) deps.onStarted?.(result.meetingId, consent as MeetingConsentInput)
+    return result
   })
 
   ipc.handle('meeting-stop', (_event, meetingId: unknown) => {

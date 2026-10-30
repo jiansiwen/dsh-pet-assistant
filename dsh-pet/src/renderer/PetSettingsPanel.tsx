@@ -7,9 +7,10 @@ interface Props {
   onPage(page: SettingsPage): void
   onClose(): void
   children: React.ReactNode
+  quotaPending?: number
 }
 
-export default function PetSettingsPanel({ page, onPage, onClose, children }: Props) {
+export default function PetSettingsPanel({ page, onPage, onClose, children, quotaPending = 0 }: Props) {
   const panel = useRef<HTMLDivElement | null>(null)
   useLayoutEffect(() => {
     const element = panel.current
@@ -25,11 +26,13 @@ export default function PetSettingsPanel({ page, onPage, onClose, children }: Pr
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__settings__') }
   }, [])
 
-  return <section className="pet-management" ref={panel} data-interactive aria-label="宠物设置与管理">
-    <header className="management-header"><h2>宠物设置</h2><button onClick={onClose} aria-label="关闭设置">×</button></header>
+  return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台">
+    <header className="management-header"><h2>小潘桌面伙伴控制台</h2><button onClick={onClose} aria-label="关闭设置">×</button></header>
     <nav className="management-tabs" aria-label="设置分类">
-      {([['general', '通用'], ['team', '团队'], ['doc', '文档'], ['meeting', '会议']] as const).map(([id, title]) =>
-        <button key={id} type="button" aria-current={page === id ? 'page' : undefined} onClick={() => onPage(id)}>{title}</button>)}
+      {([['general', '通用'], ['team', '团队'], ['doc', '文档'], ['meeting', '会议'], ['wecom', '渠道'], ['reminders', '提醒']] as const).map(([id, title]) =>
+        <button key={id} type="button" aria-current={page === id ? 'page' : undefined} onClick={() => onPage(id)}>{title}
+          {id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
+        </button>)}
     </nav>
     <div className="management-content">{children}</div>
   </section>

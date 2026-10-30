@@ -142,7 +142,7 @@ describe('确认权限：专家只能提交候选', () => {
   test('助理不能把自己的候选抬成已确认', () => {
     const created = put({ text: '构建要先跑 typecheck' }, EXPERT)
     assert.ok(created.ok)
-    assert.equal(memories.confirm(created.record.id, EXPERT, NOW), null)
+    assert.equal(memories.confirm(created.record.id, EXPERT, NOW, { [created.record.id]: created.record.revision }), null)
     assert.equal(memories.get(created.record.id, NOW)?.status, 'candidate')
   })
 
@@ -151,7 +151,7 @@ describe('确认权限：专家只能提交候选', () => {
     const candidate = put({ text: '日报按工作类别组织' }, EXPERT)
     assert.ok(first.ok && candidate.ok)
     assert.equal(candidate.record.status, 'candidate')
-    const confirmed = memories.confirm(candidate.record.id, USER, NOW)
+    const confirmed = memories.confirm(candidate.record.id, USER, NOW, { [candidate.record.id]: candidate.record.revision })
     assert.equal(confirmed?.status, 'confirmed')
     assert.deepEqual(memories.get(first.record.id, NOW), first.record)
 
@@ -159,7 +159,7 @@ describe('确认权限：专家只能提交候选', () => {
     assert.ok(other.ok)
     assert.equal(other.record.status, 'candidate')
     assert.equal(memories.injectable({}, NOW).length, 2)
-    assert.equal(memories.confirm(other.record.id, USER, NOW)?.status, 'confirmed')
+    assert.equal(memories.confirm(other.record.id, USER, NOW, { [other.record.id]: other.record.revision })?.status, 'confirmed')
     assert.equal(memories.injectable({}, NOW).length, 3)
   })
 })
@@ -257,17 +257,18 @@ describe('同主题不代表矛盾，只有用户点名才替换', () => {
     const chosen = importMemory({ id: 'chosen', confirmedBy: null })
     const rival = importMemory({ id: 'rival' })
     const untouched = importMemory({ id: 'untouched' })
-    assert.equal(memories.confirm(chosen.id, EXPERT, NOW, [rival.id]), null)
-    assert.equal(memories.confirm(chosen.id, USER, NOW, [chosen.id]), null)
-    assert.equal(memories.confirm(chosen.id, USER, NOW, [rival.id, '不存在']), null)
+    const expectedRevisions = { [chosen.id]: chosen.revision, [rival.id]: rival.revision }
+    assert.equal(memories.confirm(chosen.id, EXPERT, NOW, expectedRevisions, [rival.id]), null)
+    assert.equal(memories.confirm(chosen.id, USER, NOW, expectedRevisions, [chosen.id]), null)
+    assert.equal(memories.confirm(chosen.id, USER, NOW, { ...expectedRevisions, 不存在: 1 }, [rival.id, '不存在']), null)
     assert.deepEqual(memories.get(chosen.id, NOW), chosen)
     assert.deepEqual(memories.get(rival.id, NOW), rival)
-    const confirmed = memories.confirm(chosen.id, USER, NOW + 1, [rival.id])
+    const confirmed = memories.confirm(chosen.id, USER, NOW + 1, expectedRevisions, [rival.id])
     assert.equal(confirmed?.status, 'confirmed')
     assert.equal(confirmed?.confirmedBy, USER.id)
     assert.equal(memories.get(rival.id, NOW + 1)?.status, 'expired')
     assert.deepEqual(memories.get(untouched.id, NOW + 1), untouched)
-    assert.equal(memories.confirm(untouched.id, USER, NOW + 2)?.status, 'confirmed')
+    assert.equal(memories.confirm(untouched.id, USER, NOW + 2, { [untouched.id]: untouched.revision })?.status, 'confirmed')
     assert.equal(memories.injectable({}, NOW + 2).length, 2)
   })
 })
@@ -345,7 +346,7 @@ describe('删除传播：没有依据的结论不能继续当事实', () => {
       EXPERT,
     )
     assert.ok(result.ok)
-    const confirmed = memories.confirm(result.record.id, USER, NOW)
+    const confirmed = memories.confirm(result.record.id, USER, NOW, { [result.record.id]: result.record.revision })
     assert.ok(confirmed)
     return confirmed
   }
@@ -542,7 +543,7 @@ describe('删除历史冲突后恢复剩余项，不补造用户确认', () => {
     const expired = importMemory({ id: 'expired-conflict', expiresAt: NOW })
     const rival = importMemory({ id: 'rival' })
     assert.equal(effectiveStatus(expired, NOW), 'expired')
-    assert.equal(memories.confirm(expired.id, USER, NOW, [rival.id]), null)
+    assert.equal(memories.confirm(expired.id, USER, NOW, { [expired.id]: expired.revision, [rival.id]: rival.revision }, [rival.id]), null)
     const replacement = put({ text: '新规则', replaceIds: [expired.id] })
     assert.ok(!replacement.ok)
     assert.equal(replacement.rejection, 'invalid_replacement')

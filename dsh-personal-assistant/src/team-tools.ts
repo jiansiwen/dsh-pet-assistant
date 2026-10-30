@@ -165,14 +165,13 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
 
   ctx.tools.register(defineTool({
     name: 'desktop_team_assign',
-    description: '把一项任务派给指定成员并等待其真实运行结果。member 用点名（总助理/助理1/助理2等）；名字不存在或席位未启用会直接报错，不会替你换人。专家默认只读，需要外部副作用时它们会在 needsApproval 里提出，由你用 desktop_team_propose_action 走用户审批。',
+    description: '根据当前成员目录的职责与能力自动选择合适成员，派发任务并等待真实结果，再向用户汇总；不要让用户手工选人。member 使用目录中的 assistantId 或准确名称。不存在、停用或额度不足时如实报告，不静默换人。工具权限与日/总额度只读持久配置，派发不能修改。',
     parameters: {
-      member: { type: 'string', required: true, description: '承接成员的点名，如"总助理"' },
+      member: { type: 'string', required: true, description: '根据目录职责自动选择的成员 assistantId 或准确名称，不是固定角色' },
       goal: { type: 'string', required: true, description: '任务目标，一句话说清要解决什么' },
       evidence: { type: 'array', items: { type: 'string' }, description: '交给成员的已知材料（文件路径、报错原文、用户原话等）' },
       acceptance: { type: 'array', items: { type: 'string' }, description: '验收条件；当前自由文本产物需独立复核，模型自报不能标记任务完成' },
       dependsOn: { type: 'array', items: { type: 'string' }, description: '前置任务 id；前置未完成时本任务留在排队状态' },
-      budgetTokens: { type: 'integer', description: '累计 token 预算。默认 0 = 用户选择不设累计预算（费用不封顶，只受单次输出上限、墙钟超时与并发上限约束）；宿主没有累计硬上限，非零预算会如实拒绝启动' },
     },
     output: textOutput,
     async execute(
@@ -181,13 +180,14 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     ) {
       const context = exec as ExecContext
       if (!context.agent) return json({ ok: false, error: '当前执行上下文没有可绑定的会话 agent，无法委派子代理' })
+      if (args.budgetTokens !== undefined && args.budgetTokens !== 0) return json({ ok: false, error: '委派工具不能设置或扩大额度，请由本人在团队设置中确认；旧预算参数非零时拒绝' })
       const member = team.resolveByName(args.member)
       if (!member) {
         return json({
           ok: false,
           error: `没有可接单的成员叫「${args.member}」`,
           enabled: team.enabledMembers().map(item => item.displayName),
-          note: '名字不存在或席位未启用时不会替换成别人；请确认点名或先开启该席位',
+          note: '名字不存在或席位未启用时不会替换成别人；按最新目录核对，不要求用户手工选人或擅自开启成员',
         })
       }
       const task = team.submitTask({
@@ -197,7 +197,6 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
         ownerId: member.assistantId,
         toolScope: 'read-only',
         dependsOn: args.dependsOn ?? [],
-        budgetTokens: args.budgetTokens,
         originChannel: 'dsh-session',
       })
       const signal = context.signal ?? new AbortController().signal
@@ -229,6 +228,9 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
           role: member.roleId,
           skin: member.skinId,
           mode: member.toolPolicy.mode,
+          description: member.description ?? member.persona,
+          capabilities: member.capabilities ?? [],
+          allowedTools: member.allowedTools ?? [],
           enabled: member.enabled,
         })),
         tasks: tasks.map(task => ({
@@ -538,18 +540,17 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     text: [
       '## 桌面专家助理团',
       '',
-      '本环境装有 desktop_team_* 工具。你（当前会话）就是总助理总助理：负责理解用户目标、拆分任务、点名委派、转交审批、汇总结论。',
+      '本环境装有 desktop_team_* 工具。你（当前会话）就是总助理：理解用户目标，根据当前目录中成员的职责与能力自动委派，再汇总结论。成员列表可变化，不是固定角色。',
       '',
       '成员编制（只有 enabled 的席位能接单）：',
       '{{desktop_team_roster}}',
       '',
       '协作规则：',
       '- 用户说"开启团队模式"、"叫上专家"：调用 desktop_team_start。',
-      '- 需要专业分析时调用 desktop_team_assign 点名委派，把已知材料写进 evidence、把可核验要求写进 acceptance。返回的 summary/artifacts/blockers 是子代理的真实运行结果，直接引用，不要改写成自己的判断。',
-      '- 点名必须精确：名字不存在或席位未启用时工具会报错，此时如实告诉用户，不要自动换成别的成员。',
-      '- 专家席位是只读的：write / edit / bash / pwsh / str_replace_editor / skill / job_kill 这些工具根本不在它们手里，也别指望它们替你动手。',
-      '- 副作用任务（总助理席位 × side-effect 范围，目前由桌面点名发起）在可信执行器里运行：每次副作用调用都会先在桌面审批窗口生成审批卡，用户批准后才执行且只执行一次；改参数、目标变化、过期、重放、转委派一律拒绝。批准不是执行结果，结果以执行账本为准（desktop_team_status / desktop_team_finish_operation 只读可信记录，不接受模型自报结账）；不得在普通主会话直接调用工具冒充已走团队门禁。',
-      '- 团队任务默认不设累计 token 预算（用户的选择，费用不封顶），只受单次输出上限、墙钟超时与并发上限约束。宿主没有累计硬上限：用户要求累计预算时任务会如实拒启，不得替用户改成 0 绕过。无可信成果核验器的任务保留 review，不能把 artifacts 非空当成完成。',
+      '- 请求与已启用成员职责匹配时，自动选择其 assistantId 调用 desktop_team_assign，不要让用户手工挑选，也不要只口头说已分派。把必要材料写进 evidence、可核验要求写进 acceptance；不转发总助理全局偏好或其他成员记忆。拿到真实 summary/artifacts/blockers 后再汇总，并保留证据与阻碍。',
+      '- 使用目录中的准确身份。成员不存在、停用、忙碌或额度不足时如实解释；不静默换人，不替用户启用成员。',
+      '- 成员只拥有目录配置的能力与三档权限；企业微信能力仅表示绑定路由，会议/文档工具只接受桌面本人指令，邮件发送与普通任务仍走各自原有审批。不得在普通主会话改用其他工具绕过成员拒绝；命令、权限配置、全局记忆和再委派不向成员开放。',
+      '- 模型与单次输出上限、日额度、总额度都由本人配置。工具不能设置预算，不能自行增额、重置或批准申请。额度按真实用量累计，达到阈值生成待批申请，触线或用量未知后停止请求；首请求输入无法预知，不能承诺计费硬上限。无可信成果核验器的任务保留 review，不能把 artifacts 非空当成完成。',
       '- 被门禁拒绝时按拒绝理由改正提案，不要换个工具、换个路径或拆成小步绕过去 —— 那只会让用户看到一堆被拦下的尝试。',
       '- 提案不等于授权。不要把"已提交提案"说成"已获批准"，不要把未核验的推断写进 artifacts。',
       '- 用户问团队进度或待批准事项：调用 desktop_team_status。',
@@ -569,11 +570,13 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     ].join('\n'),
   })
 
+  const CAPABILITY_LABELS: Record<string, string> = { wecom: '企业微信接收', mail: '邮件收发与分析', meeting: '会议记录', document: '文档讲解', activity: '活动/日报', reminders: '提醒' }
   ctx.systemPrompt.variable('desktop_team_roster', () => {
     const members = team.roster()
-    if (members.length === 0) return undefined
+    // 空值会被宿主当成装配错误直接炸（真机实测过），空态必须给字符串。
+    if (members.length === 0) return '（还没有成员。需要时引导用户到宠物设置的团队管理中添加，不要虚构成员。）'
     return members
-      .map(member => `- ${member.displayName}（${member.assistantId}）：${member.toolPolicy.mode}，${member.enabled ? '已启用' : '未启用'}`)
+      .map(member => `- ${member.displayName}（${member.assistantId}）：${member.enabled ? '已启用' : '未启用'}；职责：${member.description || member.persona}；能力：${member.capabilities?.map(capability => CAPABILITY_LABELS[capability] ?? capability).join('、') || '无外部能力'}；只读工具：${member.allowedTools?.join('、') || '无额外工具'}${member.roleId === 'tangseng' ? '；当前总助理，不向自身委派' : ''}`)
       .join('\n')
   })
   return dispose

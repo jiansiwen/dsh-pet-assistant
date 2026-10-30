@@ -199,3 +199,74 @@ test('批准签发与驳回唤醒调用点的等待；放弃等待的审批卡�
   assert.equal(expired, 'expired')
   assert.equal(store.getProposal(fourth.proposalId)?.state, 'expired')
 })
+
+test('恢复仅对当前团队专家任务记 unknown，同成员的普通任务和其他团队原样保留', async t => {
+  const f = restart(t, ':memory:')
+  f.team.ensureRoster()
+  const expert = f.team.submitTask({ goal: '当前团队专家任务' })
+  const companion = { ...expert, taskId: 'companion-running', goal: '普通任务运行中', status: 'running' as const }
+  const other = { ...expert, taskId: 'other-team-running', teamId: 'other', status: 'running' as const }
+  f.store.updateTask(expert.taskId, expert.revision, { status: 'running' })
+  f.store.insertTask(companion)
+  f.store.insertTask(other)
+  f.store.saveCompanionMeta({ taskId: companion.taskId, runtimeScope: 'companion', principalId: 'owner', deviceId: 'device',
+    parentTaskId: null, kind: 'agent', inputRef: 'input', blocker: null })
+  for (const task of [expert, companion, other]) {
+    f.store.insertRun({ runId: `${task.taskId}-run`, taskId: task.taskId, assistantId: task.ownerId, childSessionId: null,
+      messageId: null, state: 'running', stopReason: null, outputDigest: null, startedAt: 1, endedAt: null })
+    f.store.insertOperation({ operationId: `${task.taskId}-op`, taskId: task.taskId, approvalId: null, kind: 'write',
+      state: 'running', resultDigest: null, startedAt: 1, endedAt: null })
+  }
+  const cards = [expert, companion, other].map(task => f.approvals.propose({ taskId: task.taskId, assistantId: task.ownerId,
+    tool: 'bash', target: '测试目标', params: { command: '测试目标' }, inputRevision: f.store.getTask(task.taskId)!.revision, summary: '待审批', risk: 'high' }))
+  f.team.recoverInterruptedTasks()
+  assert.equal(f.store.getTask(expert.taskId)?.status, 'unknown')
+  assert.equal(f.store.listRuns(expert.taskId)[0]?.state, 'unknown')
+  assert.equal(f.store.getOperation(`${expert.taskId}-op`)?.state, 'unknown')
+  assert.equal(f.approvals.proposal(cards[0]!.proposalId)?.state, 'expired')
+  for (const [index, task] of [companion, other].entries()) {
+    assert.equal(f.team.getTask(task.taskId), null)
+    assert.equal(await f.team.runTask(task.taskId, {} as never, new AbortController().signal), null)
+    assert.equal(await f.team.cancelWithReceipt(task.taskId), null)
+    assert.deepEqual(f.store.getTask(task.taskId), task)
+    assert.equal(f.store.listRuns(task.taskId)[0]?.state, 'running')
+    assert.equal(f.store.getOperation(`${task.taskId}-op`)?.state, 'running')
+    assert.equal(f.approvals.proposal(cards[index + 1]!.proposalId)?.state, 'pending')
+  }
+  const events = f.store.eventsSince(0)
+  f.team.recoverInterruptedTasks()
+  assert.deepEqual(f.store.eventsSince(0), events)
+  assert.deepEqual(await f.team.runReady({} as never, new AbortController().signal), [])
+  assert.equal(f.requests.length, 0)
+})
+
+test('关闭专家只作废当前团队未消费的待批和已批票据，普通任务票据与注入库继续可用', async t => {
+  const f = restart(t, ':memory:')
+  f.team.ensureRoster()
+  const expert = f.team.submitTask({ goal: '专家审批任务' })
+  const companion = { ...expert, taskId: 'companion-approved', goal: '普通审批任务' }
+  const other = { ...expert, taskId: 'other-approved', teamId: 'other' }
+  f.store.insertTask(companion)
+  f.store.insertTask(other)
+  f.store.saveCompanionMeta({ taskId: companion.taskId, runtimeScope: 'companion', principalId: 'owner', deviceId: 'device',
+    parentTaskId: null, kind: 'agent', inputRef: 'input', blocker: null })
+  const cards = [expert, companion, other].map(task => {
+    const propose = (target: string) => f.approvals.propose({ taskId: task.taskId, assistantId: task.ownerId,
+      tool: 'bash', target, params: { command: target }, inputRevision: task.revision, summary: '审批隔离', risk: 'high' })
+    const pending = propose('待批目标')
+    const approved = propose('已批目标')
+    f.approvals.issue(approved.proposalId, { channel: 'desktop-shell' }, true)
+    return { pending, approved }
+  })
+  await f.team.dispose()
+  assert.equal(f.approvals.proposal(cards[0]!.pending.proposalId)?.state, 'expired')
+  assert.equal(f.approvals.proposal(cards[0]!.approved.proposalId)?.state, 'expired')
+  for (const card of cards.slice(1)) {
+    assert.equal(f.approvals.proposal(card.pending.proposalId)?.state, 'pending')
+    assert.equal(f.approvals.proposal(card.approved.proposalId)?.state, 'approved')
+    assert.equal(f.store.approvalForProposal(card.approved.proposalId)?.consumedAt, null)
+    assert.doesNotThrow(() => f.approvals.issue(card.pending.proposalId, { channel: 'desktop-shell' }, true))
+  }
+  assert.deepEqual(f.store.getTask(companion.taskId), companion)
+  assert.deepEqual(f.store.getTask(other.taskId), other)
+})

@@ -20,13 +20,14 @@
  * 「对方·发言人2」），全部标"未确认"；模型缺失或失败时整条音轨归一组并写明"未自动分人"。
  * 最终分组只来自用户在这个页面上的改名/合并/拆分。纪要确认按钮是唯一能把纪要置成 confirmed 的入口。
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { pcm16Base64, resampleTo16k } from './dictation.js'
 import { TrackChunker, type TrackChunk } from './meeting-capture.js'
 import { frameWallMs, sharedCapture, type CaptureSubscription } from './audio-capture.ts'
 import MeetingMinutesReview from './meeting-minutes-review.js'
 import type {
   LiveCaption,
+  MeetingConsentInput,
   MeetingMinutesResult,
   MeetingRuntimeState,
   MeetingSpeakersResult,
@@ -311,6 +312,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
   const [mergeInto, setMergeInto] = useState('')
   const [renameFor, setRenameFor] = useState<{ speaker: string; label: string } | null>(null)
   const [elapsed, setElapsed] = useState('')
+  const handledCommands = useRef(new Set<string>())
 
   const selectedId = selected ?? runtime?.lastMeetingId ?? null
   const recording = runtime?.recording === true
@@ -416,6 +418,30 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
     const result = await api.meetingStop().catch(() => ({ ok: false, error: '主进程没有响应' }))
     if (!result.ok) setNotice(result.error ?? null)
   }, [api])
+
+  /** 子助理通过桌面命令发起：用户已在桌面明确要求，直接用这次指令作为知情记录开录。 */
+  const startFromCommand = useCallback(async (command: { requestId: string; consent: MeetingConsentInput }) => {
+    if (api === undefined || handledCommands.current.has(command.requestId)) return
+    handledCommands.current.add(command.requestId)
+    setFormError(null)
+    setName(command.consent.name)
+    setSources(command.consent.sources)
+    setRetentionDays(command.consent.retentionDays)
+    setConsented(true)
+    const result = await api.meetingStart(command.consent).catch(() => ({ ok: false, error: '主进程没有响应' }))
+    if (!result.ok) setFormError(result.error ?? '无法开始会议')
+  }, [api])
+
+  // 菜单页挂载时取一次待执行命令；已挂载时由 meeting-command 推送，两条路都按 requestId 去重。
+  useEffect(() => {
+    if (api === undefined) return
+    let cancelled = false
+    void api.meetingTakeCommand().then(command => {
+      if (!cancelled && command) void startFromCommand(command)
+    }).catch(() => undefined)
+    const off = api.onMeetingCommand(command => { if (!cancelled) void startFromCommand(command) })
+    return () => { cancelled = true; off() }
+  }, [api, startFromCommand])
 
   const runEdit = useCallback(async (edit: () => Promise<{ ok: boolean; error?: string; revision?: number }>, okMessage: string) => {
     if (api === undefined) return

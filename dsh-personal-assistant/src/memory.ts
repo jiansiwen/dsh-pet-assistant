@@ -130,7 +130,7 @@ export const WRITE_REJECTION_MESSAGES: Record<WriteRejection, string> = {
   empty_text: '记忆内容不能为空',
   unknown_sensitivity: '敏感级别不认识，只能用 normal 或 sensitive',
   sensitive_without_encryption:
-    '这条被标成敏感内容，但本机还没有落地加密存储（数据密钥 + Windows DPAPI + 密钥恢复提示），所以拒绝写入。请改标 normal，或先在配置里启用加密。',
+    '这条被标成敏感内容，但本机还没有落地加密存储（数据密钥 + Windows DPAPI + 密钥恢复提示），所以拒绝写入。不能通过改标普通内容绕过限制。',
   replacement_requires_user: '只有用户明确指定的替换才能让旧记忆失效，助理只能提交候选',
   invalid_replacement: '替换目标必须存在、尚未失效，且与新记忆类型和范围一致；不能替换选中的记忆自身',
 }
@@ -532,13 +532,24 @@ export class MemoryStore {
    * 省略 replaceIds 时其余同主题规则不变，可逐条确认多条兼容的历史冲突。
    * 非用户、已过期的选择或无效替换目标返回 null，且整次不写入。
    */
-  confirm(id: string, actor: MemoryActor, now: number, replaceIds: string[] = []): MemoryRecord | null {
-    if (!actor.isUser) return null
+  confirm(
+    id: string,
+    actor: MemoryActor,
+    now: number,
+    expectedRevisions: Readonly<Record<string, number>>,
+    replaceIds: string[] = [],
+  ): MemoryRecord | null {
+    if (actor.isUser !== true || !expectedRevisions || typeof expectedRevisions !== 'object'
+      || Array.isArray(expectedRevisions)) return null
     return inTransaction(this.db, () => {
       const current = this.get(id, now)
       if (!current || current.status === 'expired' || replaceIds.includes(id)) return null
       const superseded = this.replacementTargets(replaceIds, current.kind, current.scope, now)
       if (!superseded) return null
+      if ([current, ...superseded].some(record => !Object.hasOwn(expectedRevisions, record.id)
+        || !Number.isSafeInteger(expectedRevisions[record.id])
+        || expectedRevisions[record.id] < 1
+        || record.revision !== expectedRevisions[record.id])) return null
       this.setStatus(id, 'confirmed', now, actor.id)
       for (const record of superseded) this.setStatus(record.id, 'expired', now, null)
       return this.get(id, now)
@@ -554,21 +565,21 @@ export class MemoryStore {
    * 只有用户签发才能改（与 put 的 actor 规则一致）：模型自己改规则等于自己换掉约束。
    * 已过期的记忆不改（改一条已失效的规则没有意义，用户要的是替换）。
    */
-  revise(id: string, input: { text: string; topic?: string | null; actor: MemoryActor }, now: number): MemoryRecord | null {
-    if (!input.actor.isUser) return null
+  revise(id: string, input: { text: string; topic?: string | null; actor: MemoryActor; expectedRevision: number }, now: number): MemoryRecord | null {
+    if (input.actor.isUser !== true || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) return null
     const nextText = input.text.trim()
     if (nextText === '') return null
     return inTransaction(this.db, () => {
       const current = this.get(id, now)
-      if (!current || current.status === 'expired') return null
+      if (!current || current.status === 'expired' || current.revision !== input.expectedRevision) return null
       const topic = input.topic === undefined ? current.topic : normalizeTopic(input.topic ?? '')
-      this.db
+      const result = this.db
         .prepare(
           `UPDATE memories SET body = ?, topic = ?, revision = revision + 1, updated_at = ?, confirmed_by = ?
-           WHERE memory_id = ?`,
+           WHERE memory_id = ? AND revision = ?`,
         )
-        .run(nextText, topic, now, input.actor.id, id)
-      return this.get(id, now)
+        .run(nextText, topic, now, input.actor.id, id, input.expectedRevision)
+      return result.changes === 1 ? this.get(id, now) : null
     })
   }
 
@@ -620,6 +631,33 @@ export class MemoryStore {
 
   previewDeleteSource(sourceId: string, now: number): DeletionOutcome {
     return dryRun(this.db, () => this.deleteSource(sourceId, '预览', now))
+  }
+
+  /**
+   * 删除一个范围的全部记忆。仍走单条删除的传播与删除账本：
+   * 范围外的下游派生记忆会按“来源消失”规则被删除或退回候选，不会被静默保留成已确认。
+   */
+  purgeScope(scopeKind: ScopeKind, scopeId: string, reason: string, now: number): DeletionOutcome {
+    if (!SCOPE_KINDS.includes(scopeKind)) throw new Error('未知记忆范围')
+    if (scopeKind !== 'global' && !scopeId.trim()) throw new Error('记忆范围缺少 id')
+    if (!reason.trim()) throw new Error('删除原因不能为空')
+    return inTransaction(this.db, () => {
+      const ids = (this.db.prepare('SELECT memory_id FROM memories WHERE scope_kind = ? AND scope_id = ? ORDER BY memory_id')
+        .all(scopeKind, scopeId) as Row[]).map(row => String(row.memory_id))
+      const deleted: MemoryRecord[] = []
+      const weakened = new Map<string, MemoryRecord>()
+      const restored = new Map<string, MemoryRecord>()
+      const ledgerBefore = this.ledgerSize()
+      for (const id of ids) {
+        // 前一条的传播可能已经删掉这一条，不能重复记账或重复报告。
+        if (!this.get(id, now)) continue
+        const outcome = this.deleteWithPropagation(id, reason, now, false)
+        deleted.push(...outcome.deleted)
+        for (const record of outcome.weakened) weakened.set(record.id, record)
+        for (const record of outcome.restored) restored.set(record.id, record)
+      }
+      return { deleted, weakened: [...weakened.values()], restored: [...restored.values()], ledgerEntries: this.ledgerSize() - ledgerBefore }
+    })
   }
 
   private deleteWithPropagation(id: string, reason: string, now: number, sourceOnly: boolean): DeletionOutcome {

@@ -23,6 +23,7 @@ import type {
 import type { HealthBody } from './runtime-launch.ts'
 import type { CancelReceipt, SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
 import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
+import type { DesktopReminderDelivery } from '../companion-types.ts'
 
 export interface BridgeInfo {
   port: number
@@ -48,6 +49,10 @@ interface ApprovalCredential {
   approvalToken?: string
   reportApprovalToken?: string
   assistantApprovalToken?: string
+  /** 普通任务窗口读/写用；只在本机主进程内使用，绝不进渲染层。 */
+  companionOwnerToken?: string
+  /** 桌面提醒执行器专用；只交给主进程的投递循环。 */
+  companionExecutorToken?: string
   epoch?: string
   port?: number
 }
@@ -129,9 +134,11 @@ export function readApprovalCredential(): ApprovalCredential | null {
     const approvalToken = typeof raw.approvalToken === 'string' && raw.approvalToken ? raw.approvalToken : undefined
     const reportApprovalToken = typeof raw.reportApprovalToken === 'string' && raw.reportApprovalToken ? raw.reportApprovalToken : undefined
     const assistantApprovalToken = typeof raw.assistantApprovalToken === 'string' && raw.assistantApprovalToken ? raw.assistantApprovalToken : undefined
-    if (approvalToken || reportApprovalToken || assistantApprovalToken) {
+    const companionOwnerToken = typeof raw.companionOwnerToken === 'string' && raw.companionOwnerToken ? raw.companionOwnerToken : undefined
+    const companionExecutorToken = typeof raw.companionExecutorToken === 'string' && raw.companionExecutorToken ? raw.companionExecutorToken : undefined
+    if (approvalToken || reportApprovalToken || assistantApprovalToken || companionOwnerToken || companionExecutorToken) {
       return {
-        approvalToken, reportApprovalToken, assistantApprovalToken,
+        approvalToken, reportApprovalToken, assistantApprovalToken, companionOwnerToken, companionExecutorToken,
         epoch: typeof raw.epoch === 'string' && raw.epoch ? raw.epoch : undefined,
         port: typeof raw.port === 'number' && raw.port > 0 ? raw.port : undefined,
       }
@@ -501,6 +508,95 @@ export class BridgeClient {
     } catch {
       return null
     }
+  }
+
+  private companionCredential(kind: 'owner' | 'executor'): string | null {
+    const info = this.info
+    const credential = readApprovalCredential()
+    if (!info || !credential?.epoch || credential.epoch !== info.epoch || credential.port !== info.port) return null
+    return (kind === 'owner' ? credential.companionOwnerToken : credential.companionExecutorToken) ?? null
+  }
+
+  /**
+   * 普通任务接口。client 只带聊天令牌，能做只读与提交待确认提案；
+   * owner 使用单独的本机凭据，只由主进程在用户点击原生确认后调用。
+   */
+  async companionRequest(
+    method: string,
+    pathname: string,
+    body: unknown,
+    subject: 'client' | 'owner',
+  ): Promise<{ status: number; body: unknown } | { status: 0; body: { code: string; message: string } }> {
+    const httpMethod = method === 'POST' ? 'POST' : 'GET'
+    const info = this.info
+    if (!info || this.stopped) return { status: 0, body: { code: 'OFFLINE', message: '还没连上个人助理：请先在 dsh 里召唤宠物或从托盘启动' } }
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    let url = `http://127.0.0.1:${info.port}${pathname}`
+    if (subject === 'owner') {
+      const token = this.companionCredential('owner')
+      if (!token) return { status: 0, body: { code: 'NO_OWNER_CREDENTIAL', message: '本机确认凭据不可用，请重新连接助理' } }
+      headers['x-dsh-companion-token'] = token
+    } else {
+      url += `?token=${encodeURIComponent(info.token)}`
+    }
+    try {
+      const response = await fetch(url, {
+        method: httpMethod,
+        headers,
+        ...(httpMethod === 'GET' ? {} : { body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
+      })
+      const parsed = await response.json().catch(() => null)
+      return { status: response.status, body: parsed }
+    } catch (error) {
+      return { status: 0, body: { code: 'NETWORK', message: `任务请求没能送达：${error instanceof Error ? error.message : String(error)}` } }
+    }
+  }
+
+  async nextDesktopReminder(): Promise<DesktopReminderDelivery | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/reminders`, {
+        headers: { 'x-dsh-companion-token': token },
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      const body = await response.json() as { deliveries?: unknown }
+      const first = Array.isArray(body.deliveries) ? body.deliveries[0] : null
+      return first && typeof first === 'object' ? first as DesktopReminderDelivery : null
+    } catch { return null }
+  }
+
+  async claimDesktopReminder(deliveryId: string): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/reminders/${encodeURIComponent(deliveryId)}/claim`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ executorEpoch: info.epoch ?? '' }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
+  }
+
+  async receiptDesktopReminder(deliveryId: string, state: 'succeeded' | 'failed-before-effect' | 'partial' | 'unknown', evidenceRefs: string[]): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/reminders/${encodeURIComponent(deliveryId)}/receipt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ executorEpoch: info.epoch ?? '', state, evidenceRefs }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
   }
 
   /**

@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import TeamStage, { type TeamStageHandle } from './TeamStage.js'
 import TeamPanel from './TeamPanel.js'
+import MemberManagement, { useMemberFeed } from './MemberManagement.js'
 import DocPanel from './DocPanel.js'
 import MeetingPanel from './meeting-panel.js'
 import VoiceApiSettings from './VoiceApiSettings.js'
+import AssistantSettings from './AssistantSettings.js'
 import ChatOverlay from './ChatOverlay.js'
 import PetSettingsPanel, { PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
 import { EnvironmentCheck } from './FirstRunSettings.js'
@@ -16,6 +18,8 @@ import {
   isWorking,
   projectTaskStatuses,
   stageHitboxes,
+  registerCharacterHitbox,
+  unregisterCharacterHitbox,
   type ExitStage,
   type StageMember,
   type StageTaskStatus,
@@ -224,8 +228,33 @@ export default function App() {
    * 用旧皮肤映射到对应角色，所以单宠物时代的熊猫仍然是总助理、眼镜男生仍然是助理1 ——
    * 桌面宠物不该因为团队服务没起来就变成一片空白。
    */
+  /**
+   * 成员上台规则：总助理常驻；其余成员只在有任务/对话活动时出现，
+   * 活动结束后再留 10 秒让退场动画走完，然后自动下台。
+   */
+  const [stageTick, setStageTick] = useState(() => Date.now())
+  const lingerUntil = useRef<Record<string, number>>({})
+  useEffect(() => {
+    const timer = window.setInterval(() => setStageTick(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  useEffect(() => {
+    const now = Date.now()
+    for (const member of members ?? []) {
+      if (member.roleId === 'tangseng') continue
+      const working = isWorking(statusByAssistant[member.assistantId])
+      if (working) lingerUntil.current[member.assistantId] = Number.POSITIVE_INFINITY
+      else if (lingerUntil.current[member.assistantId] === Number.POSITIVE_INFINITY) lingerUntil.current[member.assistantId] = now + 10_000
+    }
+  }, [members, statusByAssistant])
+
   const cast = useMemo<StageMember[]>(() => {
-    if (members?.length) return members
+    if (members?.length) {
+      const chief = members.find(member => member.roleId === 'tangseng') ?? members[0]
+      const active = members.filter(member => member !== chief
+        && (lingerUntil.current[member.assistantId] ?? 0) > stageTick)
+      return [chief, ...active]
+    }
     const legacy = manifestForLegacySkin(pet)
     return [
       {
@@ -236,7 +265,7 @@ export default function App() {
         enabled: true,
       },
     ]
-  }, [members, pet])
+  }, [members, pet, stageTick])
 
   const selectedMember = useMemo(() => {
     const found = cast.find((item) => item.assistantId === selectedId)
@@ -369,6 +398,24 @@ export default function App() {
     setToast(text)
     toastTimer.current = window.setTimeout(() => setToast(''), 4000)
   }, [])
+  useEffect(() => window.petApi.onMemberNotice(notice => {
+    showToast(`${notice.kind === 'mail' ? '邮件值守' : '成员通知'}：${notice.text.slice(0, 300)}`)
+  }), [showToast])
+  const memberFeed = useMemberFeed(showToast)
+  const quotaPending = memberFeed.state?.requests.filter(item => item.state === 'pending').length ?? 0
+  useLayoutEffect(() => {
+    const element = document.querySelector('.member-quota-banner')
+    if (!element) return
+    const measure = () => {
+      const rect = element.getBoundingClientRect()
+      registerCharacterHitbox('__member_quota__', { x1: rect.left, y1: rect.top, x2: rect.right, y2: rect.bottom })
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    window.addEventListener('resize', measure)
+    return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__member_quota__') }
+  }, [stageVisible, settingsPage, quotaPending])
 
   useEffect(() => {
     const stopSettings = window.petApi.onSettingsOpen(setSettingsPage)
@@ -1116,6 +1163,13 @@ export default function App() {
   )
 
   const docOpen = useCallback((path: string) => void runDoc(() => window.petApi.openDoc(path)), [runDoc])
+  const docRead = useCallback(async (path: string) => {
+    showToast('正在准备逐页阅读…')
+    try {
+      const result = await window.petApi.officeOpen(path)
+      if (!result.ok) showToast(result.error ?? '逐页阅读窗口未能打开')
+    } catch { showToast('逐页阅读窗口未能打开') }
+  }, [showToast])
   const docExplain = useCallback(
     (path: string, from: number) => void runDoc(() => window.petApi.explainDoc(path, from)),
     [runDoc],
@@ -1217,6 +1271,10 @@ export default function App() {
   return (
     <div className="stage" onMouseDownCapture={wakeConversation} onKeyDownCapture={wakeConversation}>
       {toast && <div className="toast" role="status">{toast}</div>}
+      {quotaPending > 0 && settingsPage !== 'team' && <div className="member-quota-banner approval-banner" data-interactive role="status">
+        <span className="approval-banner-text">{quotaPending} 条成员额度申请待处理</span>
+        <button type="button" className="approval-banner-go" onClick={() => setSettingsPage('team')}>打开团队</button>
+      </div>}
 
       {panelOpen && (
         <ChatOverlay
@@ -1253,7 +1311,7 @@ export default function App() {
       )}
 
       {settingsPage !== null && (
-        <PetSettingsPanel page={settingsPage} onPage={setSettingsPage} onClose={() => setSettingsPage(null)}>
+        <PetSettingsPanel page={settingsPage} onPage={setSettingsPage} onClose={() => setSettingsPage(null)} quotaPending={quotaPending}>
           {settingsPage === 'general' ? (
             <div className="management-general">
               <section className="management-section" aria-label="运行时与诊断">
@@ -1388,6 +1446,7 @@ export default function App() {
                 </div>
               )}
               <p className="management-hint">运行时启停与连接诊断请到通用设置。</p>
+              <MemberManagement feed={memberFeed} />
               <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} bindingId={session?.bindingId} />
               {snapshot?.team && <form className="management-section" onSubmit={async event => {
                 event.preventDefault()
@@ -1414,6 +1473,8 @@ export default function App() {
             </>
           ) : settingsPage === 'meeting' ? (
             <MeetingPanel />
+          ) : settingsPage === 'wecom' || settingsPage === 'reminders' ? (
+            <AssistantSettings key={settingsPage} section={settingsPage} />
           ) : (
             <>
               <h3 className="management-page-title" id="panel-tab-doc">文档管理</h3>
@@ -1432,6 +1493,7 @@ export default function App() {
                 busy={docBusy}
                 speaking={speech.speaking}
                 onOpen={docOpen}
+                onRead={path => void docRead(path)}
                 onExplain={docExplain}
                 onAsk={docAsk}
                 onStop={() => window.petApi.stopSpeech()}

@@ -119,6 +119,59 @@ const targets = [
     format: 'iife',
     define: { 'process.env.NODE_ENV': '"production"' },
   },
+  {
+    // 任务与提醒窗口的 preload：只暴露任务读写，不暴露任何令牌或通用请求能力。
+    name: 'companion-tasks-preload',
+    entryPoints: [path.join(root, 'src/preload/companion-tasks.ts')],
+    outfile: path.join(root, 'dist/preload/companion-tasks.cjs'),
+    platform: 'node',
+    format: 'cjs',
+    external: ['electron'],
+  },
+  {
+    name: 'companion-tasks-renderer',
+    entryPoints: [path.join(root, 'src/renderer/companion-tasks-main.tsx')],
+    outfile: path.join(root, 'dist/renderer/companion-tasks.js'),
+    platform: 'browser',
+    format: 'iife',
+    define: { 'process.env.NODE_ENV': '"production"' },
+  },
+  {
+    // Office 逐页阅读窗口的 preload：只暴露只读页面会话、字节与换页授权检查。
+    name: 'office-view-preload',
+    entryPoints: [path.join(root, 'src/preload/office-view.ts')],
+    outfile: path.join(root, 'dist/preload/office-view.cjs'),
+    platform: 'node',
+    format: 'cjs',
+    external: ['electron'],
+  },
+  {
+    // docx/pptx 本地渲染页面；docx-preview 与 pptx-preview 打进独立 bundle，不加载远端资源。
+    name: 'office-view-renderer',
+    entryPoints: [path.join(root, 'src/renderer/office-view-main.tsx')],
+    outfile: path.join(root, 'dist/renderer/office-view.js'),
+    platform: 'browser',
+    format: 'iife',
+    define: { 'process.env.NODE_ENV': '"production"' },
+  },
+  {
+    // 成员编辑窗口的 preload：只暴露成员草稿、保存与上下文，不开放任意 IPC 或宿主地址。
+    name: 'member-editor-preload',
+    entryPoints: [path.join(root, 'src/preload/member-editor.ts')],
+    outfile: path.join(root, 'dist/preload/member-editor.cjs'),
+    platform: 'node',
+    format: 'cjs',
+    external: ['electron'],
+  },
+  {
+    // 成员编辑页面单独打包：不加载舞台的角色与动画资源，避免把整个舞台塞进编辑窗口。
+    name: 'member-editor-renderer',
+    entryPoints: [path.join(root, 'src/renderer/member-editor-main.tsx')],
+    outfile: path.join(root, 'dist/renderer/member-editor.js'),
+    platform: 'browser',
+    format: 'iife',
+    define: { 'process.env.NODE_ENV': '"production"' },
+  },
 ]
 
 function copyStatic() {
@@ -126,6 +179,9 @@ function copyStatic() {
   cpSync(path.join(root, 'src/renderer/approval.html'), path.join(root, 'dist/renderer/approval.html'))
   cpSync(path.join(root, 'src/renderer/doc-view.html'), path.join(root, 'dist/renderer/doc-view.html'))
   cpSync(path.join(root, 'src/renderer/report-workbench.html'), path.join(root, 'dist/renderer/report-workbench.html'))
+  cpSync(path.join(root, 'src/renderer/companion-tasks.html'), path.join(root, 'dist/renderer/companion-tasks.html'))
+  cpSync(path.join(root, 'src/renderer/member-editor.html'), path.join(root, 'dist/renderer/member-editor.html'))
+  cpSync(path.join(root, 'src/renderer/office-view.html'), path.join(root, 'dist/renderer/office-view.html'))
   cpSync(path.join(root, 'src/renderer/styles.css'), path.join(root, 'dist/renderer/styles.css'))
   // ⚠️ 这里只做「覆盖拷贝」，**不删除**目标里多余的文件。
   //

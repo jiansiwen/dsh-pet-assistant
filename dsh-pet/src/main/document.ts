@@ -21,7 +21,8 @@ import type { PdfFailure, PdfParseOptions, PdfParser, PdfPage } from './doc-pdf.
 // 后缀写 `.ts` 而不是 `.js`：这个文件被 tests/document.test.ts 直接导入，而 Node 的
 // strip-only TypeScript 不会把 `.js` 重写成 `.ts`，写 `.js` 跑测试就是 ERR_MODULE_NOT_FOUND。
 // esbuild 两种都认，所以这里按 node --test 的要求写。
-import { MARKDOWN_EXTENSIONS, OPENABLE_EXTENSIONS, PLAINTEXT_EXTENSIONS, PDF_EXTENSIONS } from './doc-formats.ts'
+import { MARKDOWN_EXTENSIONS, OFFICE_EXTENSIONS, OPENABLE_EXTENSIONS, PLAINTEXT_EXTENSIONS, PDF_EXTENSIONS } from './doc-formats.ts'
+import { parseOfficeDocument } from './doc-office.ts'
 
 /** 授权目录里的一个候选文件。 */
 export interface DocFile {
@@ -89,6 +90,7 @@ const OPENABLE = new Set(OPENABLE_EXTENSIONS)
 const MARKDOWN = new Set(MARKDOWN_EXTENSIONS)
 const PLAINTEXT = new Set(PLAINTEXT_EXTENSIONS)
 const PDF = new Set(PDF_EXTENSIONS)
+const OFFICE = new Set(OFFICE_EXTENSIONS)
 
 /**
  * 路径比较一律忽略大小写。
@@ -119,7 +121,7 @@ export function canOpenWithApp(name: string): boolean {
 /** 能不能解析出讲解提纲。能打开的格式远多于能讲的格式，这两件事别混。 */
 export function canOutline(name: string): boolean {
   const extension = extensionOf(name)
-  return MARKDOWN.has(extension) || PLAINTEXT.has(extension) || PDF.has(extension)
+  return MARKDOWN.has(extension) || PLAINTEXT.has(extension) || PDF.has(extension) || OFFICE.has(extension)
 }
 
 /** 用户给的是一句话还是一个路径。带分隔符或本身就是绝对路径的按路径处理。 */
@@ -295,6 +297,9 @@ export function buildOutline(fileName: string, content: string): ParseResult {
   if (PDF.has(extensionOf(fileName))) {
     return { kind: 'unsupported', reason: 'PDF 按纯文本读不出结构，必须通过授权后的本地二进制解析' }
   }
+  if (OFFICE.has(extensionOf(fileName))) {
+    return { kind: 'unsupported', reason: 'docx/pptx 是压缩容器，按纯文本读不出结构，必须通过授权后的本地二进制解析' }
+  }
   if (!canOutline(fileName)) {
     const extension = extensionOf(fileName)
     return {
@@ -302,7 +307,7 @@ export function buildOutline(fileName: string, content: string): ParseResult {
       reason:
         extension === ''
           ? '没有扩展名，认不出这是什么文档'
-          : `${extension} 读不出结构，当前仅支持文本和可提取文字的 PDF；只能用系统关联的应用打开给你看`,
+          : `${extension} 读不出结构，当前支持文本、可提取文字的 PDF、docx 和 pptx；只能用系统关联的应用打开给你看`,
     }
   }
 
@@ -621,16 +626,20 @@ export class DocumentLibrary {
       }
       let parsed: ParseResult
       let size = info.size
-      if (PDF.has(extensionOf(info.name))) {
+      if (PDF.has(extensionOf(info.name)) || OFFICE.has(extensionOf(info.name))) {
         const bytes = await this.files.readBytes(real, options.signal)
         if (bytes.byteLength > MAX_DOC_BYTES) return { kind: 'too-big', size: bytes.byteLength }
         if (options.signal?.aborted) return cancelled()
         // 指纹与解析来自同一快照，防止 stat/摘要/读取之间的文件更新产生错误缓存。
         fingerprint = fingerprintBytes(bytes)
         size = bytes.byteLength
-        const result = await this.parsePdf(bytes, options)
-        if (options.signal?.aborted) return cancelled()
-        parsed = result.kind === 'pdf-pages' ? { kind: 'outline', outline: pdfOutline(info.name, result.pages) } : result
+        if (PDF.has(extensionOf(info.name))) {
+          const result = await this.parsePdf(bytes, options)
+          if (options.signal?.aborted) return cancelled()
+          parsed = result.kind === 'pdf-pages' ? { kind: 'outline', outline: pdfOutline(info.name, result.pages) } : result
+        } else {
+          parsed = await parseOfficeDocument(info.name, bytes)
+        }
       } else {
         parsed = buildOutline(info.name, await this.files.read(real))
       }

@@ -3,6 +3,8 @@ import type { SessionCommand, SessionResult, SessionUpdate } from '../session-ty
 import type { SettingsPage } from '../renderer/types.js'
 import type { Box } from '../renderer/stage-layout.js'
 import type { VoiceApiInput, VoiceApiKind, VoiceApiResult } from '../voice-api-types.js'
+import type { AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
+import type { MemberAction, MemberCommandInputs, MemberDraft, MemberResult, MemoryRecord } from '../member-types.js'
 import type { FirstRunDownloadResult, FirstRunReportResult } from '../main/first-run-service.js'
 import type { DownloadConfirmation } from '../main/model-resources.js'
 import type { EvidenceIntakeOutcome } from '../evidence-types.js'
@@ -62,6 +64,18 @@ contextBridge.exposeInMainWorld('petApi', {
   onOverlayError: (callback: (message: string) => void) => listen('overlay-error', callback),
   overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
   saveSettings: (patch: PetSettingsPatch) => ipcRenderer.invoke('save-settings', patch) as Promise<{ ok: boolean }>,
+  assistantSettingsState: () => ipcRenderer.invoke('assistant-settings-state') as Promise<AssistantSettingsResult>,
+  assistantSettingsSave: (section: AssistantSettingsSection, input: unknown) =>
+    ipcRenderer.invoke('assistant-settings-save', section, input) as Promise<AssistantSettingsResult>,
+  membersState: () => ipcRenderer.invoke('members-state') as Promise<MemberResult>,
+  memberMemories: (id: string) => ipcRenderer.invoke('member-memories', id) as Promise<MemberResult<{ records: MemoryRecord[] }>>,
+  memberCommand: <A extends MemberAction>(action: A, input: MemberCommandInputs[A]) =>
+    ipcRenderer.invoke('member-command', action, input) as Promise<MemberResult>,
+  memberAssist: (input: { request: string; current?: MemberDraft }) =>
+    ipcRenderer.invoke('member-assist', input) as Promise<MemberResult>,
+  openMemberEditor: (memberId: string | null = null) => ipcRenderer.invoke('member-editor-open', memberId) as Promise<{ ok: boolean }>,
+  onMembersChanged: (callback: () => void) => listen('members-changed', callback),
+  openCompanionTasks: () => ipcRenderer.invoke('companion-tasks-open') as Promise<{ ok: boolean }>,
   voiceApiState: () => ipcRenderer.invoke('voice-api-state') as Promise<VoiceApiResult>,
   voiceApiSave: (input: VoiceApiInput) => ipcRenderer.invoke('voice-api-save', input) as Promise<VoiceApiResult>,
   voiceApiRemove: (id: string) => ipcRenderer.invoke('voice-api-remove', id) as Promise<VoiceApiResult>,
@@ -169,6 +183,8 @@ contextBridge.exposeInMainWorld('petApi', {
   onTeamEvent: (callback: (event: BridgeEventPayload) => void) => {
     subscribe('team-event', event => callback(event as BridgeEventPayload))
   },
+  onMemberNotice: (callback: (notice: { kind: 'mail' | 'member'; text: string; memberId?: string }) => void) =>
+    listen('member-notice', callback),
   onCompanionState: (callback: (state: CompanionState) => void) => {
     subscribe('companion-state', state => callback(state as CompanionState))
   },
@@ -200,6 +216,7 @@ contextBridge.exposeInMainWorld('petApi', {
     ipcRenderer.invoke('doc-explain', path, from ?? 0, speak !== false, assistantId) as Promise<DocReplyResult>,
   askDoc: (path: string, index: number, question: string, assistantId?: string) =>
     ipcRenderer.invoke('doc-ask', path, index, question, assistantId) as Promise<DocReplyResult>,
+  officeOpen: (path: string) => ipcRenderer.invoke('office-open', path) as Promise<{ ok: boolean; error?: string }>,
   docRoots: () => ipcRenderer.invoke('doc-roots') as Promise<DocRoots>,
   addDocRoot: () => ipcRenderer.invoke('doc-add-root') as Promise<DocRoots>,
   removeDocRoot: (path: string) => ipcRenderer.invoke('doc-remove-root', path) as Promise<DocRoots>,
@@ -221,6 +238,10 @@ contextBridge.exposeInMainWorld('petApi', {
     ipcRenderer.invoke('meeting-start', consent) as Promise<MeetingStartResult>,
   meetingStop: (meetingId?: string) =>
     ipcRenderer.invoke('meeting-stop', meetingId) as Promise<SimpleOkResult>,
+  /** 桌面命令预填的会议启动参数；会议页挂载时取一次，收到即开录。 */
+  meetingTakeCommand: () => ipcRenderer.invoke('meeting-take-command') as Promise<{ requestId: string; consent: MeetingConsentInput } | null>,
+  onMeetingCommand: (callback: (command: { requestId: string; consent: MeetingConsentInput }) => void) =>
+    listen('meeting-command', callback),
   /**
    * 渲染层推一块 base64 PCM（16kHz mono Int16），到主进程立即加密落盘。meta 是分轨时间轴
    * （音轨、轨内序号、起点、原始采样率、16k 帧数）：两路各自成轨，不交错拼接。

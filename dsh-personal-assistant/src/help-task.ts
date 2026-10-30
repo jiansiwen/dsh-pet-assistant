@@ -220,6 +220,7 @@ export class HelpTaskService {
   private readonly aborts = new Map<string, AbortController>()
   private readonly releases: Array<() => void> = []
   private disposed = false
+  private disposal: Promise<void> | null = null
 
   constructor(options: HelpTaskOptions) {
     this.options = options
@@ -244,7 +245,8 @@ export class HelpTaskService {
   }
 
   helpTask(taskId: string): HelpTaskLink | null {
-    return this.store.getHelpTask(taskId)
+    this.requireActive()
+    return this.getTask(taskId) ? this.store.getHelpTask(taskId) : null
   }
 
   // ───────────────────────────── 打开帮助任务与读取 ─────────────────────────────
@@ -535,15 +537,16 @@ export class HelpTaskService {
    * 只有用户在桌面审批窗口批准后才写进账本；调用本身不改任何账目，模型自报无效。
    */
   proposeReview(input: { operationId: string; resolution: string; note?: string }) {
+    this.requireActive()
     const operation = typeof input.operationId === 'string' ? this.store.getOperation(input.operationId) : null
-    if (!operation) throw new HelpTaskError('NOT_FOUND', `账本里没有操作 ${input.operationId}`)
+    if (!operation || !this.getTask(operation.taskId)) throw new HelpTaskError('NOT_FOUND', `账本里没有当前团队的操作 ${input.operationId}`)
     if (operation.state !== 'unknown') throw new HelpTaskError('BAD_INPUT', `操作 ${operation.operationId} 当前是 ${operation.state}，只有结果不明的操作需要人工复核`)
     if (!(REVIEW_RESOLUTIONS as readonly string[]).includes(input.resolution)) {
       throw new HelpTaskError('BAD_INPUT', `resolution 只能是 ${REVIEW_RESOLUTIONS.join(' / ')}`)
     }
     const resolution = input.resolution as ReviewResolution
     const note = typeof input.note === 'string' ? clip(input.note.trim(), 500) : ''
-    const task = this.store.getTask(operation.taskId)
+    const task = this.getTask(operation.taskId)
     if (!task) throw new HelpTaskError('NOT_FOUND', `操作所属的任务 ${operation.taskId} 不存在`)
     this.syncExpired(operation.taskId)
     const reviewId = randomUUID()
@@ -588,11 +591,13 @@ export class HelpTaskService {
    * 批准后照样由执行器执行，结果以账本为准。
    */
   async wait(proposalId: string, signal: AbortSignal, timeoutMs: number) {
+    this.requireActive()
     const proposal = this.options.approvals.proposal(proposalId)
-    if (!proposal || !isTrustedActionTool(proposal.tool)) throw new HelpTaskError('NOT_FOUND', `${proposalId} 不是改动、验证或复核的审批卡`)
+    if (!proposal || !isTrustedActionTool(proposal.tool) || !this.getTask(proposal.taskId)) throw new HelpTaskError('NOT_FOUND', `${proposalId} 不是当前团队的改动、验证或复核审批卡`)
     const timeout = AbortSignal.timeout(Math.max(1, timeoutMs))
     const bounded = AbortSignal.any([signal, timeout])
     const decision = await this.options.approvals.waitForDecision(proposalId, bounded, { abandonOnAbort: false })
+    this.requireActive()
     if (decision !== 'approved') {
       return { proposalId, tool: proposal.tool, decision: decision === 'aborted' ? 'still-pending' : decision, outcome: null, ...this.describe(proposal) }
     }
@@ -608,12 +613,15 @@ export class HelpTaskService {
   }
 
   private describe(proposal: ActionProposal) {
-    const status = this.store.getHelpTask(proposal.taskId) ? this.status(proposal.taskId) : null
-    return { verdict: status?.verdict ?? null, taskStatus: this.store.getTask(proposal.taskId)?.status ?? null }
+    this.requireActive()
+    const status = this.status(proposal.taskId)
+    return { verdict: status?.verdict ?? null, taskStatus: this.getTask(proposal.taskId)?.status ?? null }
   }
 
   /** 由账本推出的结论；模型的任何说法都不参与。 */
   verdict(taskId: string): HelpVerdict {
+    this.requireActive()
+    if (!this.getTask(taskId)) throw new HelpTaskError('NOT_FOUND', `${taskId} 不是当前团队的任务`)
     const base = { changeId: null, revision: null, verificationId: null, exitCode: null }
     const unknown = this.store.listOperations(taskId).filter(operation => operation.state === 'unknown')
     if (unknown.length > 0) {
@@ -650,8 +658,9 @@ export class HelpTaskService {
 
   /** 帮助任务的完整可追溯视图：episode / 授权 / 每版改动 / 每次验证 / 结论。 */
   status(taskId: string) {
-    const link = this.store.getHelpTask(taskId)
-    const task = this.store.getTask(taskId)
+    this.requireActive()
+    const task = this.getTask(taskId)
+    const link = task ? this.store.getHelpTask(taskId) : null
     if (!link || !task) return null
     this.syncExpired(taskId)
     const relative = (file: string) => this.relative(link, file)
@@ -681,9 +690,10 @@ export class HelpTaskService {
    * 每一步都重新核验，任何一项不符都拒绝且不写文件、不运行命令。
    */
   execute(proposalId: string): Promise<ExecutionOutcome> {
+    if (this.disposed) return Promise.resolve({ proposalId, tool: 'apply_change', state: 'refused', detail: '帮助任务服务已经停止，未执行', operationId: null })
     const proposal = this.options.approvals.proposal(proposalId)
-    if (!proposal || !isTrustedActionTool(proposal.tool)) {
-      return Promise.resolve({ proposalId, tool: 'apply_change', state: 'refused', detail: `${proposalId} 不是执行器审批卡`, operationId: null })
+    if (!proposal || !isTrustedActionTool(proposal.tool) || !this.getTask(proposal.taskId)) {
+      return Promise.resolve({ proposalId, tool: 'apply_change', state: 'refused', detail: `${proposalId} 不是当前团队的执行器审批卡`, operationId: null })
     }
     const tool = proposal.tool
     const body = (): Promise<ExecutionOutcome> => {
@@ -693,6 +703,9 @@ export class HelpTaskService {
     }
     const serialized = this.serialize(proposal.taskId, async () => {
       try {
+        if (this.disposed || !this.getTask(proposal.taskId)) {
+          return { proposalId, tool, state: 'refused', detail: '帮助任务服务已停止或任务不属于当前团队，未执行', operationId: null } satisfies ExecutionOutcome
+        }
         return await body()
       } catch (error) {
         this.options.logger.warn('可信执行器异常', { proposalId, error: messageOf(error) })
@@ -726,11 +739,12 @@ export class HelpTaskService {
   private onDecision(proposal: ActionProposal, decision: TrustedDecision): void {
     if (this.disposed) return
     try {
+      if (!this.getTask(proposal.taskId)) return
       if (decision === 'approved') {
         this.markApproved(proposal)
         this.outcomeHolder(proposal.proposalId)
         const schedule = this.options.schedule ?? ((run: () => void) => run())
-        schedule(() => { void this.execute(proposal.proposalId) })
+        schedule(() => { if (!this.disposed) void this.execute(proposal.proposalId) })
         return
       }
       this.markRejected(proposal)
@@ -1034,7 +1048,7 @@ export class HelpTaskService {
 
   /** 普通团队任务的 unknown 都复核完之后回到「等复核」，不自动判成完成。 */
   private reopenAfterReview(taskId: string): void {
-    const task = this.store.getTask(taskId)
+    const task = this.getTask(taskId)
     if (!task || task.status !== 'unknown') return
     if (this.store.listOperations(taskId).some(item => ['planned', 'running', 'unknown'].includes(item.state))) return
     this.setTaskStatus(taskId, 'review')
@@ -1048,6 +1062,8 @@ export class HelpTaskService {
    * 旧代次签发、尚未执行的批准再也消费不了，对应改动 / 验证记 expired。
    */
   recover(taskId: string): void {
+    if (!this.getTask(taskId)) return
+    this.syncExpired(taskId)
     // 批准签发时执行器不在（团队正在卸载）：提案已批准、记录却还停在 pending，同样没执行过。
     const approvedButIdle = (proposalId: string | null) => proposalId !== null && this.store.getProposal(proposalId)?.state === 'approved'
     for (const change of this.store.listChangeSets(taskId)) {
@@ -1072,6 +1088,7 @@ export class HelpTaskService {
 
   /** 取消帮助任务：作废待批的执行器审批卡、终止正在跑的验证命令，等在途执行收尾。 */
   async cancel(taskId: string): Promise<void> {
+    if (!this.getTask(taskId)) return
     this.aborts.get(taskId)?.abort()
     for (const proposal of this.options.approvals.proposalsForTask(taskId)) {
       if (proposal.state === 'pending' && isTrustedActionTool(proposal.tool)) this.options.approvals.expire(proposal.proposalId, '任务已取消')
@@ -1085,23 +1102,53 @@ export class HelpTaskService {
     await this.chains.get(taskId)
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
     this.disposed = true
+    if (this.disposal) return this.disposal
+    this.disposal = this.releaseResources().catch(error => {
+      this.disposal = null
+      throw error
+    })
+    return this.disposal
+  }
+
+  private async releaseResources(): Promise<void> {
+    const errors: unknown[] = []
+    for (let index = this.releases.length - 1; index >= 0; index -= 1) {
+      try {
+        this.releases[index]!()
+        this.releases.splice(index, 1)
+      } catch (error) {
+        errors.push(error)
+      }
+    }
     for (const controller of this.aborts.values()) controller.abort()
     await Promise.all([...this.chains.values()])
-    while (this.releases.length > 0) this.releases.pop()!()
+    if (errors.length > 0) throw new AggregateError(errors, '帮助任务服务释放未完成，请重试 dispose')
   }
 
   // ───────────────────────────── 内部工具 ─────────────────────────────
 
+  private requireActive(): void {
+    if (this.disposed) throw new HelpTaskError('STOPPED', '帮助任务服务已经停止')
+  }
+
+  private getTask(taskId: string): Task | null {
+    if (this.store.getTaskRuntimeScope(taskId) !== 'team') return null
+    const task = this.store.getTask(taskId)
+    return task?.teamId === this.options.teamId ? task : null
+  }
+
   private requireScopes(): HelpScopeSource {
+    this.requireActive()
     if (!this.options.scopes) throw new HelpTaskError('NOT_AVAILABLE', '帮助授权未装配，不能读取或改动项目')
     return this.options.scopes
   }
 
   private requireLink(taskId: string): { task: Task; link: HelpTaskLink } {
-    const link = typeof taskId === 'string' ? this.store.getHelpTask(taskId) : null
-    const task = link ? this.store.getTask(taskId) : null
+    this.requireActive()
+    const task = typeof taskId === 'string' ? this.getTask(taskId) : null
+    const link = task ? this.store.getHelpTask(taskId) : null
     if (!link || !task) throw new HelpTaskError('NOT_FOUND', `${taskId} 不是帮助任务；先用 desktop_team_open_help_task 在已授权范围上开任务`)
     return { task, link }
   }
@@ -1196,7 +1243,7 @@ export class HelpTaskService {
 
   private setTaskStatus(taskId: string, status: TaskStatus, artifacts?: readonly string[]): void {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const task = this.store.getTask(taskId)
+      const task = this.getTask(taskId)
       if (!task || (task.status === status && artifacts === undefined)) return
       const updated = this.store.updateTask(taskId, task.revision, { status, artifacts })
       if (updated) {
@@ -1209,7 +1256,7 @@ export class HelpTaskService {
 
   /** 按账本重算帮助任务的状态：结果不明 → unknown；有待批 → 等你点头；验证通过 → 已完成；已应用 → 等复核。 */
   private refresh(taskId: string): void {
-    const task = this.store.getTask(taskId)
+    const task = this.getTask(taskId)
     if (!task || TERMINAL_TASK_STATUSES.includes(task.status)) return
     if (this.isBusy(taskId)) {
       if (task.status !== 'running') this.setTaskStatus(taskId, 'running')

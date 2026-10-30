@@ -173,7 +173,7 @@ test('替换规则版本变化使待批失效；确认、删除只能由可信�
   await f.decide(first.proposalId)
   const memory = f.memories.list({}, Date.now())[0]!
   const replace = await f.call('remember_preference', { text: '用英文', topic: '语言', replaceIds: [memory.id] })
-  f.memories.confirm(memory.id, { id: '测试用户', isUser: true }, Date.now())
+  f.memories.confirm(memory.id, { id: '测试用户', isUser: true }, Date.now(), { [memory.id]: memory.revision })
   // 显式修改相关修订，模拟另一可信入口更新。
   f.db.prepare('UPDATE memories SET revision = revision + 1 WHERE memory_id = ?').run(memory.id)
   assert.equal((await f.decide(replace.proposalId)).ok, false)

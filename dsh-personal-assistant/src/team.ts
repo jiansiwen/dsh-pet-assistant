@@ -11,6 +11,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
+import type { MemberRuntime, MemberActivation } from './member-runtime.ts'
+import type { MemberProfile } from './member-contract.ts'
 import {
   CHILD_LOCAL_TOOLS, PATH_TARGET_TOOLS, READ_ONLY_ALLOW_TOOLS, canonicalRoot, installApprovalGate,
   installDelegationApprovalGate, installDelegationReadOnlyGate, installReadOnlyGate, verifiedGatedTools,
@@ -38,6 +40,8 @@ export interface TeamLogger {
 
 export interface TeamOptions {
   readonly teamId: string
+  /** 成员运行时拥有独立持久会话、工具门禁和日/总额度账本。 */
+  readonly members?: MemberRuntime
   /** 子代理 provider 名。`spawn` 不继承父上下文，专家只看到任务材料。 */
   readonly provider: string
   readonly maxConcurrentInference: number
@@ -104,10 +108,10 @@ export const ROSTER: readonly MemberSeed[] = [
     assistantId: 'member-wukong',
     roleId: 'wukong',
     displayName: '助理1',
-    aliases: ['悟空', '助理1', 'wukong'],
+    aliases: ['助理1', 'wukong'],
     skinId: 'boy-glasses',
     persona:
-      '你是助理1，负责编程、排障与技术探索。表达干脆机敏，直接给结论和依据。你只做只读分析并给出可核验的证据与修改建议，不得擅自修改文件、删除数据或绕过权限。',
+      '你是助理1，负责技术排查与资料分析。表达干脆机敏，直接给结论和依据。你只做只读分析并给出可核验的证据与修改建议，不得擅自修改文件、删除数据或绕过权限。',
     voiceProfile: 'bright-male',
     mode: 'read-only',
     enabled: true,
@@ -116,10 +120,10 @@ export const ROSTER: readonly MemberSeed[] = [
     assistantId: 'member-bajie',
     roleId: 'bajie',
     displayName: '助理2',
-    aliases: ['八戒', '助理2', 'bajie'],
+    aliases: ['助理2', 'bajie'],
     skinId: 'girl-glasses',
     persona:
-      '你是助理2，负责表达整理、创意与轻松陪伴。语言幽默生活化，但事实部分必须准确：不得编造、不得偷懒省略证据、不得泄露用户隐私。',
+      '你是助理2，负责文字整理与表达润色。语言幽默生活化，但事实部分必须准确：不得编造、不得偷懒省略证据、不得泄露用户隐私。',
     voiceProfile: 'warm-female',
     mode: 'read-only',
     enabled: true,
@@ -337,8 +341,9 @@ export function watchReplyDeltas(
   events: () => readonly ChunkEventLike[] | undefined,
   onText: (text: string) => void,
   tickMs = REPLY_DELTA_TICK_MS,
+  initialCursor = 0,
 ): () => void {
-  let cursor = 0
+  let cursor = initialCursor
   let stopped = false
   const timer = setInterval(() => {
     if (stopped) return
@@ -426,6 +431,7 @@ export class TeamService {
   private readonly liveRuns = new Map<string, LiveRun>()
   private recovered = false
   private disposed = false
+  private disposal: Promise<void> | null = null
   /** 「暂停后续步骤」：只挡新的领取，不中止在跑的运行；只在内存里，插件重载即恢复。 */
   private paused = false
   private readonly ctx: Context
@@ -448,13 +454,7 @@ export class TeamService {
     })
   }
 
-  /**
-   * 补写缺失成员，并把"谁上台"对齐到配置。
-   *
-   * 只对齐 `enabled` 一个字段：人设、形象、工具权限都是**职责**，换职责要提升 revision，
-   * 不该被一次重启悄悄改掉；而谁上台是用户能直接看见的资源开销 —— design.md §11.2 的
-   * 五角色闲暇目标写着未达标就"降帧/资源分辨率/角色数，不能假报低耗"，降角色数得有个开关。
-   */
+  /** 仅补写缺失的旧版种子；已有成员的启用状态、权限和人设均以持久目录为准。 */
   ensureRoster(): MemberConfig[] {
     const { enabled, unknown } = resolveSeats(ROSTER, this.options.seats)
     for (const name of unknown) this.options.logger.warn(`团队席位名单里认不出这个名字，已忽略：${name}`)
@@ -477,19 +477,17 @@ export class TeamService {
           enabled: onStage,
           revision: 1,
         })
-      } else if (existing.enabled !== onStage) {
-        this.store.upsertMember({ ...existing, enabled: onStage })
       }
     }
-    return this.store.listMembers()
+    return this.roster()
   }
 
-  roster(): MemberConfig[] {
-    return this.store.listMembers()
+  roster(): Array<MemberConfig & Partial<MemberProfile>> {
+    return this.store.listMembers().map(member => this.store.directory?.get(member.assistantId) ?? member)
   }
 
   enabledMembers(): MemberConfig[] {
-    return this.store.listMembers().filter((member) => member.enabled)
+    return this.roster().filter((member) => member.enabled)
   }
 
   /** 总助理：默认面对用户发言的成员。 */
@@ -508,10 +506,13 @@ export class TeamService {
   resolveByName(name: string): MemberConfig | null {
     const key = name.trim().toLowerCase()
     if (key.length === 0) return null
+    const members = this.roster()
+    const exact = members.find(member => member.assistantId.toLowerCase() === key)
+      ?? members.find(member => member.displayName.trim().toLowerCase() === key)
+    if (exact) return exact.enabled ? exact : null
     const assistantId = ALIASES.get(key)
-    if (!assistantId) return null
-    const member = this.store.getMember(assistantId)
-    return member && member.enabled ? member : null
+    const member = members.find(item => item.assistantId === assistantId)
+    return member?.enabled ? member : null
   }
 
   submitTask(input: TaskInput): Task {
@@ -527,7 +528,7 @@ export class TeamService {
     const now = Date.now()
     const taskId = randomUUID()
     for (const dep of dependsOn) {
-      if (!this.store.getTask(dep)) throw new Error(`dependency ${dep} does not exist`)
+      if (!this.getTask(dep)) throw new Error(`dependency ${dep} does not exist`)
       if (this.store.wouldCreateCycle(taskId, dep)) throw new Error(`dependency ${dep} would create a cycle`)
     }
     const task: Task = {
@@ -557,19 +558,32 @@ export class TeamService {
   }
 
   getTask(taskId: string): Task | null {
-    return this.store.getTask(taskId)
+    if (this.store.getTaskRuntimeScope(taskId) !== 'team') return null
+    const task = this.store.getTask(taskId)
+    return task?.teamId === this.options.teamId ? task : null
   }
 
   listTasks(filter?: { status?: TaskStatus; teamId?: string }): Task[] {
-    return this.store.listTasks(filter)
+    if (filter?.teamId !== undefined && filter.teamId !== this.options.teamId) return []
+    return this.store.listTasks({ ...filter, teamId: this.options.teamId, runtimeScope: 'team' })
   }
 
   listRuns(taskId: string) {
-    return this.store.listRuns(taskId)
+    return this.getTask(taskId) ? this.store.listRuns(taskId) : []
   }
 
-  eventsSince(seq: number, limit?: number): TeamEvent[] {
-    return this.store.eventsSince(seq, limit)
+  eventsSince(seq: number, limit = 200): TeamEvent[] {
+    const events: TeamEvent[] = []
+    let cursor = seq
+    while (events.length < limit) {
+      const batch = this.store.eventsSince(cursor, limit - events.length)
+      if (batch.length === 0) break
+      for (const event of batch) {
+        if (event.taskId === null || this.getTask(event.taskId)) events.push(event)
+        cursor = event.seq
+      }
+    }
+    return events
   }
 
   runningCount(): number {
@@ -599,7 +613,7 @@ export class TeamService {
 
   /** 依赖是否全部完成；未完成的依赖让任务留在排队状态。 */
   private dependenciesSatisfied(task: Task): boolean {
-    return task.dependsOn.every((dep) => this.store.getTask(dep)?.status === 'done')
+    return task.dependsOn.every((dep) => this.getTask(dep)?.status === 'done')
   }
 
   private setStatus(task: Task, status: TaskStatus, extra?: { artifacts?: readonly string[] }): Task | null {
@@ -620,7 +634,7 @@ export class TeamService {
   async runTask(taskId: string, parentAgent: Agent, signal: AbortSignal): Promise<TaskOutcome | null> {
     if (this.disposed) throw new Error('团队服务已经停止')
     if (!this.recovered) this.recoverInterruptedTasks()
-    const task = this.store.getTask(taskId)
+    const task = this.getTask(taskId)
     if (!task) return null
     // 待批、复核、未知及运行中均不能重新领取，避免重发已发生的副作用。
     if (!['created', 'queued'].includes(task.status)) {
@@ -640,13 +654,15 @@ export class TeamService {
     if (task.deadlineAt !== null && task.deadlineAt <= Date.now()) return refuse('failed', 'deadline-exceeded', '任务已超过截止时间，未启动')
     const member = this.store.getMember(task.ownerId)
     if (!member?.enabled) return refuse('failed', 'owner-unavailable', '任务成员不存在或已停用，不会替换成员')
-    if (task.budgetTokens !== 0) return refuse('review', 'budget-unsupported', BUDGET_REFUSAL)
+    const managed = this.options.members
+    if (!managed && task.budgetTokens !== 0) return refuse('review', 'budget-unsupported', BUDGET_REFUSAL)
+    if (managed?.busy(member.assistantId)) return refuse('queued', 'member-busy', '成员正在处理其他请求，任务保持排队')
     const denied = [...this.options.denyExpertTools, ...member.toolPolicy.denyTools]
-    // 成员是只读的，任务范围写 side-effect 也只按只读跑：任务不能扩大成员权限。
-    const sideEffect = task.toolScope === 'side-effect' && member.toolPolicy.mode === 'side-effect'
+    // 持久成员路径只认已配置的能力门禁，任务范围和旧任务预算都不能扩大成员权限。
+    const sideEffect = !managed && task.toolScope === 'side-effect' && member.toolPolicy.mode === 'side-effect'
     const plan = sideEffect ? this.sideEffectPlan(parentAgent, denied) : null
     if (sideEffect && !plan) return refuse('review', 'side-effect-unsupported', SIDE_EFFECT_REFUSAL)
-    if (this.options.provider !== 'spawn') return refuse('review', 'provider-unsupported', '只读隔离目前仅核实 spawn 的独立描述符；未启动其他 provider')
+    if (!managed && this.options.provider !== 'spawn') return refuse('review', 'provider-unsupported', '只读隔离目前仅核实 spawn 的独立描述符；未启动其他 provider')
     if (!this.dependenciesSatisfied(task)) return refuse('queued', 'queued', '前置任务尚未通过验收')
     if (this.liveRuns.size >= this.options.maxConcurrentInference) return refuse('queued', 'queued', '推理额度已满')
     if (plan && this.sideEffectRunning() >= this.options.maxConcurrentSideEffect) return refuse('queued', 'queued', '副作用执行额度已满')
@@ -679,7 +695,11 @@ export class TeamService {
     // 边跑边推可见文本：不接这一层，宠物气泡会等到 reply/done 才一次性弹出。
     let stopDelta: () => void = () => undefined
     try {
-      if (plan) {
+      if (managed) {
+        const started = await this.startChild(member, claimed, parentAgent, runSignal, runId, null)
+        live.run = started.activation
+        live.child = started.child
+      } else if (plan) {
         const scope = { allow: [...READ_ONLY_ALLOW_TOOLS, ...plan.gated], denied, workspaceRoot: plan.workspaceRoot }
         let bound: Agent | undefined
         // 先装定向审批门禁：start() 返回前子代理发出的调用也只能走允许集合，门禁工具一律拦截。
@@ -710,12 +730,14 @@ export class TeamService {
         installReadOnlyGate(live.child, denied)
       }
       this.store.attachChildSession(runId, String(live.run.childId))
+      const memberRun = managed ? live.run as MemberActivation : undefined
       stopDelta = watchReplyDeltas(
-        () => live.child ? childEvents(live.child) : undefined,
+        () => memberRun?.replyEvents ?? (live.child ? childEvents(live.child) : undefined),
         (text) => this.store.appendEvent('reply/delta', {
           requestId: claimed.originRequestId, taskId, assistantId: member.assistantId,
           displayName: member.displayName, skinId: member.skinId, text,
         }, { taskId, assistantId: member.assistantId }),
+        REPLY_DELTA_TICK_MS, memberRun?.initialCursor ?? 0,
       )
       const result = await this.awaitResult(live.run, runSignal)
       runSignal.throwIfAborted()
@@ -740,7 +762,7 @@ export class TeamService {
         controller.abort('aborted')
         this.options.logger.warn('团队子代理未能释放，必须人工核查', { runId, error: String(error) })
         this.store.transaction(() => {
-          const current = this.store.getTask(taskId)
+          const current = this.getTask(taskId)
           if (current) this.setStatus(current, 'unknown')
           this.markUncertainOperations(taskId, '子代理未能静止释放，结果待人工核查')
         })
@@ -753,7 +775,7 @@ export class TeamService {
         finished()
       }
     }
-    const current = this.store.getTask(taskId) ?? outcome.task
+    const current = this.getTask(taskId) ?? outcome.task
     return { ...outcome, task: current, diagnostic: current.status === 'unknown' ? '运行或释放结果不明，禁止自动重试' : outcome.diagnostic }
   }
 
@@ -773,6 +795,8 @@ export class TeamService {
     runId: string,
     plan: SideEffectPlan | null,
   ): Promise<{ activation: SubagentActivation; child: Agent | undefined }> {
+    if (this.options.members) return this.options.members.start(member.assistantId, this.buildPrompt(member, task, null), signal, task.taskId,
+      task.originChannel === 'wecom' ? 'wecom' : 'desktop')
     const activation = await this.ctx.subagents.startActivation({
       provider: this.options.provider,
       label: runId,
@@ -791,8 +815,9 @@ export class TeamService {
   }
 
   private buildPrompt(member: MemberConfig, task: Task, plan: SideEffectPlan | null): ContentBlock[] {
-    const permission = plan
-      ? [
+    const permission = this.options.members
+      ? '【权限】只使用本成员配置允许的工具，执行门禁以成员运行时为准。邮件与普通任务继续使用原入口的本人审批。不得使用命令、写删文件、全局记忆、权限配置或再委派工具；任务不能扩大能力或额度。'
+      : plan ? [
           `【权限】本次是副作用任务，由可信执行器把关。可直接使用的只有观测工具${plan.observe.length > 0 ? `（${plan.observe.join('、')}）` : ''}；`
             + `需要审批的副作用工具只有：${plan.gated.join('、')}。`,
           '每一次副作用调用都会先在用户的桌面审批窗口生成审批卡，用户批准前这次调用会停住等待；批准只对这一次、参数完全相同的调用生效，'
@@ -846,7 +871,7 @@ export class TeamService {
 
   private stopRun(taskId: string, runId: string, stopReason: string, diagnostic: string): TaskOutcome {
     return this.store.transaction(() => {
-      const task = this.store.getTask(taskId)!
+      const task = this.getTask(taskId)!
       const cancelled = stopReason === 'aborted'
       if (!this.store.finishRun(runId, cancelled ? 'cancelled' : 'failed', stopReason, null)) {
         return { task, report: null, stopReason: task.status, diagnostic }
@@ -870,7 +895,7 @@ export class TeamService {
    * 一律记 unknown 等人工核查；任务记 unknown 后不会再被领取，这次运行的待决审批卡也一并作废。
    */
   recoverInterruptedTasks(): void {
-    for (const task of this.store.listTasks({ teamId: this.options.teamId })) {
+    for (const task of this.listTasks()) {
       if ([...this.liveRuns.values()].some(live => live.taskId === task.taskId)) continue
       // 帮助任务的可信执行器正在执行（应用改动 / 运行验证）：不是中断，留给它自己结算。
       if (this.help.isBusy(task.taskId)) continue
@@ -887,7 +912,7 @@ export class TeamService {
         this.help.recover(task.taskId)
         if ((task.status === 'running' || runs.length > 0 || uncertain) && !['unknown', 'cancelled', 'failed'].includes(task.status)) this.setStatus(task, 'unknown')
         // 离开运行中的任务没有执行器会再消费批准：残留的待决审批卡作废，免得用户批一个注定 409 的东西。
-        const status = this.store.getTask(task.taskId)?.status
+        const status = this.getTask(task.taskId)?.status
         if (status === 'unknown' || (status !== undefined && TERMINAL_TASK_STATUSES.includes(status))) {
           for (const proposal of this.store.expirePendingProposals(task.taskId)) {
             this.store.appendEvent('proposal/decided', { proposalId: proposal.proposalId, decision: 'expired', reason: 'runtime-interrupted' },
@@ -904,7 +929,7 @@ export class TeamService {
     const report = this.parseReport(result.structured)
     if (result.stopReason !== 'completed') return { ...this.stopRun(taskId, runId, result.stopReason, result.diagnostic ?? '子代理未正常完成'), report }
     return this.store.transaction(() => {
-      const current = this.store.getTask(taskId)!
+      const current = this.getTask(taskId)!
       if (current.revision !== task.revision || current.status !== 'running') {
         if (this.store.finishRun(runId, 'unknown', 'task-changed', null)) {
           this.markUncertainOperations(taskId, '任务在运行中被改动，结果待人工核查')
@@ -965,14 +990,14 @@ export class TeamService {
 
   /** 扫描可执行任务并按并发上限推进；返回本轮真正跑过的任务结果。 */
   async runReady(parentAgent: Agent, signal: AbortSignal): Promise<TaskOutcome[]> {
+    if (this.disposed) throw new Error('团队服务已经停止')
     const outcomes: TaskOutcome[] = []
     if (!this.recovered) this.recoverInterruptedTasks()
-    const candidates = this.store
-      .listTasks({ teamId: this.options.teamId })
+    const candidates = this.listTasks()
       .filter((task) => task.status === 'created' || task.status === 'queued')
       .sort((a, b) => a.createdAt - b.createdAt)
     for (const task of candidates) {
-      if (this.liveRuns.size >= this.options.maxConcurrentInference) break
+      if (this.disposed || this.liveRuns.size >= this.options.maxConcurrentInference) break
       const outcome = await this.runTask(task.taskId, parentAgent, signal)
       if (outcome) outcomes.push(outcome)
     }
@@ -981,10 +1006,10 @@ export class TeamService {
 
   /** 取消：停掉在跑的子代理，明确列出已完成的操作，不伪称撤回。 */
   async cancelTask(taskId: string): Promise<Task | null> {
-    if (!this.store.getTask(taskId)) return null
+    if (!this.getTask(taskId)) return null
     // 帮助任务：先作废待批的改动 / 验证审批卡、终止在跑的验证命令，等可信执行器收尾，再落取消。
     if (this.store.getHelpTask(taskId)) await this.help.cancel(taskId)
-    const task = this.store.getTask(taskId)!
+    const task = this.getTask(taskId)!
     const waits: Promise<void>[] = []
     for (const [runId, live] of this.liveRuns) {
       if (live.taskId !== taskId) continue
@@ -997,7 +1022,7 @@ export class TeamService {
       this.store.transaction(() => { this.markUncertainOperations(taskId, '任务被取消时仍未结算，结果待人工核查'); this.setStatus(task, 'cancelled') })
     }
     await Promise.all(waits)
-    return this.store.getTask(taskId)
+    return this.getTask(taskId)
   }
 
   /**
@@ -1009,7 +1034,7 @@ export class TeamService {
   async cancelWithReceipt(taskId: string, waitMs = CANCEL_EVIDENCE_WAIT_MS): Promise<CancelReceipt | null> {
     // 重启后首次触达：先对账，免得把上一进程遗留的 running 当成「没在跑」报已终止。
     if (!this.recovered) this.recoverInterruptedTasks()
-    const before = this.store.getTask(taskId)
+    const before = this.getTask(taskId)
     if (!before) return null
     const lives = [...this.liveRuns].filter(([, live]) => live.taskId === taskId)
     const hadRuns = this.store.listRuns(taskId).length > 0
@@ -1034,7 +1059,7 @@ export class TeamService {
     hadRuns: boolean,
     outcome: 'done' | 'error' | 'timeout',
   ): CancelReceipt {
-    const task = this.store.getTask(taskId) ?? before
+    const task = this.getTask(taskId) ?? before
     const ledger = this.store.listOperations(taskId)
     const operations = ledger.map(operation => ({
       operationId: operation.operationId, kind: operation.kind, target: operation.target ?? null, state: operation.state,
@@ -1089,15 +1114,40 @@ export class TeamService {
   }
 
   /** 等待自有启动、运行及释放全部结束后，调用方才可关闭业务库。 */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
     this.disposed = true
-    await Promise.all([...new Set([...this.liveRuns.values()].map(live => live.taskId))].map(taskId => this.cancelTask(taskId)))
-    for (const [runId, live] of this.liveRuns) {
-      await live.run?.dispose()
-      live.releaseGuard?.()
-      this.liveRuns.delete(runId)
+    if (this.disposal) return this.disposal
+    const helpDisposal = this.help.dispose()
+    this.disposal = this.releaseResources(helpDisposal).catch(error => {
+      this.disposal = null
+      throw error
+    })
+    return this.disposal
+  }
+
+  private async releaseResources(helpDisposal: Promise<void>): Promise<void> {
+    const errors: unknown[] = []
+    try {
+      this.options.approvals.invalidateTasks(this.listTasks().map(task => task.taskId), '团队服务已停止，未消费的批准不再执行')
+    } catch (error) {
+      // 调用方已先关库（旧测试与宿主卸载顺序）：没有可作废的票据，不把一个已完成的释放判成失败。
+      if (!(error instanceof Error && /database is not open/i.test(error.message))) errors.push(error)
     }
-    // 可信执行器的在途动作（应用改动 / 运行验证）先收尾，之后对账才不会把它们误记成中断。
-    await this.help.dispose()
+    const results = await Promise.allSettled([
+      helpDisposal,
+      ...[...new Set([...this.liveRuns.values()].map(live => live.taskId))].map(taskId => this.cancelTask(taskId)),
+    ])
+    for (const result of results) if (result.status === 'rejected') errors.push(result.reason)
+    for (const [runId, live] of this.liveRuns) {
+      try {
+        await live.run?.dispose()
+        live.quiescent = true
+        live.releaseGuard?.()
+        this.liveRuns.delete(runId)
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, '团队服务释放未完成，请重试 dispose')
   }
 }

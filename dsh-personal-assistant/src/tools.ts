@@ -1092,8 +1092,13 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
         validate: () => scopeStillValid() && snapshotDigest(before) === snapshotDigest(preferenceSnapshot(args)),
         execute: () => {
           if (!scopeStillValid()) throw new Error('项目帮助授权已撤销或实际路径已改指，未确认')
-          const record = options.memories.confirm(args.id, TRUSTED_ACTOR, Date.now(), args.replaceIds ?? [])
-          if (!record) throw new Error('规则不存在、已失效或替换范围不匹配')
+          const versions: Record<string, number> = {}
+          for (const item of before.selected) {
+            if (!item.record) throw new Error('规则不存在或已失效，请刷新后重新确认')
+            versions[item.id] = item.record.revision
+          }
+          const record = options.memories.confirm(args.id, TRUSTED_ACTOR, Date.now(), versions, args.replaceIds ?? [])
+          if (!record) throw new Error('规则不存在、已失效、替换范围不匹配或在确认前已被修改')
           return { resolved: true, id: record.id, scope: scopeLabel(record.scope, {}), status: record.status, revision: record.revision }
         },
       })
@@ -1126,7 +1131,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       const before = preferenceSnapshot({ id: args.id })
       const write = (): string => {
         const record = options.memories.revise(args.id,
-          { text: args.text, ...(args.topic === undefined ? {} : { topic: args.topic }), actor: TRUSTED_ACTOR }, Date.now())
+          { text: args.text, ...(args.topic === undefined ? {} : { topic: args.topic }), actor: TRUSTED_ACTOR, expectedRevision: target.revision }, Date.now())
         if (!record) throw new Error('改写失败：这条记忆已不存在或已失效')
         return json({
           edited: true, id: record.id, scope: scopeLabel(record.scope, {}),

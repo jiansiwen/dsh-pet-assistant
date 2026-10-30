@@ -74,7 +74,7 @@ export interface WorkbenchMemoryWrites {
     memoryId: string
     text: string
     topic?: string
-    before: { text: string; topic: string }
+    before: { text: string; topic: string; revision: number }
     scopeLabel: string
   }): string
 }
@@ -561,7 +561,7 @@ export class ReportWorkbench implements WorkbenchHandler {
 
     if (writes.approvalMode() === 'auto') {
       const updated = this.deps.memories.revise(memoryId,
-        { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'auto-publish', isUser: true } }, this.now())
+        { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'auto-publish', isUser: true }, expectedRevision: record.revision }, this.now())
       if (!updated) return fail(409, 'revise_failed', '改写失败：这条记忆已不存在或已失效')
       return ok({
         saved: true, mode: 'auto', id: updated.id, text: updated.text, topic: updated.topic, revision: updated.revision,
@@ -573,7 +573,7 @@ export class ReportWorkbench implements WorkbenchHandler {
     try {
       proposalId = writes.proposeMemoryEdit({
         memoryId, text, ...(topic === undefined ? {} : { topic }),
-        before: { text: record.text, topic: record.topic }, scopeLabel: label,
+        before: { text: record.text, topic: record.topic, revision: record.revision }, scopeLabel: label,
       })
     } catch (error) {
       return fail(409, 'submit_failed', error instanceof Error ? error.message : String(error))

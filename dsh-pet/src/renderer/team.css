@@ -844,3 +844,144 @@
     animation: none;
   }
 }
+
+/* 伙伴配置沿用管理面板的浅蓝底、字号和间距，不改变原有页面布局。 */
+.pet-management nav.management-tabs {
+  flex-wrap: wrap;
+}
+
+.pet-management nav.management-tabs button {
+  flex: 1 0 44px;
+  white-space: nowrap;
+}
+
+.pet-management .assistant-settings-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.pet-management .assistant-settings-legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.pet-management .assistant-settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pet-management .assistant-settings-field :is(input, textarea) {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid #a5c8d9;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #243b4b;
+  font: inherit;
+}
+
+.pet-management .assistant-settings-field textarea {
+  resize: vertical;
+}
+
+.pet-management .assistant-settings-fields:disabled {
+  opacity: 0.65;
+}
+
+.pet-management .assistant-settings-error {
+  color: var(--risk-high);
+  overflow-wrap: anywhere;
+}
+
+.pet-management .assistant-settings-list {
+  margin: 0;
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
+/* 通用成员复用原团队卡片；430px 面板内单列编辑，不挤占任务底座。 */
+.pet-management .member-management {
+  margin: 10px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.member-management h4 { margin: 8px 0 4px; }
+.member-management p { margin: 4px 0; }
+.member-heading, .member-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.member-heading { justify-content: space-between; }
+.member-heading h3 { margin: 0; }
+.member-management .member-card { padding: 10px; }
+.member-management .member-editor,
+.member-management .member-memories {
+  padding: 12px;
+  margin: 10px 0;
+  background: var(--approval-card-bg);
+  border: 1px solid var(--approval-border);
+  border-radius: 10px;
+}
+.member-management .member-editor { border-left: 3px solid var(--approve-bg); }
+.member-management .member-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.member-management .member-capabilities { display: flex; flex-direction: column; gap: 7px; }
+.member-management .member-capabilities label { display: flex; align-items: start; gap: 6px; }
+.member-management .member-capabilities input { flex: none; }
+.member-management .member-fieldset { padding: 8px 0 0; margin: 0; border: 0; }
+.member-management .member-fieldset legend { font-size: 11.5px; color: var(--approval-meta); }
+.member-management select {
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid #a5c8d9;
+  border-radius: 6px;
+  padding: 6px;
+  background: #fff;
+  color: #243b4b;
+  font: inherit;
+}
+.member-usage { display: flex; flex-direction: column; gap: 4px; font-variant-numeric: tabular-nums; }
+.member-usage progress { width: 100%; height: 7px; accent-color: var(--approve-bg); }
+.member-session { font: 11.5px/1.5 'Cascadia Code', Consolas, monospace; overflow-wrap: anywhere; }
+.member-memory-text, .member-delete-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.member-delete-preview { padding: 10px; background: var(--task-waiting-bg); border-left: 3px solid var(--task-waiting); }
+.member-delete-preview pre { font-size: 11.5px; max-height: 220px; overflow-y: auto; }
+.member-notice { color: var(--approval-summary); }
+.member-management button:focus-visible, .member-management :is(input, textarea, select):focus-visible {
+  outline: 2px solid var(--approve-bg);
+  outline-offset: 2px;
+}
+.member-management button:disabled { opacity: .55; cursor: not-allowed; }
+.member-quota-banner {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 1100;
+  max-width: min(380px, calc(100vw - 32px));
+  box-sizing: border-box;
+  border-radius: 8px;
+  pointer-events: auto;
+}
+.pet-management .management-tabs .panel-tab-badge { margin-left: 4px; }
+@media (max-width: 430px) {
+  .member-management .member-grid { grid-template-columns: minmax(0, 1fr); }
+  .member-management .member-editor, .member-management .member-memories { padding: 8px; }
+}

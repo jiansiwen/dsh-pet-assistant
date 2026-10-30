@@ -1,7 +1,8 @@
 /**
  * dsh-personal-assistant 插件入口。
  */
-import { mkdirSync, statSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,6 +15,7 @@ import type { Config as ConfigType } from './config.ts'
 import { personalAssistantDomainSpec, type ActivitySpan, type PersonalAssistantDomainSpec } from './domain.ts'
 import { createLegacySource, purgeLegacyData, type LegacyTables } from './legacy.ts'
 import { HelpContextStore, HelpEpisodeStore, registerHelpEpisodeTools } from './help-context.ts'
+import { READ_ONLY_ALLOW_TOOLS } from './gate.ts'
 import { MemoryStore } from './memory.ts'
 import { MigrationStore, runMigration } from './migrate.ts'
 import { ObservationStore } from './observation.ts'
@@ -27,6 +29,19 @@ import { ASSISTANT_SCHEMA_VERSION, getUserFlag, openAssistantStore, setUserFlag 
 import { TeamService, type TeamLogger } from './team.ts'
 import { TeamStore } from './team-domain.ts'
 import { registerTeamTools } from './team-tools.ts'
+import { CompanionTaskRuntime } from './task-runtime.ts'
+import { registerCompanionTools } from './task-tools.ts'
+import { decryptDpapiFile, decryptSecret, registerMailTools } from './mail.ts'
+import { ChannelManager, type ChannelSettings } from './channels.ts'
+import { createWeComAdapter, readWeComConfig, weComFiles } from './wecom.ts'
+import { AssistantSettings } from './assistant-settings.ts'
+import { configureChannelAgent } from './channel-agent-settings.ts'
+import { MemberRuntime } from './member-runtime.ts'
+import { MemberMemory } from './member-memory.ts'
+import { MemberAssistant } from './member-assistant.ts'
+import { MemberManagement } from './member-management.ts'
+import { MailWatcher, readMailImapConfig, readUnreadMail } from './mail-watch.ts'
+import { registerComputerTools } from './computer.ts'
 import { localDateOf, retentionStartDate, startOfLocalDate } from './time.ts'
 import { registerAssistantTools } from './tools.ts'
 import { ActivityTracker } from './tracker.ts'
@@ -83,6 +98,54 @@ function hostAgents(ctx: PluginContext): HostAgents | undefined {
   const value = ctx.get('agents') as Partial<HostAgents> | undefined
   if (!value || typeof value.create !== 'function' || typeof value.resume !== 'function') return undefined
   return value as HostAgents
+}
+
+/** 新会话不会自动继承桌面默认模型；从当前 profile 的补丁里读出 provider/model。 */
+function resolveDefaultModel(home: string): { provider: string; model: string } | null {
+  const candidates = [
+    path.join(home, 'profiles', 'desktop', 'cordis.patch.yml'),
+    path.join(home, 'settings.yaml.imported'),
+  ]
+  for (const file of candidates) {
+    try {
+      const text = readFileSync(file, 'utf8')
+      const block = /id:\s*agent-default-model[\s\S]{0,400}/.exec(text)?.[0]
+      if (!block) continue
+      const provider = /provider:\s*['"]?([A-Za-z0-9._-]+)/.exec(block)?.[1]
+      const model = /model:\s*['"]?([A-Za-z0-9._:-]+)/.exec(block)?.[1]
+      if (provider && model) return { provider, model }
+    } catch { /* 换下一个候选 */ }
+  }
+  return null
+}
+
+/** 等渠道会话的这一轮跑完；事件和轮询双保险，避免错过 idle 事件。 */
+function waitForAgentIdle(ctx: PluginContext, agent: unknown, timeoutMs: number): Promise<void> {
+  return new Promise(resolve => {
+    let done = false
+    const started = Date.now()
+    let poll: NodeJS.Timeout | undefined
+    let timer: NodeJS.Timeout | undefined
+    let off: unknown
+    const finish = (): void => {
+      if (done) return
+      done = true
+      if (timer) clearTimeout(timer)
+      if (poll) clearInterval(poll)
+      if (typeof off === 'function') (off as () => void)()
+      resolve()
+    }
+    off = ctx.on('agent/status', payload => {
+      if (payload.agent === agent && payload.status === 'idle') finish()
+    })
+    timer = setTimeout(finish, Math.max(1_000, timeoutMs))
+    timer.unref?.()
+    poll = setInterval(() => {
+      const status = (agent as { status?: string }).status
+      if (Date.now() - started > 800 && status === 'idle') finish()
+    }, 400)
+    poll.unref?.()
+  })
 }
 
 /** 宿主命令面：交互式 UI 才有；headless/ACP 宿主没有这个服务。 */
@@ -403,6 +466,180 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const helpContexts = new HelpContextStore(db)
   const helpEpisodes = new HelpEpisodeStore(db)
 
+  // 普通任务与专家团共用同一个任务库和审批服务；专家开关只挂载/卸载专家运行时，
+  // 不能再连带关闭这里——否则关掉团队模式时，用户交给小潘的提醒也会一起消失。
+  const teamStorePath = config.teamStorePath || path.join(home, 'desktop-team', 'team.sqlite')
+  const teamStore = new TeamStore(teamStorePath)
+  let teamRuntime: TeamRuntime | null = null
+  const memberMemories = new MemberMemory({
+    store: memories, ownerId: teamStore.companionIdentity().principalId,
+    exists: id => teamStore.directory.get(id) !== null,
+    invalidate: id => {
+      if (memberRuntime.busy(id)) throw new Error('成员正在工作，请结束后修改记忆')
+      teamStore.directory.setSession(id, null)
+    },
+  })
+  const memberRuntime = new MemberRuntime({
+    ctx: ctx as never, directory: teamStore.directory, defaultModel: () => resolveDefaultModel(home),
+    enabled: () => teamRuntime !== null, memories: memberMemories,
+    desktop: { request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options) },
+    mailUnread: async limit => {
+      const config = readMailImapConfig(home)
+      if (!config) throw new Error('邮箱值守还没有配置 IMAP，请先运行 setup-mail.mjs')
+      return await readUnreadMail(config, await decryptSecret(home), { limit })
+    },
+    onChange: () => bridge.notifyApprovalSnapshot(),
+  })
+  const memberAssistant = new MemberAssistant({ ctx: ctx as never, defaultModel: () => resolveDefaultModel(home), log })
+  const mailWatcher = new MailWatcher({
+    home,
+    enabled: () => teamRuntime !== null,
+    member: () => {
+      const member = teamStore.directory.list().find(item => item.enabled && item.capabilities.includes('mail'))
+      return member ? { id: member.assistantId, name: member.displayName } : null
+    },
+    analyze: (id, prompt) => memberRuntime.chat(id, prompt, undefined, undefined, 'mail'),
+    notify: (text, memberId) => bridge.pushNotice('mail', text, memberId),
+    log,
+  })
+  mailWatcher.start()
+  if (!readMailImapConfig(home)) mailWatcher.reportMissingImap()
+  const teamApprovals = new ApprovalService(teamStore, {
+    ttlMs: Math.max(10_000, config.approvalTtlMs),
+    runtimeEpoch: bridge.epoch,
+  })
+  const companionRuntime = new CompanionTaskRuntime(teamStore, teamApprovals, {
+    epoch: bridge.epoch,
+    onChange: () => bridge.notifyApprovalSnapshot(),
+  })
+  bridge.attachCompanion(companionRuntime, teamApprovals)
+  bridge.setChatContextProvider(() => companionRuntime.consumeContextForChat())
+  companionRuntime.start()
+  ctx.effect(() => registerCompanionTools(ctx as never, companionRuntime), 'personal-assistant:companion-tools')
+  try {
+    const assets = path.join(pluginDir, 'assets')
+    ctx.effect(() => registerComputerTools(ctx as never, {
+      scriptDir: assets, shotDir: path.join(home, 'personal-assistant', 'screenshots'),
+      approvalMode: () => config.approvalMode, bridge, log,
+    }), 'personal-assistant:computer-tools')
+  } catch (error) {
+    log(`[warn] 电脑操作工具注册失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  try {
+    ctx.effect(() => registerMailTools(ctx as never, { home, bridge, log }), 'personal-assistant:mail-tools')
+  } catch (error) {
+    log(`[warn] 邮件工具注册失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  // 渠道层只做连接、身份、去重、串行和会话映射；对话与工具仍走宿主同一个 agent。
+  const channelsFile = path.join(home, 'personal-assistant', 'channels.json')
+  const readChannelSettings = (): ChannelSettings => {
+    try {
+      const raw = JSON.parse(readFileSync(channelsFile, 'utf8')) as Partial<ChannelSettings>
+      const strings = (value: unknown): string[] => Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string' && item.length > 0 && item.length <= 200) : []
+      return {
+        allowedUserIds: strings(raw.allowedUserIds),
+        deliverHere: strings(raw.deliverHere),
+        ...(typeof raw.pairingCode === 'string' && raw.pairingCode ? { pairingCode: raw.pairingCode } : {}),
+      }
+    } catch {
+      return { allowedUserIds: [], deliverHere: [] }
+    }
+  }
+  let wecomAdapter: ReturnType<typeof createWeComAdapter> | null = null
+  let connectionMatchesSettings = false
+  let delivering = false
+  const settings: AssistantSettings = new AssistantSettings({
+    home,
+    defaultModel: () => resolveDefaultModel(home),
+    connected: () => connectionMatchesSettings && wecomAdapter?.connected() === true,
+    channelSettings: () => channelManager.settingsSnapshot(),
+    reconnect: async () => {
+      connectionMatchesSettings = false
+      if (delivering || channelManager.busy) throw new Error('渠道正在处理消息，请稍后重新连接')
+      const config = readWeComConfig(home)
+      const next = config ? createWeComAdapter({
+        botId: config.botId,
+        secret: await decryptDpapiFile(weComFiles(home).secret),
+        onMessage: message => connectionMatchesSettings ? channelManager.handle(message) : Promise.resolve(), log,
+      }) : null
+      await channelManager.replaceAdapter('wecom', next)
+      wecomAdapter = next
+      connectionMatchesSettings = true
+    },
+  })
+  companionRuntime.attachSettings(settings)
+  const channelManager = new ChannelManager({
+    store: teamStore,
+    route: async (text, key) => {
+      if (!teamRuntime) return null
+      const member = teamStore.directory.list().find(item => item.enabled && item.capabilities.includes('wecom'))
+      if (!member) return null
+      if (!key.startsWith('wecom:single:')) return '成员独立记忆暂不与群聊共享，请在已配对的单聊中交办任务。'
+      try { return await memberRuntime.chat(member.assistantId, text, undefined, key) }
+      catch { return '负责企业微信的成员暂时不能接单，请到团队管理核对额度、权限与执行状态。任务未自动重试。' }
+    },
+    host: {
+      async create(key: string) {
+        const agents = hostAgents(ctx)
+        if (!agents) throw new Error('宿主没有提供可用会话服务')
+        const allowed = new Set([...READ_ONLY_ALLOW_TOOLS, 'companion_create_reminder', 'companion_create_todo',
+          'companion_task_status', 'companion_control_task', 'companion_register_input',
+          'personal_assistant_send_mail', 'personal_assistant_list_preferences',
+          'personal_assistant_remember_preference', 'personal_assistant_edit_preference'])
+        const create = agents.create as unknown as (this: unknown, options: Record<string, unknown>) => Promise<{ agent: never; dispose(): Promise<void> }>
+        const chiefChannelSettings = () => ({ name: '总助理', persona: '团队关闭时，由你直接处理用户交办的工作。',
+          provider: '', model: '', maxTokens: 4096, tokenBudget: 0 })
+        const channelModel = resolveDefaultModel(home)
+        const handle = await create.call(agents, {
+          // 会话 id 带上渠道会话标识，任务工具据此把提醒默认发回当前会话。
+          sessionId: `channel-${Buffer.from(key, 'utf8').toString('hex')}-${randomUUID()}`,
+          meta: { cwd: process.cwd() },
+          ...(channelModel ? { agentOptions: channelModel } : {}),
+          // 远程渠道只允许读与已登记的普通任务工具；shell、写文件、安装、再委派一律拒绝。
+          setup: (agentCtx: Parameters<typeof configureChannelAgent>[0] & { tools?: { guard?: (guard: (execution: { name?: string }) => string | undefined) => unknown } }) => {
+            configureChannelAgent(agentCtx, chiefChannelSettings, () => resolveDefaultModel(home))
+            agentCtx.tools?.guard?.(execution => allowed.has(String(execution.name ?? ''))
+              ? undefined : '企业微信会话不允许执行此工具；请在桌面确认后操作')
+            return undefined
+          },
+        })
+        return { agent: handle.agent, dispose: () => handle.dispose() }
+      },
+      waitForIdle: (agent, timeoutMs) => waitForAgentIdle(ctx, agent, timeoutMs),
+    },
+    settingsFile: channelsFile,
+    approve: (chatKey, decision) => companionRuntime.approveLatestChannelTask(chatKey, decision),
+    log: message => {
+      try {
+        mkdirSync(path.join(home, 'personal-assistant'), { recursive: true })
+        appendFileSync(path.join(home, 'personal-assistant', 'channels.log'), `${new Date().toISOString()} ${message}\n`, 'utf8')
+      } catch { /* 诊断写不进去不影响渠道 */ }
+      log(message)
+    },
+    readSettings: readChannelSettings,
+    writeSettings: settings => {
+      mkdirSync(path.dirname(channelsFile), { recursive: true })
+      writeFileSync(channelsFile, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+    },
+    replyTimeoutMs: 120_000,
+  })
+  companionRuntime.setRecipientPolicy((channel, recipient) => channel === 'desktop'
+    ? recipient === companionRuntime.principalId
+    : channel === 'wecom' && channelManager.canDeliver(recipient))
+  ctx.effect(() => () => {
+    mailWatcher.stop()
+    void (async () => {
+      await memberRuntime.dispose()
+      await companionRuntime.dispose()
+      teamStore.close()
+    })().catch(error => {
+      log(`[warn] 普通任务运行时释放失败，任务库保留待核查：${error instanceof Error ? error.message : String(error)}`)
+    })
+  }, 'personal-assistant:companion')
+  // 后注册先执行：先停渠道连接，再释放普通任务运行时与任务库。
+  ctx.effect(() => () => { void channelManager.stop() }, 'personal-assistant:channels')
+
   // 主动提醒（design.md §2.7）：策略在 proactive.ts，这里只做三件事 ——
   // 周期性评估、把候选推给宠物、把用户的点选记回状态机（ProactiveHelpFlow 负责落 user_flags 与 episode）。
   // 「关闭提醒」是用户意愿：重启不能把它悄悄复活。拒绝与不回应两条路上不生成候选、不读任何东西。
@@ -475,17 +712,17 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   // 也允许用户在会话里说「开启团队模式」动态挂载（personal_assistant_set_team_mode），
   // 选择记在 user_flags，重启后不丢。团队委派与审批都挂在桥接的运行时代次上，
   // 代次变化后旧批准一律失效。
-  let teamRuntime: TeamRuntime | null = null
   const teamFlagOn = (): boolean => getUserFlag(db, 'team_mode_enabled') === 'true'
   const enableTeamMode = (): { toolsRegistered: boolean } => {
     if (teamRuntime) return { toolsRegistered: teamRuntime.toolsRegistered }
-    teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log, helpContexts, helpEpisodes })
+    teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log, helpContexts, helpEpisodes, store: teamStore, approvals: teamApprovals, members: memberRuntime })
     setUserFlag(db, 'team_mode_enabled', 'true')
     return { toolsRegistered: teamRuntime.toolsRegistered }
   }
   const disableTeamMode = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
     const runtime = teamRuntime
     const running = runtime?.team.runningCount() ?? 0
+    if (memberRuntime.busy()) return { ok: false, error: '仍有成员会话正在执行，请结束后再关闭团队' }
     if (running > 0) {
       return { ok: false, error: `还有 ${running} 个团队任务在执行，等它们结束再关闭团队模式` }
     }
@@ -507,10 +744,24 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     setUserFlag(db, 'team_mode_enabled', 'false')
     return { ok: true }
   }
-  if (config.teamEnabled || teamFlagOn()) {
+  if (getUserFlag(db, 'team_mode_enabled') === null ? config.teamEnabled : teamFlagOn()) {
     enableTeamMode()
     log(`team runtime mounted (profile: ${config.teamEnabled}, flag: ${teamFlagOn()})`)
   }
+  const memberManagement = new MemberManagement({
+    directory: teamStore.directory, runtime: memberRuntime, memories: memberMemories,
+    enabled: () => teamRuntime !== null,
+    setMode: async enabled => {
+      if (enabled) enableTeamMode()
+      else {
+        const result = await disableTeamMode()
+        if (!result.ok) throw new Error(result.error)
+      }
+    },
+    defaultModel: () => resolveDefaultModel(home), changed: () => bridge.notifyApprovalSnapshot(),
+    activeTasks: id => teamStore.activeTaskCount(id), assistant: memberAssistant,
+  })
+  companionRuntime.attachMemberManagement(memberManagement)
   // 清理顺序与注册顺序相反：先等自有子代理静止，再关库，最后才是桥接。
   // 卸载钩子是同步的，等不了异步收尾；但释放失败必须出声且不关库——dispose 链路里
   // 关库排在最后，前面抛错时团队库保持打开，结果不明的账目留给下次启动对账。
@@ -582,12 +833,15 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
           // 期间记忆被删、被改或换了状态，这张卡就作废：批的必须是用户看到的那一份。
           validate: () => {
             const current = reload()
-            return current !== null && current.status !== 'expired'
+            return current !== null && current.status !== 'expired' && current.revision === before.revision
               && current.text === before.text && current.topic === before.topic
               && snapshotDigest(snapshot) === digest
           },
           execute: () => {
-            const updated = memories.revise(memoryId, { text, ...(topic === undefined ? {} : { topic }), actor: { id: 'desktop-shell', isUser: true } }, Date.now())
+            const updated = memories.revise(memoryId, {
+              text, ...(topic === undefined ? {} : { topic }), actor: { id: 'desktop-shell', isUser: true },
+              expectedRevision: before.revision,
+            }, Date.now())
             if (!updated) throw new Error('改写失败：这条记忆已不存在或已失效')
             return { edited: true, id: updated.id, text: updated.text, topic: updated.topic, revision: updated.revision }
           },
@@ -630,6 +884,36 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     else log(`[warn] ${message}`)
   }
 
+  try {
+    await settings.request('POST', '/companion/v1/settings/wecom/reconnect', { expectedRevision: settings.snapshot().revision })
+  } catch {
+    log('[warn] 企业微信渠道未启动，请在宠物设置中核对配置并重新连接')
+  }
+  const deliveryTimer = setInterval(() => {
+    if (delivering || !connectionMatchesSettings || !wecomAdapter?.connected()) return
+    delivering = true
+    void (async () => {
+      try {
+        const delivery = companionRuntime.listChannelDeliveries('wecom')[0]
+        if (!delivery || !companionRuntime.claimChannelDelivery(delivery.deliveryId)) return
+        try {
+          const sent = await channelManager.deliver(delivery.recipientRef, `**${delivery.title}**\n\n${delivery.message}`)
+          companionRuntime.receiptChannelDelivery(delivery.deliveryId, sent ? 'succeeded' : 'failed-before-effect',
+            sent ? [`wecom:${delivery.operationId}`] : [])
+        } catch (error) {
+          companionRuntime.receiptChannelDelivery(delivery.deliveryId, 'unknown', [])
+          log(`[warn] 企业微信提醒投递结果未知：${error instanceof Error ? error.message : String(error)}`)
+        }
+      } catch (error) {
+        log(`[warn] 企业微信提醒领取失败：${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        delivering = false
+      }
+    })()
+  }, 3_000)
+  deliveryTimer.unref?.()
+  ctx.effect(() => () => clearInterval(deliveryTimer), 'personal-assistant:wecom-reminders')
+
   // 模式开启但采样进程已死（插件重载/进程崩溃）时重新拉起；采集被拦住时不拉。
   await tracker.ensureSamplerAlive()
   log(`loaded (store: ${storePath}, sampleDir: ${sampleDir}, reportDir: ${reportDir}, team: ${config.teamEnabled})`)
@@ -664,6 +948,10 @@ interface MountTeamDeps {
   /** 帮助任务的读取授权与主动帮助 episode：与工具、主动提醒共用同一份。 */
   helpContexts: HelpContextStore
   helpEpisodes: HelpEpisodeStore
+  /** 插件常驻的任务库与审批服务；专家运行时只借用，不创建、不关闭。 */
+  store: TeamStore
+  approvals: ApprovalService
+  members: MemberRuntime
 }
 
 /**
@@ -671,8 +959,8 @@ interface MountTeamDeps {
  * 保证两种入口挂出来的是同一种东西。
  */
 function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps): TeamRuntime {
-  const teamStorePath = config.teamStorePath || path.join(deps.home, 'desktop-team', 'team.sqlite')
-  const store = new TeamStore(teamStorePath)
+  const store = deps.store
+  const approvals = deps.approvals
   const teamLogger: TeamLogger = {
     info: (message, meta) => deps.log(meta === undefined ? message : `${message} ${JSON.stringify(meta)}`),
     warn: (message, meta) => {
@@ -687,10 +975,6 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     },
   }
   const inferenceSlots = Math.max(1, Math.floor(config.maxConcurrentInference))
-  const approvals = new ApprovalService(store, {
-    ttlMs: Math.max(10_000, config.approvalTtlMs),
-    runtimeEpoch: deps.bridge.epoch,
-  })
   const team = new TeamService(ctx as never, store, {
     teamId: config.teamId,
     provider: config.teamProvider,
@@ -704,17 +988,13 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     logger: teamLogger,
     helpScopes: deps.helpContexts,
     episodes: deps.helpEpisodes,
+    members: deps.members,
   })
   team.ensureRoster()
   // 挂载后立即对账上次进程中断的任务：还挂着 running 的任务/运行/副作用一律记成
   // unknown，只对账、不重发。对账失败就让挂载失败并释放刚开的库句柄——
   // 带着没对过的账上岗，恢复流程就可能重发已经发生过的副作用。
-  try {
-    team.recoverInterruptedTasks()
-  } catch (error) {
-    store.close()
-    throw error
-  }
+  team.recoverInterruptedTasks()
   // 装配完成后再注册工具，宿主可能不接受：尽力注册，失败时团队服务照常工作
   //（快照、审批卡片、宠物团队页），只是模型缺委派入口，重启后必然可用。
   let toolsRegistered = true
@@ -731,14 +1011,9 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     approvals,
     toolsRegistered,
     dispose: async () => {
-      // 先等自有子代理全部静止；释放失败必须抛给调用方，并且不走到关库——
-      // 还有结果不明的运行就把库关掉，等于把副作用账目撕掉。
       await team.dispose()
-      // 关库前把仍未完成的状态对账成 unknown：卸载或关闭团队模式都不丢账，
-      // 下次启动的恢复流程据此拒绝盲重试。
       team.recoverInterruptedTasks()
       unregisterTools?.()
-      store.close()
     },
   }
 }

@@ -210,7 +210,8 @@ pnpm run build        # esbuild 打包到 dist/
 
 这些不是待修的 bug，是当前实现的真实边界，界面上也照实写了：
 
-- **文档讲解支持 Markdown、纯文本和可提取文本层的 PDF**（`.md .markdown .txt .log .csv .tsv .json .pdf`）。
+- **文档讲解支持 Markdown、纯文本、可提取文本层的 PDF，以及 Word `.docx` / PowerPoint `.pptx`**（`.md .markdown .txt .log .csv .tsv .json .pdf .docx .pptx`）。docx 按 Word 标题层级切段，pptx 按幻灯片页序切段；旧版 `.doc/.ppt`、Excel 和扫描件不在支持范围。
+- **docx/pptx 支持逐页阅读/全屏演示**：docx 本地分页渲染；pptx 优先用本机 PowerPoint 只读导出每页 PNG（不显示窗口、禁用宏、不修改原文件），PowerPoint 已在运行时跳过自动化以保护用户打开的文档，导出失败退回本地预览。阅读窗口支持上一页/下一页、方向键和全屏演示。**讲解进度会同步翻到对应页/幻灯片；中途被提问打断时页面保留，继续讲解后重新对齐到未讲完的段。**
   Word、Excel、PPT 与图片只能用系统关联**打开给你看**，讲不了；扫描版 PDF、OCR、加密文档解锁都还没实现
 - **能用系统关联打开的是一份白名单**，不是黑名单。`.docm .xlsm .pptm` 不在里面（计划明确"不执行文档宏"，而打开就可能触发），`.exe .bat .cmd .ps1 .vbs .lnk .reg .msi` 也不在（那已经不是打开文档而是执行程序）
 - **流式回答取决于宿主模型**。桥接已有文字增量和分句 TTS，宿主吐 `text-delta` 时可以边收边念；

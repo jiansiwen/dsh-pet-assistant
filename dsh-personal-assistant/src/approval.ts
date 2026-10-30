@@ -14,7 +14,7 @@ import {
  * 由插件自己的可信执行器完成的动作（不是宿主工具）：应用改动提案、运行验证命令、写入 unknown 人工复核结论。
  * 它们的批准只能经 consumeTrusted 消费；门禁路径（consume / authorizeCall）一律拒绝这些名字，反之亦然。
  */
-export const TRUSTED_ACTION_TOOLS = ['apply_change', 'run_verification', 'review_unknown'] as const
+export const TRUSTED_ACTION_TOOLS = ['apply_change', 'run_verification', 'review_unknown', 'manage_companion_task'] as const
 export type TrustedActionTool = (typeof TRUSTED_ACTION_TOOLS)[number]
 
 export function isTrustedActionTool(tool: string): tool is TrustedActionTool {
@@ -298,9 +298,11 @@ export class ApprovalService {
     if (!isTrustedActionTool(proposal.tool)) return
     const handler = this.trustedHandlers.get(proposal.tool)
     if (!handler) return
-    const fresh = this.store.getProposal(proposal.proposalId) ?? proposal
+    const tool = proposal.tool
     setImmediate(() => {
+      if (this.trustedHandlers.get(tool) !== handler) return
       try {
+        const fresh = this.store.getProposal(proposal.proposalId) ?? proposal
         handler(fresh, decision)
       } catch {
         // 回调自己负责记账与日志；这里只保证一个回调出错不影响审批请求与别的回调。
@@ -568,6 +570,27 @@ export class ApprovalService {
     const expired = this.store.transaction(() => {
       const rows = this.store.expirePendingProposals(taskId, inputRevision)
       for (const proposal of rows) {
+        this.store.appendEvent('proposal/decided', { proposalId: proposal.proposalId, decision: 'expired', reason },
+          { taskId: proposal.taskId, assistantId: proposal.assistantId })
+      }
+      return rows
+    })
+    for (const proposal of expired) this.notify(proposal.proposalId, 'expired')
+    return expired.length
+  }
+
+  invalidateTasks(taskIds: readonly string[], reason: string): number {
+    const ids = new Set(taskIds)
+    if (ids.size === 0) return 0
+    const expired = this.store.transaction(() => {
+      const rows = this.store.listProposals().filter(proposal => {
+        if (!ids.has(proposal.taskId)) return false
+        if (proposal.state === 'pending') return true
+        if (proposal.state !== 'approved') return false
+        return this.store.approvalForProposal(proposal.proposalId)?.consumedAt === null
+      })
+      for (const proposal of rows) {
+        this.store.setProposalState(proposal.proposalId, 'expired')
         this.store.appendEvent('proposal/decided', { proposalId: proposal.proposalId, decision: 'expired', reason },
           { taskId: proposal.taskId, assistantId: proposal.assistantId })
       }

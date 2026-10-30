@@ -423,7 +423,7 @@ test('重启对账：应用中途中断的改动与操作记 unknown，任务进
   }
 })
 
-test('重启对账：批准已签发但没来得及执行的改动记 expired，新代次消费不了旧批准', async t => {
+test('关闭后重启对账：未执行的改动及批准记 expired，新实例不能消费旧批准', async t => {
   const h = helpHost(t, { manual: true, fileDb: true })
   const { task } = h.open()
   const pending = h.team.help.proposeChange({ taskId: task.taskId, summary: '批准后进程重启', files: [{ path: 'src/calc.js', baseHash: hashOf(ORIGINAL), content: FIXED }] })
@@ -438,9 +438,10 @@ test('重启对账：批准已签发但没来得及执行的改动记 expired，
     team.recoverInterruptedTasks()
     assert.equal(store.getChangeSet(pending.changeId)?.state, 'expired')
     const change = store.getChangeSet(pending.changeId)!
+    assert.equal(approvals.proposal(pending.proposalId)?.state, 'expired')
     assert.throws(() => approvals.consumeTrusted(pending.proposalId, { tool: 'apply_change', taskId: task.taskId, target: change.root,
       params: changeBinding(change), inputRevision: 1, blockOnUncertain: true }),
-    (error: unknown) => error instanceof ApprovalError && error.code === 'EPOCH_MISMATCH')
+    (error: unknown) => error instanceof ApprovalError && error.code === 'NOT_FOUND')
     assert.equal(readFileSync(h.calc, 'utf8'), ORIGINAL)
   } finally {
     await team.dispose()
@@ -448,14 +449,14 @@ test('重启对账：批准已签发但没来得及执行的改动记 expired，
   }
 })
 
-test('团队卸载期间签发的批准没有执行器接手：对账记 expired，不留悬空的已批准改动', async t => {
+test('团队卸载时作废待批卡，对账记 expired，不留悬空的已批准改动', async t => {
   const h = helpHost(t)
   const { task } = h.open()
   const proposed = h.team.help.proposeChange({ taskId: task.taskId, summary: '卸载中途批准', files: [{ path: 'src/calc.js', baseHash: hashOf(ORIGINAL), content: FIXED }] })
   await h.team.dispose()
-  h.approve(proposed.proposalId)
-  await new Promise(resolve => setTimeout(resolve, 20))
-  assert.equal(h.store.getChangeSet(proposed.changeId)?.state, 'pending', '没有执行器就什么都不做')
+  assert.equal(h.approvals.proposal(proposed.proposalId)?.state, 'expired')
+  assert.throws(() => h.approve(proposed.proposalId), (error: unknown) => error instanceof ApprovalError && error.code === 'ALREADY_CONSUMED')
+  assert.equal(h.store.getChangeSet(proposed.changeId)?.state, 'pending', '执行器已经停止，记录由对账同步')
   const remounted = new TeamService({} as never, h.store, { teamId: 'test', provider: 'spawn', seats: [], maxConcurrentInference: 1,
     maxConcurrentSideEffect: 1, taskTimeoutMs: 1000, defaultBudgetTokens: 0, denyExpertTools: [], approvals: h.approvals, logger: quiet,
     helpScopes: h.helpContexts })
@@ -467,4 +468,64 @@ test('团队卸载期间签发的批准没有执行器接手：对账记 expired
   } finally {
     await remounted.dispose()
   }
+})
+
+test('帮助执行调度晚于关库到达时，不读库、不进入执行器也不写文件', async t => {
+  const h = helpHost(t, { manual: true })
+  const { task } = h.open()
+  const proposed = h.team.help.proposeChange({ taskId: task.taskId, summary: '晚到执行', files: [{ path: 'src/calc.js', baseHash: hashOf(ORIGINAL), content: FIXED }] })
+  h.approve(proposed.proposalId)
+  await h.queued()
+  const execute = t.mock.method(h.team.help, 'execute')
+  await h.close()
+  const read = t.mock.method(h.store, 'getProposal', () => { throw new Error('关闭后不允许读库') })
+  assert.doesNotThrow(() => h.queue.shift()!())
+  assert.equal(execute.mock.callCount(), 0)
+  const outcome = await h.team.help.execute(proposed.proposalId)
+  assert.equal(outcome.state, 'refused')
+  assert.equal(read.mock.callCount(), 0)
+  assert.equal(readFileSync(h.calc, 'utf8'), ORIGINAL)
+})
+
+test('帮助执行已进入串行队列但尚未开始时，释放立即拒绝真正执行且重复释放共用 Promise', async t => {
+  const h = helpHost(t, { manual: true })
+  const { task } = h.open()
+  const proposed = h.team.help.proposeChange({ taskId: task.taskId, summary: '串行队列停止', files: [{ path: 'src/calc.js', baseHash: hashOf(ORIGINAL), content: FIXED }] })
+  h.approve(proposed.proposalId)
+  await h.queued()
+  const executing = h.team.help.execute(proposed.proposalId)
+  const first = h.team.help.dispose()
+  assert.equal(h.team.help.dispose(), first)
+  await first
+  assert.equal((await executing).state, 'refused')
+  assert.equal(h.store.listOperations(task.taskId).length, 0)
+  assert.equal(readFileSync(h.calc, 'utf8'), ORIGINAL)
+  assert.throws(() => h.team.help.openTask({ projectDir: h.root, goal: '已经停止' }), code('STOPPED'))
+})
+
+test('帮助服务不读取、执行、取消或恢复普通任务，即使任务属于同一团队和成员且带帮助记录', async t => {
+  const h = helpHost(t, { manual: true })
+  const { task } = h.open()
+  const proposed = h.team.help.proposeChange({ taskId: task.taskId, summary: '运行域隔离', files: [{ path: 'src/calc.js', baseHash: hashOf(ORIGINAL), content: FIXED }] })
+  h.store.saveCompanionMeta({ taskId: task.taskId, runtimeScope: 'companion', principalId: 'owner', deviceId: 'device',
+    parentTaskId: null, kind: 'agent', inputRef: 'input', blocker: null })
+  const before = h.store.getTask(task.taskId)
+  assert.equal(h.team.help.helpTask(task.taskId), null)
+  assert.equal(h.team.help.status(task.taskId), null)
+  assert.throws(() => h.team.help.read({ taskId: task.taskId, path: 'src/calc.js' }), code('NOT_FOUND'))
+  assert.throws(() => h.team.help.verdict(task.taskId), code('NOT_FOUND'))
+  assert.throws(() => h.team.help.proposeChange({ taskId: task.taskId, summary: '不能改', files: [] }), code('NOT_FOUND'))
+  h.approve(proposed.proposalId)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(h.queue.length, 0)
+  assert.equal((await h.team.help.execute(proposed.proposalId)).state, 'refused')
+  await assert.rejects(h.wait(proposed.proposalId), code('NOT_FOUND'))
+  await h.team.help.cancel(task.taskId)
+  h.team.help.recover(task.taskId)
+  await h.team.dispose()
+  assert.equal(h.approvals.proposal(proposed.proposalId)?.state, 'approved')
+  assert.equal(h.store.getChangeSet(proposed.changeId)?.state, 'pending')
+  assert.deepEqual(h.store.getTask(task.taskId), before)
+  assert.equal(h.store.listOperations(task.taskId).length, 0)
+  assert.equal(readFileSync(h.calc, 'utf8'), ORIGINAL)
 })
