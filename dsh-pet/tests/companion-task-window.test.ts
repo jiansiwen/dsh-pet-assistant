@@ -143,6 +143,20 @@ test('列表只读走聊天令牌，伪造发送方被拒', async () => {
   assert.deepEqual(removed.sort(), Object.values(COMPANION_TASK_CHANNELS).sort())
 })
 
+test('已接受邮件但提醒未登记时，任务列表保留明确的待核查信息', async () => {
+  reply = (method, pathname) => method === 'GET' && pathname === '/companion/v1/tasks'
+    ? { status: 200, body: { tasks: [view], cursor: 1, meetingMailAttention: [
+        { intentId: 'mail-1', acceptedAt: '2026-10-25T10:00:00.000Z' },
+      ] } } : { status: 404, body: {} }
+  const handle = mount()
+  const win = open(handle)
+  const result = await call(COMPANION_TASK_CHANNELS.list, undefined, win.webContents) as {
+    ok: boolean; data: { meetingMailAttention: Array<{ intentId: string; acceptedAt: string }> } }
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.data.meetingMailAttention, [{ intentId: 'mail-1', acceptedAt: '2026-10-25T10:00:00.000Z' }])
+  handle.dispose()
+})
+
 test('取消原生确认后不登记输入、不创建任务', async () => {
   const handle = mount(async () => false)
   open(handle)

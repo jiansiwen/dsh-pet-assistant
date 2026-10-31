@@ -315,13 +315,19 @@ describe('会后精修：同一会议内自动分人（分离替身）', () => {
     h.store.close()
     const db = new DatabaseSync(path.join(h.dir, 'meetings.sqlite'))
     const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>).map(row => row.name)
+    for (const table of tables) {
+      const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      assert.equal(columns.some(column => /embedding|voiceprint|声纹/u.test(column.name)), false, `${table} 不应包含跨会议声纹列`)
+    }
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM meeting_presentations').get() as { n: number }).n, 0)
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM minutes_artifacts').get() as { n: number }).n, 0)
     db.close()
-    assert.deepEqual(tables, ['assistant_speech', 'chunks', 'meetings', 'minutes', 'transcript_meta', 'transcript_segments'])
+    assert.deepEqual(tables, ['assistant_speech', 'chunks', 'meeting_presentations', 'meetings', 'minutes', 'minutes_artifacts', 'transcript_meta', 'transcript_segments'])
   })
 })
 
 describe('助理播报区间落到转写上', () => {
-  test('与播报高度重叠的段标为助理播报，不进纪要时间线；部分重叠的裁掉重叠处', async () => {
+  test('与播报高度重叠的段标为“小潘（AI 助理）”并留在时间线；部分重叠的裁掉重叠处', async () => {
     const h = setupRecorder()
     const id = await recordAndRefine(h, {
       beforeStop: () => {
@@ -340,15 +346,14 @@ describe('助理播报区间落到转写上', () => {
 
     const minutes = h.store.getMinutes(id)?.content ?? ''
     const timeline = minutes.slice(minutes.indexOf('## 时间线'), minutes.indexOf('## 助理播报区间'))
-    assert.ok(!timeline.includes('乙说话'), '时间线里不出现助理播报段')
-    assert.ok(minutes.includes('另有 1 段转写与播报高度重叠，已从时间线排除，不计为任何参会者的发言'))
+    assert.match(timeline, /小潘（AI 助理）.*乙说话/s, '助理是独立发言人，发言要留在时间线')
     assert.ok(minutes.includes('[00:04–00:07] 桌面助理 TTS 播报'))
     const note = h.recorder.getState().transcribeNote ?? ''
     assert.ok(note.includes('1 段与助理播报高度重叠') && note.includes('1 段裁掉了与助理播报重叠的部分'), note)
     h.store.close()
   })
 
-  test('误判可纠正：把助理播报段拆成真人，它回到纪要时间线；真人段并进助理组则被排除', async () => {
+  test('误判可纠正：把助理播报段拆成真人，标签随之变化；真人段并进助理组则标为小潘发言', async () => {
     const h = setupRecorder()
     const id = await recordAndRefine(h, { beforeStop: () => markAssistantSpeech(4200, 7000) })
     const idx = h.store.getSegments(id).findIndex(segment => segment.source === 'assistant')
@@ -358,14 +363,15 @@ describe('助理播报区间落到转写上', () => {
     assert.deepEqual([fixed.source, fixed.label, fixed.uncertain], ['asr', '乙（真人）', false])
     assert.ok(h.store.getMinutes(id)?.content.includes('乙（真人）：乙说话'), '用户认定是真人后进时间线')
 
-    // 反方向：用户认定对方那组其实是助理的声音，把它并进助理播报组 → 排除出时间线。
+    // 反方向：用户认定对方那组其实是助理的声音，把它并进助理组 → 改标为小潘发言，仍留在时间线。
     const h2 = setupRecorder()
     const id2 = await recordAndRefine(h2, { beforeStop: () => markAssistantSpeech(4200, 7000) })
     assert.equal(h2.recorder.mergeSpeakers(id2, 'loop-s1', ASSISTANT_SPEAKER).ok, true)
     const merged = h2.store.getSegments(id2).filter(segment => segment.track === 'loopback')
     assert.ok(merged.length === 2 && merged.every(segment => segment.source === 'assistant' && segment.speaker === ASSISTANT_SPEAKER))
     const minutes = h2.store.getMinutes(id2)?.content ?? ''
-    assert.ok(!minutes.slice(minutes.indexOf('## 时间线'), minutes.indexOf('## 助理播报区间')).includes('对方丙说话'))
+    assert.match(minutes.slice(minutes.indexOf('## 时间线'), minutes.indexOf('## 助理播报区间')),
+      /小潘（AI 助理）.*对方丙说话/s)
     h.store.close()
     h2.store.close()
   })
@@ -494,11 +500,15 @@ describe('增量转写（临时字幕）与会后精修按版本替换', () => {
     const id = await recordAndRefine(h)
     assert.equal(h.store.getMeeting(id)?.state, 'transcript-failed')
     assert.equal(h.store.getSegments(id).length, 0)
-    assert.ok((h.recorder.getState().transcribeNote ?? '').includes('录音已完整保留'))
+    assert.ok((h.recorder.getState().transcribeNote ?? '').includes('已保存的录音块予以保留'))
+    assert.equal(h.recorder.getState().integrity?.status, 'unknown', '旧式冲刷没有末块证据，不能宣称完整')
+    const savedChunks = h.store.listChunks(id).length
+    assert.ok(savedChunks > 0)
     failValues.clear()
     assert.equal(h.recorder.retranscribe(id).ok, true)
     await h.recorder.whenSettled()
     assert.equal(h.store.getMeeting(id)?.state, 'transcribed')
+    assert.equal(h.store.listChunks(id).length, savedChunks, '转写失败及重试都不丢已保存的块')
     assert.deepEqual(brief(h.store.getSegments(id)), DIARIZED)
     h.store.close()
   })

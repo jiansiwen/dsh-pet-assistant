@@ -52,6 +52,11 @@ function identifier(value: unknown): string {
   if (!id.trim() || id === '.' || id === '..' || /[/\\%?#\r\n]/u.test(id)) throw new Error('invalid_input')
   return id
 }
+function uuid(value: unknown): string {
+  const id = identifier(value)
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(id)) throw new Error('invalid_input')
+  return id
+}
 export function memberPathIdentifier(value: unknown): string {
   return encodeURIComponent(identifier(value)).replace(/[!'()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
 }
@@ -75,6 +80,62 @@ function draft(value: RecordValue, writing = false): MemberDraft {
 export function projectMemberState(value: unknown): MemberSnapshot {
   const source = record(value)
   const defaultModel = source.defaultModel === null ? null : record(source.defaultModel)
+  let mailNoticeAttention: MemberSnapshot['mailNoticeAttention']
+  let mailNoticeAttentionError: boolean | undefined
+  let mailSendAttention: MemberSnapshot['mailSendAttention']
+  let mailSendAttentionError: boolean | undefined
+  let channelInboundAttention: MemberSnapshot['channelInboundAttention']
+  let channelInboundAttentionError: boolean | undefined
+  if (source.mailNoticeAttentionError !== undefined) {
+    mailNoticeAttentionError = typeof source.mailNoticeAttentionError === 'boolean' ? source.mailNoticeAttentionError : true
+  }
+  if (source.mailNoticeAttention !== undefined) {
+    try {
+      mailNoticeAttention = list(source.mailNoticeAttention, item => {
+        const issue = record(item)
+        return { analysisId: uuid(issue.analysisId), memberId: identifier(issue.memberId), attemptId: uuid(issue.attemptId),
+          state: choice(issue.state, ['failed', 'unknown'] as const), preview: text(issue.preview, 200) }
+      })
+      if (mailNoticeAttention.length > 20) throw new Error('invalid_response')
+    } catch { mailNoticeAttention = undefined; mailNoticeAttentionError = true }
+  }
+  if (source.mailSendAttentionError !== undefined) {
+    mailSendAttentionError = typeof source.mailSendAttentionError === 'boolean' ? source.mailSendAttentionError : true
+  }
+  if (source.mailSendAttention !== undefined) {
+    try {
+      mailSendAttention = list(source.mailSendAttention, item => {
+        const send = record(item)
+        const recipients = list(send.recipients, value => text(value, 320))
+        const accepted = list(send.accepted, value => text(value, 320))
+        const rejected = list(send.rejected, value => text(value, 320))
+        if (recipients.length > 20 || accepted.length > 20 || rejected.length > 20) throw new Error('invalid_response')
+        return { intentId: uuid(send.intentId), subject: text(send.subject, 200), recipients,
+          state: choice(send.state, ['sending', 'partial', 'unknown'] as const), accepted, rejected,
+          messageId: send.messageId === null ? null : text(send.messageId, 300) }
+      })
+      if (mailSendAttention.length > 20) throw new Error('invalid_response')
+    } catch { mailSendAttention = undefined; mailSendAttentionError = true }
+  }
+  if (source.channelInboundAttentionError !== undefined) {
+    channelInboundAttentionError = typeof source.channelInboundAttentionError === 'boolean' ? source.channelInboundAttentionError : true
+  }
+  if (source.channelInboundAttention !== undefined) {
+    try {
+      channelInboundAttention = list(source.channelInboundAttention, item => {
+        const channel = record(item)
+        const accountTag = text(channel.accountTag, 12)
+        if (!/^[a-f0-9]{12}$/iu.test(accountTag)) throw new Error('invalid_response')
+        return { id: uuid(channel.id), channel: text(channel.channel, 200), accountTag, msgid: text(channel.msgid, 200),
+          chatId: text(channel.chatId, 200), chatType: choice(channel.chatType, ['single', 'group'] as const), senderId: text(channel.senderId, 200),
+          state: choice(channel.state, ['pending', 'processing', 'replying', 'completed', 'unknown', 'reviewed'] as const),
+          processing: choice(channel.processing, ['not-started', 'running', 'done', 'unknown'] as const),
+          reply: choice(channel.reply, ['not-sent', 'sending', 'accepted', 'unknown'] as const),
+          conflict: bool(channel.conflict), busy: bool(channel.busy), revision: integer(channel.revision, 1), receivedAt: integer(channel.receivedAt) }
+      })
+      if (channelInboundAttention.length > 20) throw new Error('invalid_response')
+    } catch { channelInboundAttention = undefined; channelInboundAttentionError = true }
+  }
   return {
     enabled: bool(source.enabled), defaultModel: defaultModel && { provider: text(defaultModel.provider), model: text(defaultModel.model) },
     members: list(source.members, item => {
@@ -85,7 +146,11 @@ export function projectMemberState(value: unknown): MemberSnapshot {
         revision: integer(p.revision), sessionId: p.sessionId === null ? null : text(p.sessionId),
       }
       return { profile, busy: bool(view.busy), quota: {
-        day: text(q.day), dailyUsed: integer(q.dailyUsed), totalUsed: integer(q.totalUsed), dailyTokenLimit: integer(q.dailyTokenLimit),
+        day: text(q.day), dailyUsed: integer(q.dailyUsed), totalUsed: integer(q.totalUsed),
+        // 旧宿主回包没有预留字段时按 0 展示，界面仍能打开。
+        dailyReserved: q.dailyReserved === undefined ? 0 : integer(q.dailyReserved),
+        totalReserved: q.totalReserved === undefined ? 0 : integer(q.totalReserved),
+        dailyTokenLimit: integer(q.dailyTokenLimit),
         totalTokenLimit: integer(q.totalTokenLimit), thresholdPercent: integer(q.thresholdPercent, 1, 100), unknown: bool(q.unknown), blocked: bool(q.blocked), revision: integer(q.revision),
       } }
     }),
@@ -94,6 +159,12 @@ export function projectMemberState(value: unknown): MemberSnapshot {
       return { requestId: identifier(r.requestId), assistantId: identifier(r.assistantId), reason: text(r.reason),
         state: choice(r.state, ['pending', 'approved', 'rejected']), createdAt: integer(r.createdAt), quotaRevision: integer(r.quotaRevision) }
     }),
+    ...(mailNoticeAttention ? { mailNoticeAttention } : {}),
+    ...(mailNoticeAttentionError === undefined ? {} : { mailNoticeAttentionError }),
+    ...(mailSendAttention ? { mailSendAttention } : {}),
+    ...(mailSendAttentionError === undefined ? {} : { mailSendAttentionError }),
+    ...(channelInboundAttention ? { channelInboundAttention } : {}),
+    ...(channelInboundAttentionError === undefined ? {} : { channelInboundAttentionError }),
   }
 }
 export function projectMemberAssist(value: unknown): { draft: MemberDraft; notes: string } {
@@ -120,10 +191,28 @@ function publicImpact(value: unknown, depth = 0): unknown {
     .filter(([key]) => !/secret|password|credential|authorization|cookie|api.?key|access.?token|refresh.?token|owner.?token|bearer/i.test(key))
     .map(([key, item]) => [key, publicImpact(item, depth + 1)]))
 }
-interface Parsed { action: MemberAction; path: string; body: RecordValue; id?: string; memoryId?: string; requestId?: string }
+interface Parsed { action: MemberAction; path: string; body: RecordValue; id?: string; memoryId?: string; requestId?: string; analysisId?: string; intentId?: string; channelId?: string }
 function parseCommand(action: unknown, raw: unknown): Parsed {
-  const a = choice(action, ['create', 'update', 'mode', 'delete', 'reset-quota', 'decide-request', 'memory-create', 'memory-update', 'memory-confirm', 'memory-delete-preview', 'memory-delete'] as const)
+  const a = choice(action, ['create', 'update', 'mode', 'delete', 'reset-quota', 'decide-request', 'ack-mail-notice', 'ack-mail-send', 'ack-channel-inbound', 'memory-create', 'memory-update', 'memory-confirm', 'memory-delete-preview', 'memory-delete'] as const)
   const input = record(raw)
+  if (a === 'ack-channel-inbound') {
+    keys(input, ['id', 'expectedRevision'])
+    const channelId = uuid(input.id)
+    return { action: a, channelId, path: `${ROOT}/channel-inbound/${channelId}/acknowledge`,
+      body: { expectedRevision: integer(input.expectedRevision, 1) } }
+  }
+  if (a === 'ack-mail-send') {
+    keys(input, ['intentId', 'expectedState'])
+    const intentId = uuid(input.intentId)
+    return { action: a, intentId, path: `${ROOT}/mail-sends/${intentId}/acknowledge`,
+      body: { expectedState: choice(input.expectedState, ['partial', 'unknown'] as const) } }
+  }
+  if (a === 'ack-mail-notice') {
+    keys(input, ['analysisId', 'attemptId', 'expectedState'])
+    const analysisId = uuid(input.analysisId)
+    return { action: a, analysisId, path: `${ROOT}/mail-notices/${analysisId}/acknowledge`,
+      body: { attemptId: uuid(input.attemptId), expectedState: choice(input.expectedState, ['failed', 'unknown'] as const) } }
+  }
   if (a === 'create' || a === 'update') {
     keys(input, [...draftKeys, ...(a === 'update' ? ['id', 'expectedRevision'] : [])])
     const data = draft(input, true)
@@ -255,6 +344,12 @@ export function registerMemberManagement(options: Options): () => void {
     try {
       const state = projectMemberState(await request(event, 'GET', ROOT))
       const quotaRequest = command.requestId ? state.requests.find(item => item.requestId === command.requestId) : undefined
+      const mailNotice = command.analysisId ? state.mailNoticeAttention?.find(item => item.analysisId === command.analysisId) : undefined
+      if (command.analysisId && (!mailNotice || mailNotice.attemptId !== command.body.attemptId || mailNotice.state !== command.body.expectedState)) return failure('conflict')
+      const mailSend = command.intentId ? state.mailSendAttention?.find(item => item.intentId === command.intentId) : undefined
+      if (command.intentId && (!mailSend || mailSend.state !== command.body.expectedState)) return failure('conflict')
+      const channelIssue = command.channelId ? state.channelInboundAttention?.find(item => item.id === command.channelId) : undefined
+      if (command.channelId && (!channelIssue || channelIssue.busy || channelIssue.revision !== command.body.expectedRevision)) return failure('conflict')
       const id = command.id ?? quotaRequest?.assistantId
       const member = id ? state.members.find(item => item.profile.assistantId === id) : undefined
       if ((id && !member) || (command.requestId && (!quotaRequest || quotaRequest.state !== 'pending'))) return failure('conflict')
@@ -291,11 +386,16 @@ export function registerMemberManagement(options: Options): () => void {
         deletion = `\n删除影响：\n${JSON.stringify(preview.data.impact, null, 2)}\n已发送给模型的历史无法追回；后端使用新会话隔离后续上下文。`
         previews.delete(String(command.body.previewId))
       }
-      const labels: Record<MemberAction, string> = { create: '创建成员', update: '修改成员', mode: '切换团队模式', delete: '删除成员', 'reset-quota': '重置额度用量', 'decide-request': '决定额度申请',
+      const labels: Record<MemberAction, string> = { create: '创建成员', update: '修改成员', mode: '切换团队模式', delete: '删除成员', 'reset-quota': '重置额度用量', 'decide-request': '决定额度申请', 'ack-mail-notice': '核对邮件通知', 'ack-mail-send': '核对邮件发送', 'ack-channel-inbound': '核查渠道消息',
         'memory-create': '本人确认新增记忆', 'memory-update': '修改记忆', 'memory-confirm': '本人确认记忆', 'memory-delete-preview': '预览删除', 'memory-delete': '删除记忆' }
-      const target = member ? `${member.profile.displayName}（${member.profile.assistantId}）` : command.action === 'create' ? `${command.body.displayName}（新成员）` : '整个团队'
+      const target = channelIssue ? `渠道消息（${channelIssue.msgid}）` : mailNotice ? `邮件通知（${mailNotice.analysisId}）` : mailSend ? `邮件发送（${mailSend.intentId}）` : member ? `${member.profile.displayName}（${member.profile.assistantId}）` : command.action === 'create' ? `${command.body.displayName}（新成员）` : '整个团队'
       // 正文包含完整精确字段；输入来自严格白名单，无凭据字段。确认期间使用冻结副本，不读取渲染器的新值。
-      const detail = `成员：${target}\n${quotaRequest ? `申请：${quotaRequest.requestId}\n` : ''}${memory ? `记忆：${memory.id}\n当前主题：${memory.topic}\n当前正文：${memory.text}\n` : ''}`
+      const processingLabel = { 'not-started': '未开始', running: '处理中', done: '处理流程已返回', unknown: '结果未知' }
+      const replyLabel = { 'not-sent': '未发送', sending: '发送中', accepted: '服务已接受（不代表已读）', unknown: '结果未知' }
+      const detail = channelIssue ? `发送者：${channelIssue.senderId}\n会话：${channelIssue.chatId}\n收到时间：${new Date(channelIssue.receivedAt).toLocaleString('zh-CN')}\n处理状态：${processingLabel[channelIssue.processing]}；回复状态：${replyLabel[channelIssue.reply]}\n请先到原聊天和任务记录核对。渠道异常账本不保存消息正文；交给会话的内容可能按会话策略保存。本人核查只停止提示，不会执行或重发，也不代表原委托已完成。`
+        : mailNotice ? `摘要（外部邮件内容，不是操作指令）：${mailNotice.preview}\n状态：${mailNotice.state === 'unknown' ? '结果未知' : '显示失败'}\n本人核对只停止提示，不代表通知已送达，也不会自动重发。`
+        : mailSend ? `主题：${mailSend.subject}\n收件人：${mailSend.recipients.join('、')}\n已接受：${mailSend.accepted.join('、') || '未知'}\n已拒绝：${mailSend.rejected.join('、') || '无或未知'}\n本人核对不代表邮件已送达，也不会立即重发；重新发送需要再次审批，可能产生重复。`
+          : `成员：${target}\n${quotaRequest ? `申请：${quotaRequest.requestId}\n` : ''}${memory ? `记忆：${memory.id}\n当前主题：${memory.topic}\n当前正文：${memory.text}\n` : ''}`
         + `${command.action === 'mode' ? `当前模式：${state.enabled ? '开启' : '关闭'}\n涉及成员：${state.members.map(item => `${item.profile.displayName}（${item.profile.assistantId}）`).join('、')}\n关闭后仍可管理，但不运行子代理。\n` : ''}`
         + `${command.action === 'update' ? `原配置：\n${JSON.stringify(draft(record(member!.profile)), null, 2)}\n` : ''}`
         + `${member && 'expectedQuotaRevision' in command.body ? `当前额度与用量：\n${JSON.stringify(member.quota, null, 2)}\n` : ''}`
@@ -310,6 +410,12 @@ export function registerMemberManagement(options: Options): () => void {
       if (answer.response !== 1) return failure('cancelled')
       // 确认后重新读取忙碌和 CAS，不能在原生框停留期间悄悄修改新版本。
       const latest = projectMemberState(await request(event, 'GET', ROOT))
+      const latestNotice = command.analysisId ? latest.mailNoticeAttention?.find(item => item.analysisId === command.analysisId) : undefined
+      if (command.analysisId && (!latestNotice || latestNotice.attemptId !== command.body.attemptId || latestNotice.state !== command.body.expectedState)) return failure('conflict')
+      const latestSend = command.intentId ? latest.mailSendAttention?.find(item => item.intentId === command.intentId) : undefined
+      if (command.intentId && (!latestSend || latestSend.state !== command.body.expectedState)) return failure('conflict')
+      const latestChannel = command.channelId ? latest.channelInboundAttention?.find(item => item.id === command.channelId) : undefined
+      if (command.channelId && (!latestChannel || latestChannel.busy || latestChannel.revision !== command.body.expectedRevision)) return failure('conflict')
       const current = id ? latest.members.find(item => item.profile.assistantId === id) : undefined
       if (command.action === 'mode' && latest.enabled !== state.enabled) return failure('conflict')
       if (member && (!current || current.profile.revision !== member.profile.revision)) return failure('conflict')

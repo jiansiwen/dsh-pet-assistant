@@ -26,6 +26,7 @@ import {
   checkSender,
   confirmDialogSpec,
   needsNativeConfirm,
+  meetingMailOutcomeText,
   type ApprovalCardView,
   type ApprovalProposal,
 } from './approval-policy.ts'
@@ -215,6 +216,11 @@ export class ApprovalWindow {
       if (!currentView.canDecide) return { ok: false, error: currentView.blockedReason ?? '提案已失效' }
       const result = await this.bridge.decideApproval(proposal.proposalId, decision as ApprovalDecision,
         event.sender.id, proposal.kind ?? 'team', proposal.epoch)
+      if (result.ok && decision === 'approve' && proposal.tool === 'personal_assistant_send_meeting_minutes') {
+        const notice = meetingMailOutcomeText(result.meetingMail)
+        try { await dialog.showMessageBox({ type: 'info', title: '会议邮件与提醒结果', message: notice.message,
+          detail: notice.detail, buttons: ['知道了'], noLink: true }) } catch { /* 结果仍可在任务页和团队页核查 */ }
+      }
       if (result.ok) this.retire(proposal.proposalId)
       return result
     } catch (error) {
@@ -361,14 +367,15 @@ export class ApprovalWindow {
    */
   private async lookup(proposalId: string): Promise<{ proposal: ApprovalProposal; requester: string | null } | null> {
     let snapshot: TeamSnapshot | null = null
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
       snapshot = await Promise.race([
         this.bridge.getTeam(),
-        new Promise<null>(resolve => setTimeout(() => resolve(null), LOOKUP_TIMEOUT_MS)),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), LOOKUP_TIMEOUT_MS) }),
       ])
     } catch {
       snapshot = null
-    }
+    } finally { if (timer) clearTimeout(timer) }
     const found = snapshot?.proposals?.find(item => item.proposalId === proposalId)
     if (!found) return null
     const proposal: ApprovalProposal = {

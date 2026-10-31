@@ -4,7 +4,7 @@ import {
   BLOCKER_LABELS, CONTROL_LABELS, CYCLE_LABELS, TASK_LABELS, controlsFor, deviceTimezone, displayTime,
   localDateTimeToISO, parseInput, scheduleDescription, text,
   type CompanionCreate, type CompanionDetail, type CompanionInput, type CompanionMutation, type CompanionReply,
-  type CompanionTasksApi, type CompanionTaskView, type ReminderCycleView,
+  type CompanionTasksApi, type CompanionTaskView, type MeetingMailAttention, type ReminderCycleView,
 } from '../companion-types.ts'
 import './report-workbench.css'
 import './companion-tasks.css'
@@ -26,7 +26,7 @@ function groupOf(task: CompanionTaskView): string {
   return 'active'
 }
 function useTaskData(taskId: string | null) {
-  const [list, setList] = useState<CompanionReply<{ tasks: CompanionTaskView[] }> | null>(null)
+  const [list, setList] = useState<CompanionReply<{ tasks: CompanionTaskView[]; meetingMailAttention?: MeetingMailAttention[] }> | null>(null)
   const [detail, setDetail] = useState<CompanionReply<CompanionDetail> | null>(null)
   const [cycles, setCycles] = useState<CompanionReply<{ cycles: ReminderCycleView[] }> | null>(null)
   const [refreshing, setRefreshing] = useState(false)
@@ -106,6 +106,7 @@ function App() {
     }
   }
   const tasks = data.list?.ok ? data.list.data?.tasks ?? [] : []
+  const meetingMailAttention = data.list?.ok ? data.list.data?.meetingMailAttention ?? [] : []
   const detail = data.detail?.ok && data.detail.data?.task.taskId === selected ? data.detail.data : null
   const select = (id: string) => { setSelected(id); setCreating(false) }
   return <main className="wb ct">
@@ -117,6 +118,11 @@ function App() {
       <p className="wb-hint">查看交给小潘的任务，安排桌面提醒与催办。设备时区：<span className="mono">{timezone}</span></p>
     </header>
     <p className="wb-rules">电脑关机时不触发提醒。“知道了”只回应提醒，不等于关联业务已完成。</p>
+    {meetingMailAttention.length > 0 && <section className="wb-notice tone-warn" role="alert" aria-label="会议邮件提醒待核查">
+      <strong>会议邮件已被服务接受，但提醒尚未登记（{meetingMailAttention.length}{meetingMailAttention.length >= 20 ? '，仅显示前20条' : ''}）</strong>
+      <p>请检查助理运行状态并刷新；不要重发邮件。服务接受不代表收件或已读。</p>
+      <ul>{meetingMailAttention.map(item => <li key={item.intentId}>邮件编号 {item.intentId}；接受时间 {displayTime(item.acceptedAt)}</li>)}</ul>
+    </section>}
     {notice && <p className={`wb-notice ${notice.error ? 'tone-error' : 'tone-info'}`} role={notice.error ? 'alert' : 'status'}>{notice.text}</p>}
     {busy && <p className="wb-hint" role="status">正在读取最新详情、等待系统确认或提交操作，请勿重复点击。</p>}
     <div className="ct-layout">

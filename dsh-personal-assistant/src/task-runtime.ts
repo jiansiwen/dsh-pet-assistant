@@ -6,7 +6,7 @@ import {
   reminderResponseSchema, reminderScheduleSchema, type CompanionCommand, type CompanionCreateInput,
   type CompanionHttpResult, type CompanionSubject, type CompanionTaskView,
 } from './companion-contract.ts'
-import { CompanionReminders } from './reminders.ts'
+import { CompanionReminders, reminderClaimSchema, reminderReceiptSchema } from './reminders.ts'
 import { TERMINAL_TASK_STATUSES, TeamStore, type CompanionCommandRecord, type Task } from './team-domain.ts'
 
 const emptyPayload = z.object({}).strict()
@@ -16,6 +16,7 @@ const reschedulePayload = z.object({
 }).strict().refine(value => value.schedule !== undefined || value.deadlineAt !== undefined, '需要明确改期内容')
 
 const intervalPayload = z.object({ repeatEverySeconds: z.number().int().min(60).max(604_800) }).strict()
+const mailNoticeReceiptSchema = reminderReceiptSchema.extend({ attemptId: z.string().uuid() })
 type Action = 'create' | 'pause' | 'resume' | 'cancel' | 'complete' | 'reschedule' | 'respond' | 'set-interval'
 
 export class CompanionTaskRuntime {
@@ -26,6 +27,7 @@ export class CompanionTaskRuntime {
   private readonly epoch: string
   private readonly now: () => number
   private readonly onChange: () => void
+  private readonly activeMailAccount: () => { accountKey: string; memberId: string } | null
   private readonly reminders: CompanionReminders
   private readonly unregister: () => void
   private accepting = true
@@ -39,10 +41,12 @@ export class CompanionTaskRuntime {
   } | null = null
 
   private acceptsRecipient: (channel: 'desktop' | 'wecom', recipientRef: string) => boolean
+  private channelAccountKey: () => string | null = () => null
 
   constructor(store: TeamStore, approvals: ApprovalService, options: {
     epoch: string; now?: () => number; onChange?: () => void
     acceptsRecipient?: (channel: 'desktop' | 'wecom', recipientRef: string) => boolean
+    activeMailAccount?: () => { accountKey: string; memberId: string } | null
   }) {
     if (!options.epoch) throw new Error('运行时代次不能为空')
     this.store = store
@@ -50,6 +54,7 @@ export class CompanionTaskRuntime {
     this.epoch = options.epoch
     this.now = options.now ?? Date.now
     this.onChange = options.onChange ?? (() => {})
+    this.activeMailAccount = options.activeMailAccount ?? (() => null)
     const identity = store.companionIdentity()
     this.principalId = identity.principalId
     this.deviceId = identity.deviceId
@@ -60,7 +65,11 @@ export class CompanionTaskRuntime {
       changeTask: (id, status, blocker, artifacts) => this.changeTask(id, status, blocker, artifacts),
       createChild: (parent, cycleId) => this.insertTask(parent.goal, this.store.getCompanionMeta(parent.taskId)!.inputRef,
         parent.taskId, [], 'queued', cycleId),
-      acceptsRecipient: (channel, recipient) => this.acceptsRecipient(channel, recipient) })
+      acceptsRecipient: (channel, recipient, taskId) => {
+        if (!this.acceptsRecipient(channel, recipient)) return false
+        const followup = taskId ? this.store.meetingMailFollowupForTask(taskId) : null
+        return !followup || (channel === 'wecom' && followup.channelAccountKey === this.channelAccountKey())
+      } })
     this.unregister = approvals.onTrustedDecision('manage_companion_task', (proposal, decision) => {
       if (!this.accepting || this.disposed) return
       const command = store.companionCommandForProposal(proposal.proposalId)
@@ -78,6 +87,8 @@ export class CompanionTaskRuntime {
   setRecipientPolicy(policy: (channel: 'desktop' | 'wecom', recipientRef: string) => boolean): void {
     this.acceptsRecipient = policy
   }
+
+  setChannelAccountKey(provider: () => string | null): void { this.channelAccountKey = provider }
 
   attachSettings(settings: NonNullable<CompanionTaskRuntime['settings']>): void {
     this.settings = settings
@@ -121,6 +132,57 @@ export class CompanionTaskRuntime {
     return false
   }
 
+  /**
+   * 已绑定聊天会话回应提醒：只作用于发往该会话、正在等待回应的周期。
+   * 多条同时等待时不批量确认，先让本人指明是哪一条。
+   */
+  respondChannelReminder(chatKey: string, reply: { action: 'ack' | 'snooze' | 'cancel'; minutes?: number; index?: number }, accountKey?: string):
+  { handled: boolean; message: string } {
+    if (!this.accepting || this.disposed) return { handled: false, message: '' }
+    const pending = this.store.listReminderCycles()
+      .filter(cycle => cycle.state === 'awaiting-response')
+      .filter(cycle => {
+        const schedule = this.store.getCompanionSchedule(cycle.scheduleId)
+        const meta = schedule ? this.store.getCompanionMeta(schedule.taskId) : null
+        const record = meta ? this.store.getCompanionInput(meta.inputRef) : null
+        const followup = schedule ? this.store.meetingMailFollowupForTask(schedule.taskId) : null
+        return record?.input.kind === 'reminder' && record.input.channel === 'wecom' && record.input.recipientId === chatKey
+          && (!followup || followup.channelAccountKey === accountKey)
+      })
+      .sort((a, b) => b.triggerAt - a.triggerAt)
+    if (pending.length === 0) return { handled: false, message: '' }
+    const chosen = reply.index === undefined ? (pending.length === 1 ? pending[0] : null) : pending[reply.index - 1]
+    if (!chosen) {
+      return { handled: true, message: `你有 ${pending.length} 条提醒在等你回应：\n${pending.map((cycle, index) =>
+        `${index + 1}. ${this.store.getTask(cycle.childTaskId)?.goal ?? '提醒'}`).join('\n')}\n` +
+        '回复“确认第1条”“延后第1条 10分钟”或“取消第1条”；也可以到桌面逐条处理。' }
+    }
+    const task = this.store.getTask(chosen.childTaskId)
+    if (!task) return { handled: true, message: '这条提醒的子任务已不存在，没有代为确认，请到桌面核对。' }
+    const minutes = Math.min(Math.max(Math.round(reply.minutes ?? 10), 1), 24 * 60)
+    const command: CompanionCommand = {
+      protocolVersion: 1, commandId: randomUUID(), taskId: task.taskId, expectedRevision: task.revision,
+      expiresAt: new Date(this.now() + 120_000).toISOString(),
+      payload: { cycleId: chosen.cycleId, expectedCycleRevision: chosen.revision, action: reply.action,
+        snoozedUntil: reply.action === 'snooze' ? new Date(this.now() + minutes * 60_000).toISOString() : null },
+    }
+    const title = task.goal
+    try {
+      const result = this.submit(`/companion/v1/reminders/${chosen.cycleId}/respond`, command, 'owner')
+      this.changed()
+      if (result.status >= 200 && result.status < 300) {
+        const message = reply.action === 'ack' ? `已确认「${title}」这一轮提醒，后续不再催办。提醒结束不等于业务事项完成。`
+          : reply.action === 'snooze' ? `已延后「${title}」，约 ${minutes} 分钟后再提醒你。`
+            : `已取消「${title}」这一轮提醒。如果它是一次性计划，之后不会再有这条提醒。`
+        return { handled: true, message }
+      }
+      const detail = (result.body as { message?: string } | null)?.message
+      return { handled: true, message: `没能处理「${title}」：${detail ?? '请求未成功'}。没有把这一轮当成已确认，请到桌面核对。` }
+    } catch (error) {
+      return { handled: true, message: `没能处理「${title}」：${error instanceof Error ? error.message : String(error)}。没有把这一轮当成已确认，请到桌面核对。` }
+    }
+  }
+
   listChannelDeliveries(channel: 'desktop' | 'wecom'): ReturnType<CompanionReminders['list']> {
     if (!this.accepting || this.disposed) return []
     return this.reminders.list(channel)
@@ -151,6 +213,7 @@ export class CompanionTaskRuntime {
         this.approvals.invalidateTasks([command.taskId], '运行时代次变化，旧批准已作废')
         this.rejectCommand(command, { status: 409, body: { code: 'EPOCH_MISMATCH', message: '运行时已重启，请重新确认' } })
       }
+      this.store.recoverMailNotices(this.epoch, this.now() - 60_000, this.now())
       this.reminders.recover()
     })
     this.tick()
@@ -184,6 +247,7 @@ export class CompanionTaskRuntime {
     const cursor = this.store.companionEventCursor(this.principalId)
     this.store.transaction(() => {
       this.store.pruneCompanionContexts(this.now() - 24 * 60 * 60_000)
+      for (const followup of this.store.pendingMeetingMailFollowups()) this.ensureMeetingMailReminder(followup.intentId)
       for (const task of this.store.listTasks({ runtimeScope: 'companion', status: 'queued' })) {
         const meta = this.store.getCompanionMeta(task.taskId)!
         if (meta.principalId !== this.principalId || meta.kind !== 'agent' || meta.blocker) continue
@@ -192,6 +256,36 @@ export class CompanionTaskRuntime {
       this.reminders.tick()
     })
     if (cursor !== this.store.companionEventCursor(this.principalId)) this.changed()
+  }
+
+  /** 只消费邮件账本中明确的完整接受回执；重复调用返回同一任务，不重新发信。 */
+  ensureMeetingMailReminder(intentId: string): string | null {
+    if (!this.accepting || this.disposed) return null
+    const taskId = this.store.transaction(() => {
+      const followup = this.store.getMeetingMailFollowup(intentId)
+      const sent = this.store.getMailSendIntent(intentId)
+      if (!followup || !sent || sent.state !== 'accepted' || sent.acceptedAt === null) return null
+      if (followup.taskId) return followup.taskId
+      const runAt = sent.acceptedAt + 120_000
+      if (!Number.isSafeInteger(runAt) || runAt > 8_640_000_000_000_000) throw new Error('邮件接受时间无效，未创建提醒')
+      const input = companionInputSchema.parse({ kind: 'reminder', message: '会议纪要邮件已被邮件服务接受，请核查并回应。',
+        schedule: { kind: 'once', timezone: 'UTC', runAt: new Date(runAt).toISOString() },
+        repeatEverySeconds: followup.repeatEverySeconds, relatedBusinessTaskId: null, channel: 'wecom', recipientId: followup.recipientRef })
+      const inputRef = randomUUID()
+      const at = this.now()
+      this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input, digest: digestOf(input), createdAt: at })
+      const task = this.insertTask('查看会议纪要邮件', inputRef, null, [], 'queued', `meeting-mail-${intentId}`)
+      const operationId = randomUUID()
+      this.store.insertOperation({ operationId, taskId: task.taskId, approvalId: null, kind: 'meeting-mail.reminder', state: 'succeeded',
+        resultDigest: digestOf({ intentId, taskId: task.taskId }), startedAt: at, endedAt: at, executedAt: at,
+        assistantId: 'executor:companion', target: followup.recipientRef, paramsDigest: digestOf(followup),
+        resultDetail: `由已批准会议邮件 ${followup.approvalId} 的完整接受回执创建` })
+      this.reminders.create(task, operationId)
+      this.store.bindMeetingMailFollowup(intentId, task.taskId)
+      return task.taskId
+    })
+    if (taskId) this.changed()
+    return taskId
   }
 
   private ownedTask(taskId: string): Task {
@@ -210,11 +304,15 @@ export class CompanionTaskRuntime {
       artifactIds: [...task.artifacts], updatedAt: new Date(task.updatedAt).toISOString() })
   }
 
-  snapshot(): { tasks: CompanionTaskView[]; cursor: number } {
+  snapshot(): { tasks: CompanionTaskView[]; cursor: number; meetingMailAttention: Array<{ intentId: string; acceptedAt: string }> } {
     if (this.disposed) throw new CompanionError('DEVICE_OFFLINE', '普通任务运行时已停止', 503)
     return this.store.transaction(() => ({ tasks: this.store.listTasks({ runtimeScope: 'companion' })
       .filter(task => this.store.getCompanionMeta(task.taskId)?.principalId === this.principalId).map(task => this.view(task)),
-    cursor: this.store.companionEventCursor(this.principalId) }))
+    cursor: this.store.companionEventCursor(this.principalId),
+    meetingMailAttention: this.store.pendingMeetingMailFollowups().slice(0, 20).flatMap(followup => {
+      const acceptedAt = this.store.getMailSendIntent(followup.intentId)?.acceptedAt
+      return acceptedAt == null ? [] : [{ intentId: followup.intentId, acceptedAt: new Date(acceptedAt).toISOString() }]
+    }) }))
   }
 
   /**
@@ -299,6 +397,41 @@ export class CompanionTaskRuntime {
       if (pathname.startsWith('/executor/')) {
         if (subject !== 'executor') throw new CompanionError('FORBIDDEN', '仅可信桌面执行器可领取和回执', 403)
         if (!this.accepting && !pathname.endsWith('/receipt')) throw new CompanionError('DEVICE_OFFLINE', '运行时已停止领取', 503)
+        if (method === 'GET' && pathname === '/executor/v1/mail-notices') {
+          const now = this.now()
+          this.store.recoverMailNotices(this.epoch, now - 60_000, now)
+          const account = this.activeMailAccount()
+          if (!account) return { status: 200, body: { deliveries: [], attention: [] } }
+          const deliveries = this.store.pendingMailNotices(account.accountKey, account.memberId).map(item => {
+            const text = item.result.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, ' ').trim()
+            return { analysisId: item.analysisId, memberId: item.memberId, text: text.length > 700 ? `${text.slice(0, 699)}…` : text }
+          })
+          return { status: 200, body: { deliveries, attention: this.store.mailNoticeAttention(account.accountKey, account.memberId) } }
+        }
+        const mailNotice = /^\/executor\/v1\/mail-notices\/([^/]+)\/(claim|receipt)$/.exec(pathname)
+        if (method === 'POST' && mailNotice) {
+          const analysisId = mailNotice[1]
+          if (mailNotice[2] === 'claim') {
+            const request = reminderClaimSchema.parse(body)
+            if (request.executorEpoch !== this.epoch) throw new CompanionError('EPOCH_MISMATCH', '执行器代次已失效')
+            const account = this.activeMailAccount()
+            const attemptId = account ? this.store.claimMailNotice(analysisId, account.accountKey, account.memberId, this.epoch, this.now()) : null
+            if (!attemptId) {
+              throw new CompanionError('ALREADY_CLAIMED', '邮件通知不可领取或已失效')
+            }
+            this.changed()
+            return { status: 200, body: { analysisId, attemptId, state: 'sending' } }
+          }
+          const receipt = mailNoticeReceiptSchema.parse(body)
+          if (receipt.executorEpoch !== this.epoch) throw new CompanionError('EPOCH_MISMATCH', '执行器代次已失效')
+          if (receipt.state === 'succeeded' && !receipt.evidenceRefs.includes(`notification:${analysisId}:${receipt.attemptId}`)) {
+            throw new CompanionError('INVALID_RECEIPT', '成功回执缺少通知证据', 422)
+          }
+          const state = this.store.receiptMailNotice(analysisId, this.epoch, receipt.attemptId, receipt.state, receipt.evidenceRefs, this.now())
+          if (!state) throw new CompanionError('RECEIPT_CONFLICT', '邮件通知未领取或已有其他回执')
+          this.changed()
+          return { status: 200, body: { analysisId, state } }
+        }
         if (method === 'GET' && pathname === '/executor/v1/reminders') return { status: 200, body: { deliveries: this.reminders.list('desktop') } }
         const match = /^\/executor\/v1\/reminders\/([^/]+)\/(claim|receipt)$/.exec(pathname)
         if (method === 'POST' && match) {

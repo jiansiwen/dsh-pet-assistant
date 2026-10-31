@@ -196,7 +196,6 @@ export class SessionMirror {
   private metadata(): Omit<SessionSnapshot, 'entries'> {
     const presets = this.service<Presets>('permissionPresets')
     const commands = this.service<Commands>('commands')
-    const llm = this.service<LlmLike>('llm')
     const projected = record(this.agent && this.service<Projections>('sessionProjections')?.snapshot(this.agent.session).values.permissions)
     const permissions = projected.options ? list(projected.options).map(record).map(option => ({ value: text(option.value), label: text(option.name) }))
       : (presets?.names ?? []).map(value => { const option = presets!.optionOf(value); return { value: option.value, label: option.name } })
@@ -212,7 +211,8 @@ export class SessionMirror {
         prompt: available && typeof agent?.followup === 'function',
         cancel: available && typeof agent?.cancel === 'function',
         history: available,
-        models: available && !!llm,
+        // 当前宿主只提供模型目录，不提供这里的会话模型切换接口。
+        models: false,
         permissions: available && !!presets && !!commands?.find(this.agent!, 'permission'),
       },
       ...(this.modelError ? { error: this.modelError } : {}),
@@ -234,15 +234,6 @@ export class SessionMirror {
     void this.refreshModels()
   }
 
-  /** 会话历史分页：0.2.x 没有 apiProxy，宿主把会话事件日志直接交给插件。 */
-  private historyPage(beforeSeq: number | undefined): { events: Array<{ event: MirrorEvent }>; hasMore: boolean } {
-    const all = this.sessionEvents() ?? []
-    const withSeq = all.filter((event): event is MirrorEvent & { seq: number } => typeof event.seq === 'number')
-    const older = beforeSeq === undefined ? withSeq : withSeq.filter(event => event.seq < beforeSeq)
-    const page = older.slice(-PAGE_MESSAGES)
-    return { events: page.map(event => ({ event })), hasMore: older.length > PAGE_MESSAGES }
-  }
-
   private asModel(value: unknown): SessionModel | null {
     const model = record(value)
     if (!text(model.provider) || !text(model.model)) return null
@@ -258,24 +249,28 @@ export class SessionMirror {
     const revision = this.modelRevision
     const llm = this.service<LlmLike>('llm')
     this.modelsPending = (async () => {
+      const readCurrent = () => {
+        const options = (this.agent as { options?: RecordValue } | null)?.options
+        this.model = options ? this.asModel(options) : null
+      }
+      // 当前模型独立于目录查询；目录失败也不能把已知模型弄丢。
+      readCurrent()
       if (llm?.listProviders && llm.listModels) {
-        const groups = await Promise.all(llm.listProviders().map(async provider => ({
-          id: provider.id,
-          models: await llm.listModels!(provider.id).catch(() => []),
-        })))
+        const groups = await Promise.all(llm.listProviders().map(async provider => {
+          try { return { id: provider.id, models: await llm.listModels!(provider.id), failed: false } }
+          catch { return { id: provider.id, models: [], failed: true } }
+        }))
         if (!this.active || revision !== this.modelRevision) return
         this.models = groups.flatMap(group => group.models.map(model => ({
           provider: group.id, model: text(model.id), label: text(model.name) || text(model.id),
         })))
+        readCurrent()
+        this.modelError = groups.some(group => group.failed) ? '部分模型目录读取失败，请检查宿主配置' : undefined
+      } else {
+        this.modelError = undefined
       }
-      // 当前模型取自 live agent 的 options；列不出目录也要如实显示它。
-      const options = (this.agent as { options?: RecordValue } | null)?.options
-      if (options && typeof options.provider === 'string' && typeof options.model === 'string') {
-        this.model = this.asModel(options)
-      }
-      this.modelError = undefined
-    })().catch(error => {
-      if (this.active && revision === this.modelRevision) this.modelError = String(error instanceof Error ? error.message : error)
+    })().catch(() => {
+      if (this.active && revision === this.modelRevision) this.modelError = '模型目录读取失败，请检查宿主配置'
     }).finally(() => { this.modelsPending = null; if (this.active) this.flush() })
     return this.modelsPending
   }
@@ -286,25 +281,25 @@ export class SessionMirror {
       return { ok: false, error: '历史分页必须提供有效 beforeSeq 和 bindingId' }
     }
     try {
-      let page: { events: Array<{ event: MirrorEvent }>; hasMore: boolean } | undefined
-      if (this.metadata().capabilities.history) page = this.historyPage(beforeSeq)
-      else if (beforeSeq !== undefined) return { ok: false, error: '宿主历史分页不可用' }
+      const history = this.metadata().capabilities.history
+      if (!history && beforeSeq !== undefined) return { ok: false, error: '宿主历史分页不可用' }
       await this.refreshModels()
       if (!this.active) return stale()
       refresh()
-      const raw = list(page?.events).map(item => record(record(item).event))
-      const seqs = raw.map(item => number(item.seq)).filter((seq): seq is number => seq !== undefined)
-      const low = seqs.length ? seqs.reduce((a, b) => Math.min(a, b)) : undefined
-      const high = seqs.length ? seqs.reduce((a, b) => Math.max(a, b)) : -1
-      let entries = this.projection.values()
-      if (page) entries = entries.filter(entry => (low !== undefined && entry.seq >= low && (beforeSeq === undefined || entry.seq <= high))
-        || (beforeSeq === undefined && entry.seq > high))
+      // ponytail: 复用已有完整投影分页；超大会话需要宿主提供真正的分段历史接口。
+      const all = this.projection.values().filter(entry => beforeSeq === undefined || entry.seq < beforeSeq)
+      let start = history ? Math.max(0, all.length - PAGE_MESSAGES) : 0
+      // 同一事件可能投影出思考和正文；不能把相同序号拆到两页而漏掉其中一条。
+      while (start > 0 && all[start - 1].seq === all[start].seq) start--
+      const entries = all.slice(start)
+      const low = entries[0]?.seq
+      const hasMore = start > 0
       if (beforeSeq === undefined) {
-        this.hasMore = page?.hasMore === true
+        this.hasMore = hasMore
         this.beforeSeq = low
         this.flush()
       }
-      return { ok: true, state: { ...this.metadata(), entries, hasMore: page?.hasMore === true, beforeSeq: low } }
+      return { ok: true, state: { ...this.metadata(), entries, hasMore, beforeSeq: low } }
     } catch (error) {
       return this.active ? { ok: false, error: error instanceof Error ? error.message : String(error) } : stale()
     }
@@ -341,7 +336,8 @@ export class SessionMirror {
         }
         case 'cancel': {
           if (!capabilities.cancel) throw new Error('宿主停止能力不可用')
-          ;(this.agent as unknown as { cancel: (cause: unknown) => void }).cancel({ kind: 'user' })
+          ;(this.agent as unknown as { cancel: (cause: unknown, options: { keepInbox: boolean }) => void })
+            .cancel({ kind: 'user' }, { keepInbox: true })
           break
         }
         case 'model': {

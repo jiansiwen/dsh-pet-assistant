@@ -67,19 +67,24 @@ test('总助理的只读任务使用独立运行与只读守卫，不放行插�
 
 test('启动窗口守卫只拦目标子代理，不干扰普通主会话或其他子代理', async t => {
   const f = fixture(t)
+  let checked = false
   f.setStart(async request => {
-    const execution = (name: string, label: string, parentSession: string) => ({ name, agent: { session: {
-      header: { parentSession }, events: [{ type: 'subagent/descriptor', data: { label } }],
-    } } })
+    const execution = (name: string, label: string, parentSession: string) => {
+      const events = [{ type: 'subagent/descriptor', data: { label } }]
+      return { name, agent: { session: { header: { parentSession }, events, snapshotEvents: () => events } } }
+    }
     const guard = f.startupGuards[0]!
     assert.ok(guard(execution('personal_assistant_write', request.label!, 'parent') as never))
     assert.ok(guard(execution('run_code', request.label!, 'parent') as never))
     assert.equal(guard(execution('write', 'other-task', 'parent') as never), undefined)
     assert.equal(guard(execution('write', request.label!, 'unrelated') as never), undefined)
     assert.equal(guard({ name: 'write', agent: f.parent } as never), undefined)
+    checked = true
     return f.run
   })
-  await f.team.runTask(f.team.submitTask({ goal: '检查启动窗口' }).taskId, f.parent, signal())
+  const outcome = await f.team.runTask(f.team.submitTask({ goal: '检查启动窗口' }).taskId, f.parent, signal())
+  assert.equal(checked, true, '启动替身内的断言不能被运行时捕获后误报通过')
+  assert.equal(outcome?.task.status, 'review')
 })
 
 for (const [title, structured, status] of [
@@ -297,14 +302,19 @@ test('默认配置不设累计预算：未指定预算的任务直接启动；�
 
 test('只读子代理能用宿主自身层的 structured_output 交回报告，restrict 名单里不出现子代理本地工具', async t => {
   const f = fixture(t)
+  let checked = false
   f.setStart(async request => {
-    const execution = (name: string) => ({ name, agent: { session: {
-      header: { parentSession: 'parent' }, events: [{ type: 'subagent/descriptor', data: { label: request.label } }],
-    } } })
+    const execution = (name: string) => {
+      const events = [{ type: 'subagent/descriptor', data: { label: request.label } }]
+      return { name, agent: { session: { header: { parentSession: 'parent' }, events, snapshotEvents: () => events } } }
+    }
     assert.equal(f.startupGuards[0]!(execution('structured_output') as never), undefined)
+    checked = true
     return f.run
   })
-  await f.team.runTask(f.team.submitTask({ goal: '交回结构化结论' }).taskId, f.parent, signal())
+  const outcome = await f.team.runTask(f.team.submitTask({ goal: '交回结构化结论' }).taskId, f.parent, signal())
+  assert.equal(checked, true, '启动替身内的断言必须实际执行完毕')
+  assert.equal(outcome?.task.status, 'review')
   assert.equal(f.childGuards[0]!({ agent: f.child, name: 'structured_output', signal: signal() } as never), undefined)
   assert.ok(f.requests[0]?.request.outputSchema)
 })

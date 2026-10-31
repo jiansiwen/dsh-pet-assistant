@@ -234,9 +234,10 @@ export class BargeInSession {
     if (this.stopped) this.close()
   }
 
-  /** 授权撤回 / 播放结束：没有待交接的就立即退订；有就等听写取走（或超时）。 */
-  stop(): void {
+  /** 正常交接可等待听写取走；取消或失效时立即丢弃预滚动并退订。 */
+  stop(force = false): void {
     this.stopped = true
+    if (force) this.handover = null
     if (this.handover === null) this.close()
   }
 
@@ -368,6 +369,8 @@ export function installAudioBridge(api: AudioBridgeApi, handlers: AudioBridgeHan
   let kwsStarting = false
   let kwsWanted = false
   let session: BargeInSession | null = null
+  /** 正在交给听写但尚未取走预滚动的会话，取消听写时也必须能找到并释放。 */
+  let handoverSession: BargeInSession | null = null
   let disposed = false
 
   const startKws = async (): Promise<void> => {
@@ -440,9 +443,14 @@ export function installAudioBridge(api: AudioBridgeApi, handlers: AudioBridgeHan
   const apply = (grants: AudioGrantsPayload): void => {
     if (disposed) return
     lastGrants = grants
+    if (!grants.dictation && handoverSession !== null) {
+      const cancelled = handoverSession
+      handoverSession = null
+      cancelled.stop(true)
+    }
     // 插话 → 听写交接的那几毫秒：主进程已把设备判给听写，但检测器手里的预滚动帧还没被取走。
     // 这时先不撤插话订阅（否则交接前后会漏掉一帧），等交接完成再按主进程的授权全集落实。
-    const handingOver = session !== null && session.pendingHandover && !grants.bargeIn
+    const handingOver = session !== null && session.pendingHandover && !grants.bargeIn && grants.dictation
     capture.setGrants(handingOver ? { ...grants, bargeIn: true } : grants)
     kwsWanted = grants.kws
     if (grants.kws) void startKws()
@@ -451,8 +459,14 @@ export function installAudioBridge(api: AudioBridgeApi, handlers: AudioBridgeHan
     else if (session !== null) {
       const ending = session
       session = null
-      if (handingOver) ending.whenClosed(() => { if (!disposed) capture.setGrants(lastGrants) })
-      ending.stop()
+      if (handingOver) {
+        handoverSession = ending
+        ending.whenClosed(() => {
+          if (handoverSession === ending) handoverSession = null
+          if (!disposed) capture.setGrants(lastGrants)
+        })
+      }
+      ending.stop(!handingOver)
     }
   }
 
@@ -480,8 +494,10 @@ export function installAudioBridge(api: AudioBridgeApi, handlers: AudioBridgeHan
       for (const off of offs) off()
       kws?.close()
       kws = null
-      session?.stop()
+      session?.stop(true)
       session = null
+      handoverSession?.stop(true)
+      handoverSession = null
     },
   }
 }

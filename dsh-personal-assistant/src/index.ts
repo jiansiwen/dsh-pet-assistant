@@ -31,8 +31,10 @@ import { TeamStore } from './team-domain.ts'
 import { registerTeamTools } from './team-tools.ts'
 import { CompanionTaskRuntime } from './task-runtime.ts'
 import { registerCompanionTools } from './task-tools.ts'
-import { decryptDpapiFile, decryptSecret, registerMailTools } from './mail.ts'
-import { ChannelManager, type ChannelSettings } from './channels.ts'
+import { decryptDpapiFile, decryptSecret, mailSendAccountKey, readMailConfig, registerMailTools } from './mail.ts'
+import { ChannelManager, channelAccountKey, type ChannelSettings } from './channels.ts'
+import { registerMeetingMailTools } from './meeting-mail.ts'
+import { registerMeetingPresentationTools } from './meeting-presentation-tools.ts'
 import { createWeComAdapter, readWeComConfig, weComFiles } from './wecom.ts'
 import { AssistantSettings } from './assistant-settings.ts'
 import { configureChannelAgent } from './channel-agent-settings.ts'
@@ -40,7 +42,7 @@ import { MemberRuntime } from './member-runtime.ts'
 import { MemberMemory } from './member-memory.ts'
 import { MemberAssistant } from './member-assistant.ts'
 import { MemberManagement } from './member-management.ts'
-import { MailWatcher, readMailImapConfig, readUnreadMail } from './mail-watch.ts'
+import { MailWatcher, mailWatchAccountKey, readMailImapConfig, readUnreadMail } from './mail-watch.ts'
 import { registerComputerTools } from './computer.ts'
 import { localDateOf, retentionStartDate, startOfLocalDate } from './time.ts'
 import { registerAssistantTools } from './tools.ts'
@@ -491,15 +493,16 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     onChange: () => bridge.notifyApprovalSnapshot(),
   })
   const memberAssistant = new MemberAssistant({ ctx: ctx as never, defaultModel: () => resolveDefaultModel(home), log })
+  const mailMember = () => {
+    const member = teamStore.directory.list().find(item => item.enabled && item.capabilities.includes('mail'))
+    return member ? { id: member.assistantId, name: member.displayName } : null
+  }
   const mailWatcher = new MailWatcher({
     home,
+    store: teamStore,
     enabled: () => teamRuntime !== null,
-    member: () => {
-      const member = teamStore.directory.list().find(item => item.enabled && item.capabilities.includes('mail'))
-      return member ? { id: member.assistantId, name: member.displayName } : null
-    },
+    member: mailMember,
     analyze: (id, prompt) => memberRuntime.chat(id, prompt, undefined, undefined, 'mail'),
-    notify: (text, memberId) => bridge.pushNotice('mail', text, memberId),
     log,
   })
   mailWatcher.start()
@@ -511,6 +514,11 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const companionRuntime = new CompanionTaskRuntime(teamStore, teamApprovals, {
     epoch: bridge.epoch,
     onChange: () => bridge.notifyApprovalSnapshot(),
+    activeMailAccount: () => {
+      const mail = readMailImapConfig(home)
+      const member = mailMember()
+      return teamRuntime !== null && mail?.watchEnabled && member ? { accountKey: mailWatchAccountKey(mail), memberId: member.id } : null
+    },
   })
   bridge.attachCompanion(companionRuntime, teamApprovals)
   bridge.setChatContextProvider(() => companionRuntime.consumeContextForChat())
@@ -526,7 +534,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     log(`[warn] 电脑操作工具注册失败：${error instanceof Error ? error.message : String(error)}`)
   }
   try {
-    ctx.effect(() => registerMailTools(ctx as never, { home, bridge, log }), 'personal-assistant:mail-tools')
+    ctx.effect(() => registerMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log }), 'personal-assistant:mail-tools')
   } catch (error) {
     log(`[warn] 邮件工具注册失败：${error instanceof Error ? error.message : String(error)}`)
   }
@@ -548,6 +556,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }
   let wecomAdapter: ReturnType<typeof createWeComAdapter> | null = null
   let connectionMatchesSettings = false
+  let connectedWecomAccountKey: string | null = null
   let delivering = false
   const settings: AssistantSettings = new AssistantSettings({
     home,
@@ -556,6 +565,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     channelSettings: () => channelManager.settingsSnapshot(),
     reconnect: async () => {
       connectionMatchesSettings = false
+      connectedWecomAccountKey = null
       if (delivering || channelManager.busy) throw new Error('渠道正在处理消息，请稍后重新连接')
       const config = readWeComConfig(home)
       const next = config ? createWeComAdapter({
@@ -565,19 +575,22 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       }) : null
       await channelManager.replaceAdapter('wecom', next)
       wecomAdapter = next
+      connectedWecomAccountKey = config && next ? channelAccountKey('wecom', config.botId) : null
       connectionMatchesSettings = true
     },
   })
   companionRuntime.attachSettings(settings)
   const channelManager = new ChannelManager({
     store: teamStore,
-    route: async (text, key) => {
+    epoch: bridge.epoch,
+    acceptsMessage: message => message.channel !== 'wecom' || (connectionMatchesSettings && wecomAdapter?.connected() === true
+      && !!message.accountId && readWeComConfig(home)?.botId === message.accountId),
+    route: async (text, key, sessionScope) => {
       if (!teamRuntime) return null
       const member = teamStore.directory.list().find(item => item.enabled && item.capabilities.includes('wecom'))
       if (!member) return null
       if (!key.startsWith('wecom:single:')) return '成员独立记忆暂不与群聊共享，请在已配对的单聊中交办任务。'
-      try { return await memberRuntime.chat(member.assistantId, text, undefined, key) }
-      catch { return '负责企业微信的成员暂时不能接单，请到团队管理核对额度、权限与执行状态。任务未自动重试。' }
+      return await memberRuntime.chat(member.assistantId, text, undefined, key, 'wecom', sessionScope)
     },
     host: {
       async create(key: string) {
@@ -610,6 +623,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     },
     settingsFile: channelsFile,
     approve: (chatKey, decision) => companionRuntime.approveLatestChannelTask(chatKey, decision),
+    replyReminder: (chatKey, reply, accountKey) => companionRuntime.respondChannelReminder(chatKey, reply, accountKey),
     log: message => {
       try {
         mkdirSync(path.join(home, 'personal-assistant'), { recursive: true })
@@ -627,6 +641,29 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   companionRuntime.setRecipientPolicy((channel, recipient) => channel === 'desktop'
     ? recipient === companionRuntime.principalId
     : channel === 'wecom' && channelManager.canDeliver(recipient))
+  const activeWecomBinding = (): { accountKey: string; botId: string } | null => {
+    const config = readWeComConfig(home)
+    const current = config ? channelAccountKey('wecom', config.botId) : null
+    return config && current && connectionMatchesSettings && wecomAdapter?.connected() === true && current === connectedWecomAccountKey
+      ? { accountKey: current, botId: config.botId } : null
+  }
+  companionRuntime.setChannelAccountKey(() => activeWecomBinding()?.accountKey ?? null)
+  try {
+    ctx.effect(() => registerMeetingMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log,
+      wecomBinding: recipient => channelManager.canDeliver(recipient) ? activeWecomBinding() : null,
+      wecomRecipients: () => channelManager.settingsSnapshot().deliverHere.filter(recipient => channelManager.canDeliver(recipient)),
+      reminderInterval: () => settings.getReminderInterval(),
+      ensureReminder: intentId => companionRuntime.ensureMeetingMailReminder(intentId) }), 'personal-assistant:meeting-mail-tools')
+  } catch (error) {
+    log(`[warn] 会议邮件交接工具注册失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  try {
+    ctx.effect(() => registerMeetingPresentationTools(ctx as never, {
+      request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options),
+    }), 'personal-assistant:meeting-presentation-tools')
+  } catch (error) {
+    log(`[warn] 会议讲解工具注册失败：${error instanceof Error ? error.message : String(error)}`)
+  }
   ctx.effect(() => () => {
     mailWatcher.stop()
     void (async () => {
@@ -699,7 +736,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ctx.effect(() => () => clearInterval(proactiveTimer), 'personal-assistant:proactive')
   }
 
-  bridge.attachAssistantApprovals(new AssistantApprovalService({ epoch: bridge.epoch, ttlMs: Math.max(10_000, config.approvalTtlMs) }))
+  const assistantApprovals = new AssistantApprovalService({ epoch: bridge.epoch, ttlMs: Math.max(10_000, config.approvalTtlMs) })
+  bridge.attachAssistantApprovals(assistantApprovals)
   const reportDir = config.reportDir || path.join(home, 'personal-assistant', 'reports')
   bridge.attachReportApprovals(new ReportApprovalService(db, reports, {
     epoch: bridge.epoch,
@@ -760,6 +798,36 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     },
     defaultModel: () => resolveDefaultModel(home), changed: () => bridge.notifyApprovalSnapshot(),
     activeTasks: id => teamStore.activeTaskCount(id), assistant: memberAssistant,
+    mailNoticeAttention: () => {
+      const mail = readMailImapConfig(home)
+      return mail ? teamStore.mailNoticeAttention(mailWatchAccountKey(mail), null) : []
+    },
+    acknowledgeMailNotice: (analysisId, attemptId, expectedState) => {
+      const mail = readMailImapConfig(home)
+      return !!mail && teamStore.acknowledgeMailNotice(analysisId, mailWatchAccountKey(mail), attemptId, expectedState, Date.now())
+    },
+    mailSendAttention: () => {
+      const mail = readMailConfig(home)
+      if (!mail) return []
+      const now = Date.now()
+      teamStore.recoverMailSends(bridge.epoch, now - 120_000, now)
+      const display = (value: string, max: number) => value.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, ' ').slice(0, max)
+      return teamStore.mailSendAttention(mailSendAccountKey(mail)).map(item => ({
+        intentId: item.intentId, subject: display(item.subject, 200), recipients: item.recipients.map(value => display(value, 320)),
+        state: item.state as 'sending' | 'partial' | 'unknown', accepted: item.accepted.map(value => display(value, 320)),
+        rejected: item.rejected.map(value => display(value, 320)), messageId: item.messageId === null ? null : display(item.messageId, 300),
+      }))
+    },
+    acknowledgeMailSend: (intentId, expectedState) => {
+      const mail = readMailConfig(home)
+      if (!mail || assistantApprovals.isIntentRunning('mail', intentId)
+        || !teamStore.acknowledgeMailSend(intentId, mailSendAccountKey(mail), expectedState, Date.now())) return false
+      assistantApprovals.acknowledgeUnknown('mail', intentId)
+      return true
+    },
+    channelInboundAttention: () => channelManager.inboundAttention(),
+    acknowledgeChannelInbound: (id, revision) => !channelManager.isInboundBusy(id)
+      && teamStore.acknowledgeChannelInbound(id, revision, Date.now()),
   })
   companionRuntime.attachMemberManagement(memberManagement)
   // 清理顺序与注册顺序相反：先等自有子代理静止，再关库，最后才是桥接。
@@ -890,6 +958,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     log('[warn] 企业微信渠道未启动，请在宠物设置中核对配置并重新连接')
   }
   const deliveryTimer = setInterval(() => {
+    try { channelManager.pruneExpired() } catch { log('[warn] 渠道记录到期清理暂不可用') }
     if (delivering || !connectionMatchesSettings || !wecomAdapter?.connected()) return
     delivering = true
     void (async () => {

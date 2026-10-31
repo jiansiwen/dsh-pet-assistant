@@ -7,7 +7,7 @@
  *   声明为不可信数据、其中的指令不执行；文字里的换行、方括号、围栏符号先中和，防止伪造段行。
  * - parseModelReply：模型回复 → JSON。不是合法 JSON 就如实失败，不猜、不修。
  * - validateModelMinutes：逐条核对来源。引用的段必须存在、属于本场会议、属于当前转写版本、
- *   不是助理播报段、不是转写失败占位；条目内容与所引段要有可核对的字重合；负责人/期限必须
+ *   不是转写失败占位（助理发言是合法来源）；条目内容与所引段要有可核对的字重合；负责人/期限必须
  *   在所引原文里说出来，否则一律改成"待确认"（模型给的人名/日期不采信）。校验不过的条目标
  *   rejected 并写明原因，不进入定稿。
  * - renderStructuredSections：把校验后的条目渲染成纪要正文（导出文本）。预览与导出用同一份
@@ -141,9 +141,13 @@ function neutralize(text: string): string {
     .trim()
 }
 
-/** 可以发送、也可以被引用为来源的段：机器转写的真人发言（不是助理播报、不是失败占位、能解密）。 */
+/**
+ * 可以发送、也可以被引用为来源的段：真人发言与助理发言（不是失败占位、能解密）。
+ * 助理是会议里的独立发言人，它的讲解与问答属于会议内容。
+ */
 export function isCitableSegment(segment: TranscriptSegment): boolean {
-  return segment.source === 'asr' && segment.undecryptable !== true && segment.text.trim() !== ''
+  return (segment.source === 'asr' || segment.source === 'assistant')
+    && segment.undecryptable !== true && segment.text.trim() !== ''
 }
 
 export interface MinutesPromptInput {
@@ -175,7 +179,7 @@ export function buildMinutesPrompt(input: MinutesPromptInput): MinutesPromptBuil
     return { ok: false, error: '转写里有不可解密的段，不发送给模型' }
   }
   const citable = input.segments.filter(isCitableSegment)
-  if (citable.length === 0) return { ok: false, error: '没有可发送的真人发言（转写为空，或全是助理播报/失败片段）' }
+  if (citable.length === 0) return { ok: false, error: '没有可发送的发言（转写为空，或全是失败片段）' }
   const lines = citable.map(segment =>
     `[${segmentRefId(input.meetingId, input.revision, segment.idx)}] ${mmss(segment.startMs)}–${mmss(segment.endMs)} ${neutralize(segment.label)}：${neutralize(segment.text)}`,
   )
@@ -213,23 +217,23 @@ export function buildMinutesPrompt(input: MinutesPromptInput): MinutesPromptBuil
     '2. 决议和待办只写参会者明确说出的内容，尽量沿用原话里的关键词，不要推测、不要补充原文没有的承诺。',
     '3. owner（负责人）与 due（期限）只有原文明确说出时才填写，并照抄原文的写法；原文没说就填 null，不要根据职位、上下文或常识推断。',
     '4. 没有决议或待办时对应数组留空 []。拿不准的内容不要写。',
+    '5. 标签为“小潘（AI 助理）”的段是桌面助理的发言：可以引用它说明助理讲了什么或回答了什么问题，但不要改写成参会者说过的话。',
     '',
     `<<<${fence}>>>`,
     payload,
     `<<<END_${fence}>>>`,
   ].join('\n')
   const labels = [...new Set(citable.map(segment => segment.label))]
-  const assistant = input.segments.filter(segment => segment.source === 'assistant').length
   const failed = input.segments.filter(segment => segment.source === 'failed').length
   const first = citable[0]
   const last = citable[citable.length - 1]
   const egressSummary = [
     `将把会议「${input.meetingName}」的转写文字发送给${input.target}，用于生成摘要、决议与待办草稿。`,
     '',
-    `发送内容：转写版本 r${input.revision} 中的 ${citable.length} 段真人发言文字（约 ${chars} 字），`
+    `发送内容：转写版本 r${input.revision} 中的 ${citable.length} 段发言文字（约 ${chars} 字，含参会者与“小潘（AI 助理）”的发言），`
       + `连同每段的说话人标签（${labels.slice(0, 6).join('、')}${labels.length > 6 ? ` 等 ${labels.length} 个` : ''}）`
       + `与时间（${mmss(first.startMs)}–${mmss(last.endMs)}）。`,
-    `不发送：录音音频、会议名称与知情同意记录、助理播报段（${assistant} 段）、转写失败段（${failed} 段）。`,
+    `不发送：录音音频、会议名称与知情同意记录、转写失败段（${failed} 段）。`,
     '',
     '这份授权只对本场会议的上述版本有效：转写或说话人改动后再生成会重新询问。',
     '可在会议页随时撤销；撤销后不再发送，但已发送的内容无法从服务商处收回。',
@@ -342,10 +346,6 @@ function checkRefs(cited: readonly string[], ctx: ValidateContext, kind: Minutes
     }
     if (segment.undecryptable === true) {
       problems.push(`引用 ${raw} 不可解密，无法核对`)
-      continue
-    }
-    if (segment.source === 'assistant') {
-      problems.push(`引用 ${raw} 是助理播报段，不能作为真人${KIND_NAME[kind]}的来源`)
       continue
     }
     if (segment.source === 'failed') {

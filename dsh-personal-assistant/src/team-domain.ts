@@ -127,8 +127,113 @@ export interface CompanionContextRecord {
  * v5：帮助任务（授权项目绑定）、改动提案（基线哈希与修订）、验证命令、unknown 人工复核；
  *     提案补基线哈希与审阅内容，操作账本补验收证据与人工复核结论。
  * v9：通用成员扩展配置、独立用量、额度申请与重置基线账本。
+ * v10：邮件值守的账户代次游标、待分析 UID、分析结果及待通知状态。
+ * v11：邮件分析通知的桌面领取、回执与结果不明状态。
+ * v12：邮件发送意图、服务回执及人工核对状态。
+ * v13：渠道消息执行与回复的持久状态，不保存消息正文。
  */
-export const TEAM_SCHEMA_VERSION = 9
+export const TEAM_SCHEMA_VERSION = 14
+
+export interface ChannelInboundRecord {
+  id: string
+  channel: string
+  accountKey: string
+  msgid: string
+  chatId: string | null
+  chatType: 'single' | 'group'
+  senderId: string | null
+  digest: string | null
+  state: 'pending' | 'processing' | 'replying' | 'completed' | 'unknown' | 'reviewed' | 'tombstone'
+  processing: 'not-started' | 'running' | 'done' | 'unknown'
+  reply: 'not-sent' | 'sending' | 'accepted' | 'unknown'
+  conflict: boolean
+  revision: number
+  receivedAt: number
+  updatedAt: number
+  epoch: string | null
+}
+
+export interface MailWatchLegacy {
+  uidValidity: string
+  seen: number[]
+  accountKey?: string
+  folder?: string
+  note: string
+}
+
+export interface MailWatchScope {
+  scopeId: string
+  accountKey: string
+  folder: string
+  uidValidity: string
+  /** 首启只查询此上界以内的未读邮件；之后新增 UID 不依赖已读标志。 */
+  bootstrapUpperUid: number
+  scannedUid: number
+  scanUpperUid: number
+  revision: number
+  lastRun: number
+  legacy: MailWatchLegacy | null
+}
+
+export interface MailWatchMessage {
+  scopeId: string
+  uid: number
+  state: 'pending' | 'analyzed' | 'missing' | 'legacy-completed'
+  attempts: number
+  detail: string | null
+  analysisId: string | null
+  sourceDigest: string | null
+  truncated: boolean
+}
+
+export interface MailWatchAnalysis {
+  analysisId: string
+  scopeId: string
+  memberId: string
+  uids: number[]
+  result: string
+  createdAt: number
+  notifiedAt: number | null
+}
+
+export interface MailNoticeAttention {
+  analysisId: string
+  memberId: string
+  attemptId: string
+  state: 'failed' | 'unknown'
+  preview: string
+}
+
+export interface MailSendIntent {
+  intentId: string
+  accountKey: string
+  digest: string
+  subject: string
+  recipients: string[]
+  state: 'sending' | 'accepted' | 'partial' | 'unknown' | 'acknowledged'
+  epoch: string
+  createdAt: number
+  updatedAt: number
+  acceptedAt: number | null
+  messageId: string | null
+  accepted: string[]
+  rejected: string[]
+  resolutionOf: 'partial' | 'unknown' | null
+}
+
+/** 已批准的会议邮件后续提醒范围，不保存会议正文。 */
+export interface MeetingMailFollowup {
+  intentId: string
+  artifactId: string
+  meetingId: string
+  revision: number
+  recipientRef: string
+  channelAccountKey: string
+  repeatEverySeconds: number
+  approvalId: string
+  createdAt: number
+  taskId: string | null
+}
 
 export const ROLE_IDS = ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma', 'custom'] as const
 export type RoleId = (typeof ROLE_IDS)[number]
@@ -458,6 +563,12 @@ export interface TeamEvent {
 
 interface Row {
   [key: string]: string | number | bigint | null
+}
+
+function rowToMailWatchMessage(row: Row): MailWatchMessage {
+  return { scopeId: String(row.scope_id), uid: Number(row.uid), state: row.state as MailWatchMessage['state'],
+    attempts: Number(row.attempts), detail: text(row.detail as string | null), analysisId: text(row.analysis_id as string | null),
+    sourceDigest: text(row.source_digest as string | null), truncated: Number(row.truncated) === 1 }
 }
 
 function text(value: string | null | undefined): string | null {
@@ -961,6 +1072,26 @@ export class TeamStore {
         received_at INTEGER NOT NULL,
         PRIMARY KEY (channel, msgid)
       );
+      CREATE TABLE IF NOT EXISTS channel_inbound (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        account_key TEXT NOT NULL,
+        msgid TEXT NOT NULL,
+        chat_id TEXT,
+        chat_type TEXT NOT NULL CHECK(chat_type IN ('single', 'group')),
+        sender_id TEXT,
+        digest TEXT,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'processing', 'replying', 'completed', 'unknown', 'reviewed', 'tombstone')),
+        processing TEXT NOT NULL CHECK(processing IN ('not-started', 'running', 'done', 'unknown')),
+        reply TEXT NOT NULL CHECK(reply IN ('not-sent', 'sending', 'accepted', 'unknown')),
+        conflict INTEGER NOT NULL DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 1,
+        received_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        epoch TEXT,
+        UNIQUE(channel, account_key, msgid)
+      );
+      CREATE INDEX IF NOT EXISTS idx_channel_inbound_attention ON channel_inbound(state, conflict, received_at);
       CREATE TABLE IF NOT EXISTS artifacts (
         artifact_id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(task_id),
@@ -970,6 +1101,85 @@ export class TeamStore {
       );
     `)
     migrateMemberDirectory(this.db)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS mail_watch_scopes (
+        scope_id TEXT PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        uid_validity TEXT NOT NULL,
+        bootstrap_upper_uid INTEGER NOT NULL,
+        scanned_uid INTEGER NOT NULL DEFAULT 0,
+        scan_upper_uid INTEGER NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0,
+        last_run INTEGER NOT NULL,
+        legacy TEXT,
+        UNIQUE(account_key, folder, uid_validity)
+      );
+      CREATE TABLE IF NOT EXISTS mail_watch_analyses (
+        analysis_id TEXT PRIMARY KEY,
+        scope_id TEXT NOT NULL REFERENCES mail_watch_scopes(scope_id),
+        member_id TEXT NOT NULL,
+        uids TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        notified_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS mail_watch_messages (
+        scope_id TEXT NOT NULL REFERENCES mail_watch_scopes(scope_id),
+        uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+        state TEXT NOT NULL CHECK(state IN ('pending', 'analyzed', 'missing', 'legacy-completed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        detail TEXT,
+        analysis_id TEXT REFERENCES mail_watch_analyses(analysis_id),
+        source_digest TEXT,
+        truncated INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(scope_id, uid)
+      );
+      CREATE INDEX IF NOT EXISTS idx_mail_watch_pending ON mail_watch_messages(scope_id, state, attempts, uid);
+      CREATE INDEX IF NOT EXISTS idx_mail_watch_notices ON mail_watch_analyses(scope_id, notified_at, created_at);
+      CREATE TABLE IF NOT EXISTS mail_notice_deliveries (
+        analysis_id TEXT PRIMARY KEY REFERENCES mail_watch_analyses(analysis_id),
+        state TEXT NOT NULL CHECK(state IN ('pending', 'sending', 'accepted', 'failed', 'unknown', 'acknowledged')),
+        epoch TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        claimed_at INTEGER NOT NULL,
+        receipt_state TEXT,
+        evidence TEXT,
+        resolution_of TEXT,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mail_notice_delivery_state ON mail_notice_deliveries(state, claimed_at);
+      CREATE TABLE IF NOT EXISTS mail_send_intents (
+        intent_id TEXT PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        recipients TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('sending', 'accepted', 'partial', 'unknown', 'acknowledged')),
+        epoch TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        accepted_at INTEGER,
+        message_id TEXT,
+        accepted TEXT NOT NULL DEFAULT '[]',
+        rejected TEXT NOT NULL DEFAULT '[]',
+        resolution_of TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_mail_send_intents_scope ON mail_send_intents(account_key, digest, state);
+      CREATE TABLE IF NOT EXISTS meeting_mail_followups (
+        intent_id TEXT PRIMARY KEY REFERENCES mail_send_intents(intent_id),
+        artifact_id TEXT NOT NULL,
+        meeting_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        recipient_ref TEXT NOT NULL,
+        channel_account_key TEXT NOT NULL,
+        repeat_seconds INTEGER NOT NULL,
+        approval_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        task_id TEXT UNIQUE REFERENCES tasks(task_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_meeting_mail_revision ON meeting_mail_followups(meeting_id, revision);
+    `)
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
       .prepare('INSERT OR IGNORE INTO migrations (version, applied_at) VALUES (?, ?)')
@@ -1807,7 +2017,121 @@ export class TeamStore {
   }
 
   pruneChannelMessages(before: number): number {
-    return Number(this.db.prepare('DELETE FROM channel_messages WHERE received_at < ?').run(before).changes)
+    // ponytail: 旧标记没有处理结果，保留其最小去重信息；将来可在明确迁移策略后清理。
+    return this.scrubChannelInbound(before)
+  }
+
+  private channelInboundRow(row: Row): ChannelInboundRecord {
+    return { id: String(row.id), channel: String(row.channel), accountKey: String(row.account_key), msgid: String(row.msgid),
+      chatId: text(row.chat_id as string | null), chatType: row.chat_type as ChannelInboundRecord['chatType'],
+      senderId: text(row.sender_id as string | null), digest: text(row.digest as string | null),
+      state: row.state as ChannelInboundRecord['state'], processing: row.processing as ChannelInboundRecord['processing'],
+      reply: row.reply as ChannelInboundRecord['reply'], conflict: Number(row.conflict) === 1, revision: Number(row.revision),
+      receivedAt: Number(row.received_at), updatedAt: Number(row.updated_at), epoch: text(row.epoch as string | null) }
+  }
+
+  getChannelInbound(id: string): ChannelInboundRecord | null {
+    const row = this.db.prepare('SELECT * FROM channel_inbound WHERE id = ?').get(id) as Row | undefined
+    return row ? this.channelInboundRow(row) : null
+  }
+
+  hasChannelInbound(channel: string, accountKey: string, msgid: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM channel_inbound WHERE channel = ? AND account_key = ? AND msgid = ?')
+      .get(channel, accountKey, msgid)
+  }
+
+  /** 未绑定消息只保留编号，不保存配对码或内容。 */
+  claimUnboundChannelMessage(channel: string, accountKey: string, msgid: string, at: number): boolean {
+    return this.transaction(() => {
+      if (this.hasChannelInbound(channel, accountKey, msgid)) return false
+      if (this.db.prepare('SELECT 1 FROM channel_messages WHERE channel = ? AND msgid = ?').get(channel, msgid)) return false
+      return this.claimChannelMessage(`${channel}:${accountKey}`, msgid, at)
+    })
+  }
+
+  /** 旧版只有去重标记、没有执行证据，永远不能推断为可安全重放。 */
+  registerChannelInbound(input: Pick<ChannelInboundRecord, 'channel' | 'accountKey' | 'msgid' | 'chatId' | 'chatType' | 'senderId' | 'digest'>,
+    at: number): { kind: 'new' | 'pending' | 'duplicate' | 'conflict' | 'legacy'; id: string | null } {
+    return this.transaction(() => {
+      const old = this.db.prepare('SELECT 1 FROM channel_messages WHERE msgid = ? AND channel IN (?, ?)')
+        .get(input.msgid, input.channel, `${input.channel}:${input.accountKey}`)
+      if (old) return { kind: 'legacy', id: null }
+      const existing = this.db.prepare('SELECT * FROM channel_inbound WHERE channel = ? AND account_key = ? AND msgid = ?')
+        .get(input.channel, input.accountKey, input.msgid) as Row | undefined
+      if (existing) {
+        const record = this.channelInboundRow(existing)
+        if (record.state === 'tombstone') {
+          // 原指纹已按保留期清除，无法比较新投递；只提示核查，不执行。
+          this.db.prepare(`UPDATE channel_inbound SET chat_id = ?, chat_type = ?, sender_id = ?, state = 'unknown',
+            processing = 'unknown', reply = 'unknown', conflict = 1, revision = revision + 1, updated_at = ? WHERE id = ?`)
+            .run(input.chatId, input.chatType, input.senderId, at, record.id)
+          return { kind: 'conflict', id: record.id }
+        }
+        if (record.digest !== null && record.digest !== input.digest) {
+          if (!record.conflict) this.db.prepare('UPDATE channel_inbound SET conflict = 1, revision = revision + 1, updated_at = ? WHERE id = ?')
+            .run(at, record.id)
+          return { kind: 'conflict', id: record.id }
+        }
+        return { kind: record.state === 'pending' ? 'pending' : 'duplicate', id: record.id }
+      }
+      const id = randomUUID()
+      this.db.prepare(`INSERT INTO channel_inbound(id, channel, account_key, msgid, chat_id, chat_type, sender_id, digest,
+        state, processing, reply, received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'not-started', 'not-sent', ?, ?)`)
+        .run(id, input.channel, input.accountKey, input.msgid, input.chatId, input.chatType, input.senderId, input.digest, at, at)
+      return { kind: 'new', id }
+    })
+  }
+
+  startChannelInbound(id: string, epoch: string, at: number): boolean {
+    return Number(this.db.prepare(`UPDATE channel_inbound SET state = 'processing', processing = 'running', epoch = ?,
+      revision = revision + 1, updated_at = ? WHERE id = ? AND state = 'pending'`).run(epoch, at, id).changes) === 1
+  }
+
+  beginChannelReply(id: string, epoch: string, processing: 'done' | 'unknown', at: number): boolean {
+    return Number(this.db.prepare(`UPDATE channel_inbound SET state = 'replying', processing = ?, reply = 'sending',
+      revision = revision + 1, updated_at = ? WHERE id = ? AND epoch = ? AND state = 'processing'`)
+      .run(processing, at, id, epoch).changes) === 1
+  }
+
+  finishChannelReply(id: string, epoch: string, reply: 'accepted' | 'not-sent' | 'unknown', at: number): boolean {
+    return Number(this.db.prepare(`UPDATE channel_inbound SET state = CASE WHEN processing = 'done' AND ? = 'accepted' THEN 'completed' ELSE 'unknown' END,
+      reply = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND epoch = ? AND state = 'replying'`)
+      .run(reply, reply, at, id, epoch).changes) === 1
+  }
+
+  /** 进程中断后不能推断外部动作是否发生，也不能自动再次回复。 */
+  recoverChannelInbound(epoch: string, at: number): void {
+    this.db.prepare(`UPDATE channel_inbound SET
+      processing = CASE WHEN state = 'processing' THEN 'unknown' ELSE processing END,
+      reply = CASE WHEN state = 'replying' THEN 'unknown' ELSE reply END,
+      state = 'unknown', revision = revision + 1, updated_at = ?
+      WHERE state IN ('processing', 'replying') AND epoch != ?`).run(at, epoch)
+  }
+
+  interruptChannelInbound(id: string, epoch: string, at: number): boolean {
+    return Number(this.db.prepare(`UPDATE channel_inbound SET
+      processing = CASE WHEN state = 'processing' THEN 'unknown' ELSE processing END,
+      reply = CASE WHEN state = 'replying' THEN 'unknown' ELSE reply END,
+      state = 'unknown', revision = revision + 1, updated_at = ?
+      WHERE id = ? AND epoch = ? AND state IN ('processing', 'replying')`).run(at, id, epoch).changes) === 1
+  }
+
+  channelInboundAttention(limit = 20): ChannelInboundRecord[] {
+    return (this.db.prepare(`SELECT * FROM channel_inbound WHERE state IN ('pending', 'processing', 'replying', 'unknown') OR conflict = 1
+      ORDER BY CASE WHEN state = 'unknown' OR conflict = 1 THEN 0 WHEN state = 'pending' THEN 1 ELSE 2 END, received_at, id LIMIT ?`)
+      .all(limit) as Row[]).map(row => this.channelInboundRow(row))
+  }
+
+  acknowledgeChannelInbound(id: string, revision: number, at: number): boolean {
+    return Number(this.db.prepare(`UPDATE channel_inbound SET state = CASE WHEN state IN ('pending', 'unknown') THEN 'reviewed' ELSE state END,
+      conflict = 0, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?
+      AND (state IN ('pending', 'unknown') OR conflict = 1)`).run(at, id, revision).changes) === 1
+  }
+
+  /** 已处理或本人核对的记录过期后抹去身份与指纹，保留最小去重墓碑。 */
+  scrubChannelInbound(before: number): number {
+    return Number(this.db.prepare(`UPDATE channel_inbound SET chat_id = NULL, sender_id = NULL, digest = NULL, state = 'tombstone',
+      revision = revision + 1 WHERE state IN ('completed', 'reviewed') AND conflict = 0 AND updated_at < ?`).run(before).changes)
   }
 
   companionIdentity(): { principalId: string; deviceId: string } {
@@ -1882,6 +2206,364 @@ export class TeamStore {
       ORDER BY e.seq LIMIT ?`).all(after, principalId, limit) as Row[]
     return rows.map(row => ({ seq: Number(row.seq), type: row.type as TeamEventType, taskId: String(row.task_id),
       assistantId: null, payload: JSON.parse(String(row.payload)), createdAt: Number(row.created_at) }))
+  }
+
+  getMailWatchScope(scopeId: string): MailWatchScope | null {
+    const row = this.db.prepare('SELECT * FROM mail_watch_scopes WHERE scope_id = ?').get(scopeId) as Row | undefined
+    return row ? {
+      scopeId: String(row.scope_id), accountKey: String(row.account_key), folder: String(row.folder),
+      uidValidity: String(row.uid_validity), bootstrapUpperUid: Number(row.bootstrap_upper_uid),
+      scannedUid: Number(row.scanned_uid), scanUpperUid: Number(row.scan_upper_uid), revision: Number(row.revision),
+      lastRun: Number(row.last_run), legacy: parseJson(row.legacy) as MailWatchLegacy | null,
+    } : null
+  }
+
+  mailWatchLastRun(accountKey: string): number {
+    const row = this.db.prepare('SELECT MAX(last_run) AS at FROM mail_watch_scopes WHERE account_key = ?').get(accountKey) as Row
+    return Number(row.at ?? 0)
+  }
+
+  /** 不根据旧 seen 的最大值设置水位；中间的缺口仍须逐页发现。 */
+  ensureMailWatchScope(input: Pick<MailWatchScope, 'scopeId' | 'accountKey' | 'folder' | 'uidValidity' | 'bootstrapUpperUid' | 'legacy'>, at: number): MailWatchScope {
+    return this.transaction(() => {
+      const existing = this.getMailWatchScope(input.scopeId)
+      if (existing) return existing
+      this.db.prepare(`INSERT INTO mail_watch_scopes
+        (scope_id, account_key, folder, uid_validity, bootstrap_upper_uid, scan_upper_uid, last_run, legacy)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(input.scopeId, input.accountKey, input.folder, input.uidValidity,
+          input.bootstrapUpperUid, input.bootstrapUpperUid, at, input.legacy ? json(input.legacy) : null)
+      const legacy = input.legacy
+      // 只有明确的账户、文件夹、代次全部匹配才能信任旧消费标记。无归属旧文件只留审计记录。
+      if (legacy?.accountKey === input.accountKey && legacy.folder === input.folder && legacy.uidValidity === input.uidValidity) {
+        const insert = this.db.prepare(`INSERT OR IGNORE INTO mail_watch_messages(scope_id, uid, state, detail)
+          VALUES (?, ?, 'legacy-completed', '旧版已见记录；没有可恢复的分析结果')`)
+        for (const uid of legacy.seen) {
+          if (Number.isInteger(uid) && uid > 0 && uid <= input.bootstrapUpperUid) insert.run(input.scopeId, uid)
+        }
+      }
+      return this.getMailWatchScope(input.scopeId)!
+    })
+  }
+
+  beginMailWatchScan(scopeId: string, upperUid: number, at: number): MailWatchScope {
+    // 顺序扫描未完成时不扩大上界；新近发现单独登记，不改变该固定终点。
+    this.db.prepare(`UPDATE mail_watch_scopes SET
+      scan_upper_uid = CASE WHEN scanned_uid = scan_upper_uid THEN MAX(scanned_uid, ?) ELSE scan_upper_uid END,
+      last_run = ?, revision = revision + 1 WHERE scope_id = ?`).run(upperUid, at, scopeId)
+    const scope = this.getMailWatchScope(scopeId)
+    if (!scope) throw new Error('邮件值守范围不存在')
+    return scope
+  }
+
+  /** 顺序页与新近页共用幂等登记；调用方负责事务与修订号校验。 */
+  private insertMailWatchPending(scopeId: string, uids: readonly number[]): void {
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO mail_watch_messages(scope_id, uid, state) VALUES (?, ?, 'pending')`)
+    for (const uid of uids) insert.run(scopeId, uid)
+  }
+
+  /** 一页只有完整查询成功后才能提交；待补取 UID 与水位同生同灭。 */
+  commitMailWatchPage(scope: MailWatchScope, throughUid: number, uids: readonly number[]): MailWatchScope {
+    if (!Number.isInteger(throughUid) || throughUid <= scope.scannedUid || throughUid > scope.scanUpperUid
+      || uids.some(uid => !Number.isInteger(uid) || uid <= scope.scannedUid || uid > throughUid)) {
+      throw new Error('邮件 UID 页面范围无效')
+    }
+    return this.transaction(() => {
+      const current = this.getMailWatchScope(scope.scopeId)
+      if (!current || current.revision !== scope.revision) throw new Error('邮件扫描游标已变化，拒绝旧页面')
+      this.insertMailWatchPending(scope.scopeId, uids)
+      this.db.prepare('UPDATE mail_watch_scopes SET scanned_uid = ?, revision = revision + 1 WHERE scope_id = ?')
+        .run(throughUid, scope.scopeId)
+      return this.getMailWatchScope(scope.scopeId)!
+    })
+  }
+
+  /** 只登记首启后新增的已查询 UID；事务和修订号防止半页及迟到结果，不推进顺序水位。 */
+  registerMailWatchTailPage(scope: MailWatchScope, fromUid: number, throughUid: number, uids: readonly number[]): MailWatchScope {
+    if (!Number.isInteger(fromUid) || fromUid <= Math.max(scope.bootstrapUpperUid, scope.scannedUid)
+      || !Number.isInteger(throughUid) || throughUid < fromUid || throughUid > 0xffff_ffff
+      || uids.some(uid => !Number.isInteger(uid) || uid < fromUid || uid > throughUid)
+      || new Set(uids).size !== uids.length) {
+      throw new Error('邮件 UID 新近页面范围无效')
+    }
+    return this.transaction(() => {
+      const current = this.getMailWatchScope(scope.scopeId)
+      if (!current || current.revision !== scope.revision) throw new Error('邮件扫描游标已变化，拒绝旧页面')
+      this.insertMailWatchPending(scope.scopeId, uids)
+      this.db.prepare('UPDATE mail_watch_scopes SET revision = revision + 1 WHERE scope_id = ?').run(scope.scopeId)
+      return this.getMailWatchScope(scope.scopeId)!
+    })
+  }
+
+  listMailWatchMessages(scopeId: string, state: MailWatchMessage['state'], limit = 5): MailWatchMessage[] {
+    const rows = this.db.prepare(`SELECT * FROM mail_watch_messages WHERE scope_id = ? AND state = ?
+      ORDER BY attempts, uid LIMIT ?`).all(scopeId, state, limit) as Row[]
+    return rows.map(rowToMailWatchMessage)
+  }
+
+  /** 复用旧队列的尝试次数轮换，并为首启后的新信留一个名额；其余名额继续从队首取。 */
+  listMailWatchPendingForAnalysis(scope: MailWatchScope, limit = 5): MailWatchMessage[] {
+    if (!Number.isInteger(limit) || limit <= 0) return []
+    const pending = this.listMailWatchMessages(scope.scopeId, 'pending', limit)
+    if (!pending.length) return pending
+    const recent = this.db.prepare(`SELECT * FROM mail_watch_messages WHERE scope_id = ? AND state = 'pending' AND uid > ?
+      ORDER BY attempts, uid DESC LIMIT 1`).get(scope.scopeId, scope.bootstrapUpperUid) as Row | undefined
+    if (!recent) return pending
+    const newest = rowToMailWatchMessage(recent)
+    return [...pending.filter(item => item.uid !== newest.uid).slice(0, limit - 1), newest]
+  }
+
+  attemptMailWatchMessage(scopeId: string, uid: number): void {
+    this.db.prepare(`UPDATE mail_watch_messages SET attempts = attempts + 1 WHERE scope_id = ? AND uid = ? AND state = 'pending'`)
+      .run(scopeId, uid)
+  }
+
+  noteMailWatchMessage(scopeId: string, uid: number, detail: string, missing = false): void {
+    this.db.prepare(`UPDATE mail_watch_messages SET detail = ?, state = ? WHERE scope_id = ? AND uid = ? AND state = 'pending'`)
+      .run(detail, missing ? 'missing' : 'pending', scopeId, uid)
+  }
+
+  /** 分析成功与待通知一起落库；通知失败或重启不能让已完成分析再次花费额度。 */
+  completeMailWatchAnalysis(scopeId: string, memberId: string,
+    messages: readonly { uid: number; sourceDigest: string; truncated: boolean }[], result: string, at: number): MailWatchAnalysis {
+    if (!result.trim() || messages.length === 0) throw new Error('不能保存空邮件分析')
+    return this.transaction(() => {
+      const analysis: MailWatchAnalysis = { analysisId: randomUUID(), scopeId, memberId,
+        uids: messages.map(message => message.uid), result, createdAt: at, notifiedAt: null }
+      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result, at)
+      const update = this.db.prepare(`UPDATE mail_watch_messages SET state = 'analyzed', analysis_id = ?,
+        source_digest = ?, truncated = ?, detail = NULL WHERE scope_id = ? AND uid = ? AND state = 'pending'`)
+      for (const message of messages) {
+        if (Number(update.run(analysis.analysisId, message.sourceDigest, bool(message.truncated), scopeId, message.uid).changes) !== 1) {
+          throw new Error('邮件分析消费状态已变化')
+        }
+      }
+      return analysis
+    })
+  }
+
+  /** 尚未确认送达的分析；结果未知或本人已核对的不一定允许重发。 */
+  pendingMailWatchNotifications(scopeId: string, limit = 5, deliverableOnly = false): MailWatchAnalysis[] {
+    const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses WHERE scope_id = ? AND notified_at IS NULL
+      AND (? = 0 OR NOT EXISTS (SELECT 1 FROM mail_notice_deliveries d
+        WHERE d.analysis_id = mail_watch_analyses.analysis_id AND d.state != 'pending'))
+      ORDER BY created_at, rowid LIMIT ?`).all(scopeId, deliverableOnly ? 1 : 0, limit) as Row[]
+    return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), createdAt: Number(row.created_at), notifiedAt: null }))
+  }
+
+  markMailWatchNotified(analysisId: string, at: number): void {
+    this.db.prepare(`UPDATE mail_watch_analyses SET notified_at = ? WHERE analysis_id = ? AND notified_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM mail_notice_deliveries d WHERE d.analysis_id = mail_watch_analyses.analysis_id
+        AND d.state IN ('sending', 'failed', 'unknown', 'acknowledged'))`).run(at, analysisId)
+  }
+
+  /** 只列当前账户尚未领取的分析；旧代次仍属于同一账户，不因 UIDVALIDITY 改变而丢通知。 */
+  pendingMailNotices(accountKey: string, memberId: string, limit = 5): MailWatchAnalysis[] {
+    const rows = this.db.prepare(`SELECT a.* FROM mail_watch_analyses a
+      JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
+      LEFT JOIN mail_notice_deliveries d ON d.analysis_id = a.analysis_id
+      WHERE s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL AND (d.analysis_id IS NULL OR d.state = 'pending')
+      ORDER BY a.created_at, a.rowid LIMIT ?`).all(accountKey, memberId, limit) as Row[]
+    return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), createdAt: Number(row.created_at), notifiedAt: null }))
+  }
+
+  mailNoticeAttention(accountKey: string, memberId: string | null, limit = 20): MailNoticeAttention[] {
+    const rows = this.db.prepare(`SELECT a.analysis_id, a.member_id, a.result, d.state, d.attempt_id FROM mail_notice_deliveries d
+      JOIN mail_watch_analyses a ON a.analysis_id = d.analysis_id JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
+      WHERE s.account_key = ? AND (? IS NULL OR a.member_id = ?) AND a.notified_at IS NULL AND d.state IN ('failed', 'unknown')
+      ORDER BY d.updated_at, a.rowid LIMIT ?`).all(accountKey, memberId, memberId, limit) as Row[]
+    return rows.map(row => {
+      const text = String(row.result).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, ' ').trim()
+      return { analysisId: String(row.analysis_id), memberId: String(row.member_id), attemptId: String(row.attempt_id), state: row.state as 'failed' | 'unknown',
+        preview: text.length > 200 ? `${text.slice(0, 199)}…` : text }
+    })
+  }
+
+  claimMailNotice(analysisId: string, accountKey: string, memberId: string, epoch: string, at: number): string | null {
+    return this.transaction(() => {
+      const available = this.db.prepare(`SELECT 1 FROM mail_watch_analyses a JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
+        LEFT JOIN mail_notice_deliveries d ON d.analysis_id = a.analysis_id
+        WHERE a.analysis_id = ? AND s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL
+        AND (d.analysis_id IS NULL OR d.state = 'pending')`).get(analysisId, accountKey, memberId)
+      if (!available) return null
+      const attemptId = randomUUID()
+      const result = this.db.prepare(`INSERT INTO mail_notice_deliveries(analysis_id, state, epoch, attempt_id, claimed_at, updated_at)
+        VALUES (?, 'sending', ?, ?, ?, ?) ON CONFLICT(analysis_id) DO UPDATE SET state = 'sending', epoch = excluded.epoch,
+        attempt_id = excluded.attempt_id, claimed_at = excluded.claimed_at, receipt_state = NULL, evidence = NULL, updated_at = excluded.updated_at
+        WHERE mail_notice_deliveries.state = 'pending'`).run(analysisId, epoch, attemptId, at, at)
+      return Number(result.changes) === 1 ? attemptId : null
+    })
+  }
+
+  /** 重启或在途超时仅转未知，不自动重新领取。 */
+  recoverMailNotices(epoch: string, staleBefore: number, at: number): void {
+    this.db.prepare(`UPDATE mail_notice_deliveries SET state = 'unknown', updated_at = ?
+      WHERE state = 'sending' AND (epoch != ? OR claimed_at <= ?)`).run(at, epoch, staleBefore)
+    // 明确未显示的通知可延后再试；结果未知则绝不自动重发。
+    this.db.prepare(`UPDATE mail_notice_deliveries SET state = 'pending', updated_at = ?
+      WHERE state = 'failed' AND updated_at <= ?`).run(at, at - 5 * 60_000)
+  }
+
+  receiptMailNotice(analysisId: string, epoch: string, attemptId: string, state: 'succeeded' | 'failed-before-effect' | 'partial' | 'unknown',
+    evidenceRefs: readonly string[], at: number): 'accepted' | 'failed' | 'unknown' | null {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM mail_notice_deliveries WHERE analysis_id = ?').get(analysisId) as Row | undefined
+      if (!row || row.epoch !== epoch || row.attempt_id !== attemptId) return null
+      if (row.state === 'pending' || row.state === 'acknowledged') return null
+      const evidence = JSON.stringify(evidenceRefs)
+      if (row.receipt_state === state && row.evidence === evidence) return row.state as 'accepted' | 'failed' | 'unknown'
+      // 超时后同一执行器的可信迟到回执仍可结算；其他终态不能被改写。
+      if (row.state !== 'sending' && !(row.state === 'unknown' && row.receipt_state === null)) return null
+      const result = state === 'succeeded' ? 'accepted' : state === 'failed-before-effect' ? 'failed' : 'unknown'
+      this.db.prepare(`UPDATE mail_notice_deliveries SET state = ?, receipt_state = ?, evidence = ?, updated_at = ? WHERE analysis_id = ?`)
+        .run(result, state, evidence, at, analysisId)
+      if (result === 'accepted') this.markMailWatchNotified(analysisId, at)
+      return result
+    })
+  }
+
+  /** 本人核对只停止后续提示，不把未知结果改写成已送达。 */
+  acknowledgeMailNotice(analysisId: string, accountKey: string, attemptId: string, expectedState: 'failed' | 'unknown', at: number): boolean {
+    const result = this.db.prepare(`UPDATE mail_notice_deliveries SET state = 'acknowledged', resolution_of = ?, updated_at = ?
+      WHERE analysis_id = ? AND attempt_id = ? AND state = ? AND EXISTS (
+        SELECT 1 FROM mail_watch_analyses a JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
+        WHERE a.analysis_id = mail_notice_deliveries.analysis_id AND s.account_key = ? AND a.notified_at IS NULL
+      )`).run(expectedState, at, analysisId, attemptId, expectedState, accountKey)
+    return Number(result.changes) === 1
+  }
+
+  private mailSendRow(row: Row): MailSendIntent {
+    return { intentId: String(row.intent_id), accountKey: String(row.account_key), digest: String(row.digest), subject: String(row.subject),
+      recipients: parseList(text(row.recipients as string | null)), state: row.state as MailSendIntent['state'], epoch: String(row.epoch),
+      createdAt: Number(row.created_at), updatedAt: Number(row.updated_at), acceptedAt: num(row.accepted_at as number | null),
+      messageId: text(row.message_id as string | null), accepted: parseList(text(row.accepted as string | null)),
+      rejected: parseList(text(row.rejected as string | null)), resolutionOf: row.resolution_of as MailSendIntent['resolutionOf'] }
+  }
+
+  getMailSendIntent(intentId: string): MailSendIntent | null {
+    const row = this.db.prepare('SELECT * FROM mail_send_intents WHERE intent_id = ?').get(intentId) as Row | undefined
+    return row ? this.mailSendRow(row) : null
+  }
+
+  unresolvedMailSend(accountKey: string, digest: string): MailSendIntent | null {
+    const row = this.db.prepare(`SELECT * FROM mail_send_intents WHERE account_key = ? AND digest = ?
+      AND state IN ('sending', 'partial', 'unknown') ORDER BY created_at DESC LIMIT 1`).get(accountKey, digest) as Row | undefined
+    return row ? this.mailSendRow(row) : null
+  }
+
+  reviewedMailSend(accountKey: string, digest: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM mail_send_intents WHERE account_key = ? AND digest = ? AND state = 'acknowledged' LIMIT 1`)
+      .get(accountKey, digest)
+  }
+
+  beginMailSend(input: Pick<MailSendIntent, 'intentId' | 'accountKey' | 'digest' | 'subject' | 'recipients' | 'epoch'>, at: number): boolean {
+    return this.transaction(() => {
+      if (this.unresolvedMailSend(input.accountKey, input.digest)) return false
+      this.db.prepare(`INSERT INTO mail_send_intents(intent_id, account_key, digest, subject, recipients, state, epoch, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'sending', ?, ?, ?)`)
+        .run(input.intentId, input.accountKey, input.digest, input.subject, JSON.stringify(input.recipients), input.epoch, at, at)
+      return true
+    })
+  }
+
+  /** 旧运行时中断或发送长时间无回执时保留未知，不自动重新发送。 */
+  recoverMailSends(epoch: string, staleBefore: number, at: number): void {
+    this.db.prepare(`UPDATE mail_send_intents SET state = 'unknown', updated_at = ?
+      WHERE state = 'sending' AND (epoch != ? OR created_at <= ?)`).run(at, epoch, staleBefore)
+  }
+
+  finishMailSend(intentId: string, epoch: string, state: 'accepted' | 'partial' | 'unknown',
+    result: { messageId?: string; accepted?: readonly string[]; rejected?: readonly string[] }, at: number): boolean {
+    const accepted = result.accepted ?? []
+    const updated = this.db.prepare(`UPDATE mail_send_intents SET state = ?, message_id = ?, accepted = ?, rejected = ?,
+      accepted_at = ?, updated_at = ? WHERE intent_id = ? AND epoch = ? AND state IN ('sending', 'unknown')`)
+      .run(state, text(result.messageId), JSON.stringify(accepted), JSON.stringify(result.rejected ?? []),
+        state !== 'unknown' && accepted.length > 0 ? at : null, at, intentId, epoch)
+    return Number(updated.changes) === 1
+  }
+
+  mailSendAttention(accountKey: string, limit = 20): MailSendIntent[] {
+    return (this.db.prepare(`SELECT * FROM mail_send_intents WHERE account_key = ? AND state IN ('sending', 'partial', 'unknown')
+      ORDER BY updated_at DESC LIMIT ?`).all(accountKey, limit) as Row[]).map(row => this.mailSendRow(row))
+  }
+
+  acknowledgeMailSend(intentId: string, accountKey: string, expectedState: 'partial' | 'unknown', at: number): boolean {
+    const updated = this.db.prepare(`UPDATE mail_send_intents SET state = 'acknowledged', resolution_of = ?, updated_at = ?
+      WHERE intent_id = ? AND account_key = ? AND state = ?`).run(expectedState, at, intentId, accountKey, expectedState)
+    return Number(updated.changes) === 1
+  }
+
+  private meetingMailFollowupRow(row: Row): MeetingMailFollowup {
+    return { intentId: String(row.intent_id), artifactId: String(row.artifact_id), meetingId: String(row.meeting_id),
+      revision: Number(row.revision), recipientRef: String(row.recipient_ref), channelAccountKey: String(row.channel_account_key),
+      repeatEverySeconds: Number(row.repeat_seconds), approvalId: String(row.approval_id), createdAt: Number(row.created_at),
+      taskId: text(row.task_id as string | null) }
+  }
+
+  /** 只能在批准已消费、邮件仍处于发送登记阶段时创建固定后续范围。 */
+  insertMeetingMailFollowup(input: Omit<MeetingMailFollowup, 'taskId'>): void {
+    if (![input.intentId, input.artifactId, input.meetingId, input.approvalId].every(value => typeof value === 'string' && value.length > 0 && value.length <= 200)
+      || !/^wecom:(single|group):[^\u0000-\u001f\u007f]{1,180}$/u.test(input.recipientRef)
+      || !/^[a-f0-9]{64}$/u.test(input.channelAccountKey) || !Number.isSafeInteger(input.revision) || input.revision < 1
+      || !Number.isSafeInteger(input.repeatEverySeconds) || input.repeatEverySeconds < 60 || input.repeatEverySeconds > 604_800
+      || !Number.isSafeInteger(input.createdAt) || input.createdAt < 0) throw new Error('会议邮件提醒范围无效')
+    this.transaction(() => {
+      if (this.unresolvedMeetingMail(input.meetingId, input.revision)) throw new Error('同一会议修订有未核查的邮件结果')
+      const result = this.db.prepare(`INSERT INTO meeting_mail_followups(intent_id, artifact_id, meeting_id, revision, recipient_ref,
+        channel_account_key, repeat_seconds, approval_id, created_at, task_id)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL WHERE EXISTS
+          (SELECT 1 FROM mail_send_intents WHERE intent_id = ? AND state = 'sending')`)
+        .run(input.intentId, input.artifactId, input.meetingId, input.revision, input.recipientRef, input.channelAccountKey,
+          input.repeatEverySeconds, input.approvalId, input.createdAt, input.intentId)
+      if (Number(result.changes) !== 1) throw new Error('邮件不在已批准的发送登记阶段')
+    })
+  }
+
+  unresolvedMeetingMail(meetingId: string, revision: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM meeting_mail_followups f JOIN mail_send_intents m ON m.intent_id = f.intent_id
+      WHERE f.meeting_id = ? AND f.revision = ? AND m.state IN ('sending', 'partial', 'unknown') LIMIT 1`).get(meetingId, revision)
+  }
+
+  reviewedMeetingMail(meetingId: string, revision: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM meeting_mail_followups f JOIN mail_send_intents m ON m.intent_id = f.intent_id
+      WHERE f.meeting_id = ? AND f.revision = ? AND m.state = 'acknowledged' LIMIT 1`).get(meetingId, revision)
+  }
+
+  acceptedMeetingMail(meetingId: string, revision: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM meeting_mail_followups f JOIN mail_send_intents m ON m.intent_id = f.intent_id
+      WHERE f.meeting_id = ? AND f.revision = ? AND m.state = 'accepted' LIMIT 1`).get(meetingId, revision)
+  }
+
+  hasMeetingMailAttention(accountKey: string, reviewed = false): boolean {
+    const states = reviewed ? "('acknowledged')" : "('sending', 'partial', 'unknown')"
+    return !!this.db.prepare(`SELECT 1 FROM meeting_mail_followups f JOIN mail_send_intents m ON m.intent_id = f.intent_id
+      WHERE m.account_key = ? AND m.state IN ${states} LIMIT 1`).get(accountKey)
+  }
+
+  getMeetingMailFollowup(intentId: string): MeetingMailFollowup | null {
+    const row = this.db.prepare('SELECT * FROM meeting_mail_followups WHERE intent_id = ?').get(intentId) as Row | undefined
+    return row ? this.meetingMailFollowupRow(row) : null
+  }
+
+  meetingMailFollowupForTask(taskId: string): MeetingMailFollowup | null {
+    const parent = this.getCompanionMeta(taskId)?.parentTaskId ?? taskId
+    const row = this.db.prepare('SELECT * FROM meeting_mail_followups WHERE task_id = ?').get(parent) as Row | undefined
+    return row ? this.meetingMailFollowupRow(row) : null
+  }
+
+  pendingMeetingMailFollowups(): MeetingMailFollowup[] {
+    return (this.db.prepare(`SELECT f.* FROM meeting_mail_followups f JOIN mail_send_intents m ON m.intent_id = f.intent_id
+      WHERE f.task_id IS NULL AND m.state = 'accepted' AND m.accepted_at IS NOT NULL ORDER BY f.created_at`).all() as Row[])
+      .map(row => this.meetingMailFollowupRow(row))
+  }
+
+  bindMeetingMailFollowup(intentId: string, taskId: string): void {
+    const result = this.db.prepare(`UPDATE meeting_mail_followups SET task_id = ? WHERE intent_id = ? AND task_id IS NULL
+      AND EXISTS (SELECT 1 FROM mail_send_intents WHERE intent_id = ? AND state = 'accepted' AND accepted_at IS NOT NULL)`)
+      .run(taskId, intentId, intentId)
+    if (Number(result.changes) !== 1) throw new Error('会议邮件提醒已登记或接受回执已失效')
   }
 
   close(): void {

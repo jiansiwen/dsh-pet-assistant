@@ -243,7 +243,8 @@ export default function ChatOverlay(props: Props) {
             {!session?.permission && <option value="">权限不可用</option>}
             {session?.permissions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
-          <select className="hud-model" aria-label="会话模型" title="与原生 dsh 一致：切换对后续请求生效，并保存为默认模型" value={currentModel ? modelKey(currentModel) : ''}
+          <select className="hud-model" aria-label="会话模型" title={session?.capabilities.models
+            ? '切换对后续请求生效' : '当前宿主不支持在这里切换，请到应用的模型设置调整'} value={currentModel ? modelKey(currentModel) : ''}
             disabled={changing || !session?.capabilities.models} onChange={event => {
               const chosen = choices.find(model => modelKey(model) === event.target.value)
               if (chosen && session) void choose({ kind: 'model', bindingId: session.bindingId,

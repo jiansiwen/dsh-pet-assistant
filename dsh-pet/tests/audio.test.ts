@@ -231,9 +231,11 @@ const ALL_EVENTS: readonly AudioEvent[] = [
   { type: 'wake-config', enabled: false },
   { type: 'wake-engine-changed' },
   { type: 'barge-in-requested' },
+  { type: 'barge-in-requested', allowInMeeting: true },
   { type: 'barge-in-detected' },
   { type: 'barge-in-finished' },
   { type: 'barge-in-finished', force: true },
+  { type: 'dictation-requested', source: 'barge-in' },
 ]
 
 describe('穷举：唤醒与插话两类监听的起停份数始终和 holder 对得上', () => {
@@ -253,17 +255,22 @@ describe('穷举：唤醒与插话两类监听的起停份数始终和 holder �
           assert.ok(b >= 0 && b <= 1, `插话监听份数越界：${JSON.stringify(event)} ${JSON.stringify(state)}`)
         }
         assert.equal(w, turn.state.holder === 'wake' ? 1 : 0, `唤醒份数与 holder 不一致（${JSON.stringify(event)}）`)
-        assert.equal(b, turn.state.holder === 'barge-in' ? 1 : 0, `插话份数与 holder 不一致（${JSON.stringify(event)}）`)
+        const barges = (turn.state.holder === 'barge-in' ? 1 : 0) + (turn.state.bargeInMeeting ? 1 : 0)
+        assert.equal(b, barges, `插话份数与 holder 不一致（${JSON.stringify(event)}）`)
         // 不变量：关着唤醒 / 专注 / 不可用时绝不会处于"唤醒在听"。
         if (turn.state.holder === 'wake') {
           assert.ok(turn.state.wakeEnabled && !turn.state.focus && !turn.state.wakeUnavailable, `不该在听唤醒：${JSON.stringify(turn.state)}`)
         }
-        // 交接标志只在插话持有时存在。
-        if (turn.state.bargeHandover) assert.equal(turn.state.holder, 'barge-in')
-        // 专注时不会新开插话监听（交接中的那一次除外，那已经是用户开口了）。
-        if (turn.effects.includes('start-barge-in')) assert.equal(turn.state.focus, false)
-        // 会议与听写互斥依旧：会议占着时听写请求不改变 holder。
-        if (state.holder === 'meeting' && event.type === 'dictation-requested') assert.equal(turn.state.holder, 'meeting')
+        // 交接标志只在插话监听存在时才有意义（独立 holder 或会议内的插话监听）。
+        if (turn.state.bargeHandover) assert.ok(turn.state.holder === 'barge-in' || turn.state.bargeInMeeting)
+        // 会议外的专注仍然不新开插话监听；会议里的插话正是为了评审提问。
+        if (turn.effects.includes('start-barge-in')) assert.ok(!turn.state.focus || turn.state.meetingActive)
+        // 会议中只有插话交接能听写；手动听写不改变 holder。
+        if (state.holder === 'meeting' && event.type === 'dictation-requested') {
+          assert.equal(turn.state.holder, event.source === 'barge-in' ? 'dictation' : 'meeting')
+        }
+        // 会议结束（或插话交接结束）不得把设备交给唤醒。
+        if (turn.state.meetingActive) assert.notEqual(turn.state.holder, 'wake')
         checked++
         if (depth > 0) walk(turn.state, w, b, depth - 1)
       }
@@ -344,17 +351,79 @@ describe('插话监听（M1-05）', () => {
     assert.equal(cut.state.holder, null)
   })
 
-  test('听写 / 会议占着设备时不抢；会议开始掐掉插话监听', () => {
+  test('听写占着设备时不抢；会议开始掐掉普通插话监听', () => {
     const dictating = nextAudio(AWAKE, { type: 'dictation-requested' }).state
     assert.equal(nextAudio(dictating, { type: 'barge-in-requested' }).state.holder, 'dictation')
     const meeting = nextAudio(BARGE.state, { type: 'meeting-requested' })
     assert.deepEqual(meeting.effects, ['stop-barge-in'])
     assert.equal(meeting.state.holder, 'meeting')
-    assert.equal(nextAudio(meeting.state, { type: 'barge-in-requested' }).state.holder, 'meeting')
+    assert.equal(meeting.state.bargeInMeeting, false)
+    // 不带会议许可的申请仍然被拒：日常外放不会被意外开麦。
+    const denied = nextAudio(meeting.state, { type: 'barge-in-requested' })
+    assert.equal(denied.state.holder, 'meeting')
+    assert.ok(denied.denied)
+  })
+})
+
+describe('会议里的自然插话（比赛链）', () => {
+  const MEETING = nextAudio(INITIAL_AUDIO_STATE, { type: 'meeting-requested' }).state
+
+  test('会议中允许另开插话监听，唤醒保持关闭', () => {
+    const turn = nextAudio(MEETING, { type: 'barge-in-requested', allowInMeeting: true })
+    assert.deepEqual(turn.effects, ['start-barge-in'])
+    assert.equal(turn.state.holder, 'meeting')
+    assert.equal(turn.state.bargeInMeeting, true)
+    assert.equal(turn.state.meetingActive, true)
+  })
+
+  test('会议插话检出后可交接给听写，会议仍记为在录', () => {
+    const listening = nextAudio(MEETING, { type: 'barge-in-requested', allowInMeeting: true }).state
+    const detected = nextAudio(listening, { type: 'barge-in-detected' })
+    assert.equal(detected.state.bargeHandover, true)
+    const dictation = nextAudio(detected.state, { type: 'dictation-requested', source: 'barge-in' })
+    assert.deepEqual(dictation.effects, ['stop-barge-in'])
+    assert.equal(dictation.state.holder, 'dictation')
+    assert.equal(dictation.state.meetingActive, true)
+    assert.equal(dictation.denied, null)
+    const finished = nextAudio(dictation.state, { type: 'dictation-finished' })
+    assert.deepEqual(finished.effects, [], '会议还在录，不能把设备交给唤醒')
+    assert.equal(finished.state.holder, 'meeting')
+  })
+
+  test('会议中手动听写仍被拒绝，插话监听的结束只停监听', () => {
+    const manual = nextAudio(MEETING, { type: 'dictation-requested' })
+    assert.ok(manual.denied)
+    assert.equal(manual.state.holder, 'meeting')
+    const listening = nextAudio(MEETING, { type: 'barge-in-requested', allowInMeeting: true }).state
+    const ended = nextAudio(listening, { type: 'barge-in-finished' })
+    assert.deepEqual(ended.effects, ['stop-barge-in'])
+    assert.equal(ended.state.holder, 'meeting')
+    assert.equal(ended.state.meetingActive, true)
+  })
+
+  test('会议中的专注不清插话监听；会议结束才归还设备并恢复唤醒', () => {
+    const listening = nextAudio(MEETING, { type: 'barge-in-requested', allowInMeeting: true }).state
+    const focus = nextAudio(listening, { type: 'focus', on: true })
+    assert.deepEqual(focus.effects, [])
+    assert.equal(focus.state.bargeInMeeting, true)
+    const done = nextAudio(focus.state, { type: 'meeting-finished' })
+    assert.deepEqual(done.effects, ['stop-barge-in'], '会议结束，插话监听一起收掉')
+    assert.equal(done.state.meetingActive, false)
+  })
+
+  test('会议中检出后人没再说话：超时强制收掉插话监听，会议继续', () => {
+    const listening = nextAudio(MEETING, { type: 'barge-in-requested', allowInMeeting: true }).state
+    const detected = nextAudio(listening, { type: 'barge-in-detected' }).state
+    const ended = nextAudio(detected, { type: 'barge-in-finished' })
+    assert.deepEqual(ended.effects, [], '交接中不提前收')
+    const forced = nextAudio(ended.state, { type: 'barge-in-finished', force: true })
+    assert.deepEqual(forced.effects, ['stop-barge-in'])
+    assert.equal(forced.state.holder, 'meeting')
   })
 
   test('重复申请幂等；唤醒关着时插话结束不拉起唤醒', () => {
-    assert.deepEqual(nextAudio(BARGE.state, { type: 'barge-in-requested' }).effects, [])
+    const listening = nextAudio(AWAKE, { type: 'barge-in-requested' }).state
+    assert.deepEqual(nextAudio(listening, { type: 'barge-in-requested' }).effects, [])
     const off = nextAudio(AWAKE, { type: 'wake-config', enabled: false }).state
     const barge = nextAudio(off, { type: 'barge-in-requested' })
     assert.deepEqual(barge.effects, ['start-barge-in'])

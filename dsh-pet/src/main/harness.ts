@@ -23,7 +23,8 @@ import type {
 import type { HealthBody } from './runtime-launch.ts'
 import type { CancelReceipt, SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
 import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
-import type { DesktopReminderDelivery } from '../companion-types.ts'
+import type { DesktopMailNotice, DesktopMailNoticeAttention, DesktopReminderDelivery } from '../companion-types.ts'
+import { parseMeetingMailOutcome } from './approval-policy.ts'
 
 export interface BridgeInfo {
   port: number
@@ -161,6 +162,7 @@ const SNAPSHOT_TIMEOUT_MS = 4_000
  */
 const INTAKE_TIMEOUT_MS = 30_000
 const APPROVAL_TIMEOUT_MS = 10_000
+const ASSISTANT_APPROVAL_TIMEOUT_MS = 180_000
 /** 新建会话要等宿主建 agent，比读快照慢得多；恢复失败再新建也在这一次请求里。 */
 const SESSION_START_TIMEOUT_MS = 30_000
 /** 长轮询服务端 25s 超时返回，客户端要留足余量，否则会先于服务端断开。 */
@@ -599,6 +601,58 @@ export class BridgeClient {
     } catch { return false }
   }
 
+  /** 邮件分析结果只由本机可信执行器领取；聊天令牌不能签发投递回执。 */
+  async desktopMailNotices(): Promise<{ deliveries: DesktopMailNotice[]; attention: DesktopMailNoticeAttention[] } | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/mail-notices`, {
+        headers: { 'x-dsh-companion-token': token }, signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      const body = await response.json() as { deliveries?: unknown; attention?: unknown }
+      if (!Array.isArray(body.deliveries) || !Array.isArray(body.attention)) return null
+      const id = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9-]{36}$/iu.test(value)
+      const member = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 200
+      const deliveries = body.deliveries.filter((item): item is DesktopMailNotice => !!item && typeof item === 'object'
+        && id(item.analysisId) && member(item.memberId) && typeof item.text === 'string' && item.text.length > 0 && item.text.length <= 700)
+      const attention = body.attention.filter((item): item is DesktopMailNoticeAttention => !!item && typeof item === 'object'
+        && id(item.analysisId) && member(item.memberId) && (item.state === 'failed' || item.state === 'unknown'))
+      return { deliveries, attention }
+    } catch { return null }
+  }
+
+  async claimDesktopMailNotice(analysisId: string): Promise<string | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/mail-notices/${encodeURIComponent(analysisId)}/claim`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ executorEpoch: info.epoch ?? '' }), signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      const body = await response.json() as { attemptId?: unknown }
+      return typeof body.attemptId === 'string' && /^[a-f0-9-]{36}$/iu.test(body.attemptId) ? body.attemptId : null
+    } catch { return null }
+  }
+
+  async receiptDesktopMailNotice(analysisId: string, attemptId: string, state: 'succeeded' | 'failed-before-effect' | 'unknown'): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/mail-notices/${encodeURIComponent(analysisId)}/receipt`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ executorEpoch: info.epoch ?? '', attemptId, state,
+          evidenceRefs: state === 'succeeded' ? [`notification:${analysisId}:${attemptId}`] : [] }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
+  }
+
   /**
    * 回执主动提醒的用户选择（design.md §2.7：不用则本次抑制，反复拒绝建议关闭）。
    * 只认聊天令牌 —— 这些端点不触发任何副作用，与聊天同级。
@@ -702,7 +756,7 @@ export class BridgeClient {
           'content-type': 'application/json',
           'x-dsh-approval-token': token,
         },
-        signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
+        signal: AbortSignal.timeout(kind === 'assistant' ? ASSISTANT_APPROVAL_TIMEOUT_MS : APPROVAL_TIMEOUT_MS),
         body: JSON.stringify({
           proposalId,
           decision,
@@ -710,12 +764,15 @@ export class BridgeClient {
           windowId,
         }),
       })
-      const body = await response.json().catch(() => ({})) as Partial<DecideApprovalResult>
+      const body = await response.json().catch(() => ({})) as Partial<DecideApprovalResult> & { result?: unknown }
       if (response.ok && body.ok === true) {
+        const meetingMail = kind === 'assistant' && decision === 'approve' && body.confirmed === true
+          ? parseMeetingMailOutcome(body.result) : undefined
         return {
           ok: true, approvalId: body.approvalId, decision: body.decision,
           confirmed: body.confirmed, savedPath: body.savedPath, revision: body.revision,
           digest: body.digest, modeExited: body.modeExited, message: body.message,
+          ...(meetingMail ? { meetingMail } : {}),
         }
       }
       // 审批的 409 几乎都是业务态：提案不存在、已被消费、已过期。这些要原样告诉用户，
@@ -729,7 +786,9 @@ export class BridgeClient {
         error: body.message ?? body.error ?? `审批被拒绝（${response.status}）`,
       }
     } catch (error) {
-      return { ok: false, error: `审批请求失败：${error instanceof Error ? error.message : String(error)}` }
+      return { ok: false, error: kind === 'assistant' && decision === 'approve'
+        ? '审批请求未收到回执；操作可能已执行，请核查实际状态，不要重复批准或重发。'
+        : `审批请求失败：${error instanceof Error ? error.message : String(error)}` }
     }
   }
 

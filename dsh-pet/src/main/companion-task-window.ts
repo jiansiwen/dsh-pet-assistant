@@ -158,7 +158,13 @@ export function registerCompanionTasks(options: CompanionTasksOptions): Companio
   register(COMPANION_TASK_CHANNELS.list, false, async () => {
     const result = await call('GET', `${root}/tasks`, undefined, 'client')
     if (!Array.isArray(result.body.tasks)) throw new CallFailure('invalid_response', '服务没有返回任务列表，不能视为空列表')
-    return success({ tasks: result.body.tasks.map(parseTask) }, result.status)
+    const rawAttention = result.body.meetingMailAttention
+    if (rawAttention !== undefined && (!Array.isArray(rawAttention) || rawAttention.length > 20)) throw new CallFailure('invalid_response', '会议邮件提醒状态不完整，请刷新核查')
+    const meetingMailAttention = (rawAttention ?? []).map((raw: unknown) => {
+      const item = record(raw)
+      return { intentId: identifier(item.intentId), acceptedAt: isoTime(item.acceptedAt) }
+    })
+    return success({ tasks: result.body.tasks.map(parseTask), meetingMailAttention }, result.status)
   })
   register(COMPANION_TASK_CHANNELS.defaults, false, async () => {
     const result = await call('GET', `${root}/reminder-defaults`, undefined, 'client')

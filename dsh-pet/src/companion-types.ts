@@ -36,8 +36,22 @@ export interface DesktopReminderDelivery {
   message: string
   executorEpoch: string
 }
+export interface DesktopMailNotice {
+  analysisId: string
+  memberId: string
+  text: string
+}
+export interface DesktopMailNoticeAttention {
+  analysisId: string
+  memberId: string
+  state: 'failed' | 'unknown'
+}
+export interface MeetingMailAttention {
+  intentId: string
+  acceptedAt: string
+}
 export interface CompanionTasksApi {
-  list(): Promise<CompanionReply<{ tasks: CompanionTaskView[] }>>
+  list(): Promise<CompanionReply<{ tasks: CompanionTaskView[]; meetingMailAttention?: MeetingMailAttention[] }>>
   defaults(): Promise<CompanionReply<{ repeatEverySeconds: number }>>
   setInterval(draft: { taskId: string; repeatEverySeconds: number }): Promise<CompanionReply<CompanionMutation>>
   detail(taskId: string): Promise<CompanionReply<CompanionDetail>>

@@ -109,6 +109,59 @@ test('扩展 JSON 不复制基础字段，会话独立且权限变动强制换�
   }
 })
 
+test('渠道会话引用不可跨成员复用，配置权限变化时失效而普通编辑不清除', t => {
+  const dir = memory(t).directory
+  const a = dir.create(draft())
+  const b = dir.create(draft({ displayName: '第二成员' }))
+  const scope = 'a'.repeat(64)
+  dir.setSession(a.assistantId, '桌面会话')
+  assert.throws(() => dir.getChannelSession(a.assistantId, '无效范围'), /范围无效/u)
+  assert.throws(() => dir.setChannelSession(a.assistantId, scope, '桌面会话'), /不能与成员桌面会话共用/u)
+  dir.setChannelSession(a.assistantId, scope, '渠道甲')
+  dir.setChannelSession(a.assistantId, scope, '渠道甲')
+  assert.throws(() => dir.setChannelSession(a.assistantId, scope, '渠道乙'), /不能覆盖/u)
+  assert.throws(() => dir.setSession(b.assistantId, '渠道甲'), /不能与渠道会话共用/u)
+  assert.throws(() => dir.setChannelSession(b.assistantId, 'b'.repeat(64), '渠道甲'), /UNIQUE/u)
+  const edited = dir.update(a.assistantId, 1, draft({ description: '普通修改' }))
+  assert.equal(dir.getChannelSession(a.assistantId, scope), '渠道甲')
+  const changed = dir.update(a.assistantId, edited.revision, draft({ permissionMode: 'auto' }))
+  assert.equal(changed.sessionId, null)
+  assert.equal(dir.getChannelSession(a.assistantId, scope), null)
+  dir.setChannelSession(a.assistantId, scope, '新的渠道会话')
+  dir.setSession(a.assistantId, null)
+  assert.equal(dir.getChannelSession(a.assistantId, scope), null, '撤回记忆时不能继续恢复含旧记忆的渠道历史')
+  dir.setChannelSession(a.assistantId, scope, '再次创建的渠道会话')
+  assert.doesNotThrow(() => dir.delete(a.assistantId, changed.revision))
+})
+
+test('v13 迁移失败时回滚；成功后保留已有成员和会话，渠道引用可跨连接恢复', t => {
+  const fixture = file(t)
+  const original = fixture.open()
+  const member = original.directory.create(draft())
+  original.directory.setSession(member.assistantId, '原桌面会话')
+  spend(original.directory, member.assistantId, '原用量', 10)
+  assert.equal(original.beginMailSend({ intentId: '旧邮件', accountKey: '账户', digest: '摘要', subject: '主题',
+    recipients: ['a@example.com'], epoch: '旧代次' }, beforeMidnight), true)
+  const raw = fixture.raw()
+  raw.exec(`DROP TABLE member_channel_sessions; DROP TABLE meeting_mail_followups; DELETE FROM migrations WHERE version = 14; PRAGMA user_version = 13;
+    CREATE TRIGGER fail_member_scope_migration BEFORE INSERT ON migrations WHEN NEW.version = 14
+    BEGIN SELECT RAISE(ABORT, '模拟渠道会话迁移失败'); END;`)
+  assert.throws(() => fixture.open(), /模拟渠道会话迁移失败/u)
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 13)
+  assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'member_channel_sessions'").get(), undefined)
+  assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meeting_mail_followups'").get(), undefined)
+  raw.exec('DROP TRIGGER fail_member_scope_migration')
+  const upgraded = fixture.open()
+  assert.equal(upgraded.directory.get(member.assistantId)?.sessionId, '原桌面会话')
+  assert.equal(upgraded.directory.quota(member.assistantId, beforeMidnight).totalUsed, 10)
+  assert.equal(upgraded.getMailSendIntent('旧邮件')?.state, 'sending')
+  assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meeting_mail_followups'").get())
+  upgraded.directory.setChannelSession(member.assistantId, 'c'.repeat(64), '企微新会话')
+  const reopened = fixture.open()
+  assert.equal(reopened.directory.getChannelSession(member.assistantId, 'c'.repeat(64)), '企微新会话')
+  assert.equal(reopened.directory.get(member.assistantId)?.sessionId, '原桌面会话')
+})
+
 test('启用企业微信能力的成员至多一位，停用不影响其他独立成员', t => {
   const dir = memory(t).directory
   const first = dir.create(draft({ capabilities: ['wecom'] }))
@@ -389,7 +442,7 @@ test('嵌套团队事务回滚同时撤销成员、用量、申请与基线，�
   assert.doesNotThrow(() => dir.beginUsage(member.assistantId, '回滚用量', beforeMidnight))
 })
 
-test('迁移 v8 到 v9 保留身份，当前版本再次打开不重跑迁移或覆盖扩展', t => {
+test('迁移 v8 到当前版本保留身份，当前版本再次打开不重跑迁移或覆盖扩展', t => {
   const fixture = file(t)
   const raw = fixture.raw()
   raw.exec(`CREATE TABLE assistants (
@@ -400,8 +453,11 @@ test('迁移 v8 到 v9 保留身份，当前版本再次打开不重跑迁移或
   raw.prepare('INSERT INTO assistants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(old.assistantId, old.roleId, old.displayName,
     old.skinId, old.persona, old.voiceProfile, JSON.stringify(old.toolPolicy), 1, old.revision)
   const store = fixture.open()
-  assert.equal(TEAM_SCHEMA_VERSION, 9)
-  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 9)
+  assert.equal(TEAM_SCHEMA_VERSION, 14)
+  assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, TEAM_SCHEMA_VERSION)
+  assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_notice_deliveries'").get())
+  assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_send_intents'").get())
+  assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'channel_inbound'").get())
   assert.deepEqual(store.getMember(old.assistantId), old)
   assert.equal(raw.prepare('SELECT COUNT(*) AS n FROM assistant_profiles').get()!.n, 1)
   store.directory.update(old.assistantId, 7, draft({ displayName: old.displayName, allowedTools: ['read'] }))
@@ -411,12 +467,12 @@ test('迁移 v8 到 v9 保留身份，当前版本再次打开不重跑迁移或
     CREATE TRIGGER forbid_repeat_migration BEFORE INSERT ON migrations
     BEGIN SELECT RAISE(ABORT, '当前版本不应再登记迁移'); END;`)
   const version = raw.prepare('PRAGMA schema_version').get()!.schema_version
-  const migration = raw.prepare('SELECT applied_at FROM migrations WHERE version = 9').get()!.applied_at
+  const migration = raw.prepare('SELECT applied_at FROM migrations WHERE version = ?').get(TEAM_SCHEMA_VERSION)!.applied_at
   const again = fixture.open()
   assert.equal(again.directory.get(old.assistantId)!.sessionId, '迁移会话')
   assert.deepEqual(again.directory.get(old.assistantId)!.allowedTools, ['read'])
   assert.equal(raw.prepare('PRAGMA schema_version').get()!.schema_version, version)
-  assert.equal(raw.prepare('SELECT applied_at FROM migrations WHERE version = 9').get()!.applied_at, migration)
+  assert.equal(raw.prepare('SELECT applied_at FROM migrations WHERE version = ?').get(TEAM_SCHEMA_VERSION)!.applied_at, migration)
   assert.throws(() => again.directory.update(old.assistantId, 7, draft()), /修订冲突/)
 })
 

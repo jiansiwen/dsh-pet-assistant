@@ -7,7 +7,7 @@ import { describe, test } from 'node:test'
 
 import { AudioCaptureService, type CaptureDeps, type CaptureFrame, type ContextLike, type ProcessorLike, type StreamLike } from '../src/renderer/audio-capture.ts'
 import { BargeInDetector, BargeInSession, DEFAULT_BARGE_IN, isWakePhraseOnly, type BargeInMetrics } from '../src/renderer/barge-in.ts'
-import { recordDictation } from '../src/renderer/dictation.ts'
+import { END_SILENCE_MS, recordDictation } from '../src/renderer/dictation.ts'
 import { RendererPlayer, type PlaybackContextLike, type PlaybackReceiptPayload } from '../src/renderer/playback.ts'
 
 const FRAME_MS = 20
@@ -154,7 +154,7 @@ function fakePlayer(clock: { now: number }) {
 }
 
 describe('插话管线（假采集 + 假播放）', () => {
-  test('检出即本地止声；预滚动（检出点前 ≥300ms）+ 交接期帧完整交给听写，不重不漏', async () => {
+  test('检出后预滚动（检出点前 ≥300ms）与交接期帧完整交给听写，不重不漏', { timeout: 5000 }, async () => {
     const { capture, clock, pump } = fakeCapture(320) // 20ms/帧 @16k
     const { player, receipts, probe } = fakePlayer(clock)
     capture.setGrants({ bargeIn: true })
@@ -189,14 +189,15 @@ describe('插话管线（假采集 + 假播放）', () => {
     const recording = recordDictation({ capture, takeHandover: () => session.takeHandover(), onChunk: c => chunks.push(c.length) })
     await new Promise(r => setTimeout(r, 0))
     for (let i = 0; i < 3; i++) pump(0.08)
-    for (let i = 0; i < 50; i++) pump(0.001) // 说完的静音
+    const silenceFrames = Math.ceil(END_SILENCE_MS / FRAME_MS)
+    for (let i = 0; i < silenceFrames; i++) pump(0.001) // 说完的静音
     const result = await recording
     assert.ok(result.wav)
     const samples = (result.wav.byteLength - 44) / 2
     const onsetFrames = 12 // 语音持续帧（含交接与之后）
     // 预滚动：语音起点前 prerollMs（400ms = 20 帧）+ 检出前的语音 + 交接期 5 帧 + 之后 3 帧 + 静音。
     assert.ok(samples >= (20 + 10 + 5 + 3) * 320, `听写拿到 ${samples / 320} 帧，话头被切了`)
-    assert.ok(samples < (20 + onsetFrames + 5 + 3 + 50 + 2) * 320, '有重复帧')
+    assert.ok(samples < (20 + onsetFrames + 5 + 3 + silenceFrames + 2) * 320, '有重复帧')
     // 按序号不重复：第一块是预滚动的最早一帧，之后连续。
     assert.equal(chunks.length * 320, samples, '流式喂数与 wav 一致')
     // 口令式打断下，检出本身不产生本地停止，所以这里不会有 barge-in 原因的取消回执；
@@ -219,7 +220,7 @@ describe('插话管线（假采集 + 假播放）', () => {
     assert.deepEqual(capture.snapshot().consumers, [])
   })
 
-  test('听写第一次判到开口只报一次 onSpeechStart（连续对话据此撤掉静默窗）', async () => {
+  test('听写第一次判到开口只报一次 onSpeechStart（连续对话据此撤掉静默窗）', { timeout: 5000 }, async () => {
     const { capture, pump } = fakeCapture(320)
     capture.setGrants({ dictation: true })
     let started = 0
@@ -230,7 +231,7 @@ describe('插话管线（假采集 + 假播放）', () => {
     for (let i = 0; i < 10; i++) pump(0.08)
     assert.equal(started, 1)
     for (let i = 0; i < 10; i++) pump(0.08) // 同一句话继续说
-    for (let i = 0; i < 50; i++) pump(0.001) // 说完的静音
+    for (let i = 0; i < Math.ceil(END_SILENCE_MS / FRAME_MS); i++) pump(0.001) // 说完的静音
     const result = await recording
     assert.ok(result.wav)
     assert.equal(started, 1, '一句话只报一次')

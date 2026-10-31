@@ -127,8 +127,8 @@ function mount(section: AssistantSettingsPage, initial: AssistantSettingsResult 
   }
 }
 
-test('三个页面读取失败可刷新恢复，未读取时不能保存', async () => {
-  for (const section of ['wecom', 'reminders', 'agent'] as const) {
+test('两个页面读取失败可刷新恢复，未读取时不能保存', async () => {
+  for (const section of ['wecom', 'reminders'] as const) {
     const view = mount(section, { ok: false, message: '服务离线，请刷新' })
     try {
       await view.flush()
@@ -217,29 +217,13 @@ test('提醒用分钟编辑，校验整数秒并打开已有任务窗口', async
   } finally { view.dispose() }
 })
 
-test('独立智能体展示真实宿主默认与预算边界，空模型原样提交', async () => {
+// 企业微信独立智能体表单已按 2026-10-29 的通用成员改造迁移到团队管理；
+// 成员模型与软额度边界由 member-management-ui/member-editor-ui 的测试覆盖。
+test('助理设置页不再保留已迁移的独立智能体表单', async () => {
   const view = mount('agent')
   try {
     await view.flush()
-    assert.match(view.text, /企业微信独立智能体/)
-    assert.match(view.text, /与桌面主会话隔离/)
-    assert.match(view.text, /下一条消息生效/)
-    assert.match(view.text, /配置不会放开敏感操作/)
-    assert.match(view.text, /真实服务商.*真实默认模型/)
-    assert.match(view.text, /0 表示不限.*达到停线后停止本轮后续请求.*不是计费硬封顶/)
-    view.change('单次最大输出', '0')
-    view.submit()
-    assert.equal(view.writes.length, 0)
-    view.change('单次最大输出', '1024')
-    view.change('模型服务商', '仅填服务商')
-    view.submit()
-    assert.equal(view.writes.length, 0)
-    assert.match(view.text, /服务商和模型须同时填写/)
-    view.change('模型服务商', '')
-    view.change('每轮 token', '0')
-    view.submit()
-    assert.deepEqual(view.writes[0], { section: 'agent', input: { expectedRevision: 4, ...snapshot().agent, maxTokens: 1024 } })
-    await view.flush()
-    assert.match(view.text, /已保存，下一条企业微信消息生效/)
+    assert.doesNotMatch(view.text, /企业微信独立智能体/)
+    assert.doesNotMatch(view.text, /每轮 token/)
   } finally { view.dispose() }
 })

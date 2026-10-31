@@ -24,6 +24,9 @@ export interface MemberQuotaView {
   day: string
   dailyUsed: number
   totalUsed: number
+  /** 已登记、尚未结算的模型请求预留；与已用量一起参与阈值和停线判断。 */
+  dailyReserved: number
+  totalReserved: number
   dailyTokenLimit: number
   totalTokenLimit: number
   thresholdPercent: number
@@ -44,11 +47,34 @@ export interface MemberView {
   quota: MemberQuotaView
   busy: boolean
 }
+export interface ChannelInboundAttention {
+  id: string
+  channel: string
+  accountTag: string
+  msgid: string
+  chatId: string
+  chatType: 'single' | 'group'
+  senderId: string
+  state: 'pending' | 'processing' | 'replying' | 'completed' | 'unknown' | 'reviewed'
+  processing: 'not-started' | 'running' | 'done' | 'unknown'
+  reply: 'not-sent' | 'sending' | 'accepted' | 'unknown'
+  conflict: boolean
+  busy: boolean
+  revision: number
+  receivedAt: number
+}
 export interface MemberSnapshot {
   enabled: boolean
   members: MemberView[]
   requests: MemberQuotaRequest[]
   defaultModel: { provider: string; model: string } | null
+  mailNoticeAttention?: Array<{ analysisId: string; memberId: string; attemptId: string; state: 'failed' | 'unknown'; preview: string }>
+  mailNoticeAttentionError?: boolean
+  mailSendAttention?: Array<{ intentId: string; subject: string; recipients: string[]; state: 'sending' | 'partial' | 'unknown';
+    accepted: string[]; rejected: string[]; messageId: string | null }>
+  mailSendAttentionError?: boolean
+  channelInboundAttention?: ChannelInboundAttention[]
+  channelInboundAttentionError?: boolean
 }
 export interface MemberDraft {
   displayName: string

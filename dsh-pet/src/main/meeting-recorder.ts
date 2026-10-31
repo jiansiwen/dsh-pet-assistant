@@ -18,7 +18,8 @@
  * 写库按版本：精修开始时记下段 revision，写入时库里已被人工修订就不覆盖（乐观锁）；整体重转
  * 遇到人工修订只重试失败片段。转写失败的片段写成 source='failed' 的占位段（缺口如实可见），
  * 可单独重试，重试只替换占位段本身，不碰其余段与用户改过的名字。
- * 助理播报区间（narrator 打点）在转写上落实：与之高度重叠的段标为助理播报，不算真人发言。
+ * 助理播报区间（narrator 打点）在转写上落实：与之高度重叠的段标为助理发言（小潘），
+ * 它是会议里的独立发言人，照常留在时间线。
  *
  * 纪要（M4-06）两个版本：
  * - 本地模板版：转写写库后自动生成，不经模型，如实标"未经模型"；
@@ -31,7 +32,9 @@
  * 于是编排逻辑能在纯 Node 下单测。
  */
 import type { AudioEvent, AudioTransition } from './audio.ts'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import {
   applyItemPatch,
   asItemPatch,
@@ -66,6 +69,10 @@ import {
   validateMeetingConsent,
   type AssistantSpeechSpan,
   type MeetingConsentInput,
+  type MeetingIntegrity,
+  type MeetingIntegrityTrack,
+  type MeetingMinutesArtifact,
+  type MeetingPresentationRecord,
   type MeetingRow,
   type MeetingSources,
   type MeetingStoreDeps,
@@ -95,6 +102,12 @@ export interface MeetingChunkMeta {
   readonly sampleRate: number
   /** 重采样到 16k 后的帧数，必须等于 PCM 字节数 / 2。 */
   readonly frames: number
+}
+
+/** 渲染层停止采集后给出的逐轨发送与接收确认；实际落盘仍由主进程核验。 */
+export interface MeetingFlushReport {
+  readonly tracks: Readonly<Partial<Record<MeetingTrack, { readonly sent: number | null; readonly acknowledged: number | null }>>>
+  readonly errors: readonly string[]
 }
 
 /** 一条临时字幕（录音中逐块转写，只在内存，停录精修后被替换）。 */
@@ -135,9 +148,11 @@ export interface MeetingRuntimeState {
   readonly missingTrackReasons: Readonly<Partial<Record<MeetingTrack, string>>>
   readonly transcribe: TranscribePhase
   readonly transcribeNote: string | null
+  /** null 表示旧会议没有完整性证据，不代表完整。 */
+  readonly integrity: MeetingIntegrity | null
   /** 最近结束（或正在进行）的会议，供面板接着做转写状态/修订/纪要。 */
   readonly lastMeetingId: string | null
-  readonly recent: ReadonlyArray<{ id: string; name: string; startedAt: number; state: string }>
+  readonly recent: ReadonlyArray<{ id: string; name: string; startedAt: number; state: string; integrity: MeetingIntegrity | null }>
   /** 录音中各音轨的收块进度（没在录时为空）。 */
   readonly tracks: ReadonlyArray<MeetingTrackState>
   /** 临时字幕：录音中与精修完成前展示；精修写库后清空，界面改看库里的段。 */
@@ -161,6 +176,8 @@ export interface MeetingRecorderDeps {
    */
   readonly liveCaptions?: boolean
   readonly now?: () => number
+  /** 仅供隔离测试模拟文件名冲突。 */
+  readonly newArtifactId?: () => string
   /** 通知渲染层停流后，等它冲刷最后一块的超时。到点强制结算，不能永远挂着。 */
   readonly flushTimeoutMs?: number
   /**
@@ -307,6 +324,8 @@ export interface MinutesInput {
   readonly missingTrackReasons?: Readonly<Partial<Record<MeetingTrack, string>>>
   /** 转写说明（分人情况、断流、失败片段）。没有就不写这一行。 */
   readonly transcriptNote?: string | null
+  /** 录音不完整或停止结果未知时，草稿必须保留该事实。 */
+  readonly recordingNote?: string | null
   /** 生成方式。不传 = 本地模板版。模型版带校验后的结构化条目。 */
   readonly generation?: MinutesGeneration
 }
@@ -347,8 +366,8 @@ export type MinutesGenerateResult =
  * 模型版：摘要/决议/待办三节只列通过来源校验的条目，每条带段号、时间与说话人；剔除的
  * 只计数、不进正文；没说出的负责人/期限写"待确认"。时间线照旧附上，便于对照原话。
  *
- * 助理播报区间单列一节并注明不算真人发言——TTS 的声音被 loopback 录进去时，
- * 不能让它冒充参会者说过的话；与播报高度重叠的转写段不进时间线。
+ * 助理是会议里的独立发言人：TTS 播报被 loopback 录进去后照常转写，说话人标为
+ * “小潘（AI 助理）”，与参会者一起留在时间线；播报时间区间另列一节便于对照。
  */
 export function buildMinutesContent(input: MinutesInput): string {
   const generation = input.generation ?? { kind: 'local' as const }
@@ -357,6 +376,7 @@ export function buildMinutesContent(input: MinutesInput): string {
   lines.push('')
   lines.push(`- 时间：${formatTime(input.startedAt)} — ${formatTime(input.endedAt)}`)
   lines.push(`- 录音来源：${input.sources === 'mic+loopback' ? '麦克风 + 系统回环声' : '麦克风'}`)
+  if (input.recordingNote) lines.push(`- 录音完整性：${input.recordingNote}`)
   if (input.missingTracks.length > 0) {
     lines.push(`- 音轨缺失：${trackListText(input.missingTracks)}（缺失期间未录到内容，不做推测）`)
     // 原因单列一行：纪要要能回答"这场为什么只有一半声音"，而不只是"少了一轨"。
@@ -386,12 +406,11 @@ export function buildMinutesContent(input: MinutesInput): string {
     lines.push('')
   }
   lines.push('## 时间线')
-  const people = input.segments.filter(segment => segment.source !== 'assistant')
-  const assistantSegments = input.segments.length - people.length
-  if (people.length === 0) {
+  // 助理是会议里的独立发言人：它的播报与问答留在时间线，靠说话人标签区分，不再从时间线剔除。
+  if (input.segments.length === 0) {
     lines.push('- （没有可用的转写内容）')
   } else {
-    for (const segment of people) {
+    for (const segment of input.segments) {
       // 段号与界面上的段号、纪要条目的〔来源：段N〕一致，导出文本里也能对回原话。
       const when = `段${segment.idx + 1} [${mmss(segment.startMs)}–${mmss(segment.endMs)}]`
       if (segment.source === 'failed') {
@@ -403,15 +422,12 @@ export function buildMinutesContent(input: MinutesInput): string {
     }
   }
   lines.push('')
-  lines.push('## 助理播报区间（不算真人发言）')
-  if (input.assistantSpeech.length === 0 && assistantSegments === 0) {
+  lines.push('## 助理播报区间（说话人：小潘）')
+  if (input.assistantSpeech.length === 0) {
     lines.push('- 无')
   } else {
     for (const span of input.assistantSpeech) {
-      lines.push(`- [${mmss(span.startMs)}–${mmss(span.endMs)}] 桌面助理 TTS 播报；此区间的声音是助理自己，不代表任何参会者发言`)
-    }
-    if (assistantSegments > 0) {
-      lines.push(`- 另有 ${assistantSegments} 段转写与播报高度重叠，已从时间线排除，不计为任何参会者的发言`)
+      lines.push(`- [${mmss(span.startMs)}–${mmss(span.endMs)}] 桌面助理 TTS 播报；对应转写按“小潘（AI 助理）”列入时间线`)
     }
   }
   lines.push('')
@@ -475,7 +491,7 @@ function composeRefineNote(input: {
   }
   if (input.corrupted > 0) parts.push(`${input.corrupted} 块录音解不开（已损坏），对应时间按缺口处理`)
   if (input.recovered > 0) parts.push(`${input.recovered} 段有声片段分人模型没覆盖到，归为「未分人」单独转写`)
-  if (input.assistantMarked > 0) parts.push(`${input.assistantMarked} 段与助理播报高度重叠，已标为助理播报，不算真人发言`)
+  if (input.assistantMarked > 0) parts.push(`${input.assistantMarked} 段与助理播报高度重叠，已标为“小潘（AI 助理）”的发言`)
   if (input.assistantTrimmed > 0) parts.push(`${input.assistantTrimmed} 段裁掉了与助理播报重叠的部分`)
   return { mode, note: `${parts.join('。')}。` }
 }
@@ -504,6 +520,8 @@ export class MeetingRecorder {
   private readonly store: MeetingStore
   private active: ActiveMeeting | null = null
   private last: LastMeeting | null = null
+  /** 落盘本身失败时保留本进程的未知结果；重启时 pending 仍会被恢复为未知。 */
+  private lastIntegrity: { meetingId: string; value: MeetingIntegrity } | null = null
   private phase: TranscribePhase = 'idle'
   private note: string | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -524,6 +542,7 @@ export class MeetingRecorder {
   constructor(deps: MeetingRecorderDeps) {
     this.deps = deps
     this.store = deps.store
+    this.store.recoverInterruptedRecordings()
     activeRecorder = this
   }
 
@@ -548,6 +567,8 @@ export class MeetingRecorder {
   getState(): MeetingRuntimeState {
     const active = this.active
     const last = active !== null ? active : this.last
+    const recent = this.store.listMeetings(10)
+    const lastMeetingId = this.last?.meetingId ?? recent[0]?.id ?? null
     const captions = this.liveMeetingId === null
       ? null
       : [...this.liveEntries.values()]
@@ -565,8 +586,10 @@ export class MeetingRecorder {
       missingTrackReasons: last?.missingTrackReasons ?? {},
       transcribe: active !== null ? 'idle' : this.phase,
       transcribeNote: active !== null ? null : this.note,
-      lastMeetingId: this.last?.meetingId ?? null,
-      recent: this.store.listMeetings(10).map(m => ({ id: m.id, name: m.name, startedAt: m.startedAt, state: m.state })),
+      integrity: this.getRecordingIntegrity(active?.meetingId ?? lastMeetingId ?? ''),
+      lastMeetingId,
+      recent: recent.map(m => ({ id: m.id, name: m.name, startedAt: m.startedAt, state: m.state,
+        integrity: this.lastIntegrity?.meetingId === m.id ? this.lastIntegrity.value : m.integrity })),
       tracks: active === null
         ? []
         : TRACK_ORDER.filter(track => active.tracks.has(track)).map(track => {
@@ -587,6 +610,12 @@ export class MeetingRecorder {
     return this.liveDrain ?? Promise.resolve()
   }
 
+  /** 读取本场持久停录结果；历史记录的 null 不得被当成完整。 */
+  getRecordingIntegrity(meetingId: string): MeetingIntegrity | null {
+    if (this.lastIntegrity?.meetingId === meetingId) return this.lastIntegrity.value
+    return this.store.getMeeting(meetingId)?.integrity ?? null
+  }
+
   startMeeting(consent: MeetingConsentInput): { ok: true; meetingId: string } | { ok: false; error: string } {
     if (this.active !== null) return { ok: false, error: '已经有一场会议在录制' }
     const invalid = validateMeetingConsent(consent)
@@ -594,7 +623,13 @@ export class MeetingRecorder {
     // 先过仲裁：设备被听写占着就如实拒绝，不开一场录不到声的会。
     const granted = this.deps.audio({ type: 'meeting-requested' })
     if (granted.denied !== null) return { ok: false, error: granted.denied }
-    const started = this.store.startMeeting(consent)
+    let started: ReturnType<MeetingStore['startMeeting']>
+    try {
+      started = this.store.startMeeting(consent, { status: 'pending', reasons: [], tracks: {} })
+    } catch (error) {
+      this.deps.audio({ type: 'meeting-finished' })
+      return { ok: false, error: `会议记录无法保存：${error instanceof Error ? error.message : String(error)}` }
+    }
     if (!started.ok) {
       // 库拒了（密钥不可用等）：把刚拿到的设备还回去，别把唤醒词永久锁死。
       this.deps.audio({ type: 'meeting-finished' })
@@ -629,6 +664,33 @@ export class MeetingRecorder {
     })
     this.broadcast()
     return { ok: true, meetingId: started.meetingId }
+  }
+
+  /**
+   * 等两条必需音轨都真的收到音频，或明确报告缺失。
+   *
+   * “已开始录制”不能只等于“已下发开始事件”：回环轨没拿到声时，返回成功会让用户
+   * 以为对方的声音录上了。这里按实际音轨进度判断，超时如实返回缺哪条。
+   */
+  async waitTracksReady(meetingId: string, timeoutMs = 8_000): Promise<{ ready: boolean; recorded: MeetingTrack[]; missing: MeetingTrack[] }> {
+    const active = this.active
+    const needed: MeetingTrack[] = active?.sources === 'mic+loopback' ? ['mic', 'loopback'] : ['mic']
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const state = this.getState()
+      if (state.meetingId !== meetingId) {
+        return { ready: false, recorded: [], missing: [...needed] }
+      }
+      const recorded = needed.filter(track => state.tracks.some(item => item.track === track))
+      const missing = needed.filter(track => state.missingTracks.includes(track))
+      if (!state.recording || state.stopping) return { ready: false, recorded, missing: needed.filter(track => !recorded.includes(track)) }
+      if (missing.length > 0) return { ready: false, recorded, missing }
+      if (recorded.length === needed.length) return { ready: true, recorded, missing: [] }
+      if (Date.now() >= deadline) {
+        return { ready: false, recorded, missing: needed.filter(track => !recorded.includes(track)) }
+      }
+      await new Promise(resolve => setTimeout(resolve, 150))
+    }
   }
 
   /**
@@ -808,7 +870,11 @@ export class MeetingRecorder {
    */
   requestStop(meetingId?: string): { ok: true } | { ok: false; error: string } {
     const active = this.active
-    if (active === null) return { ok: false, error: '没有会议在录制' }
+    if (active === null) {
+      const previous = meetingId === undefined ? null : this.getRecordingIntegrity(meetingId)
+      if (previous?.status === 'complete') return { ok: true }
+      return { ok: false, error: previous === null ? '没有会议在录制' : '会议已停止，但录音不完整或停止结果未知' }
+    }
     if (meetingId !== undefined && meetingId !== active.meetingId) return { ok: false, error: '会议对不上' }
     if (active.stopping) return { ok: true }
     active.stopping = true
@@ -816,31 +882,115 @@ export class MeetingRecorder {
     const timeout = this.deps.flushTimeoutMs ?? 5000
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null
-      void this.finalize()
+      void this.finalize({ status: 'unknown', reasons: ['等待渲染层停止和冲刷回执超时，录音完整性未知'], tracks: {} })
     }, timeout)
     this.flushTimer.unref?.()
     this.broadcast()
     return { ok: true }
   }
 
-  /** 渲染层停流并推完最后一块后回报。触发结算（幂等）。 */
-  async flushDone(meetingId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  /** 对照渲染层末序、主进程元数据和加密块文件，不能把空队列或 IPC 成功当作落盘证明。 */
+  private assessFlush(active: ActiveMeeting, report: unknown): MeetingIntegrity {
+    const reasons: string[] = active.missingTracks.map(track =>
+      `${track} 音轨缺失：${active.missingTrackReasons[track] ?? '采集未完成'}`)
+    const tracks: Partial<Record<MeetingTrack, MeetingIntegrityTrack>> = {}
+    if (report === undefined || report === null) {
+      reasons.push('未收到逐轨停止与冲刷证据')
+      return { status: active.missingTracks.length > 0 ? 'incomplete' : 'unknown', reasons, tracks }
+    }
+    if (typeof report !== 'object' || Array.isArray(report)) {
+      return { status: 'unknown', reasons: [...reasons, '停止回执格式无效'], tracks }
+    }
+    const value = report as { tracks?: unknown; errors?: unknown }
+    if (typeof value.tracks !== 'object' || value.tracks === null || Array.isArray(value.tracks) || !Array.isArray(value.errors) || value.errors.length > 32
+      || value.errors.some(error => typeof error !== 'string')) {
+      return { status: 'unknown', reasons: [...reasons, '停止回执缺少逐轨证据'], tracks }
+    }
+    for (const error of value.errors.slice(0, 32)) {
+      const text = (error as string).trim().slice(0, 240)
+      reasons.push(text || '音频块接收或冲刷失败')
+    }
+    const entries = this.store.listChunks(active.meetingId)
+    const wanted: MeetingTrack[] = active.sources === 'mic+loopback' ? ['mic', 'loopback'] : ['mic']
+    const sequence = (item: unknown): item is number | null => item === null || (typeof item === 'number' && Number.isSafeInteger(item) && item >= 0)
+    for (const track of wanted) {
+      const candidate = (value.tracks as Record<string, unknown>)[track]
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+        reasons.push(`${track} 音轨没有停止回执`)
+        continue
+      }
+      const sent = (candidate as { sent?: unknown }).sent
+      const acknowledged = (candidate as { acknowledged?: unknown }).acknowledged
+      if (!sequence(sent) || !sequence(acknowledged)) {
+        reasons.push(`${track} 音轨末块序号无效`)
+        continue
+      }
+      const stored = entries.filter(entry => entry.track === track).sort((a, b) => (a.trackSeq ?? -1) - (b.trackSeq ?? -1))
+      const persisted = stored.length === 0 ? null : stored[stored.length - 1].trackSeq
+      tracks[track] = { sent, acknowledged, persisted }
+      if (sent === null || acknowledged === null || persisted === null) reasons.push(`${track} 音轨没有可核验的音频块`)
+      else if (sent !== acknowledged || sent !== persisted) reasons.push(`${track} 音轨末块发送、确认和落盘序号不一致`)
+      if (stored.some((entry, index) => entry.trackSeq !== index)) reasons.push(`${track} 音轨块序号不连续`)
+      if (stored.some(entry => entry.startMs === null || !Number.isFinite(entry.startMs)
+        || entry.frames === null || !Number.isFinite(entry.frames) || entry.frames <= 0)) {
+        reasons.push(`${track} 音轨时间轴无法核验`)
+      }
+      if (stored.some((entry, index) => {
+        if (typeof entry.sidecar?.gapAfterMs === 'number' && entry.sidecar.gapAfterMs > 0) return true
+        const previous = stored[index - 1]
+        return previous !== undefined && previous.startMs !== null && previous.frames !== null && entry.startMs !== null
+          && Math.abs(Math.round(entry.startMs - (previous.startMs + previous.frames / FRAMES_PER_MS))) > this.store.trackGapThresholdMs
+      })) reasons.push(`${track} 音轨存在采集时间缺口`)
+      for (const entry of stored) {
+        if (this.store.readChunk(active.meetingId, entry.seq) === null) {
+          reasons.push(`${track} 音轨第 ${entry.trackSeq ?? entry.seq} 块无法从加密存储核验`)
+        }
+      }
+    }
+    return { status: reasons.length === 0 ? 'complete' : 'incomplete', reasons, tracks }
+  }
+
+  /** 渲染层停流并推完最后一块后回报。旧调用可以不传回执，但结果只能是未知。 */
+  async flushDone(meetingId: string, report?: unknown): Promise<{ ok: true; integrity?: MeetingIntegrity } | { ok: false; error: string; integrity?: MeetingIntegrity }> {
     const active = this.active
-    if (active === null || active.meetingId !== meetingId) return { ok: false, error: '没有这场会议在录制' }
+    if (active === null || active.meetingId !== meetingId) {
+      const prior = this.getRecordingIntegrity(meetingId)
+      if (prior?.status === 'complete') return { ok: true, integrity: prior }
+      return { ok: false, error: prior === null ? '没有这场会议在录制' : '录音不完整或停止结果未知', ...(prior ? { integrity: prior } : {}) }
+    }
+    if (!active.stopping) return { ok: false, error: '尚未请求停止会议' }
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer)
       this.flushTimer = null
     }
-    await this.finalize()
-    return { ok: true }
+    let assessed: MeetingIntegrity
+    try {
+      assessed = this.assessFlush(active, report)
+    } catch (error) {
+      assessed = { status: 'unknown', reasons: [`无法核验录音存储：${error instanceof Error ? error.message : String(error)}`], tracks: {} }
+    }
+    await this.finalize(assessed)
+    const result = this.getRecordingIntegrity(meetingId) ?? assessed
+    if (result.status === 'complete' || (report === undefined && result.status === 'unknown')) return { ok: true, integrity: result }
+    return { ok: false, error: `录音不完整或停止结果未知：${result.reasons.join('；')}`, integrity: result }
   }
 
-  /** 结算：落 stopped、还设备、跑转写任务。幂等：重复调用直接返回进行中的任务。 */
-  private async finalize(): Promise<void> {
+  /** 结算：先持久化停止结果、还设备，再跑转写；失败也保留已有块。 */
+  private async finalize(assessed: MeetingIntegrity): Promise<void> {
     const active = this.active
     if (active === null || active.finalized) return this.settle ?? undefined
     active.finalized = true
     this.active = null
+    let saved = false
+    let result = assessed
+    try {
+      saved = this.store.finishRecording(active.meetingId, assessed, this.now())
+      if (!saved) throw new Error('会议停止状态没有写入')
+    } catch (error) {
+      result = { status: 'unknown', reasons: [`停止结果落盘失败：${error instanceof Error ? error.message : String(error)}`], tracks: assessed.tracks }
+      try { saved = this.store.finishRecording(active.meetingId, result, this.now()) } catch { saved = false }
+    }
+    this.lastIntegrity = { meetingId: active.meetingId, value: result }
     this.last = {
       meetingId: active.meetingId,
       name: active.name,
@@ -850,9 +1000,14 @@ export class MeetingRecorder {
       missingTrackReasons: { ...active.missingTrackReasons },
     }
     this.stopLive()
-    this.store.stopMeeting(active.meetingId, this.now())
     // 先还设备再转写：转写不占麦克风，唤醒词没理由多停一分钟。
     this.deps.audio({ type: 'meeting-finished' })
+    if (!saved) {
+      this.phase = 'transcript-failed'
+      this.note = result.reasons.join('；')
+      this.broadcast()
+      return
+    }
     // 上一个转写任务（例如对旧会议的重试）还没完就排在它后面：两个任务不同时写段与状态。
     const last = this.last
     const previous = this.settle ?? Promise.resolve()
@@ -1068,9 +1223,9 @@ export class MeetingRecorder {
     })
     const usable = segments.filter(segment => segment.source !== 'failed').length
     if (usable === 0 && (failed > 0 || corrupted > 0)) {
-      // 一个字都没转出来：不写占位段，整体标失败，录音完整保留等重试。
+      // 一个字都没转出来：不写占位段，整体标失败，已保存的块保留等重试。
       const count = failed + corrupted
-      return { state: 'transcript-failed', note: `转写失败（${count} 个片段无法识别）。录音已完整保留，可稍后重试。${note}` }
+      return { state: 'transcript-failed', note: `转写失败（${count} 个片段无法识别）。已保存的录音块予以保留，可稍后重试。${note}` }
     }
     const replaced = this.store.replaceSegments(meetingId, segments, {
       expectRevision: baseRevision,
@@ -1168,6 +1323,8 @@ export class MeetingRecorder {
       missingTracks: last?.meetingId === meetingId ? [...last.missingTracks] : [],
       missingTrackReasons: last?.meetingId === meetingId ? last.missingTrackReasons : {},
       transcriptNote: meta === null ? null : displayNote(meta.note, segments.filter(segment => segment.source === 'failed').length),
+      recordingNote: meeting.integrity === null ? '历史录音缺少停止与冲刷回执，完整性无法核验'
+        : meeting.integrity.status !== 'complete' ? `不完整或未知：${meeting.integrity.reasons.join('；') || '尚未取得停止回执'}` : null,
     }
   }
 
@@ -1179,7 +1336,7 @@ export class MeetingRecorder {
     return this.store.saveMinutes(meetingId, content, structured.basedOnRevision, { kind: 'model', structured: JSON.stringify(structured) })
   }
 
-  /** narrator TTS 打点：记进 assistant_speech，纪要里单列并注明不算真人发言。 */
+  /** narrator TTS 打点：记进 assistant_speech；播报文字作为助理发言留在纪要时间线。 */
   markAssistantSpeech(startMs: number, endMs: number): void {
     const active = this.active
     if (active === null) return
@@ -1208,6 +1365,7 @@ export class MeetingRecorder {
     segments: TranscriptSegment[]
     speakers: Array<{ speaker: string; label: string; count: number }>
     transcript: { mode: TranscriptMode; note: string | null; userEdited: boolean } | null
+    integrity: MeetingIntegrity | null
   } | { ok: false; error: string } {
     const meeting = this.store.getMeeting(meetingId)
     if (meeting === null) return { ok: false, error: '没有这场会议' }
@@ -1224,6 +1382,7 @@ export class MeetingRecorder {
       revision: meeting.segmentsRevision,
       segments,
       speakers,
+      integrity: this.getRecordingIntegrity(meetingId),
       transcript: meta === null
         ? null
         : {
@@ -1311,12 +1470,188 @@ export class MeetingRecorder {
   exportMinutes(meetingId: string): { ok: true; content: string; digest: string; confirmedAt: number; kind: 'local' | 'model' } | { ok: false; error: string } {
     const meeting = this.store.getMeeting(meetingId)
     if (meeting === null) return { ok: false, error: '没有这场会议' }
+    const integrity = this.getRecordingIntegrity(meetingId)
+    if (integrity !== null && integrity.status !== 'complete') return { ok: false, error: '录音不完整或停止结果未知，不能导出为完整纪要' }
     const minutes = this.store.getMinutes(meetingId)
     if (minutes === null) return { ok: false, error: '纪要还没有生成' }
     if (minutes.undecryptable === true) return { ok: false, error: '纪要不可解密，不能导出' }
     if (minutes.state !== 'confirmed' || minutes.confirmedAt === null) return { ok: false, error: '纪要还没确认，不能导出为定稿' }
     if (minutes.revision < meeting.segmentsRevision) return { ok: false, error: '转写在确认后被修订过，请重新确认后再导出' }
     return { ok: true, content: minutes.content, digest: minutes.digest, confirmedAt: minutes.confirmedAt, kind: minutes.kind }
+  }
+
+  /** 停录回执只证明当时写入过；之后仍需核验加密块及时间轴。 */
+  private storedAudioComplete(meeting: MeetingRow): boolean {
+    if (meeting.integrity?.status !== 'complete' || this.getRecordingIntegrity(meeting.id)?.status !== 'complete') return false
+    const meetingId = meeting.id
+    try {
+      const entries = this.store.listChunks(meetingId)
+      const tracks: MeetingTrack[] = meeting.sources === 'mic+loopback' ? ['mic', 'loopback'] : ['mic']
+      if (entries.some(entry => entry.track === null || !tracks.includes(entry.track))) throw new Error('音轨不符')
+      for (const track of tracks) {
+        const receipt = meeting.integrity.tracks[track]
+        const wanted = receipt?.sent
+        if (typeof wanted !== 'number' || !Number.isSafeInteger(wanted) || wanted < 0
+          || receipt?.acknowledged !== wanted || receipt.persisted !== wanted) throw new Error('音轨回执不完整')
+        const chunks = entries.filter(entry => entry.track === track).sort((a, b) => (a.trackSeq ?? -1) - (b.trackSeq ?? -1))
+        if (chunks.length !== wanted + 1) throw new Error('音频块数量不符')
+        for (let index = 0; index < chunks.length; index++) {
+          const entry = chunks[index]
+          const previous = chunks[index - 1]
+          if (entry.trackSeq !== index || entry.startMs === null || !Number.isFinite(entry.startMs)
+            || entry.frames === null || !Number.isSafeInteger(entry.frames) || entry.frames <= 0
+            || (entry.sidecar?.gapAfterMs ?? 0) > 0
+            || (previous && previous.startMs !== null && previous.frames !== null
+              && Math.abs(Math.round(entry.startMs - (previous.startMs + previous.frames / FRAMES_PER_MS))) > this.store.trackGapThresholdMs)) {
+            throw new Error('音频时间轴不连续')
+          }
+          const expectedPath = path.resolve(this.store.meetingDir(meetingId), `chunk-${entry.seq}.enc`)
+          const actualPath = path.resolve(entry.path)
+          const samePath = process.platform === 'win32' ? actualPath.toLowerCase() === expectedPath.toLowerCase() : actualPath === expectedPath
+          if (!samePath || !lstatSync(actualPath).isFile() || statSync(actualPath).size !== entry.frames * 2 + 28
+            || this.store.readChunk(meetingId, entry.seq)?.length !== entry.frames * 2) throw new Error('音频块缺失或损坏')
+        }
+      }
+      return true
+    } catch { return false }
+  }
+
+  /** 供会议步骤核查转写，明确区分完整、部分和仍在处理。 */
+  transcriptionStatus(meetingId: string): { ok: true; state: MeetingRow['state']; revision: number; complete: boolean; issue: string | null } | { ok: false; error: string } {
+    const meeting = this.store.getMeeting(meetingId)
+    if (!meeting || meeting.undecryptable) return { ok: false, error: '会议不存在或无法解密' }
+    if (meeting.state !== 'transcribed') return { ok: true, state: meeting.state, revision: meeting.segmentsRevision, complete: false,
+      issue: meeting.state === 'transcript-failed' ? '转写失败，请在会议页核查或重试' : '转写尚未完成' }
+    const segments = this.store.getSegments(meetingId)
+    const issue = !this.storedAudioComplete(meeting) ? '录音块无法完整核验'
+      : segments.length === 0 || segments.some(segment => segment.undecryptable || segment.source === 'failed')
+        ? '转写为空、有失败片段或无法解密' : null
+    return { ok: true, state: meeting.state, revision: meeting.segmentsRevision, complete: issue === null, issue }
+  }
+
+  /** 严格文件交接不接受历史未知完整性或转写失败片段。 */
+  checkMinutesFileVersion(meetingId: string, revision: number, digest: string):
+  { ok: true; content: string; confirmedAt: number } | { ok: false; error: string } {
+    if (!Number.isSafeInteger(revision) || revision < 1 || !/^[a-f0-9]{64}$/u.test(digest)) return { ok: false, error: '纪要版本参数不对' }
+    const meeting = this.store.getMeeting(meetingId)
+    if (!meeting || meeting.undecryptable) return { ok: false, error: '会议不存在或无法解密' }
+    if (meeting.integrity?.status !== 'complete' || this.getRecordingIntegrity(meetingId)?.status !== 'complete') {
+      return { ok: false, error: '录音不完整或完整性未知，不能生成确认版文件' }
+    }
+    if (meeting.state !== 'transcribed') return { ok: false, error: '转写尚未完成，不能生成确认版文件' }
+    if (!this.storedAudioComplete(meeting)) return { ok: false, error: '录音块无法完整核验，不能将这份纪要作为完整产物' }
+    const segments = this.store.getSegments(meetingId)
+    if (segments.length === 0 || segments.some(segment => segment.undecryptable || segment.source === 'failed')) {
+      return { ok: false, error: '转写为空、有失败片段或无法解密，请先核查' }
+    }
+    const minutes = this.store.getMinutes(meetingId)
+    if (!minutes || minutes.undecryptable || minutes.state !== 'confirmed' || minutes.confirmedAt === null
+      || minutes.revision !== revision || meeting.segmentsRevision !== revision || minutes.digest !== digest
+      || createHash('sha256').update(minutes.content, 'utf8').digest('hex') !== digest) {
+      return { ok: false, error: '纪要未确认或版本已改变，请重新核对' }
+    }
+    return { ok: true, content: minutes.content, confirmedAt: minutes.confirmedAt }
+  }
+
+  /** directory 必须来自主进程原生目录选择，不从模型或渲染层参数取得。 */
+  saveMinutesFile(meetingId: string, revision: number, digest: string, directory: string):
+  { ok: true; artifact: MeetingMinutesArtifact } | { ok: false; error: string } {
+    const snapshot = this.checkMinutesFileVersion(meetingId, revision, digest)
+    if (!snapshot.ok) return snapshot
+    const id = (this.deps.newArtifactId ?? randomUUID)()
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(id)) return { ok: false, error: '产物编号无效' }
+    let target: string
+    try {
+      const folder = realpathSync(directory)
+      if (!statSync(folder).isDirectory()) throw new Error('选择的路径不是目录')
+      target = path.join(folder, `meeting-minutes-${id}.md`)
+    } catch (error) { return { ok: false, error: `无法使用所选目录：${error instanceof Error ? error.message : String(error)}` } }
+    let fd: number | undefined
+    let created = false
+    try {
+      fd = openSync(target, 'wx+', 0o600)
+      created = true
+      const bytes = Buffer.from(snapshot.content, 'utf8')
+      writeFileSync(fd, bytes)
+      fsyncSync(fd)
+      if (fstatSync(fd).size !== bytes.length) throw new Error('文件长度核验失败')
+      const written = Buffer.alloc(bytes.length)
+      let offset = 0
+      while (offset < written.length) {
+        const n = readSync(fd, written, offset, written.length - offset, offset)
+        if (n === 0) throw new Error('文件读取不完整')
+        offset += n
+      }
+      if (createHash('sha256').update(written).digest('hex') !== digest) throw new Error('文件摘要核验失败')
+      closeSync(fd)
+      fd = undefined
+    } catch (error) {
+      return { ok: false, error: created ? `纪要文件写入或核验失败，可能留下未完成文件，请检查 ${target}：${error instanceof Error ? error.message : String(error)}`
+        : `无法新建纪要文件（不会覆盖已有文件）：${error instanceof Error ? error.message : String(error)}` }
+    } finally { if (fd !== undefined) { try { closeSync(fd) } catch { /* 文件结果按失败保留 */ } } }
+    const artifact: MeetingMinutesArtifact = { id, meetingId, revision, digest, confirmedAt: snapshot.confirmedAt, path: target, createdAt: this.now() }
+    let saved: ReturnType<MeetingStore['saveMinutesArtifact']>
+    try { saved = this.store.saveMinutesArtifact(artifact) }
+    catch (error) { saved = { ok: false, error: `产物登记结果未知：${error instanceof Error ? error.message : String(error)}` } }
+    if (!saved.ok) return { ok: false, error: `${saved.error}；文件可能已写出但不可作为有效产物，请检查 ${target}` }
+    return { ok: true, artifact }
+  }
+
+  /** 交接时重新核验会议、确认版本和文件字节，不能信任文件名或旧回执。 */
+  readMinutesArtifact(id: string): { ok: true; artifact: MeetingMinutesArtifact; content: string } | { ok: false; error: string } {
+    const artifact = this.store.getMinutesArtifact(id)
+    if (!artifact) return { ok: false, error: '纪要产物不存在或无法解密' }
+    const snapshot = this.checkMinutesFileVersion(artifact.meetingId, artifact.revision, artifact.digest)
+    if (!snapshot.ok || snapshot.confirmedAt !== artifact.confirmedAt) return { ok: false, error: '会议或纪要确认版本已变化，旧产物不能交接' }
+    let fd: number | undefined
+    try {
+      if (!lstatSync(artifact.path).isFile()) throw new Error('文件不是普通文件')
+      const actual = realpathSync(artifact.path)
+      const samePath = process.platform === 'win32' ? actual.toLowerCase() === artifact.path.toLowerCase() : actual === artifact.path
+      if (!samePath) throw new Error('文件路径已变化')
+      fd = openSync(artifact.path, 'r')
+      const size = Buffer.byteLength(snapshot.content, 'utf8')
+      if (!fstatSync(fd).isFile() || fstatSync(fd).size !== size) throw new Error('文件长度已变化')
+      const bytes = readFileSync(fd)
+      if (createHash('sha256').update(bytes).digest('hex') !== artifact.digest || !bytes.equals(Buffer.from(snapshot.content, 'utf8'))) {
+        throw new Error('文件内容已变化')
+      }
+      return { ok: true, artifact, content: snapshot.content }
+    } catch (error) {
+      return { ok: false, error: `纪要文件无法核验：${error instanceof Error ? error.message : String(error)}` }
+    } finally { if (fd !== undefined) { try { closeSync(fd) } catch { /* 只读句柄 */ } } }
+  }
+
+  /** 供桌面交接列出可选编号；列表本身不是文件仍有效的证明。 */
+  listMinutesArtifacts(meetingId: string): Array<Omit<MeetingMinutesArtifact, 'path'>> {
+    return this.store.listMinutesArtifacts(meetingId).map(({ path: _path, ...artifact }) => artifact)
+  }
+
+  savePresentation(record: MeetingPresentationRecord, expectedRevision: number): { ok: true } | { ok: false; error: string } {
+    return this.store.saveMeetingPresentation(record, expectedRevision)
+  }
+
+  /** 进程重启后在途步骤只读回为未知，不从磁盘自动恢复录音、播报或发送。 */
+  savedPresentationStatus(id?: string): { id: string; meetingId: string | null; meetingName: string; documentName: string;
+    fingerprint: string; state: string; lectureOutcome: MeetingPresentationRecord['lectureOutcome'];
+    next: number; total: number; completed: number[]; error: string | null } | null {
+    const saved = id ? this.store.getMeetingPresentation(id) : this.store.latestMeetingPresentation()
+    if (!saved) return null
+    let state: string = saved.state
+    let error = saved.error
+    if (!['completed', 'partial', 'awaiting-review', 'cancelled', 'failed'].includes(state)) {
+      state = 'unknown'
+      error = '应用中断或重新启动，未自动继续原步骤；请在会议页核查。'
+    } else if (state === 'awaiting-review') {
+      const status = saved.meetingId ? this.transcriptionStatus(saved.meetingId) : null
+      if (!status || !status.ok || !status.complete) {
+        state = 'unknown'
+        error = '会后转写或录音无法重新核验，请在会议页核查。'
+      }
+    }
+    return { id: saved.id, meetingId: saved.meetingId, meetingName: saved.meetingName, documentName: saved.documentName,
+      fingerprint: saved.fingerprint, state, lectureOutcome: saved.lectureOutcome ?? null,
+      next: saved.next, total: saved.total, completed: saved.completed, error }
   }
 
   /** 放弃模型草稿，改回本地模板版（不经模型）。 */
@@ -1384,6 +1719,8 @@ export class MeetingRecorder {
     const meeting = this.store.getMeeting(meetingId)
     if (meeting === null) return refuse('没有这场会议')
     if (meeting.state === 'recording' || this.active?.meetingId === meetingId) return refuse('会议还在录制中')
+    const integrity = this.getRecordingIntegrity(meetingId)
+    if (integrity !== null && integrity.status !== 'complete') return refuse('录音不完整或停止结果未知，不发送会议文字生成完整纪要')
     if (this.jobRunning) return refuse('转写正在进行，等它跑完再生成')
     if (this.minutesJobs.has(meetingId)) return refuse('这场会议的纪要正在生成')
     if (meeting.undecryptable === true) return refuse('会议信息不可解密，不发送')
@@ -1504,7 +1841,9 @@ export class MeetingRecorder {
         clearTimeout(this.flushTimer)
         this.flushTimer = null
       }
-      this.store.stopMeeting(active.meetingId, this.now())
+      const unknown: MeetingIntegrity = { status: 'unknown', reasons: ['应用退出时没有收到完整的停止与冲刷回执'], tracks: {} }
+      this.lastIntegrity = { meetingId: active.meetingId, value: unknown }
+      try { this.store.finishRecording(active.meetingId, unknown, this.now()) } catch { /* 保留原 pending，重启仍按未知处理 */ }
       this.deps.audio({ type: 'meeting-finished' })
     }
     // 转写还在跑就不关库：任务里还要写状态，关了只会把异常变成第二次异常。
@@ -1568,7 +1907,11 @@ export interface MeetingIpcDeps {
   readonly ipc: MeetingIpcMain
   readonly recorder: MeetingRecorder
   /** 会议真正由 recorder 接受后回调；主进程据此结算桌面命令。 */
-  readonly onStarted?: (meetingId: string, consent: MeetingConsentInput) => void
+  readonly onStarted?: (meetingId: string, consent: MeetingConsentInput, requestId?: string) => void
+  /** 桌面命令须匹配本次请求与确认参数；手动开始不使用命令编号。 */
+  readonly authorizeStart?: (event: unknown, consent: unknown, requestId?: string) => string | null
+  /** 由主进程弹出原生目录选择；不能采用 IPC 传入的路径。 */
+  readonly chooseExportDirectory?: (event: unknown) => Promise<string | null>
 }
 
 function asString(value: unknown): string | null {
@@ -1592,9 +1935,12 @@ function asIntList(value: unknown): number[] | null {
 export function registerMeetingIpc(deps: MeetingIpcDeps): void {
   const { ipc, recorder } = deps
 
-  ipc.handle('meeting-start', (_event, consent: unknown) => {
+  ipc.handle('meeting-start', (event, consent: unknown, requestId: unknown) => {
+    if (requestId !== undefined && (typeof requestId !== 'string' || requestId === '')) return { ok: false, error: '会议请求编号无效' }
+    const denied = deps.authorizeStart?.(event, consent, requestId as string | undefined)
+    if (denied) return { ok: false, error: denied }
     const result = recorder.startMeeting(consent as MeetingConsentInput)
-    if (result.ok) deps.onStarted?.(result.meetingId, consent as MeetingConsentInput)
+    if (result.ok) deps.onStarted?.(result.meetingId, consent as MeetingConsentInput, requestId as string | undefined)
     return result
   })
 
@@ -1620,10 +1966,10 @@ export function registerMeetingIpc(deps: MeetingIpcDeps): void {
     return { ok: true }
   })
 
-  ipc.handle('meeting-flush-done', async (_event, meetingId: unknown) => {
+  ipc.handle('meeting-flush-done', async (_event, meetingId: unknown, report: unknown) => {
     const id = asString(meetingId)
     if (id === null) return { ok: false, error: '参数不对' }
-    return recorder.flushDone(id)
+    return recorder.flushDone(id, report)
   })
 
   ipc.handle('meeting-state', () => recorder.getState())
@@ -1671,12 +2017,12 @@ export function registerMeetingIpc(deps: MeetingIpcDeps): void {
   // 对话框授权）；'revoke-egress' 撤销数据去向授权；'edit' 改一条（itemId + patch）；'export'
   // 取已确认的定稿；'use-local' 改回本地模板版。复用这一条通道，舞台侧的 IPC 面不变。
   // 这条通道只有会议页的按钮会调：模型/工具没有任何路径能走到这里，授权本身还要过主进程对话框。
-  ipc.handle('meeting-minutes', async (_event, meetingId: unknown, request: unknown) => {
+  ipc.handle('meeting-minutes', async (event, meetingId: unknown, request: unknown) => {
     const id = asString(meetingId)
     if (id === null) return { ok: false, error: '参数不对' }
     if (request === undefined || request === null) return recorder.getMinutes(id)
     if (typeof request !== 'object' || Array.isArray(request)) return { ok: false, error: '参数不对' }
-    const value = request as { action?: unknown; itemId?: unknown; patch?: unknown }
+    const value = request as { action?: unknown; itemId?: unknown; patch?: unknown; digest?: unknown; revision?: unknown }
     switch (value.action) {
       case 'generate':
         return recorder.generateModelMinutes(id, { userInitiated: true })
@@ -1689,6 +2035,16 @@ export function registerMeetingIpc(deps: MeetingIpcDeps): void {
       }
       case 'export':
         return recorder.exportMinutes(id)
+      case 'save-file': {
+        if (typeof value.digest !== 'string' || typeof value.revision !== 'number') return { ok: false, error: '纪要版本参数不对' }
+        const checked = recorder.checkMinutesFileVersion(id, value.revision, value.digest)
+        if (!checked.ok) return checked
+        if (!deps.chooseExportDirectory) return { ok: false, error: '无法打开目录选择窗口' }
+        let directory: string | null
+        try { directory = await deps.chooseExportDirectory(event) } catch { return { ok: false, error: '无法打开目录选择窗口' } }
+        if (!directory) return { ok: false, error: '已取消保存纪要文件' }
+        return recorder.saveMinutesFile(id, value.revision, value.digest, directory)
+      }
       case 'use-local':
         return recorder.useLocalMinutes(id)
       default:

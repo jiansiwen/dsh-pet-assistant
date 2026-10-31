@@ -28,7 +28,7 @@ const draft: MemberDraft = { displayName: '研究员甲', personality: '', permi
 function snapshot(): MemberSnapshot {
   return { enabled: false, defaultModel: { provider: '宿主', model: '默认模型' }, members: [{ profile: { ...draft, assistantId: id, roleId: 'wukong',
     voiceProfile: '', toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 3, sessionId: '独立会话甲' },
-    quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
+    quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 0, totalReserved: 0, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
     requests: [{ requestId, assistantId: id, reason: '日用量达到阈值', state: 'pending', createdAt: 1, quotaRevision: 9 }] }
 }
 function memory(): MemoryRecord {
@@ -78,6 +78,100 @@ test('直接对象快照逐字段投影，密钥与扩展字段不混入', async
     profile: { ...safe.members[0]!.profile, credential: '秘密', toolPolicy: { ...safe.members[0]!.profile.toolPolicy, apiKey: '秘密' } }, quota: { ...safe.members[0]!.quota, secret: '秘密' } }] } })
   assert.deepEqual(await read(), { ok: true, state: safe })
   assert.deepEqual(requests, [{ method: 'GET', path: ROOT, body: undefined, subject: 'owner' }])
+})
+test('邮件通知核查投影只包含状态与摘要，不暴露扩展字段', async () => {
+  mount()
+  const safe = snapshot()
+  const issue = { analysisId: '00000000-0000-4000-8000-000000000001', memberId: id,
+    attemptId: '00000000-0000-4000-8000-000000000002', state: 'unknown', preview: '隔离摘要' }
+  respond = async () => ({ status: 200, body: { ...safe, mailNoticeAttention: [{ ...issue, secret: '不能外传' }] } })
+  assert.deepEqual(await read(), { ok: true, state: { ...safe, mailNoticeAttention: [issue] } })
+})
+test('邮件通知核查数据损坏时不阻塞成员列表，并提示刷新核对', async () => {
+  mount()
+  const safe = snapshot()
+  respond = async () => ({ status: 200, body: { ...safe, mailNoticeAttention: [{ analysisId: '损坏' }] } })
+  assert.deepEqual(await read(), { ok: true, state: { ...safe, mailNoticeAttentionError: true } })
+})
+test('邮件发送核查数据损坏时不阻塞成员列表，并提示刷新核对', async () => {
+  mount()
+  const safe = snapshot()
+  respond = async () => ({ status: 200, body: { ...safe, mailSendAttention: [{ intentId: '损坏' }] } })
+  assert.deepEqual(await read(), { ok: true, state: { ...safe, mailSendAttentionError: true } })
+})
+test('本人核对邮件通知须原生确认并绑定当前尝试，不能伪造送达', async () => {
+  mount()
+  const issue = { analysisId: '00000000-0000-4000-8000-000000000001', memberId: id,
+    attemptId: '00000000-0000-4000-8000-000000000002', state: 'unknown' as const, preview: '隔离摘要' }
+  state.mailNoticeAttention = [issue]
+  const input = { analysisId: issue.analysisId, attemptId: issue.attemptId, expectedState: issue.state }
+  confirm = async () => ({ response: 0 })
+  assert.equal(code(await command('ack-mail-notice', input)), 'cancelled')
+  assert.equal(writes().length, 0)
+  confirm = async () => {
+    state.mailNoticeAttention = [{ ...issue, attemptId: '00000000-0000-4000-8000-000000000003' }]
+    return { response: 1 }
+  }
+  assert.equal(code(await command('ack-mail-notice', input)), 'conflict')
+  assert.equal(writes().length, 0, '确认期间尝试变化不能沿用旧决定')
+  state.mailNoticeAttention = [issue]
+  confirm = async () => ({ response: 1 })
+  assert.equal((await command('ack-mail-notice', input)).ok, true)
+  assert.equal(writes().at(-1)?.path, `${ROOT}/mail-notices/${issue.analysisId}/acknowledge`)
+  assert.deepEqual(writes().at(-1)?.body, { attemptId: issue.attemptId, expectedState: 'unknown' })
+  assert.match(dialogs.at(-1)?.detail ?? '', /不代表.*送达.*不.*重发/su)
+})
+test('本人核对邮件发送须原生确认，状态变化时旧确认无效', async () => {
+  mount()
+  const issue = { intentId: '00000000-0000-4000-8000-000000000003', subject: '隔离纪要', recipients: ['a@example.com'],
+    state: 'unknown' as const, accepted: [], rejected: [], messageId: null }
+  state.mailSendAttention = [issue]
+  const input = { intentId: issue.intentId, expectedState: issue.state }
+  confirm = async () => ({ response: 0 })
+  assert.equal(code(await command('ack-mail-send', input)), 'cancelled')
+  assert.equal(writes().length, 0)
+  confirm = async () => { state.mailSendAttention = [{ ...issue, state: 'partial' }]; return { response: 1 } }
+  assert.equal(code(await command('ack-mail-send', input)), 'conflict')
+  assert.equal(writes().length, 0)
+  state.mailSendAttention = [issue]
+  confirm = async () => ({ response: 1 })
+  assert.equal((await command('ack-mail-send', input)).ok, true)
+  assert.equal(writes().at(-1)?.path, `${ROOT}/mail-sends/${issue.intentId}/acknowledge`)
+  assert.deepEqual(writes().at(-1)?.body, { expectedState: 'unknown' })
+  assert.match(dialogs.at(-1)?.detail ?? '', /不代表.*送达.*不会.*重发/su)
+})
+
+test('企业微信异常投影只包含定位信息，损坏时不阻塞成员列表', async () => {
+  mount()
+  const safe = snapshot()
+  const issue = { id: '00000000-0000-4000-8000-000000000004', channel: 'wecom', accountTag: '0123456789ab', msgid: '消息甲',
+    chatId: '测试会话', chatType: 'single', senderId: '主人', state: 'unknown', processing: 'unknown', reply: 'unknown',
+    conflict: false, busy: false, revision: 3, receivedAt: 1_800_000_000_000 }
+  respond = async () => ({ status: 200, body: { ...safe, channelInboundAttention: [{ ...issue, text: '不应外传', secret: '密钥' }] } })
+  assert.deepEqual(await read(), { ok: true, state: { ...safe, channelInboundAttention: [issue] } })
+  respond = async () => ({ status: 200, body: { ...safe, channelInboundAttention: [{ id: '损坏' }] } })
+  assert.deepEqual(await read(), { ok: true, state: { ...safe, channelInboundAttentionError: true } })
+})
+
+test('渠道异常本人核查须原生确认并重验版本，不执行或重发', async () => {
+  mount()
+  const issue = { id: '00000000-0000-4000-8000-000000000004', channel: 'wecom', accountTag: '0123456789ab', msgid: '消息甲',
+    chatId: '测试会话', chatType: 'single' as const, senderId: '主人', state: 'unknown' as const, processing: 'unknown' as const,
+    reply: 'unknown' as const, conflict: false, busy: false, revision: 3, receivedAt: 1_800_000_000_000 }
+  ;(state as MemberSnapshot & { channelInboundAttention: typeof issue[] }).channelInboundAttention = [issue]
+  const input = { id: issue.id, expectedRevision: issue.revision }
+  confirm = async () => ({ response: 0 })
+  assert.equal(code(await command('ack-channel-inbound', input)), 'cancelled')
+  assert.equal(writes().length, 0)
+  confirm = async () => { (state as MemberSnapshot & { channelInboundAttention: typeof issue[] }).channelInboundAttention = [{ ...issue, revision: 4 }]; return { response: 1 } }
+  assert.equal(code(await command('ack-channel-inbound', input)), 'conflict')
+  assert.equal(writes().length, 0)
+  ;(state as MemberSnapshot & { channelInboundAttention: typeof issue[] }).channelInboundAttention = [issue]
+  confirm = async () => ({ response: 1 })
+  assert.equal((await command('ack-channel-inbound', input)).ok, true)
+  assert.equal(writes().at(-1)?.path, `${ROOT}/channel-inbound/${issue.id}/acknowledge`)
+  assert.deepEqual(writes().at(-1)?.body, { expectedRevision: 3 })
+  assert.match(dialogs.at(-1)?.detail ?? '', /不会.*执行.*重发|不.*执行.*重发/su)
 })
 test('记忆逐字段镜像，范围只读，标识严格编码', async () => {
   mount()

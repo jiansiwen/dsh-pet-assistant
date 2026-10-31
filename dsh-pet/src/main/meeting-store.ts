@@ -95,6 +95,20 @@ export interface MeetingConsentInput {
   readonly retentionDays: number
 }
 
+/** 停录屏障逐轨证据；序号为 null 表示没有对应块，不表示静音。 */
+export interface MeetingIntegrityTrack {
+  readonly sent: number | null
+  readonly acknowledged: number | null
+  readonly persisted: number | null
+}
+
+/** 新录音的完整性结果；旧记录没有该字段，不能反推其当时的停录结果。 */
+export interface MeetingIntegrity {
+  readonly status: 'pending' | 'complete' | 'incomplete' | 'unknown'
+  readonly reasons: readonly string[]
+  readonly tracks: Readonly<Partial<Record<MeetingTrack, MeetingIntegrityTrack>>>
+}
+
 export interface MeetingRow {
   readonly id: string
   readonly name: string
@@ -105,6 +119,8 @@ export interface MeetingRow {
   readonly retentionDays: number
   readonly state: MeetingStateName
   readonly segmentsRevision: number
+  /** null 为历史记录：旧版没有保存停录证据。 */
+  readonly integrity: MeetingIntegrity | null
   /** name 或 consent 解不开（密钥不可用/不对、密文被篡改或挪行）。此时它们是占位文本。 */
   readonly undecryptable?: true
 }
@@ -215,6 +231,61 @@ export interface MinutesRecord {
   readonly structured: string | null
   /** content 解不开或 HMAC 对不上。此时 content 是占位文本，不能确认、不能被覆盖。 */
   readonly undecryptable?: true
+}
+
+/** 导出文件的定位与确认版本；路径和内容摘要在会议库内加密保存。 */
+export interface MeetingMinutesArtifact {
+  readonly id: string
+  readonly meetingId: string
+  readonly revision: number
+  readonly digest: string
+  readonly confirmedAt: number
+  readonly path: string
+  readonly createdAt: number
+}
+
+export type MeetingPresentationState = 'authorizing' | 'opening' | 'waiting-to-present' | 'starting' | 'presenting' | 'paused' | 'completed' | 'partial'
+  | 'stopping' | 'transcribing' | 'awaiting-review' | 'cancelled' | 'failed'
+
+/** 讲解步骤与播放进度；会议名、文档路径和摘要都只存密文。 */
+export interface MeetingPresentationRecord {
+  id: string
+  requestId: string
+  bindingId: string
+  meetingId: string | null
+  meetingName: string
+  documentName: string
+  documentPath: string
+  fingerprint: string
+  expiresAt: number
+  state: MeetingPresentationState
+  lectureOutcome?: 'completed' | 'partial' | 'interrupted' | null
+  error: string | null
+  next: number
+  total: number
+  completed: number[]
+  revision: number
+  updatedAt: number
+}
+
+function validPresentation(value: unknown): value is MeetingPresentationRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Partial<MeetingPresentationRecord>
+  const text = (item: unknown, limit: number): item is string => typeof item === 'string' && item.length > 0 && item.length <= limit
+  return text(record.id, 200) && text(record.requestId, 200) && text(record.bindingId, 256)
+    && (record.meetingId === null || text(record.meetingId, 200)) && text(record.meetingName, 80)
+    && text(record.documentName, 4096) && text(record.documentPath, 32_000) && path.isAbsolute(record.documentPath)
+    && text(record.fingerprint, 256) && Number.isSafeInteger(record.expiresAt) && Number(record.expiresAt) >= 0
+    && ['authorizing', 'opening', 'waiting-to-present', 'starting', 'presenting', 'paused', 'completed', 'partial', 'stopping', 'transcribing', 'awaiting-review', 'cancelled', 'failed'].includes(record.state ?? '')
+    && (record.lectureOutcome === undefined || record.lectureOutcome === null || ['completed', 'partial', 'interrupted'].includes(record.lectureOutcome))
+    && (record.error === null || (typeof record.error === 'string' && record.error.length <= 2000))
+    && Number.isSafeInteger(record.next) && Number.isSafeInteger(record.total) && Number(record.total) >= 0
+    && Number(record.total) <= 100_000 && Number(record.next) >= 0 && Number(record.next) <= Number(record.total)
+    && Array.isArray(record.completed) && record.completed.length <= Number(record.total)
+    && new Set(record.completed).size === record.completed.length
+    && record.completed.every(index => Number.isSafeInteger(index) && index >= 0 && index < Number(record.total))
+    && Number.isSafeInteger(record.revision) && Number(record.revision) >= 1
+    && Number.isSafeInteger(record.updatedAt) && Number(record.updatedAt) >= 0
 }
 
 export type MinutesKind = 'local' | 'model'
@@ -331,6 +402,17 @@ CREATE TABLE IF NOT EXISTS minutes (
   state TEXT NOT NULL DEFAULT 'draft',
   confirmedAt INTEGER
 );
+CREATE TABLE IF NOT EXISTS minutes_artifacts (
+  id TEXT PRIMARY KEY,
+  meetingId TEXT NOT NULL,
+  data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_minutes_artifacts_meeting ON minutes_artifacts(meetingId);
+CREATE TABLE IF NOT EXISTS meeting_presentations (
+  id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL,
+  data TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS assistant_speech (
   meetingId TEXT NOT NULL,
   startMs INTEGER NOT NULL,
@@ -356,6 +438,7 @@ const ADDED_COLUMNS: ReadonlyArray<readonly [table: string, column: string, decl
   ['minutes', 'kind', 'TEXT'],
   ['minutes', 'structured', 'TEXT'],
   ['meetings', 'egress', 'TEXT'],
+  ['meetings', 'integrity', 'TEXT'],
 ]
 
 const DAY_MS = 86_400_000
@@ -481,7 +564,8 @@ export class MeetingStore {
   private readonly userDataDir: string
   private readonly deps: MeetingStoreDeps
   private readonly gapThresholdMs: number
-  private readonly trackGapThresholdMs: number
+  /** 记录缺口与停录完整性核验共用同一阈值。 */
+  readonly trackGapThresholdMs: number
   /** 解出来的数据密钥，进程内缓存：每 4 秒 spawn 一次 PowerShell 解包是不可接受的开销。 */
   private cachedKey: Buffer | null = null
   /** 纪要 digest 的 HMAC 子密钥（随 cachedKey 派生）。 */
@@ -560,7 +644,8 @@ export class MeetingStore {
 
   private hasEncryptedData(): boolean {
     const row = this.db
-      .prepare('SELECT EXISTS(SELECT 1 FROM chunks) OR EXISTS(SELECT 1 FROM meetings WHERE substr(name, 1, ?) = ?) AS v')
+      .prepare('SELECT EXISTS(SELECT 1 FROM chunks) OR EXISTS(SELECT 1 FROM meetings WHERE substr(name, 1, ?) = ?) ' +
+        'OR EXISTS(SELECT 1 FROM minutes_artifacts) OR EXISTS(SELECT 1 FROM meeting_presentations) AS v')
       .get(FIELD_PREFIX.length, FIELD_PREFIX) as Row
     return Number(row.v) === 1
   }
@@ -708,7 +793,7 @@ export class MeetingStore {
   /**
    * 开一场会议。参数校验不过、或拿不到数据密钥，都拒绝——**绝不先录再补加密**。
    */
-  startMeeting(consent: MeetingConsentInput): { ok: true; meetingId: string } | { ok: false; error: string } {
+  startMeeting(consent: MeetingConsentInput, integrity?: MeetingIntegrity): { ok: true; meetingId: string } | { ok: false; error: string } {
     const invalid = validateMeetingConsent(consent)
     if (invalid !== null) return { ok: false, error: invalid }
     const key = this.ensureKey(true)
@@ -726,7 +811,7 @@ export class MeetingStore {
     mkdirSync(this.meetingDir(id), { recursive: true })
     this.db
       .prepare(
-        'INSERT INTO meetings (id, name, startedAt, endedAt, sources, consent, retentionDays, state, segmentsRevision) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 0)',
+        'INSERT INTO meetings (id, name, startedAt, endedAt, sources, consent, retentionDays, state, segmentsRevision, integrity) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 0, ?)',
       )
       .run(
         id,
@@ -736,6 +821,7 @@ export class MeetingStore {
         this.seal(key.key, JSON.stringify(normalized), 'meetings', 'consent', id),
         normalized.retentionDays,
         'recording',
+        integrity === undefined ? null : this.seal(key.key, JSON.stringify(integrity), 'meetings', 'integrity', id),
       )
     return { ok: true, meetingId: id }
   }
@@ -763,6 +849,22 @@ export class MeetingStore {
         consent = { name: name.ok ? name.value : UNDECRYPTABLE_TEXT, sources: 'mic', consentText: '(同意记录损坏)', consented: true, retentionDays }
       }
     }
+    let integrity: MeetingIntegrity | null = null
+    if (typeof row.integrity === 'string') {
+      try {
+        const field = this.readField(row.integrity, 'meetings', 'integrity', id)
+        if (!field.ok) throw new Error('完整性记录不可解密')
+        const parsed = JSON.parse(field.value) as Partial<MeetingIntegrity>
+        if (['pending', 'complete', 'incomplete', 'unknown'].includes(parsed.status ?? '')
+          && Array.isArray(parsed.reasons) && parsed.tracks !== null && typeof parsed.tracks === 'object') {
+          integrity = parsed as MeetingIntegrity
+        } else {
+          integrity = { status: 'unknown', reasons: ['录音完整性记录无法核验'], tracks: {} }
+        }
+      } catch {
+        integrity = { status: 'unknown', reasons: ['录音完整性记录无法读取'], tracks: {} }
+      }
+    }
     return {
       id,
       name: name.ok ? name.value : UNDECRYPTABLE_TEXT,
@@ -773,6 +875,7 @@ export class MeetingStore {
       retentionDays,
       state: String(row.state) as MeetingStateName,
       segmentsRevision: Number(row.segmentsRevision),
+      integrity,
       ...(!name.ok || !consentField.ok ? { undecryptable: true as const } : {}),
     }
   }
@@ -788,6 +891,31 @@ export class MeetingStore {
 
   stopMeeting(meetingId: string, endedAt: number = this.now()): void {
     this.db.prepare("UPDATE meetings SET endedAt = ?, state = 'stopped' WHERE id = ? AND state = 'recording'").run(endedAt, meetingId)
+  }
+
+  /** 停止状态与完整性证据同一条 SQL 写入；失败时原来的 pending 不会变成完整。 */
+  finishRecording(meetingId: string, integrity: MeetingIntegrity, endedAt: number = this.now()): boolean {
+    const key = this.ensureKey()
+    if (!key.ok) throw new Error(key.error)
+    const stored = this.seal(key.key, JSON.stringify(integrity), 'meetings', 'integrity', meetingId)
+    const result = this.db.prepare("UPDATE meetings SET endedAt = ?, state = 'stopped', integrity = ? WHERE id = ? AND state = 'recording'")
+      .run(endedAt, stored, meetingId)
+    return Number(result.changes) === 1
+  }
+
+  /** 进程重启后不再有旧采集句柄：未结算会议一律记为未知，不触碰已保存的块。 */
+  recoverInterruptedRecordings(): void {
+    const unknown: MeetingIntegrity = { status: 'unknown', reasons: ['应用中断，未收到可靠的停止和冲刷回执'], tracks: {} }
+    const rows = this.db.prepare("SELECT id FROM meetings WHERE state = 'recording'").all() as Row[]
+    if (rows.length === 0) return
+    const key = this.ensureKey()
+    const update = this.db.prepare("UPDATE meetings SET endedAt = COALESCE(endedAt, ?), state = 'stopped', integrity = ? WHERE id = ? AND state = 'recording'")
+    for (const row of rows) {
+      const id = String(row.id)
+      // 密钥不可用时只写固定的非敏感未知标记，绝不创建新密钥覆盖旧录音。
+      const stored = key.ok ? this.seal(key.key, JSON.stringify(unknown), 'meetings', 'integrity', id) : JSON.stringify(unknown)
+      update.run(this.now(), stored, id)
+    }
   }
 
   /**
@@ -823,7 +951,11 @@ export class MeetingStore {
     const row = this.db
       .prepare('SELECT COALESCE(MAX(seq), -1) + 1 AS next, MAX(seq) AS last FROM chunks WHERE meetingId = ?')
       .get(meetingId) as Row
-    const seq = Number(row.next)
+    const dir = this.meetingDir(meetingId)
+    mkdirSync(dir, { recursive: true })
+    let seq = Number(row.next)
+    // 上一次可能先写出了密文、却在写 sidecar 或数据库时失败；未登记文件不是可覆盖的空位。
+    while (['.enc', '.enc.tmp', '.json', '.json.tmp'].some(suffix => existsSync(path.join(dir, `chunk-${seq}${suffix}`)))) seq++
 
     const nonce = randomBytes(12)
     const cipher = createCipheriv('aes-256-gcm', key.key, nonce)
@@ -833,8 +965,6 @@ export class MeetingStore {
     const enc = Buffer.concat([nonce, body, tag])
     const sha = sha256Hex(enc)
 
-    const dir = this.meetingDir(meetingId)
-    mkdirSync(dir, { recursive: true })
     const encPath = path.join(dir, `chunk-${seq}.enc`)
     const sidecarPath = path.join(dir, `chunk-${seq}.json`)
     const startMs = timeline === undefined ? null : Math.round(timeline.startMs)
@@ -852,9 +982,9 @@ export class MeetingStore {
           sourceSampleRate: timeline.sourceSampleRate,
         }
     // 先临时文件再改名：崩溃不会留下半个 chunk 冒充完整数据。
-    writeFileSync(`${encPath}.tmp`, enc)
+    writeFileSync(`${encPath}.tmp`, enc, { flag: 'wx' })
     renameSync(`${encPath}.tmp`, encPath)
-    writeFileSync(`${sidecarPath}.tmp`, JSON.stringify(sidecar))
+    writeFileSync(`${sidecarPath}.tmp`, JSON.stringify(sidecar), { flag: 'wx' })
     renameSync(`${sidecarPath}.tmp`, sidecarPath)
 
     // gap 回填到上一块的 sidecar。
@@ -1195,6 +1325,93 @@ export class MeetingStore {
     }
     // 旧版明文行（迁移被阻断时）：digest 列本身就是 sha256(明文)，原样返回。
     return { revision, content: content.value, digest: storedDigest, state, confirmedAt, kind, structured }
+  }
+
+  /** 文件写出后再次持锁比对确认版本，冲突时不登记可交接的产物。 */
+  saveMinutesArtifact(artifact: MeetingMinutesArtifact): { ok: true } | { ok: false; error: string } {
+    const key = this.ensureKey()
+    if (!key.ok) return key
+    let begun = false
+    try {
+      this.db.exec('BEGIN IMMEDIATE')
+      begun = true
+      const meeting = this.getMeeting(artifact.meetingId)
+      const minutes = this.getMinutes(artifact.meetingId)
+      const segments = this.getSegments(artifact.meetingId)
+      if (!meeting || meeting.undecryptable || meeting.integrity?.status !== 'complete' || meeting.state !== 'transcribed'
+        || !minutes || minutes.undecryptable || minutes.state !== 'confirmed' || minutes.confirmedAt !== artifact.confirmedAt
+        || minutes.revision !== artifact.revision || meeting.segmentsRevision !== artifact.revision || minutes.digest !== artifact.digest
+        || sha256Hex(minutes.content) !== artifact.digest
+        || segments.length === 0 || segments.some(segment => segment.undecryptable || segment.source === 'failed')) {
+        this.db.exec('ROLLBACK')
+        begun = false
+        return { ok: false, error: '会议、转写或确认版纪要已改变，文件不能登记为有效产物' }
+      }
+      this.db.prepare('INSERT INTO minutes_artifacts(id, meetingId, data) VALUES (?, ?, ?)')
+        .run(artifact.id, artifact.meetingId, this.seal(key.key, JSON.stringify(artifact), 'minutes_artifacts', 'data', artifact.id))
+      this.db.exec('COMMIT')
+      begun = false
+      return { ok: true }
+    } catch (error) {
+      if (begun) { try { this.db.exec('ROLLBACK') } catch { /* 事务可能已由 SQLite 回滚 */ } }
+      return { ok: false, error: `产物登记失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  getMinutesArtifact(id: string): MeetingMinutesArtifact | null {
+    const row = this.db.prepare('SELECT meetingId, data FROM minutes_artifacts WHERE id = ?').get(id) as Row | undefined
+    if (!row || !isSealed(row.data)) return null
+    const field = this.readField(row.data, 'minutes_artifacts', 'data', id)
+    if (!field.ok) return null
+    try {
+      const value = JSON.parse(field.value) as Partial<MeetingMinutesArtifact>
+      if (value.id !== id || typeof value.meetingId !== 'string' || value.meetingId !== row.meetingId || typeof value.path !== 'string'
+        || !path.isAbsolute(value.path) || !Number.isSafeInteger(value.revision) || !Number.isSafeInteger(value.confirmedAt)
+        || !Number.isSafeInteger(value.createdAt) || typeof value.digest !== 'string' || !/^[a-f0-9]{64}$/u.test(value.digest)) return null
+      return value as MeetingMinutesArtifact
+    } catch { return null }
+  }
+
+  listMinutesArtifacts(meetingId: string, limit = 20): MeetingMinutesArtifact[] {
+    const rows = this.db.prepare('SELECT id FROM minutes_artifacts WHERE meetingId = ? ORDER BY rowid DESC LIMIT ?')
+      .all(meetingId, Math.max(1, Math.min(20, limit))) as Row[]
+    return rows.flatMap(row => {
+      const artifact = this.getMinutesArtifact(String(row.id))
+      return artifact ? [artifact] : []
+    })
+  }
+
+  /** 版本比较和密文写入在同一 SQL 中完成，旧回执不能覆盖新步骤。 */
+  saveMeetingPresentation(record: MeetingPresentationRecord, expectedRevision: number): { ok: true } | { ok: false; error: string } {
+    if (!validPresentation(record) || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || record.revision !== expectedRevision + 1) {
+      return { ok: false, error: '会议讲解状态参数无效' }
+    }
+    const key = this.ensureKey(true)
+    if (!key.ok) return key
+    try {
+      const sealed = this.seal(key.key, JSON.stringify(record), 'meeting_presentations', 'data', record.id)
+      const changed = expectedRevision === 0
+        ? this.db.prepare('INSERT OR IGNORE INTO meeting_presentations(id, revision, data) VALUES (?, ?, ?)').run(record.id, record.revision, sealed)
+        : this.db.prepare('UPDATE meeting_presentations SET revision = ?, data = ? WHERE id = ? AND revision = ?')
+          .run(record.revision, sealed, record.id, expectedRevision)
+      return Number(changed.changes) === 1 ? { ok: true } : { ok: false, error: '会议讲解状态已变化，未覆盖旧记录' }
+    } catch (error) { return { ok: false, error: `会议讲解状态无法保存：${error instanceof Error ? error.message : String(error)}` } }
+  }
+
+  getMeetingPresentation(id: string): MeetingPresentationRecord | null {
+    const row = this.db.prepare('SELECT revision, data FROM meeting_presentations WHERE id = ?').get(id) as Row | undefined
+    if (!row || !isSealed(row.data)) return null
+    const field = this.readField(row.data, 'meeting_presentations', 'data', id)
+    if (!field.ok) return null
+    try {
+      const record = JSON.parse(field.value) as MeetingPresentationRecord
+      return validPresentation(record) && record.id === id && record.revision === Number(row.revision) ? record : null
+    } catch { return null }
+  }
+
+  latestMeetingPresentation(): MeetingPresentationRecord | null {
+    const row = this.db.prepare('SELECT id FROM meeting_presentations ORDER BY rowid DESC LIMIT 1').get() as Row | undefined
+    return row ? this.getMeetingPresentation(String(row.id)) : null
   }
 
   /**

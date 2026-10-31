@@ -1,6 +1,7 @@
 /** 助理审批生产接线：真实工具、HTTP、数据库；不启动真实采集或模型。 */
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, symlinkSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { AssistantApprovalService, snapshotDigest, type AssistantSubmission } from '../src/assistant-approval.ts'
@@ -14,7 +15,7 @@ import { registerAssistantTools } from '../src/tools.ts'
 import { ActivityTracker } from '../src/tracker.ts'
 import { Classifier } from '../src/classifier.ts'
 
-const scratch = path.resolve(import.meta.dirname, '../../generated-videos/moved-from-assets/petsBak/dsh-personal-assistant')
+const scratch = tmpdir()
 const submission = (execute: AssistantSubmission['execute'] = () => null): AssistantSubmission => ({
   subject: '测试', tool: '测试工具', summary: '测试说明', target: '本地测试', risk: 'high',
   snapshot: { text: '完整内容' }, validate: () => true, execute,

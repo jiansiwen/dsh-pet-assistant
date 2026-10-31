@@ -15,7 +15,7 @@ export interface ReminderHost {
   ownedTask(taskId: string): Task
   changeTask(taskId: string, status: Task['status'], blocker?: 'manual-pause' | null, artifacts?: string[]): Task
   createChild(parent: Task, cycleId: string): Task
-  acceptsRecipient(channel: 'desktop' | 'wecom', recipientRef: string): boolean
+  acceptsRecipient(channel: 'desktop' | 'wecom', recipientRef: string, taskId?: string): boolean
 }
 
 export const reminderClaimSchema = z.object({ executorEpoch: z.string().min(1).max(200) }).strict()
@@ -148,7 +148,7 @@ export class CompanionReminders {
     const task = store.getTask(delivery.taskId)
     const channel = delivery.channel === 'wecom' ? 'wecom' : 'desktop'
     return !!(cycle && schedule && task && this.validSchedule(schedule) &&
-      this.host.acceptsRecipient(channel, delivery.recipientRef) && delivery.grantRef === schedule.grantRef &&
+      this.host.acceptsRecipient(channel, delivery.recipientRef, delivery.taskId) && delivery.grantRef === schedule.grantRef &&
       delivery.executorEpoch === this.host.epoch && cycle.generation === delivery.generation &&
       schedule.generation === delivery.generation && cycle.state === 'awaiting-response' &&
       cycle.revision === delivery.cycleRevision && task.revision === delivery.taskRevision &&
@@ -170,7 +170,7 @@ export class CompanionReminders {
     if (request.executorEpoch !== this.host.epoch) throw new CompanionError('EPOCH_MISMATCH', '执行器代次已失效')
     return this.host.store.transaction(() => {
       const delivery = this.host.store.getReminderDelivery(deliveryId)
-      if (!delivery || !this.host.acceptsRecipient(delivery.channel === 'wecom' ? 'wecom' : 'desktop', delivery.recipientRef)) {
+      if (!delivery || !this.host.acceptsRecipient(delivery.channel === 'wecom' ? 'wecom' : 'desktop', delivery.recipientRef, delivery.taskId)) {
         throw new CompanionError('NOT_FOUND', '投递不存在', 404)
       }
       if (delivery.state !== 'pending' || !this.validDelivery(delivery)) throw new CompanionError('ALREADY_CLAIMED', '投递已领取或已失效，禁止再次显示')
@@ -189,7 +189,7 @@ export class CompanionReminders {
     const { store, approvals } = this.host
     return store.transaction(() => {
       const delivery = store.getReminderDelivery(deliveryId)
-      if (!delivery || !this.host.acceptsRecipient(delivery.channel === 'wecom' ? 'wecom' : 'desktop', delivery.recipientRef)) {
+      if (!delivery || !this.host.acceptsRecipient(delivery.channel === 'wecom' ? 'wecom' : 'desktop', delivery.recipientRef, delivery.taskId)) {
         throw new CompanionError('NOT_FOUND', '投递不存在', 404)
       }
       if (delivery.executorEpoch !== receipt.executorEpoch) throw new CompanionError('EPOCH_MISMATCH', '领取代次已失效')
@@ -227,8 +227,9 @@ export class CompanionReminders {
     const next: ReminderCycleRecord = { ...cycle, state: ['acknowledged', 'cancelled'].includes(cycle.state) ? cycle.state : 'unknown',
       nextNagAt: null, revision: cycle.revision + 1 }
     store.saveReminderCycle(next)
-    this.host.changeTask(cycle.childTaskId, 'unknown')
-    this.host.changeTask(schedule.taskId, 'unknown')
+    for (const taskId of [cycle.childTaskId, schedule.taskId]) {
+      if (!TERMINAL_TASK_STATUSES.includes(this.host.ownedTask(taskId).status)) this.host.changeTask(taskId, 'unknown')
+    }
     this.event(next)
   }
 
@@ -356,14 +357,23 @@ export class CompanionReminders {
 
   recover(): void {
     const { store } = this.host
+    const ownsTask = (taskId: string): boolean => {
+      const meta = store.getCompanionMeta(taskId)
+      return store.getTaskRuntimeScope(taskId) === 'companion' && meta?.runtimeScope === 'companion' &&
+        meta.principalId === this.host.principalId && meta.deviceId === this.host.deviceId
+    }
     store.transaction(() => {
       for (const delivery of store.listReminderDeliveries()) {
-        if (delivery.recipientRef !== this.host.principalId || store.getTaskRuntimeScope(delivery.taskId) !== 'companion') continue
+        // 账本恢复只按任务归属判断，不依赖收件人、渠道在线状态或当前绑定策略。
+        if (!['pending', 'sending'].includes(delivery.state) || !ownsTask(delivery.taskId)) continue
+        const cycle = store.getReminderCycle(delivery.cycleId)
+        const schedule = cycle && store.getCompanionSchedule(cycle.scheduleId)
+        if (!cycle || cycle.childTaskId !== delivery.taskId || !schedule || !ownsTask(schedule.taskId)) continue
         if (delivery.state === 'sending') {
           store.saveReminderDelivery({ ...delivery, state: 'unknown' })
           this.host.approvals.settle(delivery.operationId, 'unknown', null, '执行器退出前没有确定回执，禁止重发')
           store.finishRun(delivery.deliveryId, 'unknown', '执行器回执缺失', null)
-          this.holdUnknown(store.getReminderCycle(delivery.cycleId)!)
+          this.holdUnknown(cycle)
         } else if (delivery.state === 'pending') {
           store.saveReminderDelivery({ ...delivery, executorEpoch: this.host.epoch })
         }

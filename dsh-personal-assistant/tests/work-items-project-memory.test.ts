@@ -1,6 +1,7 @@
 /** M3-01 工作事项与证据关联、M3-06 项目范围记忆：真实工具、真实库与审批服务；不启动采集或模型。 */
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { AssistantApprovalService } from '../src/assistant-approval.ts'
@@ -16,7 +17,7 @@ import { registerAssistantTools } from '../src/tools.ts'
 import type { ActivityTracker } from '../src/tracker.ts'
 import { planWorkItem, WorkItemStore } from '../src/work-items.ts'
 
-const scratch = path.resolve(import.meta.dirname, '../../generated-videos/moved-from-assets/petsBak/dsh-personal-assistant')
+const scratch = tmpdir()
 const today = localDateOf(Date.now())
 const base = startOfLocalDate(today) + 60_000
 const span = (offsetMin: number, minutes: number, app: string, title: string): ActivitySpan =>

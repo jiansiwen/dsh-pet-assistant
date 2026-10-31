@@ -87,3 +87,40 @@ test('普通任务接口与执行器凭据互不通用，聊天令牌不能替�
   })
   assert.equal(respondByChat.status, 403, '聊天侧不能替本人回应提醒')
 })
+
+test('桌面纪要回执支持有界多字节正文，仍只接受本人凭据及一次性命令编号', async t => {
+  const home = mkdtempSync(path.join(tmpdir(), 'dsh-desktop-receipt-'))
+  const bridge = new SessionBridge({ dshHome: home })
+  t.after(async () => { await bridge.dispose(); rmSync(home, { recursive: true, force: true }) })
+  const listening = await bridge.listen()
+  const chat = credential(path.join(home, 'personal-assistant', 'bridge.json'))
+  const owner = credential(path.join(home, 'personal-assistant', 'bridge-approval.json'))
+  const events: Array<{ type: string; payload: { id: string; command: string; payload: unknown; expiresAt: number } }> = []
+  ;(bridge as unknown as { push(value: unknown): void }).push = value => { events.push(value as typeof events[number]) }
+  const pending = bridge.requestDesktopCommand('meeting.artifact.read', { artifactId: '测试' })
+  const id = events[0]!.payload.id
+  const content = '会议文字'.repeat(12_000)
+  const payload = JSON.stringify({ id, ok: true, result: { content } })
+  assert.ok(Buffer.byteLength(payload) > 65_536)
+  const base = `http://127.0.0.1:${listening.port}`
+  const claimPath = `${base}/companion/v1/desktop/claim`
+  const clientClaim = await fetch(`${claimPath}?token=${encodeURIComponent(String(chat.token))}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(events[0]!.payload) })
+  assert.equal(clientClaim.status, 403)
+  const headers = { 'content-type': 'application/json', 'x-dsh-companion-token': String(owner.companionOwnerToken) }
+  const tampered = await fetch(claimPath, { method: 'POST', headers, body: JSON.stringify({ ...events[0]!.payload, command: 'meeting.start' }) })
+  assert.equal(tampered.status, 409)
+  assert.equal((await fetch(claimPath, { method: 'POST', headers, body: JSON.stringify(events[0]!.payload) })).status, 200)
+  assert.equal((await fetch(claimPath, { method: 'POST', headers, body: JSON.stringify(events[0]!.payload) })).status, 409)
+  const client = await fetch(`${base}/companion/v1/desktop/result?token=${encodeURIComponent(String(chat.token))}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: payload })
+  assert.equal(client.status, 403)
+  const ownerReply = await fetch(`${base}/companion/v1/desktop/result`, { method: 'POST', headers, body: payload })
+  assert.equal(ownerReply.status, 200)
+  assert.deepEqual(await pending, { content })
+  const repeated = await fetch(`${base}/companion/v1/desktop/result`, { method: 'POST', headers, body: payload })
+  assert.equal(repeated.status, 409)
+  const oversized = await fetch(`${base}/companion/v1/desktop/result`, { method: 'POST', headers,
+    body: JSON.stringify({ id: '不存在', ok: true, result: { content: 'a'.repeat(520_000) } }) })
+  assert.equal(oversized.status, 400)
+})

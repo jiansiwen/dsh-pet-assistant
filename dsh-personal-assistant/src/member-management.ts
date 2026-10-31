@@ -20,6 +20,9 @@ const reset = z.enum(['daily', 'total', 'both'])
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject']), expectedQuotaRevision: revision,
   change: z.object({ dailyTokenLimit: limit.optional(), totalTokenLimit: limit.optional(), reset: reset.optional() }).strict().optional() }).strict()
 const assistSchema = z.object({ request: z.string().trim().min(1).max(4000), current: draft.optional() }).strict()
+const noticeAcknowledgement = z.object({ attemptId: z.string().uuid(), expectedState: z.enum(['failed', 'unknown']) }).strict()
+const sendAcknowledgement = z.object({ expectedState: z.enum(['partial', 'unknown']) }).strict()
+const channelAcknowledgement = z.object({ expectedRevision: revision }).strict()
 
 export class MemberManagement {
   private readonly options: {
@@ -28,13 +31,40 @@ export class MemberManagement {
     defaultModel(): { provider: string; model: string } | null
     changed(): void
     activeTasks?(id: string): number
+    mailNoticeAttention?(): NonNullable<MemberSnapshot['mailNoticeAttention']>
+    acknowledgeMailNotice?(analysisId: string, attemptId: string, expectedState: 'failed' | 'unknown'): boolean
+    mailSendAttention?(): NonNullable<MemberSnapshot['mailSendAttention']>
+    acknowledgeMailSend?(intentId: string, expectedState: 'partial' | 'unknown'): boolean
+    channelInboundAttention?(): NonNullable<MemberSnapshot['channelInboundAttention']>
+    acknowledgeChannelInbound?(id: string, expectedRevision: number): boolean
     assistant?: { draft(input: { request: string; current?: MemberDraft }): Promise<{ draft: MemberDraft; notes: string }> }
   }
   constructor(options: MemberManagement['options']) { this.options = options }
   snapshot(): MemberSnapshot {
     const { directory, runtime } = this.options
+    let mailNoticeAttention: MemberSnapshot['mailNoticeAttention']
+    let mailNoticeAttentionError = false
+    let mailSendAttention: MemberSnapshot['mailSendAttention']
+    let mailSendAttentionError = false
+    let channelInboundAttention: MemberSnapshot['channelInboundAttention']
+    let channelInboundAttentionError = false
+    if (this.options.mailNoticeAttention) {
+      try { mailNoticeAttention = this.options.mailNoticeAttention() }
+      catch { mailNoticeAttentionError = true }
+    }
+    if (this.options.mailSendAttention) {
+      try { mailSendAttention = this.options.mailSendAttention() }
+      catch { mailSendAttentionError = true }
+    }
+    if (this.options.channelInboundAttention) {
+      try { channelInboundAttention = this.options.channelInboundAttention() }
+      catch { channelInboundAttentionError = true }
+    }
     return { enabled: this.options.enabled(), members: directory.list().map(profile => ({ profile, quota: directory.quota(profile.assistantId), busy: runtime.busy(profile.assistantId) })),
-      requests: directory.requests(), defaultModel: this.options.defaultModel() }
+      requests: directory.requests(), defaultModel: this.options.defaultModel(),
+      ...(mailNoticeAttention ? { mailNoticeAttention } : {}), ...(mailNoticeAttentionError ? { mailNoticeAttentionError } : {}),
+      ...(mailSendAttention ? { mailSendAttention } : {}), ...(mailSendAttentionError ? { mailSendAttentionError } : {}),
+      ...(channelInboundAttention ? { channelInboundAttention } : {}), ...(channelInboundAttentionError ? { channelInboundAttentionError } : {}) }
   }
   private idle(id: string): void {
     if (!this.options.directory.get(id)) throw new Error('智能体不存在')
@@ -53,6 +83,33 @@ export class MemberManagement {
         } catch (error) {
           return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '成员配置助手暂时不可用' } }
         }
+      }
+      const notice = /^\/companion\/v1\/members\/mail-notices\/([a-f0-9-]{36})\/acknowledge$/iu.exec(pathname)
+      if (method === 'POST' && notice) {
+        const input = noticeAcknowledgement.parse(raw)
+        if (!this.options.acknowledgeMailNotice?.(notice[1], input.attemptId, input.expectedState)) {
+          throw new Error('邮件通知状态或账户已变化，请刷新后核对')
+        }
+        this.options.changed()
+        return { status: 200, body: this.snapshot() }
+      }
+      const send = /^\/companion\/v1\/members\/mail-sends\/([a-f0-9-]{36})\/acknowledge$/iu.exec(pathname)
+      if (method === 'POST' && send) {
+        const input = sendAcknowledgement.parse(raw)
+        if (!this.options.acknowledgeMailSend?.(send[1], input.expectedState)) {
+          throw new Error('邮件发送状态或账户已变化，请刷新后核对')
+        }
+        this.options.changed()
+        return { status: 200, body: this.snapshot() }
+      }
+      const channel = /^\/companion\/v1\/members\/channel-inbound\/([a-f0-9-]{36})\/acknowledge$/iu.exec(pathname)
+      if (method === 'POST' && channel) {
+        const input = channelAcknowledgement.parse(raw)
+        if (!this.options.acknowledgeChannelInbound?.(channel[1], input.expectedRevision)) {
+          throw new Error('渠道消息正在处理或状态已变化，请刷新后核对')
+        }
+        this.options.changed()
+        return { status: 200, body: this.snapshot() }
       }
       const memory = /^\/companion\/v1\/members\/([A-Za-z0-9_-]+)\/memories(?:\/([A-Za-z0-9_-]+)\/(update|confirm|delete-preview|delete))?$/.exec(pathname)
       if (memory) {

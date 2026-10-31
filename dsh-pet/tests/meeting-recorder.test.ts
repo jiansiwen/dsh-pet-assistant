@@ -3,7 +3,7 @@
  *
  * 钉住的是闭环上最容易悄悄坏掉的几条：consent 必填缺一个就拒；麦克风仲裁与听写互斥、
  * 失败要回滚；停止是"先停流落盘、再结算转写"；转写失败只标状态、录音一块不丢；
- * 说话人修订 bump revision；助理播报区间进纪要且注明不算真人发言；纪要没点确认就
+ * 说话人修订 bump revision；助理作为独立发言人留在纪要时间线；纪要没点确认就
  * 永远是 draft。
  *
  * 跑法：`npm test`。
@@ -355,7 +355,7 @@ describe('音频仲裁：会议与听写互斥（纯函数）', () => {
   })
 })
 
-describe('narrator TTS 区间：助理播报不算真人发言', () => {
+describe('narrator TTS 区间：助理作为独立发言人留在纪要', () => {
   test('录制中打点进 assistant_speech，纪要单列一节并注明', async () => {
     const h = setup()
     const started = h.recorder.startMeeting(CONSENT)
@@ -372,8 +372,8 @@ describe('narrator TTS 区间：助理播报不算真人发言', () => {
     assert.deepEqual(spans, [{ startMs: 3000, endMs: 7500 }])
     const minutes = h.store.getMinutes(meetingId)
     assert.ok(minutes !== null)
-    assert.ok(minutes.content.includes('助理播报区间（不算真人发言）'))
-    assert.ok(minutes.content.includes('不代表任何参会者发言'))
+    assert.ok(minutes.content.includes('助理播报区间（说话人：小潘）'))
+    assert.ok(minutes.content.includes('对应转写按“小潘（AI 助理）”列入时间线'))
     assert.ok(minutes.content.includes('[00:03–00:07]'))
     h.store.close()
   })
@@ -476,6 +476,61 @@ describe('说话人修订与纪要确认（经 recorder 门面）', () => {
     assert.equal(result.segments.length, 2)
     assert.equal(result.transcript?.mode, 'undiarized')
     assert.equal(result.transcript?.userEdited, false)
+    h.store.close()
+  })
+})
+
+describe('双轨就绪：没收到音频不算开始成功', () => {
+  test('开始后两轨都到齐才算就绪，中途如实报缺哪条', async () => {
+    const h = setup()
+    const started = h.recorder.startMeeting({ ...CONSENT, sources: 'mic+loopback' })
+    assert.equal(started.ok, true)
+    if (!started.ok) return
+    const before = await h.recorder.waitTracksReady(started.meetingId, 0)
+    assert.equal(before.ready, false)
+    assert.deepEqual(before.missing, ['mic', 'loopback'])
+
+    const pcm = Buffer.alloc(640 * 100, 1)
+    const frames = pcm.length / 2
+    const pushed = h.recorder.pushChunk(started.meetingId, pcm.toString('base64'),
+      { track: 'mic', seq: 0, startMs: 0, sampleRate: 16000, frames })
+    assert.equal(pushed.ok, true)
+    const one = await h.recorder.waitTracksReady(started.meetingId, 0)
+    assert.equal(one.ready, false)
+    assert.deepEqual(one.recorded, ['mic'])
+    assert.deepEqual(one.missing, ['loopback'])
+
+    assert.equal(h.recorder.pushChunk(started.meetingId, pcm.toString('base64'),
+      { track: 'loopback', seq: 0, startMs: 0, sampleRate: 16000, frames }).ok, true)
+    const both = await h.recorder.waitTracksReady(started.meetingId, 0)
+    assert.equal(both.ready, true)
+    assert.deepEqual([...both.recorded].sort(), ['loopback', 'mic'])
+    h.store.close()
+  })
+
+  test('某条轨明确报告缺失时立即失败，不把缺轨会议当成已开始', async () => {
+    const h = setup()
+    const started = h.recorder.startMeeting({ ...CONSENT, sources: 'mic+loopback' })
+    assert.equal(started.ok, true)
+    if (!started.ok) return
+    h.recorder.reportTrackMissing(started.meetingId, 'loopback', '没有系统回环权限')
+    const result = await h.recorder.waitTracksReady(started.meetingId, 0)
+    assert.equal(result.ready, false)
+    assert.deepEqual(result.missing, ['loopback'])
+    h.store.close()
+  })
+
+  test('只录麦克风时不需要回环轨', async () => {
+    const h = setup()
+    const started = h.recorder.startMeeting({ ...CONSENT, sources: 'mic' })
+    assert.equal(started.ok, true)
+    if (!started.ok) return
+    const pcm = Buffer.alloc(640 * 50, 2)
+    assert.equal(h.recorder.pushChunk(started.meetingId, pcm.toString('base64'),
+      { track: 'mic', seq: 0, startMs: 0, sampleRate: 16000, frames: pcm.length / 2 }).ok, true)
+    const result = await h.recorder.waitTracksReady(started.meetingId, 0)
+    assert.equal(result.ready, true)
+    assert.deepEqual(result.recorded, ['mic'])
     h.store.close()
   })
 })

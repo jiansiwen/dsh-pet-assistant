@@ -18,6 +18,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { mock, test } from 'node:test'
+import { BridgeClient } from '../src/main/harness.ts'
 
 // ── 隔离：所有写盘都落在临时目录，绝不碰真用户的 ~/.dsh 与 pet-settings.json ──
 const sandbox = mkdtempSync(path.join(tmpdir(), 'dsh-pet-e2e-'))
@@ -119,6 +120,22 @@ let dockHideCalls = 0
 let displayMediaHandlers = 0
 const windows: FakeBrowserWindow[] = []
 const trays: FakeTray[] = []
+let noticeMode: 'show' | 'failed' | 'throw' | 'silent' = 'show'
+let noticeShowCount = 0
+let noticeBody = ''
+
+class FakeNotification {
+  private readonly listeners = new Map<string, () => void>()
+  constructor(options: { title: string; body: string }) { noticeBody = options.body }
+  static isSupported(): boolean { return true }
+  on(event: string, handler: () => void): void { this.listeners.set(event, handler) }
+  show(): void {
+    noticeShowCount++
+    if (noticeMode === 'throw') throw new Error('模拟通知结果未知')
+    if (noticeMode === 'silent') return
+    queueMicrotask(() => this.listeners.get(noticeMode)?.())
+  }
+}
 
 class FakeWebContents {
   sent: Array<{ channel: string; payload: unknown }> = []
@@ -197,7 +214,11 @@ const fakeElectron = {
     // macOS 上装配会调 app.dock.hide() 把宠物从 Dock 里拿掉。测试跑在任意平台上，
     // 所以这里必须提供 dock —— 缺了就是 "Cannot read properties of undefined"。
     dock: { hide: () => { dockHideCalls += 1 } },
+    // Windows 系统通知需要在装配时设置 AppUserModelId（32dc4d0 引入）。
+    setAppUserModelId: () => {},
   },
+  // 提醒投递装配会构造系统通知；这份测试没有待投递提醒，但不能因缺替身导入失败。
+  Notification: FakeNotification,
   // 装配时会问一次麦克风权限（macOS 上没声明用途说明会被系统直接终止进程）。
   // 这里给一个"已授权"的替身：测试不该弹系统对话框。
   systemPreferences: {
@@ -286,7 +307,7 @@ const fakeElectron = {
 mock.module('electron', { namedExports: fakeElectron })
 
 // ── 导入真的主进程装配。whenReady 已 resolve，装配在微任务里跑。 ──
-await import('../src/main/index.ts')
+const appMain = await import('../src/main/index.ts')
 await new Promise(resolve => setTimeout(resolve, 30))
 
 /** 渲染层收到的最后一个某频道消息。 */
@@ -304,6 +325,61 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
     '主选注册成功就停手；备选 Ctrl+Alt+Space 只在主选被占用时兜底')
   assert.equal(wakeStarts.length, 1, 'boot 后唤醒监听被仲裁器拉起一次（mock 的，没起真 PowerShell）')
   assert.equal(playHostCalls.starts, 1, '唤醒应答的常驻播放进程在装配时预热一次')
+})
+
+test('邮件通知只有系统确认显示后才回执，失败和未知如实保留', { timeout: 10000 }, async t => {
+  const analysisId = '00000000-0000-4000-8000-000000000001'
+  const attemptId = '00000000-0000-4000-8000-000000000002'
+  const calls: string[] = []
+  let canClaim = true
+  let text = '隔离邮件摘要'
+  let attention: Array<{ analysisId: string; memberId: string; state: 'unknown' | 'failed' }> = []
+  t.mock.method(BridgeClient.prototype, 'desktopMailNotices', async () => ({
+    deliveries: [{ analysisId, memberId: 'mail-member', text }], attention,
+  }))
+  t.mock.method(BridgeClient.prototype, 'claimDesktopMailNotice', async (id: string) => { calls.push(`claim:${id}`); return canClaim ? attemptId : null })
+  t.mock.method(BridgeClient.prototype, 'receiptDesktopMailNotice', async (id: string, attempt: string, state: string) => {
+    calls.push(`receipt:${id}:${attempt}:${state}`); return true
+  })
+  try {
+    noticeMode = 'show'
+    await appMain.deliverMailNoticesOnce()
+    assert.deepEqual(calls, [`claim:${analysisId}`, `receipt:${analysisId}:${attemptId}:succeeded`])
+    assert.deepEqual(lastSent('member-notice'), { kind: 'mail', text: '隔离邮件摘要', memberId: 'mail-member' })
+
+    calls.length = 0
+    text = '长'.repeat(600)
+    await appMain.deliverMailNoticesOnce()
+    assert.equal(noticeBody.length, 500)
+    assert.ok(noticeBody.endsWith('…'), '系统通知被截断时要明确标记')
+    text = '隔离邮件摘要'
+
+    calls.length = 0
+    noticeMode = 'failed'
+    await appMain.deliverMailNoticesOnce()
+    assert.deepEqual(calls, [`claim:${analysisId}`, `receipt:${analysisId}:${attemptId}:failed-before-effect`])
+
+    calls.length = 0
+    noticeMode = 'throw'
+    await appMain.deliverMailNoticesOnce()
+    assert.deepEqual(calls, [`claim:${analysisId}`, `receipt:${analysisId}:${attemptId}:unknown`])
+
+    calls.length = 0
+    noticeMode = 'silent'
+    const waiting = appMain.deliverMailNoticesOnce()
+    await appMain.deliverMailNoticesOnce()
+    await waiting
+    assert.deepEqual(calls, [`claim:${analysisId}`, `receipt:${analysisId}:${attemptId}:unknown`], '没有系统回执不能当成功')
+
+    calls.length = 0
+    canClaim = false
+    const shown = noticeShowCount
+    attention = [{ analysisId, memberId: 'mail-member', state: 'unknown' }]
+    await appMain.deliverMailNoticesOnce()
+    assert.deepEqual(calls, [`claim:${analysisId}`])
+    assert.equal(noticeShowCount, shown, '领取失败不能显示或伪造回执')
+    assert.match((lastSent('member-notice') as { text: string }).text, /结果未知.*核对/u)
+  } finally { noticeMode = 'show' }
 })
 
 test('通道清单：舞台侧注册的每一条都该在，一条不多', () => {
@@ -338,6 +414,19 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
     'audio-sync', 'residency-state', 'residency-set',
+    // 成员目录、成员编辑窗口与额度（团队管理）。
+    'members-state', 'member-command', 'member-memories', 'member-assist',
+    'member-editor-open', 'member-editor-context', 'member-editor-close',
+    // 普通任务与提醒窗口（P0-02/P0-03）。
+    'companion-tasks-open', 'companion-tasks:list', 'companion-tasks:detail', 'companion-tasks:create',
+    'companion-tasks:control', 'companion-tasks:reminders', 'companion-tasks:respond',
+    'companion-tasks:set-interval', 'companion-tasks:request-review', 'companion-tasks:defaults',
+    // 会议指令回传与 Office 阅读窗口。
+    'meeting-take-command',
+    'office-open', 'office-view-session', 'office-view-bytes', 'office-view-image', 'office-view-check',
+    'office-view-fullscreen', 'office-view-close',
+    // 助理设置页（渠道与邮箱）。
+    'assistant-settings-state', 'assistant-settings-save',
   ]
   assert.deepEqual([...ipcListeners.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedOn].sort())
   assert.deepEqual([...ipcHandlers.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedHandle].sort())

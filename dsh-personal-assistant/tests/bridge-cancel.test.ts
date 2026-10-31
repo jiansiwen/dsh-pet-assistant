@@ -14,7 +14,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRun, SubagentResult, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import type { SubagentActivationSpec, SubagentResult, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { SessionBridge, type BridgeAgent, type BridgeEvent } from '../src/bridge.ts'
 import { ApprovalService } from '../src/approval.ts'
 import { TeamStore } from '../src/team-domain.ts'
@@ -83,10 +83,11 @@ function teamFixture(t: TestContext) {
       get: (name: string, scope: unknown) => scope === parent && ['read', 'grep'].includes(name),
       guard: () => () => undefined,
     },
+    agents: { get: (id: string) => id === child.id ? child : undefined },
     subagents: {
-      start: async (_provider: string, request: SubagentStartRequest): Promise<SubagentRun> => {
-        requests.push(request)
-        return { id: child.id, localAgent: child, result: result.promise, dispose: () => dispose() }
+      startActivation: async (spec: SubagentActivationSpec) => {
+        requests.push({ ...spec.request, label: spec.label, signal: spec.signal })
+        return { childId: child.id, messageId: '测试消息', result: result.promise, dispose: () => dispose() }
       },
     },
   }

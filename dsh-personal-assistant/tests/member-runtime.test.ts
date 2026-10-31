@@ -139,11 +139,14 @@ async function fixture(t: TestContext, file?: string) {
   const arrivals: Driver[] = []
   const waiters: Array<(driver: Driver) => void> = []
   let failResume = false
+  let channelFollowup = false
   let beforeSetup: ((driver: Driver) => void) | undefined
   let runtime!: MemberRuntime
   const globalNames = ['read', 'web_search', 'bash', 'write', 'subagent', 'desktop_team_assign', 'personal_assistant_remember_preference',
     'personal_assistant_list_preferences', 'personal_assistant_start', 'personal_assistant_delete_activity', 'companion_set_owner',
-    'personal_assistant_send_mail', 'personal_assistant_today', 'personal_assistant_get_draft', 'personal_assistant_save_draft',
+    'personal_assistant_send_mail', 'personal_assistant_meeting_artifacts', 'personal_assistant_send_meeting_minutes',
+    'personal_assistant_start_meeting_presentation', 'personal_assistant_meeting_presentation_status', 'personal_assistant_finish_meeting_presentation',
+    'personal_assistant_today', 'personal_assistant_get_draft', 'personal_assistant_save_draft',
     'companion_create_reminder', 'companion_create_task', 'companion_task_status']
   for (const name of globalNames) root.tools.register(defineTool({ name, description: '无副作用测试工具', parameters: {},
     output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
@@ -158,7 +161,7 @@ async function fixture(t: TestContext, file?: string) {
     calls.push({ kind: resume ? 'resume' : 'create', id })
     if (resume && (failResume || !logs.has(id))) throw new Error('持久日志读取失败')
     const driver = new Driver(root, id, logs.get(id) ?? [], driver => {
-      assert.equal(store.directory.list().find(member => member.sessionId === id)?.sessionId, id, '先持久 sessionId 再 followup')
+      if (!channelFollowup) assert.equal(store.directory.list().find(member => member.sessionId === id)?.sessionId, id, '先持久 sessionId 再 followup')
       const waiter = waiters.shift()
       if (waiter) waiter(driver); else arrivals.push(driver)
     })
@@ -202,6 +205,7 @@ async function fixture(t: TestContext, file?: string) {
     get runtime() { return runtime }, restart() { runtime = new MemberRuntime(options); return runtime },
     notifications: () => notifications, setEnabled: (value: boolean) => { enabled = value },
     failResume: () => { failResume = true }, beforeSetup: (callback: (driver: Driver) => void) => { beforeSetup = callback },
+    allowChannelFollowup: () => { channelFollowup = true },
     next: () => arrivals.length ? Promise.resolve(arrivals.shift()!) : new Promise<Driver>(resolve => waiters.push(resolve)),
     async start(id: string, signal = new AbortController().signal, taskId?: string) {
       const started = await runtime.start(id, [{ type: 'text', text: '只处理本次任务' }], signal, taskId)
@@ -244,6 +248,49 @@ test('不同成员会话隔离，任务与聊天共享持久 id，重建运行�
   assert.equal(await chat, '聊天结果')
   assert.equal(driver.agent.id, first.child.id)
   assert.equal(h.store.directory.quota(a.assistantId).totalUsed, 22)
+})
+
+test('成员企微会话按机器人和聊天范围持久隔离，桌面历史与确认记忆不丢失', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('企微成员', { capabilities: ['wecom'] }))
+  h.memories.set(member.assistantId, '本人确认过的成员记忆')
+  const desktop = await h.start(member.assistantId)
+  await complete(desktop.driver, 10, '桌面私有历史')
+  await desktop.activation.dispose()
+  await h.next()
+  h.allowChannelFollowup()
+  const scopeA = 'a'.repeat(64), scopeB = 'b'.repeat(64)
+  const chatA = h.runtime.chat(member.assistantId, '甲消息', undefined, 'wecom:single:主人', 'desktop', scopeA)
+  void chatA.catch(() => undefined)
+  const first = await h.next()
+  assert.equal(h.store.directory.getChannelSession(member.assistantId, scopeA), first.agent.id, '先登记专属会话再交付消息')
+  assert.notEqual(first.agent.id, desktop.child.id)
+  assert.doesNotMatch(JSON.stringify(first.events), /桌面私有历史/u)
+  assert.match(await first.prompt(), /本人确认过的成员记忆/u)
+  await complete(first, 10, '甲机器人历史')
+  assert.equal(await chatA, '甲机器人历史')
+  const chatB = h.runtime.chat(member.assistantId, '乙消息', undefined, 'wecom:single:主人', 'desktop', scopeB)
+  const second = await h.next()
+  assert.notEqual(second.agent.id, first.agent.id)
+  assert.doesNotMatch(JSON.stringify(second.events), /甲机器人历史|桌面私有历史/u)
+  await complete(second, 10, '乙机器人历史')
+  assert.equal(await chatB, '乙机器人历史')
+  await h.runtime.dispose(); h.restart()
+  const againA = h.runtime.chat(member.assistantId, '甲后续', undefined, 'wecom:single:主人', 'desktop', scopeA)
+  const resumed = await h.next()
+  assert.equal(resumed.agent.id, first.agent.id)
+  assert.match(JSON.stringify(resumed.events), /甲机器人历史/u)
+  assert.doesNotMatch(JSON.stringify(resumed.events), /乙机器人历史|桌面私有历史/u)
+  await complete(resumed, 10, '甲后续完成')
+  assert.equal(await againA, '甲后续完成')
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, desktop.child.id)
+  assert.equal(h.store.directory.quota(member.assistantId).totalUsed, 40, '额度仍按成员累计')
+  await assert.rejects(h.runtime.chat(member.assistantId, '无范围', undefined, 'wecom:single:主人'), /缺少可核验的会话范围/u)
+  await assert.rejects(h.runtime.start(member.assistantId, [{ type: 'text', text: '无任务标识' }], new AbortController().signal, undefined, 'wecom'), /缺少独立任务标识/u)
+  h.failResume()
+  await assert.rejects(h.runtime.chat(member.assistantId, '不能换会话', undefined, 'wecom:single:主人', 'desktop', scopeA), /不可用.*未创建替代会话/u)
+  assert.equal(h.store.directory.getChannelSession(member.assistantId, scopeA), first.agent.id)
+  assert.equal(h.runtime.busy(), false)
 })
 
 test('恢复失败不创建替代会话，持久收件箱残留不自动重发', async t => {
@@ -331,6 +378,70 @@ test('会议能力只在桌面来源注册工具，并驱动一次性桌面命�
   await second.activation.dispose()
 })
 
+test('会议邮件交接只向同时具备会议和邮件能力的桌面成员开放，渠道来源不可借用', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('会议邮件成员', { capabilities: ['meeting', 'mail'] }))
+  const desktop = await h.start(member.assistantId)
+  await h.next()
+  assert.equal((await desktop.driver.tool('personal_assistant_meeting_artifacts')).isError, false)
+  assert.equal((await desktop.driver.tool('personal_assistant_send_meeting_minutes')).isError, false)
+  await complete(desktop.driver); await desktop.activation.dispose()
+  h.allowChannelFollowup()
+  const remote = await h.runtime.start(member.assistantId, [{ type: 'text', text: '企微任务' }], new AbortController().signal, '企微任务-2', 'wecom')
+  const driver = await h.next()
+  assert.equal((await driver.tool('personal_assistant_meeting_artifacts')).isError, true)
+  assert.equal((await driver.tool('personal_assistant_send_meeting_minutes')).isError, true)
+  await complete(driver); await remote.activation.dispose()
+})
+
+test('会议讲解使用共享桌面模型，有限额成员不能借此绕过软额度；非桌面来源不能启动', async t => {
+  const h = await fixture(t)
+  const limited = h.store.directory.create(draft('有限额讲解成员', { capabilities: ['meeting', 'document'], dailyTokenLimit: 500 }))
+  const first = await h.start(limited.assistantId)
+  await h.next()
+  assert.equal((await first.driver.tool('personal_assistant_start_meeting_presentation')).isError, true)
+  assert.equal((await first.driver.tool('personal_assistant_meeting_presentation_status')).isError, false)
+  assert.equal((await first.driver.tool('personal_assistant_finish_meeting_presentation')).isError, false)
+  await complete(first.driver); await first.activation.dispose()
+  const unlimited = h.store.directory.create(draft('不限额讲解成员', { capabilities: ['meeting', 'document'], dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  const second = await h.start(unlimited.assistantId)
+  await h.next()
+  assert.equal((await second.driver.tool('personal_assistant_start_meeting_presentation')).isError, false)
+  await complete(second.driver); await second.activation.dispose()
+  h.allowChannelFollowup()
+  const remote = await h.runtime.start(unlimited.assistantId, [{ type: 'text', text: '企微任务' }], new AbortController().signal, '企微讲解任务', 'wecom')
+  const driver = await h.next()
+  assert.equal((await driver.tool('personal_assistant_start_meeting_presentation')).isError, true)
+  assert.equal((await driver.tool('personal_assistant_finish_meeting_presentation')).isError, true)
+  await complete(driver); await remote.activation.dispose()
+})
+
+test('有限额成员不能借共享会话生成纪要，其他会议工具仍可用', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('有限额会议成员', { capabilities: ['meeting'], dailyTokenLimit: 500 }))
+  const first = await h.start(member.assistantId)
+  await h.next()
+  assert.equal((await first.driver.tool('companion_meeting_status')).isError, false)
+  const minutes = await first.driver.tool('companion_meeting_minutes')
+  assert.equal(minutes.isError, true, '纪要走共享会话、不进成员账本，有限额成员不应获得该工具')
+  assert.equal(h.desktopCalls.some(call => call.command === 'meeting.minutes'), false)
+  await complete(first.driver)
+  await first.activation.dispose()
+})
+
+test('不限额成员仍可使用纪要工具', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('不限额会议成员',
+    { capabilities: ['meeting'], dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  const first = await h.start(member.assistantId)
+  await h.next()
+  const minutes = await first.driver.tool('companion_meeting_minutes')
+  assert.equal(minutes.isError, false)
+  assert.deepEqual(h.desktopCalls[0], { command: 'meeting.minutes', payload: {} })
+  await complete(first.driver)
+  await first.activation.dispose()
+})
+
 test('文档能力只读取授权文档参数，非桌面来源不注册工具', async t => {
   const h = await fixture(t)
   const member = h.store.directory.create(draft('文档成员', { capabilities: ['document'] }))
@@ -342,7 +453,8 @@ test('文档能力只读取授权文档参数，非桌面来源不注册工具',
   await complete(first.driver)
   await first.activation.dispose()
 
-  const second = await h.runtime.start(member.assistantId, [{ type: 'text', text: '企业微信来源不能读文档' }], new AbortController().signal, undefined, 'wecom')
+  h.allowChannelFollowup()
+  const second = await h.runtime.start(member.assistantId, [{ type: 'text', text: '企业微信来源不能读文档' }], new AbortController().signal, '企微任务', 'wecom')
   const driver = await h.next()
   assert.equal((await driver.tool('companion_document_read', { name: '产品说明' })).isError, true)
   await complete(driver)

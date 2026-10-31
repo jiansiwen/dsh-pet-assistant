@@ -239,7 +239,7 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
         <label className="editor-field"><span>日计量时区</span>
           <input required maxLength={128} value={form.timezone} disabled={busy} onChange={event => set('timezone', event.target.value)} /></label>
       </div>
-      <p className="editor-hint">服务商和模型同时留空＝跟随主默认；0 额度＝不限。额度按模型返回的用量累计，不是计费硬封顶；阈值只产生申请，不自动加额。</p>
+      <p className="editor-hint">服务商和模型同时留空＝跟随主默认；0 额度＝不限。软限额：按模型返回的用量加在途预留停线，单次请求仍可能超出上限，不是计费硬封顶；阈值只产生申请，不自动加额。</p>
     </details>
 
     {error && <p className="editor-error" role="alert">{error}</p>}

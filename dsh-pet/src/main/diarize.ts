@@ -29,9 +29,12 @@ const FRAMES_PER_MS = TIMELINE_RATE / 1000
 
 // ===== 说话人 id 与标签 =====
 
-/** 助理播报段的 speaker id。它不是参会者，纪要时间线里不算真人发言。 */
+/**
+ * 助理播报段的 speaker id。它是会议里的一个独立发言人（桌边的小潘），
+ * 不是参会者，但它的发言与问答要留在纪要时间线里。
+ */
 export const ASSISTANT_SPEAKER = 'assistant'
-export const ASSISTANT_LABEL = '桌面助理播报（不算真人发言）'
+export const ASSISTANT_LABEL = '小潘（AI 助理）'
 
 function trackPrefix(track: MeetingTrack): string {
   return track === 'mic' ? 'mic' : 'loop'

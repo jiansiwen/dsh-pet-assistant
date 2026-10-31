@@ -13,6 +13,34 @@
 
 export type Risk = 'low' | 'medium' | 'high'
 
+export type MeetingMailOutcome =
+  | { state: 'pending'; intentId: string; acceptedAt: number }
+  | { state: 'scheduled'; intentId: string; acceptedAt: number; taskId: string; runAt: string }
+
+/** 只采用完整服务回执和精确的两分钟锚点，不信任自由文本的成功宣称。 */
+export function parseMeetingMailOutcome(value: unknown): MeetingMailOutcome | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const result = value as { intentId?: unknown; acceptedAt?: unknown; followup?: unknown }
+  if (typeof result.intentId !== 'string' || !result.intentId || result.intentId.length > 200
+    || /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(result.intentId)
+    || typeof result.acceptedAt !== 'number' || !Number.isSafeInteger(result.acceptedAt) || result.acceptedAt < 0
+    || !result.followup || typeof result.followup !== 'object' || Array.isArray(result.followup)) return undefined
+  const followup = result.followup as { state?: unknown; taskId?: unknown; runAt?: unknown }
+  if (followup.state === 'pending') return { state: 'pending', intentId: result.intentId, acceptedAt: result.acceptedAt }
+  if (followup.state !== 'scheduled' || typeof followup.taskId !== 'string' || !followup.taskId || followup.taskId.length > 200
+    || /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(followup.taskId) || typeof followup.runAt !== 'string'
+    || Date.parse(followup.runAt) !== result.acceptedAt + 120_000) return undefined
+  return { state: 'scheduled', intentId: result.intentId, acceptedAt: result.acceptedAt, taskId: followup.taskId, runAt: followup.runAt }
+}
+
+export function meetingMailOutcomeText(outcome: MeetingMailOutcome | undefined): { message: string; detail: string } {
+  if (!outcome) return { message: '邮件与提醒结果未确认', detail: '请到团队页和任务页核查，不要重复批准或重发邮件。' }
+  if (outcome.state === 'pending') return { message: '邮件服务已接受，但提醒尚未登记',
+    detail: `邮件编号：${outcome.intentId}\n请打开任务与提醒页面核查运行状态；不要重发邮件。服务接受不代表收件或已读。` }
+  return { message: '邮件服务已接受，提醒计划已登记',
+    detail: `邮件编号：${outcome.intentId}\n提醒任务：${outcome.taskId}\n计划时间：${new Date(outcome.runAt).toLocaleString('zh-CN')}\n服务接受不代表收件或已读；提醒送达以实际回执为准。` }
+}
+
 /**
  * 桥接推来的操作提案。
  *

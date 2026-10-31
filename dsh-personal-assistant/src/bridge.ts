@@ -145,6 +145,7 @@ export type BridgeEventType =
   | 'team/snapshot'
   | 'session/update'
   | 'desktop/command'
+  | 'desktop/cancel'
   | 'notice'
   | TeamEventType
 
@@ -1742,11 +1743,21 @@ export class SessionBridge {
     url: URL,
     subject: CompanionSubject,
   ): Promise<void> {
+    if (url.pathname === '/companion/v1/desktop/claim') {
+      if (request.method !== 'POST') { this.respond(response, 405, { claimed: false }); return }
+      if (subject !== 'owner') { this.respond(response, 403, { claimed: false }); return }
+      try {
+        const claimed = this.desktopCommands.claim(JSON.parse(await this.readBody(request)) as unknown)
+        this.respond(response, claimed ? 200 : 409, { claimed })
+      } catch { this.respond(response, 400, { claimed: false }) }
+      return
+    }
     if (url.pathname === '/companion/v1/desktop/result') {
       if (request.method !== 'POST') { this.respond(response, 405, { accepted: false }); return }
       if (subject !== 'owner') { this.respond(response, 403, { ok: false, code: 'FORBIDDEN', message: '桌面命令回执只接受本机所有者凭据' }); return }
       try {
-        const accepted = this.desktopCommands.resolve(JSON.parse(await this.readBody(request)) as unknown)
+        // 会议纪要可含多字节中文；仍有界且仅接受本机所有者凭据。
+        const accepted = this.desktopCommands.resolve(JSON.parse(await this.readBody(request, 512_000)) as unknown)
         this.respond(response, accepted ? 200 : 409, { accepted })
       } catch { this.respond(response, 400, { accepted: false }) }
       return

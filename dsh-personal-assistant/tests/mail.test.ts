@@ -4,12 +4,15 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { normalizeDraft, readMailConfig, registerMailTools } from '../src/mail.ts'
+import { TeamStore } from '../src/team-domain.ts'
 
 test('收件人、主题与正文在提交前被严格校验', () => {
   assert.deepEqual(normalizeDraft({ to: 'a@example.com, b@example.com', subject: '周报', text: '正文' }).to,
     ['a@example.com', 'b@example.com'])
   assert.throws(() => normalizeDraft({ to: '', subject: 'x', text: 'y' }), /收件人/)
   assert.throws(() => normalizeDraft({ to: 'not-a-mail', subject: 'x', text: 'y' }), /格式/)
+  assert.throws(() => normalizeDraft({ to: 'a\u0000@example.com', subject: 'x', text: 'y' }), /格式/)
+  assert.throws(() => normalizeDraft({ to: 'a@example.com', subject: '主题\u0000', text: 'y' }), /主题/)
   assert.equal(normalizeDraft({ to: 'a@example.com', subject: 'x\r\nBcc: evil@example.com', text: 'y' }).subject,
     'x Bcc: evil@example.com', '标题里的换行被折成空格，不能注入额外邮件头')
   assert.throws(() => normalizeDraft({ to: 'a@example.com', subject: 'x', text: ' ' }), /正文/)
@@ -23,6 +26,8 @@ function fixture(t: TestContext) {
     host: 'smtp.example.com', port: 465, secure: true, user: 'sender@example.com', from: 'sender@example.com',
   }))
   const submissions: Array<Record<string, unknown>> = []
+  const store = new TeamStore(':memory:')
+  t.after(() => store.close())
   const bridge = {
     submitAssistant(submission: Record<string, unknown>) {
       submissions.push(submission)
@@ -31,7 +36,7 @@ function fixture(t: TestContext) {
   }
   let definition: { execute(args: unknown): Promise<string> } | null = null
   const host = { tools: { register(value: unknown) { definition = value as typeof definition; return () => undefined } } }
-  registerMailTools(host as never, { home, bridge: bridge as never, log: () => undefined })
+  registerMailTools(host as never, { home, bridge: bridge as never, store, epoch: 'test', log: () => undefined })
   return { home, submissions, definition: definition! }
 }
 
@@ -60,7 +65,9 @@ test('未配置邮箱时明确拒绝，不产生待批卡', async t => {
   t.after(() => rmSync(home, { recursive: true, force: true }))
   let definition: { execute(args: unknown): Promise<string> } | null = null
   const host = { tools: { register(value: unknown) { definition = value as typeof definition; return () => undefined } } }
-  registerMailTools(host as never, { home, bridge: { submitAssistant: () => ({ proposalId: 'x' }) } as never, log: () => undefined })
+  const store = new TeamStore(':memory:')
+  t.after(() => store.close())
+  registerMailTools(host as never, { home, bridge: { submitAssistant: () => ({ proposalId: 'x' }) } as never, store, epoch: 'test', log: () => undefined })
   const result = JSON.parse(await definition!.execute({ to: 'a@example.com', subject: 'x', text: 'y' })) as { ok: boolean; error: string }
   assert.equal(result.ok, false)
   assert.match(result.error, /邮箱还没有配置/)

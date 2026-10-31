@@ -44,6 +44,8 @@ export interface MemberQuotaView {
   day: string
   dailyUsed: number
   totalUsed: number
+  dailyReserved: number
+  totalReserved: number
   dailyTokenLimit: number
   totalTokenLimit: number
   thresholdPercent: number
@@ -60,11 +62,25 @@ export interface MemberQuotaRequest {
   quotaRevision: number
 }
 export interface MemberView { profile: MemberProfile; quota: MemberQuotaView; busy: boolean }
+export interface ChannelInboundAttention {
+  id: string; channel: string; accountTag: string; msgid: string; chatId: string; chatType: 'single' | 'group'; senderId: string
+  state: 'pending' | 'processing' | 'replying' | 'completed' | 'unknown' | 'reviewed'
+  processing: 'not-started' | 'running' | 'done' | 'unknown'
+  reply: 'not-sent' | 'sending' | 'accepted' | 'unknown'
+  conflict: boolean; busy: boolean; revision: number; receivedAt: number
+}
 export interface MemberSnapshot {
   enabled: boolean
   members: MemberView[]
   requests: MemberQuotaRequest[]
   defaultModel: { provider: string; model: string } | null
+  mailNoticeAttention?: Array<{ analysisId: string; memberId: string; attemptId: string; state: 'failed' | 'unknown'; preview: string }>
+  mailNoticeAttentionError?: boolean
+  mailSendAttention?: Array<{ intentId: string; subject: string; recipients: string[]; state: 'sending' | 'partial' | 'unknown';
+    accepted: string[]; rejected: string[]; messageId: string | null }>
+  mailSendAttentionError?: boolean
+  channelInboundAttention?: ChannelInboundAttention[]
+  channelInboundAttentionError?: boolean
 }
 export const MEMORY_KINDS = ['user_preference', 'project_fact', 'task_breakpoint', 'team_experience', 'role_expression', 'ephemeral_chat'] as const
 export type MemoryKind = typeof MEMORY_KINDS[number]
@@ -94,6 +110,9 @@ export interface MemberCommandInputs {
   delete: { id: string; expectedRevision: number }
   'reset-quota': { id: string; expectedQuotaRevision: number; scope: QuotaResetScope }
   'decide-request': { requestId: string; decision: 'approve' | 'reject'; expectedQuotaRevision: number; change?: QuotaChange }
+  'ack-mail-notice': { analysisId: string; attemptId: string; expectedState: 'failed' | 'unknown' }
+  'ack-mail-send': { intentId: string; expectedState: 'partial' | 'unknown' }
+  'ack-channel-inbound': { id: string; expectedRevision: number }
   'memory-create': { id: string; kind: MemoryKind; topic: string; text: string }
   'memory-update': { id: string; memoryId: string; expectedRevision: number; text: string; topic: string }
   'memory-confirm': { id: string; memoryId: string; expectedRevision: number }

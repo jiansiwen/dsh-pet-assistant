@@ -13,7 +13,7 @@ import type { TestContext } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentResult, SubagentRun, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import type { SubagentActivationSpec, SubagentResult, SubagentRun, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import ToolRuntime, { type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { ApprovalService } from '../../src/approval.ts'
 import { Config } from '../../src/config.ts'
@@ -81,7 +81,7 @@ export async function sideEffectHost(t: TestContext, options: HostOptions = {}) 
       scope = createScope(inner, agent, parentScope === undefined ? undefined : { parent: parentScope })
     }, { inject: ['tools', 'systemPrompt'] }))
     const events: ScopedAgent['events'] = []
-    Object.assign(agent, { ctx: scope.ctx, session: { header: { id, parentSession, cwd }, events } })
+    Object.assign(agent, { ctx: scope.ctx, session: { header: { id, parentSession, cwd }, events, snapshotEvents: () => events } })
     Object.defineProperty(scope.ctx, 'agent', { value: agent, configurable: true })
     t.after(() => scope.dispose())
     return { agent, ctx: scope.ctx, events }
@@ -134,8 +134,8 @@ export async function sideEffectHost(t: TestContext, options: HostOptions = {}) 
     agents: { get: (id: string) => id === child.agent.id ? child.agent : undefined },
     subagents: {
       start,
-      startActivation: async (input: { provider: string; request: SubagentStartRequest }) => {
-        const run = await start(input.provider, input.request)
+      startActivation: async (input: SubagentActivationSpec) => {
+        const run = await start(input.provider, { ...input.request, label: input.label, signal: input.signal })
         return { id: child.agent.id, childId: child.agent.id, messageId: `message-${requests.length}`,
           result: run.result, dispose: run.dispose }
       },

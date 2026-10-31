@@ -274,6 +274,15 @@ export default function MeetingMinutesReview({ api, meetingId, result, revision,
               <button type="button" className="meeting-btn" onClick={() => void copyFinal()}>
                 复制定稿
               </button>
+              <button type="button" className="meeting-btn" disabled={generating} onClick={() => void run(
+                async () => {
+                  const saved = await api.meetingMinutesSaveFile(meetingId, minutes.digest, minutes.revision)
+                  return saved.ok && !saved.artifact ? { ok: false, error: '未收到文件登记回执，请到所选目录核查。' } : saved
+                },
+                value => `已保存明文纪要：${value.artifact?.path ?? '路径不可用'}；产物编号：${value.artifact?.id ?? '不可用'}。修改文件或转写后，旧产物不能交接。`,
+              )}>
+                保存明文纪要文件
+              </button>
               <button type="button" className="meeting-btn primary" disabled={generating} onClick={() => void intake()}>
                 转为日报证据
               </button>

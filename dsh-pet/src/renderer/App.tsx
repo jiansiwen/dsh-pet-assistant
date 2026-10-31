@@ -672,7 +672,7 @@ export default function App() {
    * 第三个参数只在外放插话（M1-05）时给：插话检测器检出用户开口后，把检出点之前的预滚动音频
    * 交给这次听写，用户开头那几个字不丢。
    */
-  const startListen = useCallback(async (autoSend = false, continuous = false, takeHandover?: () => DictationHandover | null, gateInterrupt = false) => {
+  const startListen = useCallback(async (autoSend = false, continuous = false, takeHandover?: () => DictationHandover | null, gateInterrupt = false, bargeIn = false) => {
     if (listeningRef.current) {
       if (continuous) stopContinuous(false)
       else if (!autoSend) stopDictation()
@@ -696,9 +696,11 @@ export default function App() {
     if (!gateInterrupt) window.petApi.stopSpeech()
     setListening(true)
     asrDeltaText.current = ''
+    // 主进程按场景判定：会议演讲 / 文档讲解中，评委的话直接当问题，不要求“停一下”这类口令。
+    let directMode = false
     const accept = async (text: string): Promise<void> => {
       if (cancelled()) return
-      if (gateInterrupt) {
+      if (gateInterrupt && !directMode) {
         const phrase = parseInterruptPhrase(text)
         if (!phrase.matched) return
         window.petApi.stopSpeech()
@@ -775,11 +777,12 @@ export default function App() {
     // 无论录音还是转写哪一步抛错，finally 都会把状态收回来。
     // 红灯在申请仲裁前就亮：双击的第二下会走进上面的停止分支，而不是发出第二个请求。
     try {
-      const granted = await window.petApi.asrBegin()
+      const granted = await window.petApi.asrBegin({ bargeIn })
       if (!granted.ok) {
         showToast(granted.error || '麦克风正被占用')
         return
       }
+      directMode = granted.direct === true
       if (cancelled()) {
         if (granted.streaming) await window.petApi.asrStreamStop()
         else await window.petApi.asrTranscribe('')
@@ -890,8 +893,8 @@ export default function App() {
       setContinuousActive(true)
       armIdleDeadline()
     }
-    // 口令式打断：只有明确口令才停朗读，其余声音（包括助理自己的回声）不打断。
-    void startListen(true, continuous, takeHandover, true)
+    // 日常外放仍然只认明确口令（防自回声）；会议演讲/讲解时由主进程放开为直接提问。
+    void startListen(true, continuous, takeHandover, true, true)
   }
   useEffect(() => {
     const bridge = installAudioBridge(window.petApi, { onBargeIn: take => bargeInRef.current(take) })

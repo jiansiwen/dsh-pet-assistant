@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import AiBot, { generateReqId } from '@wecom/aibot-node-sdk'
-import type { ChannelAdapter, InboundChannelMessage } from './channels.ts'
+import { ChannelReplyError, type ChannelAdapter, type InboundChannelMessage } from './channels.ts'
 
 export interface WeComConfig {
   enabled: boolean
@@ -22,7 +22,7 @@ export function weComSecretFile(home: string): string {
   return path.join(home, 'personal-assistant', 'wecom.secret')
 }
 
-type FrameLike = { body?: Record<string, unknown> }
+type FrameLike = { body?: Record<string, unknown>; headers?: { req_id?: unknown } }
 
 function objectOf(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
@@ -54,26 +54,22 @@ export interface WeComAdapterOptions {
 export function createWeComAdapter(options: WeComAdapterOptions): ChannelAdapter & { connected(): boolean } {
   let client: InstanceType<typeof AiBot.WSClient> | null = null
   let authenticated = false
-  const frames = new WeakMap<object, FrameLike>()
 
-  const replyTo = async (frame: FrameLike, chatId: string, text: string): Promise<void> => {
-    if (client && typeof frame === 'object' && frame !== null) {
-      try {
-        await client.replyStream(frame as never, generateReqId('stream'), text, true)
-        return
-      } catch (error) {
-        options.log(`[wecom] 流式回复失败，改用主动发送：${error instanceof Error ? error.message : String(error)}`)
-      }
+  const replyTo = async (source: InstanceType<typeof AiBot.WSClient>, frame: FrameLike, text: string): Promise<void> => {
+    if (client !== source || !authenticated || !source.isConnected || typeof frame.headers?.req_id !== 'string' || !frame.headers.req_id) {
+      throw new ChannelReplyError('not-sent', '企业微信连接或原始回复标识不可用，未发送回复')
     }
-    await sendTo(chatId, text)
+    try { await source.replyStream(frame as never, generateReqId('stream'), text, true) }
+    catch { throw new ChannelReplyError('unknown', '企业微信回复结果未知，不自动切换主动发送') }
   }
 
   const sendTo = async (chatId: string, text: string): Promise<void> => {
-    if (!client) throw new Error('企业微信机器人未连接')
+    if (!client || !authenticated || !client.isConnected) throw new Error('企业微信机器人未连接')
     await client.sendMessage(chatId, { msgtype: 'markdown', markdown: { content: text } } as never)
   }
 
-  const dispatch = (frame: FrameLike): void => {
+  const dispatch = (source: InstanceType<typeof AiBot.WSClient>, frame: FrameLike): void => {
+    if (client !== source || !authenticated || !source.isConnected) return
     const body = objectOf(frame.body)
     if (!body) return
     const msgid = typeof body.msgid === 'string' ? body.msgid : ''
@@ -82,12 +78,13 @@ export function createWeComAdapter(options: WeComAdapterOptions): ChannelAdapter
     const chatId = chatType === 'group' ? (typeof body.chatid === 'string' ? body.chatid : '') : senderId
     const text = textOf(body).trim()
     if (!msgid || !chatType || !senderId || !chatId || !text) return
-    frames.set(frame as object, frame)
+    // 当前 SDK 回复只使用 req_id；入队后不再引用可变的原始事件或消息正文。
+    const replyFrame: FrameLike = { headers: { req_id: frame.headers?.req_id } }
     void options.onMessage({
-      channel: 'wecom', msgid, chatId, chatType, senderId, text,
-      reply: message => replyTo(frame, chatId, message),
-    }).catch(error => {
-      options.log(`[wecom] 处理消息失败：${error instanceof Error ? error.message : String(error)}`)
+      channel: 'wecom', accountId: options.botId, msgid, chatId, chatType, senderId, text,
+      reply: message => replyTo(source, replyFrame, message),
+    }).catch(() => {
+      options.log('[wecom] 处理消息未完成，请在桌面核查；不会自动重发')
     })
   }
 
@@ -96,7 +93,7 @@ export function createWeComAdapter(options: WeComAdapterOptions): ChannelAdapter
     connected: () => authenticated && client?.isConnected === true,
     async start() {
       if (client) return
-      client = new AiBot.WSClient({
+      const current = new AiBot.WSClient({
         botId: options.botId,
         secret: options.secret,
         maxReconnectAttempts: -1,
@@ -104,22 +101,23 @@ export function createWeComAdapter(options: WeComAdapterOptions): ChannelAdapter
         logger: { debug: () => undefined, info: message => options.log(`[wecom] ${message}`),
           warn: message => options.log(`[wecom] ${message}`), error: message => options.log(`[wecom] ${message}`) },
       })
-      client.on('authenticated', () => { authenticated = true })
-      client.on('disconnected', () => { authenticated = false })
-      client.on('reconnecting', () => { authenticated = false })
-      client.on('message.text', (frame: FrameLike) => dispatch(frame))
-      client.on('message.voice', (frame: FrameLike) => dispatch(frame))
-      client.on('message.mixed', (frame: FrameLike) => dispatch(frame))
-      client.on('event.enter_chat', (frame: FrameLike) => {
+      client = current
+      current.on('authenticated', () => { if (client === current) authenticated = true })
+      current.on('disconnected', () => { if (client === current) authenticated = false })
+      current.on('reconnecting', () => { if (client === current) authenticated = false })
+      current.on('message.text', (frame: FrameLike) => dispatch(current, frame))
+      current.on('message.voice', (frame: FrameLike) => dispatch(current, frame))
+      current.on('message.mixed', (frame: FrameLike) => dispatch(current, frame))
+      current.on('event.enter_chat', (frame: FrameLike) => {
         const body = objectOf(frame.body)
         const chatType = body?.chattype === 'group' ? 'group' : 'single'
         const chatId = chatType === 'group' ? String(body?.chatid ?? '') : String(objectOf(body?.from)?.userid ?? '')
-        if (!chatId || !client) return
-        void client.replyWelcome(frame as never, { msgtype: 'text', text: { content: '你好，我是小潘。可以直接给我发消息。' } } as never)
+        if (!chatId || client !== current || !authenticated || !current.isConnected) return
+        void current.replyWelcome(frame as never, { msgtype: 'text', text: { content: '你好，我是小潘。可以直接给我发消息。' } } as never)
           .catch(() => undefined)
       })
-      client.on('error', (error: unknown) => options.log(`[wecom] 连接错误：${error instanceof Error ? error.message : String(error)}`))
-      client.connect()
+      current.on('error', (error: unknown) => { if (client === current) options.log(`[wecom] 连接错误：${error instanceof Error ? error.message : String(error)}`) })
+      current.connect()
     },
     async stop() {
       const current = client

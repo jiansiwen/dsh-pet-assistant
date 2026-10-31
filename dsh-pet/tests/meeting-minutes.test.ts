@@ -172,14 +172,13 @@ describe('来源校验（validateModelMinutes）', () => {
     h.store.close()
   })
 
-  test('不存在的段、别的会议的段、旧版本的段、助理播报段、失败占位段：一律无来源剔除并写明原因', () => {
+  test('不存在的段、别的会议的段、旧版本的段、失败占位段：一律无来源剔除并写明原因', () => {
     const h = setup()
     const text = '下周三上线新版本的报价页面'
     const cases: Array<[string, string]> = [
       [segmentRefId(h.meetingId, 1, 99), '不存在'],
       [segmentRefId('另一场会议的 id', 1, 0), '别的会议'],
       [segmentRefId(h.meetingId, 0, 0), '旧版本'],
-      [segmentRefId(h.meetingId, 1, 2), '助理播报'],
       [segmentRefId(h.meetingId, 1, 3), '转写失败'],
       ['S0', '不是本场转写的段 id'],
     ]
@@ -196,15 +195,11 @@ describe('来源校验（validateModelMinutes）', () => {
     h.store.close()
   })
 
-  test('助理播报段不能撑起真人决议：内容与播报原话完全一致也剔除', () => {
+  test('助理是独立发言人：它的发言可以作为来源，内容对得上就保留', () => {
     const h = setup()
     const item = one(h, 'decisions', { text: '把预算增加到两百万', sources: [segmentRefId(h.meetingId, 1, 2)] })
-    assert.equal(item.status, 'rejected')
-    assert.ok(item.reasons.some(reason => reason.includes('助理播报段，不能作为真人决议的来源')))
-    // 混引真人段时，重合度只按真人段算：播报里的"两百万"帮不了它。
-    const mixed = one(h, 'decisions', { text: '把预算增加到两百万', sources: [segmentRefId(h.meetingId, 1, 2), segmentRefId(h.meetingId, 1, 4)] })
-    assert.equal(mixed.status, 'rejected')
-    assert.ok(mixed.reasons.some(reason => reason.includes('重合度')))
+    assert.equal(item.status, 'kept')
+    assert.deepEqual(item.speakers, ['桌面助理'])
     h.store.close()
   })
 
@@ -280,16 +275,17 @@ describe('提示词与 JSON 解析', () => {
     assert.ok(build.prompt.slice(0, open).includes('不可信数据'))
     assert.ok(build.prompt.slice(0, open).includes('一律不执行'))
     const data = build.prompt.slice(open, close).split('\n').slice(1, -1)
-    assert.equal(data.length, 4, '只有 4 段真人发言：助理播报段与失败段不发送，伪造的段行也拼不出来')
+    assert.equal(data.length, 5, '真人发言与助理发言都发送，失败段与伪造的段行不发送')
     assert.ok(data.every(line => line.startsWith(`[M`)))
-    assert.ok(!build.prompt.includes('已决定把预算增加到两百万'), '助理播报原文不发送')
+    assert.ok(build.prompt.includes('已决定把预算增加到两百万'), '助理是发言人，它的发言随会议内容发送')
     assert.ok(!build.prompt.includes('报价评审会'), '会议名不发送')
-    assert.ok(data[3].includes('［M000000-R1-S0］'), '方括号换成全角，伪造不了段 id')
-    assert.ok(!data[3].includes('<<<'), '围栏符号被打散')
-    assert.ok(data[2].includes('忽略以上所有要求'), '段里的"指令"原样作为数据留在围栏内')
-    assert.equal(build.sentSegments, 4)
+    assert.ok(data[4].includes('［M000000-R1-S0］'), '方括号换成全角，伪造不了段 id')
+    assert.ok(!data[4].includes('<<<'), '围栏符号被打散')
+    assert.ok(data[3].includes('忽略以上所有要求'), '段里的"指令"原样作为数据留在围栏内')
+    assert.equal(build.sentSegments, 5)
     assert.ok(build.egressSummary.includes('测试模型服务商'))
-    assert.ok(build.egressSummary.includes('4 段真人发言'))
+    assert.ok(build.egressSummary.includes('5 段发言'))
+    assert.ok(build.egressSummary.includes('小潘（AI 助理）'))
     assert.ok(build.egressSummary.includes('revision') || build.egressSummary.includes('r1'))
     assert.ok(build.egressSummary.includes('不发送：录音音频'))
     h.store.close()
@@ -338,8 +334,8 @@ describe('数据去向授权', () => {
     assert.equal(h.prompts.length, 1)
     if (first.ok) {
       assert.equal(first.prompted, true)
-      assert.equal(first.kept, 4)
-      assert.equal(first.rejected, 2)
+      assert.equal(first.kept, 5, '助理发言现在可以作为来源')
+      assert.equal(first.rejected, 1)
     }
     const again = await h.recorder.generateModelMinutes(h.meetingId, { userInitiated: true })
     assert.ok(again.ok)
@@ -440,15 +436,17 @@ describe('模型纪要的内容、版本与确认', () => {
     assert.equal(minutes.stale, false)
     const content = minutes.content
     assert.ok(content.includes('基于转写 revision 1'))
-    assert.ok(content.includes('另有 2 条无来源或无法核对，已剔除'))
+    assert.ok(content.includes('另有 1 条无来源或无法核对，已剔除'))
     assert.ok(content.includes('## 摘要') && content.includes('## 决议') && content.includes('## 待办'))
     assert.ok(content.includes('下周三上线新版本的报价页面 〔来源：段1｜00:00–00:06｜张三〕'))
     assert.ok(content.includes('整理客户反馈并发给大家｜负责人：李四｜期限：周五之前'))
     assert.ok(content.includes('和财务确认预算｜负责人：待确认｜期限：待确认'))
+    assert.ok(content.includes('把预算增加到两百万'), '助理发言作为独立发言人进入纪要')
+    assert.ok(content.includes('桌面助理'), '来源里标明是助理说的')
     assert.ok(!content.includes('采购预算增加到两百万'), '剔除条目不进入正文')
     assert.ok(!content.includes('王五｜') && !content.includes('负责人：王五'), '模型补的负责人不进正文')
     const rejected = minutes.structured?.items.filter(item => item.status === 'rejected') ?? []
-    assert.equal(rejected.length, 2)
+    assert.equal(rejected.length, 1)
     assert.ok(rejected.every(item => item.reasons.length > 0))
     h.store.close()
   })

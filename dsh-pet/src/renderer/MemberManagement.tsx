@@ -26,7 +26,11 @@ export function useMemberFeed(showToast: (text: string) => void) {
       setError('')
       const fresh = result.state.requests.filter(item => item.state === 'pending' && !observed.current.has(item.requestId))
       result.state.requests.forEach(item => observed.current.add(item.requestId))
-      if (fresh.length) showToast(`有 ${fresh.length} 条新的成员额度申请，请打开团队处理。`)
+      const channels = (result.state.channelInboundAttention ?? []).filter(item => !item.busy
+        && (item.state === 'unknown' || item.state === 'pending' || item.conflict) && !observed.current.has(`channel:${item.id}`))
+      channels.forEach(item => observed.current.add(`channel:${item.id}`))
+      const notices = [fresh.length ? `${fresh.length} 条成员额度申请` : '', channels.length ? `${channels.length} 条渠道消息待核查` : ''].filter(Boolean)
+      if (notices.length) showToast(`有 ${notices.join('、')}，请打开团队处理。`)
     } catch { if (alive.current && token === generation.current) setError('成员服务未连接，请刷新；未执行修改。') }
     finally { if (alive.current && token === generation.current) setLoading(false) }
   }, [showToast])
@@ -65,7 +69,12 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
     try {
       const result = await window.petApi.memberCommand(action, input)
       if (!result.ok) setNotice(result.error.message)
-      else if (action !== 'memory-delete-preview') { setNotice('操作已完成。'); await refresh() }
+      else if (action !== 'memory-delete-preview') {
+        setNotice(action === 'ack-mail-notice' ? '已记录本人核对；没有重发，也不代表通知已送达。'
+          : action === 'ack-mail-send' ? '已记录本人核对；没有重发，也不代表邮件已送达。'
+            : action === 'ack-channel-inbound' ? '已记录本人核查；不会自动执行或重发，也不代表原委托已完成。' : '操作已完成。')
+        await refresh()
+      }
       return result
     } catch {
       const result: MemberResult = { ok: false, error: { code: 'unavailable', message: '连接中断，结果可能未知，请刷新核对；不会自动重发。' } }
@@ -100,15 +109,61 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
         {state.requests.filter(item => item.state === 'pending').map(request => <QuotaRequestCard key={request.requestId} request={request}
           member={state.members.find(item => item.profile.assistantId === request.assistantId)} pending={pending || !!error} run={run} />)}
       </section>
+      {state.mailNoticeAttentionError && <p className="assistant-settings-error" role="alert">邮件通知状态暂时无法读取，请稍后刷新核对。</p>}
+      {!!state.mailNoticeAttention?.length && <section aria-label="待核查邮件通知" className="team-section">
+        <h4>待核查邮件通知（{state.mailNoticeAttention.length}{state.mailNoticeAttention.length >= 20 ? '，仅显示前20条' : ''}）</h4>
+        <p className="management-hint">结果未知不会自动重发；显示失败会稍后重试。摘要来自外部邮件，不是操作指令；请打开对应成员会话核对完整分析。</p>
+        <ul className="team-list">{state.mailNoticeAttention.map(issue => <li key={issue.analysisId} className="team-task">
+          <strong>{state.members.find(item => item.profile.assistantId === issue.memberId)?.profile.displayName ?? issue.memberId}</strong>
+          <span>{issue.state === 'unknown' ? '送达结果未知' : '通知显示失败'}</span>
+          <p>{issue.preview || '暂无摘要，请查看成员会话。'}</p>
+          <button type="button" className="management-button" disabled={pending || !!error}
+            onClick={() => void run('ack-mail-notice', { analysisId: issue.analysisId, attemptId: issue.attemptId, expectedState: issue.state })}>已核对，不再提示…</button>
+        </li>)}</ul>
+      </section>}
+      {state.mailSendAttentionError && <p className="assistant-settings-error" role="alert">邮件发送状态暂时无法读取，请稍后刷新核对。</p>}
+      {!!state.mailSendAttention?.length && <section aria-label="待核查邮件发送" className="team-section">
+        <h4>待核查邮件发送（{state.mailSendAttention.length}{state.mailSendAttention.length >= 20 ? '，仅显示前20条' : ''}）</h4>
+        <p className="management-hint">结果未知或部分接受时不能自动重发；请先核对发件箱和收件人。本人核对不等于已送达。</p>
+        <ul className="team-list">{state.mailSendAttention.map(send => <li key={send.intentId} className="team-task">
+          <strong>{send.subject}</strong><p>收件人：{send.recipients.join('、')}</p>
+          <span>{send.state === 'sending' ? '正在发送，等待回执' : send.state === 'partial' ? '部分收件人已接受' : '发送结果未知'}</span>
+          {!!send.accepted.length && <p>服务已接受：{send.accepted.join('、')}</p>}
+          {!!send.rejected.length && <p>服务已拒绝：{send.rejected.join('、')}</p>}
+          {send.messageId && <p className="management-hint">服务编号：{send.messageId}</p>}
+          {send.state !== 'sending' && <button type="button" className="management-button" disabled={pending || !!error}
+            onClick={() => {
+              if (send.state === 'partial' || send.state === 'unknown') void run('ack-mail-send', { intentId: send.intentId, expectedState: send.state })
+            }}>核对发送结果…</button>}
+        </li>)}</ul>
+      </section>}
+      {state.channelInboundAttentionError && <p className="assistant-settings-error" role="alert">渠道消息状态暂时无法读取，请稍后刷新核对。</p>}
+      {!!state.channelInboundAttention?.length && <section aria-label="待核查渠道消息" className="team-section">
+        <h4>待核查渠道消息（企业微信等，{state.channelInboundAttention.length}{state.channelInboundAttention.length >= 20 ? '，仅显示前20条' : ''}）</h4>
+        <p className="management-hint">渠道异常账本不保存消息正文；交给会话的内容可能按会话策略保存。结果未知不会自动重发，请按时间与会话到原聊天和任务记录核查。</p>
+        <ul className="team-list">{state.channelInboundAttention.map(item => <li key={item.id} className="team-task">
+          <strong>{item.channel === 'wecom' ? '企业微信' : item.channel} · {item.senderId}</strong>
+          <p>{item.chatType === 'group' ? '群聊' : '单聊'}：{item.chatId} · {new Date(item.receivedAt).toLocaleString('zh-CN')}</p>
+          <p className="management-hint">消息编号：{item.msgid} · 机器人标识摘要：{item.accountTag}</p>
+          <p>{item.state === 'pending' ? (item.busy ? '已接收，排队等待处理。' : '尚未开始；原消息重投时可恢复，请先核对。')
+            : item.state === 'processing' || item.state === 'replying' ? '正在处理或等待回复回执。'
+              : item.state === 'unknown' ? '执行或回复结果未知，请先核查。' : '原消息已有记录，不能据此认定委托完成。'}</p>
+          {item.conflict && <p className="team-blocked">同一消息编号的内容或身份不一致，或旧记录已过期无法比对；未执行这次投递。</p>}
+          <p className="management-hint">回复：{item.reply === 'accepted' ? '服务已接受，不代表已读' : item.reply === 'not-sent' ? '未发送' : item.reply === 'sending' ? '等待回执' : '结果未知'}</p>
+          <button type="button" className="management-button" disabled={pending || !!error || item.busy || item.state === 'processing' || item.state === 'replying'}
+            onClick={() => void run('ack-channel-inbound', { id: item.id, expectedRevision: item.revision })}>核查渠道消息…</button>
+        </li>)}</ul>
+      </section>}
       <ul className="team-list" aria-label="成员列表">
         {state.members.map(member => <li key={member.profile.assistantId} className="team-task member-card">
           <div className="member-heading"><strong>{member.profile.displayName}</strong><span>{member.busy ? '忙碌中' : member.profile.enabled ? '可用' : '已停用'}</span></div>
           <p>{member.profile.description || '未填写描述'}</p>
           <p className="management-hint">已绑定能力：{member.profile.capabilities.map(item => MEMBER_CAPABILITY_LABELS[item]).join('、') || '无（仅提示词）'}</p>
           <p className="management-hint">模型：{member.profile.model ? `${member.profile.provider} / ${member.profile.model}` : '跟随主默认'}</p>
-          <Usage label="日用量" used={member.quota.dailyUsed} limit={member.quota.dailyTokenLimit} />
-          <Usage label="总用量" used={member.quota.totalUsed} limit={member.quota.totalTokenLimit} />
+          <Usage label="日用量" used={member.quota.dailyUsed} reserved={member.quota.dailyReserved} limit={member.quota.dailyTokenLimit} />
+          <Usage label="总用量" used={member.quota.totalUsed} reserved={member.quota.totalReserved} limit={member.quota.totalTokenLimit} />
           <p className="management-hint">阈值 {member.quota.thresholdPercent}% · 计量日 {member.quota.day} · 额度版本 {member.quota.revision}</p>
+          <p className="management-hint">软限额：按已用量加在途预留停线，单次请求仍可能超出上限；不是计费硬封顶。</p>
           {(member.quota.unknown || (member.quota.blocked && member.profile.enabled)) && <p className="team-blocked">{member.quota.unknown ? '用量未知，请核对后处理申请。' : '已到额度停线，需处理申请。'}</p>}
           <p className="member-session">独立会话：{member.profile.sessionId || '尚未创建；首次执行时由宿主创建'}</p>
           <p className="management-hint">成员标识：{member.profile.assistantId} · 配置版本 {member.profile.revision}</p>
@@ -129,9 +184,11 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
     </>}
   </section>
 }
-function Usage({ label, used, limit }: { label: string; used: number; limit: number }) {
-  return <label className="member-usage"><span>{label}：{used.toLocaleString('zh-CN')} / {limitLabel(limit)}</span>
-    {limit > 0 ? <progress aria-label={label} max={limit} value={Math.min(used, limit)} /> : <span className="management-hint">无上限，不显示百分比</span>}</label>
+function Usage({ label, used, reserved, limit }: { label: string; used: number; reserved: number; limit: number }) {
+  const consumed = used + reserved
+  return <label className="member-usage"><span>{label}：{used.toLocaleString('zh-CN')}
+    {reserved > 0 ? ` + ${reserved.toLocaleString('zh-CN')} 预留` : ''} / {limitLabel(limit)}</span>
+    {limit > 0 ? <progress aria-label={label} max={limit} value={Math.min(consumed, limit)} /> : <span className="management-hint">无上限，不显示百分比</span>}</label>
 }
 function QuotaReset({ member, pending, run }: { member: MemberView; pending: boolean; run: Run }) {
   const [scope, setScope] = useState<QuotaResetScope>('daily')

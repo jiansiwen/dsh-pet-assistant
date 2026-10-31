@@ -4,14 +4,18 @@
  * 纯类型导入，运行时被擦除，不会把 electron 拖进渲染层的包。
  */
 import type { CompanionState } from '../main/companion-host.js'
+import type { MeetingMailOutcome } from '../main/approval-policy.js'
 import type {
   MeetingConsentInput,
+  MeetingIntegrity,
+  MeetingMinutesArtifact,
   MinutesRecord,
   TranscriptSegment,
 } from '../main/meeting-store.js'
 import type {
   LiveCaption,
   MeetingChunkMeta,
+  MeetingFlushReport,
   MeetingMinutesView,
   MeetingRuntimeState,
   MeetingTrack,
@@ -221,6 +225,7 @@ export interface DecideApprovalResult {
   digest?: string
   modeExited?: boolean
   message?: string
+  meetingMail?: MeetingMailOutcome
   error?: string
 }
 
@@ -294,7 +299,7 @@ export interface DocReplyResult {
 // ===== 会议闭环（P6）=====
 
 /** 分轨协议（M4-02）：音轨、每块的时间轴信息、临时字幕。真源在 meeting-recorder.ts。 */
-export type { LiveCaption, MeetingChunkMeta, MeetingTrack }
+export type { LiveCaption, MeetingChunkMeta, MeetingFlushReport, MeetingIntegrity, MeetingTrack }
 export type { MeetingMinutesView, MinutesGenerateResult, MinutesItem, MinutesItemPatch, MinutesView, StructuredMinutes }
 
 /** 通用回执。error 非空时是给用户看的那句拒绝/故障原因。 */
@@ -335,6 +340,7 @@ export interface MeetingSpeakersResult {
   readonly speakers?: MeetingSpeakerBrief[]
   /** 最近一次机器转写的分人模式与说明；userEdited = 之后有过人工修订。旧会议为 null。 */
   readonly transcript?: { readonly mode: 'diarized' | 'partial' | 'undiarized'; readonly note: string | null; readonly userEdited: boolean } | null
+  readonly integrity?: MeetingIntegrity | null
 }
 
 /** 常驻与语音开关（M1-02 / M1-05）的实际状态。真源在主进程：audio-prefs.ts + 仲裁器 + 壳层。 */
@@ -401,6 +407,12 @@ export interface MeetingMinutesExportResult {
   readonly digest?: string
   readonly confirmedAt?: number
   readonly kind?: 'local' | 'model'
+}
+
+export interface MeetingMinutesFileResult {
+  readonly ok: boolean
+  readonly error?: string
+  readonly artifact?: MeetingMinutesArtifact
 }
 
 /** 改一条纪要的回执。digest 是改后的新版本（旧确认已失效）。 */
@@ -479,7 +491,7 @@ export interface PetApi extends MemberApi {
   /** 听写第一拍：申请麦克风并开流式会话。streaming=true 时走逐帧喂数。 */
   onVoiceTurnComplete(callback: (event: import('../session-types.js').VoiceTurnCompletion) => void): () => void
   onVoiceConversationStop(callback: () => void): () => void
-  asrBegin(): Promise<{ ok: boolean; streaming?: boolean; error?: string }>
+  asrBegin(options?: { bargeIn?: boolean }): Promise<{ ok: boolean; streaming?: boolean; direct?: boolean; error?: string }>
   // ===== 共享采集 / 唤醒 / 插话（M1-02、M1-03、M1-05）=====
   onAudioGrants(callback: (grants: import('./barge-in.ts').AudioGrantsPayload) => void): () => void
   audioSync(): Promise<import('./barge-in.ts').AudioGrantsPayload>
@@ -585,7 +597,7 @@ export interface PetApi extends MemberApi {
    * 开一场会议录制。consent 必填项缺一个都会被拒：名字、来源、知情同意文本、
    * 勾选状态、保留天数。拒绝原因在 error 里，是要显示给用户的那句话。
    */
-  meetingStart(consent: MeetingConsentInput): Promise<MeetingStartResult>
+  meetingStart(consent: MeetingConsentInput, requestId?: string): Promise<MeetingStartResult>
   /** 请求停止当前会议：主进程先让渲染层停流冲刷，再结算转写。 */
   meetingStop(meetingId?: string): Promise<SimpleOkResult>
   /** 子助理发起的会议启动参数；面板挂载时取一次，同一 requestId 只处理一次。 */
@@ -604,7 +616,7 @@ export interface PetApi extends MemberApi {
    */
   meetingLoopbackCapability(): Promise<{ available: boolean; reason: string | null }>
   /** 渲染层停流并推完最后一块后回报，触发结算与转写。 */
-  meetingFlushDone(meetingId: string): Promise<SimpleOkResult>
+  meetingFlushDone(meetingId: string, report?: MeetingFlushReport): Promise<SimpleOkResult>
   /** 拉一次会议运行时状态（录音中/停止中/转写进度/最近会议）。 */
   meetingState(): Promise<MeetingRuntimeState>
   /** 手动重跑转写（转写失败后的重试入口）。录音始终保留；已有人工修订时只重试失败片段。 */
@@ -630,6 +642,7 @@ export interface PetApi extends MemberApi {
   meetingMinutesEditItem(meetingId: string, itemId: string, patch: MinutesItemPatch): Promise<MeetingMinutesEditResult>
   /** 取已确认的定稿正文（与确认时预览的那份一致）。 */
   meetingMinutesExport(meetingId: string): Promise<MeetingMinutesExportResult>
+  meetingMinutesSaveFile(meetingId: string, digest: string, revision: number): Promise<MeetingMinutesFileResult>
   /**
    * 把已确认的会议纪要交给个人助理，成为日报可引用的证据。
    * 主进程先弹原生对话框（正文预览 + 去向）；取消则一个请求都不发。

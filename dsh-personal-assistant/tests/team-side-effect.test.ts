@@ -17,8 +17,14 @@ test('默认配置不设累计预算：副作用任务真实启动，工具面�
   const { task, pending } = await f.startSideEffect()
   assert.equal(task.status, 'running')
   const request = f.requests[0]!
-  assert.deepEqual(request.toolFilter, { allow: ['read', 'grep', 'bash', 'write', 'edit'] })
-  for (const name of ['todo_write', 'subagent', 'report', 'structured_output']) assert.equal(request.toolFilter!.allow!.includes(name), false, name)
+  assert.ok(request.label, '真实运行标签必须绑定到宿主描述符')
+  assert.equal((await f.exec('read', { file_path: path.join(f.workspace, 'a.txt') })).isError, false)
+  for (const name of ['todo_write', 'subagent']) {
+    const blocked = await f.exec(name, {})
+    assert.equal(blocked.isError, true)
+    assert.match(JSON.stringify(blocked.content), /不在团队允许集合|禁止/u, '必须由门禁拒绝而非替身异常')
+  }
+  assert.deepEqual(f.bodies, ['read'], '不允许的工具不能进入工具体')
   const prompt = (request.prompt[0] as { text: string }).text
   assert.match(prompt, /副作用任务/)
   assert.ok(prompt.includes(f.workspace), '提示词说明写类工具的授权工作区')
@@ -213,8 +219,19 @@ test('副作用并发上限：启动中的副作用任务占住额度，第二�
 test('没有工作区时写类工具不放行；宿主工具参数不带门禁字段时副作用任务如实拒启', async t => {
   const f = await sideEffectHost(t, { noWorkspace: true })
   const { pending } = await f.startSideEffect()
-  assert.deepEqual(f.requests[0]!.toolFilter, { allow: ['read', 'grep', 'bash'] })
-  assert.equal((await f.exec('write', { file_path: 'a.txt', content: 'x' })).isError, true)
+  assert.equal((await f.exec('read', { file_path: 'a.txt' })).isError, false)
+  const write = await f.exec('write', { file_path: 'a.txt', content: 'x' })
+  assert.equal(write.isError, true)
+  assert.match(JSON.stringify(write.content), /不在团队允许集合|禁止/u)
+  const edit = await f.exec('edit', { file_path: 'a.txt', old_string: 'a', new_string: 'b' })
+  assert.equal(edit.isError, true)
+  assert.match(JSON.stringify(edit.content), /不在团队允许集合|禁止/u)
+  const command = f.exec('bash', { command: '隔离测试命令' })
+  const card = await f.pendingCard()
+  assert.equal(card.tool, 'bash', '无工作区也不能跳过命令审批')
+  f.approvals.reject(card.proposalId, desktop, true)
+  assert.equal((await command).isError, true)
+  assert.deepEqual(f.bodies, ['read'], '写入和被拒命令都不能进入工具体')
   f.finish()
   await pending
 

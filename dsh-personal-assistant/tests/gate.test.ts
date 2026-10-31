@@ -65,7 +65,7 @@ test('真实宿主执行链：只读集合拦继承及自身层副作用，不�
   for (const name of ['read', 'write', 'personal_assistant_remember', 'desktop_team_assign']) h.register(name)
   h.register('local_write', true)
   h.register('report', true)
-  installReadOnlyGate(h.scope.ctx)
+  installReadOnlyGate(h.key)
   const parent = { id: 'parent' } as Agent
   for (const name of ['write', 'personal_assistant_remember', 'desktop_team_assign', 'local_write']) {
     assert.equal((await h.run(name)).isError, true)
@@ -74,15 +74,19 @@ test('真实宿主执行链：只读集合拦继承及自身层副作用，不�
   assert.equal((await h.run('report')).isError, false)
   assert.equal((await h.run('write', {}, parent)).isError, false)
   assert.deepEqual(h.calls, ['read', 'report', 'write'])
-  assert.throws(() => installReadOnlyGate(h.ctx), /agent.ctx/)
+  assert.throws(() => installReadOnlyGate({} as Agent), /agent.ctx/)
+  assert.throws(() => installReadOnlyGate(h.ctx as never), '全局上下文不能冒充精确代理')
 })
 
 test('真实宿主启动前守卫：随机持久标签精确匹配，释放不影响普通会话', async t => {
   const h = await host(t)
   h.register('write')
-  Object.assign(h.key, { session: { header: { parentSession: 'parent' }, events: [{ type: 'subagent/descriptor', data: { label: 'run-1' } }] } })
+  const events = [{ type: 'subagent/descriptor', data: { label: 'run-1' } }]
+  Object.assign(h.key, { session: { header: { parentSession: 'parent' }, events, snapshotEvents: () => events } })
   const release = installDelegationReadOnlyGate(h.ctx, 'parent', 'run-1', [])
-  assert.equal((await h.run('write')).isError, true)
+  const blocked = await h.run('write')
+  assert.equal(blocked.isError, true)
+  assert.match(JSON.stringify(blocked.content), /只读委派禁止/u, '必须由定向门禁拒绝，不能靠替身异常误判')
   assert.equal((await h.run('write', {}, { id: 'parent' } as Agent)).isError, false)
   release()
   assert.equal((await h.run('write')).isError, false)
@@ -96,7 +100,7 @@ test('真实宿主审批门禁：完整参数、成员和版本绑定，真实�
   const proposal = service.propose({ taskId: 'task', assistantId: 'chief', tool: 'write', target: 'virtual.txt',
     params, inputRevision: 1, summary: '测试提案', risk: 'low' })
   service.issue(proposal.proposalId, { channel: 'local-ui' }, true)
-  const release = installApprovalGate(h.scope.ctx, { taskId: 'task', assistantId: 'chief', inputRevision: 1, approvals: service, label: '测试' })
+  const release = installApprovalGate(h.key, { taskId: 'task', assistantId: 'chief', inputRevision: 1, approvals: service, label: '测试' })
   assert.equal((await h.run('write', { ...params, content: '被替换' })).isError, true)
   assert.equal((await h.run('write', params)).isError, false)
   assert.equal(service.operations()[0]?.state, 'succeeded')
@@ -114,7 +118,7 @@ test('工具失败不冒充无副作用，未知账目阻止盲重试', async t 
   const proposal = service.propose({ taskId: 'task', assistantId: 'chief', tool: 'write', target: 'virtual.txt', params,
     inputRevision: 1, summary: '测试提案', risk: 'low' })
   service.issue(proposal.proposalId, { channel: 'local-ui' }, true)
-  installApprovalGate(h.scope.ctx, { taskId: 'task', assistantId: 'chief', inputRevision: 1, approvals: service, label: '测试' })
+  installApprovalGate(h.key, { taskId: 'task', assistantId: 'chief', inputRevision: 1, approvals: service, label: '测试' })
   assert.equal((await h.run('write', params)).isError, true)
   assert.equal(service.operations()[0]?.state, 'unknown')
   assert.equal((await h.run('write', params)).isError, true)

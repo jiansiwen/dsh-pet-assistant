@@ -17,6 +17,7 @@ import {
   confirmDialogSpec,
   ellipsizeMiddle,
   formatCountdown,
+  meetingMailOutcomeText,
   needsNativeConfirm,
   normalizeTarget,
   riskOf,
@@ -24,6 +25,21 @@ import {
   type ApprovalProposal,
   type SenderFacts,
 } from '../src/main/approval-policy.ts'
+
+describe('会议邮件结果提示', () => {
+  it('提醒尚未登记时必须说明邮件已接受且不要重发', () => {
+    const text = meetingMailOutcomeText({ state: 'pending', intentId: 'm1', acceptedAt: 1_800_000_000_000 })
+    assert.match(text.message + text.detail, /服务.*接受/u)
+    assert.match(text.message + text.detail, /提醒.*未登记/u)
+    assert.match(text.detail, /不要重发/u)
+  })
+  it('计划已登记不等于已送达或已读，缺少结果时只报告未知', () => {
+    const scheduled = meetingMailOutcomeText({ state: 'scheduled', intentId: 'm1', acceptedAt: 1_800_000_000_000,
+      taskId: 't1', runAt: '2027-01-15T08:02:00.000Z' })
+    assert.match(scheduled.detail, /不代表.*收件.*已读/u)
+    assert.match(meetingMailOutcomeText(undefined).message, /未知|未确认/u)
+  })
+})
 
 describe('助理范围确认', () => {
   const full: ApprovalProposal = {

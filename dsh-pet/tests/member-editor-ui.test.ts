@@ -25,7 +25,7 @@ function member(revision = 3): MemberView {
   return { profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', description: '通用研究', persona: '按证据回答',
     roleId: 'wukong', skinId: 'panda', voiceProfile: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision, sessionId: '独立会话甲', provider: '', model: '',
     maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' },
-    quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }
+    quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 0, totalReserved: 0, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }
 }
 const baseDraft: MemberDraft = { displayName: '日报助理', description: '整理日报', personality: '简洁直接', permissionMode: 'ask', persona: '只依据证据', skinId: 'panda',
   enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: ['activity'], allowedTools: [], dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai' }

@@ -17,9 +17,11 @@ import type {
   DocState,
   MeetingConsentInput,
   MeetingChunkMeta,
+  MeetingFlushReport,
   MeetingEditResult,
   MeetingMinutesEditResult,
   MeetingMinutesExportResult,
+  MeetingMinutesFileResult,
   MeetingMinutesResult,
   MeetingRuntimeState,
   MeetingSpeakersResult,
@@ -110,7 +112,8 @@ contextBridge.exposeInMainWorld('petApi', {
   openApproval: (proposalId: string) =>
     ipcRenderer.invoke('approval-open', proposalId) as Promise<{ ok: boolean; error?: string }>,
   /** 听写第一拍：申请麦克风并开流式会话。streaming=true 时走逐帧喂数。 */
-  asrBegin: () => ipcRenderer.invoke('asr-begin') as Promise<{ ok: boolean; streaming?: boolean; error?: string }>,
+  asrBegin: (options?: { bargeIn?: boolean }) =>
+    ipcRenderer.invoke('asr-begin', options) as Promise<{ ok: boolean; streaming?: boolean; direct?: boolean; error?: string }>,
   /** 流式喂数：一帧 16kHz Int16 PCM（base64），返回当前累积的识别文本。 */
   asrStreamFeed: (chunkBase64: string) =>
     ipcRenderer.invoke('asr-stream-feed', chunkBase64) as Promise<{ text: string }>,
@@ -234,8 +237,8 @@ contextBridge.exposeInMainWorld('petApi', {
   // 音频采集在渲染层（getUserMedia），主进程只做加密落盘、仲裁与转写。
   // 停止是两段式：meeting-stop 让渲染层停流并冲刷最后一块，渲染层推完再调
   // meeting-flush-done 触发结算——顺序反了会丢会议最后几秒。
-  meetingStart: (consent: MeetingConsentInput) =>
-    ipcRenderer.invoke('meeting-start', consent) as Promise<MeetingStartResult>,
+  meetingStart: (consent: MeetingConsentInput, requestId?: string) =>
+    ipcRenderer.invoke('meeting-start', consent, requestId) as Promise<MeetingStartResult>,
   meetingStop: (meetingId?: string) =>
     ipcRenderer.invoke('meeting-stop', meetingId) as Promise<SimpleOkResult>,
   /** 桌面命令预填的会议启动参数；会议页挂载时取一次，收到即开录。 */
@@ -260,8 +263,8 @@ contextBridge.exposeInMainWorld('petApi', {
   meetingLoopbackCapability: () =>
     ipcRenderer.invoke('meeting-loopback-capability') as Promise<{ available: boolean; reason: string | null }>,
   /** 渲染层停流并推完最后一块后回报，触发结算与转写。 */
-  meetingFlushDone: (meetingId: string) =>
-    ipcRenderer.invoke('meeting-flush-done', meetingId) as Promise<SimpleOkResult>,
+  meetingFlushDone: (meetingId: string, report?: MeetingFlushReport) =>
+    ipcRenderer.invoke('meeting-flush-done', meetingId, report) as Promise<SimpleOkResult>,
   meetingState: () => ipcRenderer.invoke('meeting-state') as Promise<MeetingRuntimeState>,
   meetingTranscribe: (meetingId: string) =>
     ipcRenderer.invoke('meeting-transcribe', meetingId) as Promise<SimpleOkResult>,
@@ -287,6 +290,8 @@ contextBridge.exposeInMainWorld('petApi', {
     ipcRenderer.invoke('meeting-minutes', meetingId, { action: 'edit', itemId, patch }) as Promise<MeetingMinutesEditResult>,
   meetingMinutesExport: (meetingId: string) =>
     ipcRenderer.invoke('meeting-minutes', meetingId, { action: 'export' }) as Promise<MeetingMinutesExportResult>,
+  meetingMinutesSaveFile: (meetingId: string, digest: string, revision: number) =>
+    ipcRenderer.invoke('meeting-minutes', meetingId, { action: 'save-file', digest, revision }) as Promise<MeetingMinutesFileResult>,
   meetingMinutesUseLocal: (meetingId: string) =>
     ipcRenderer.invoke('meeting-minutes', meetingId, { action: 'use-local' }) as Promise<SimpleOkResult>,
   meetingMinutesConfirm: (meetingId: string, digest?: string) =>

@@ -31,6 +31,19 @@ test('达到阈值先申请、额度耗尽阻止下一请求、可信批准重�
   assert.throws(() => directory.beginUsage(id, 'fifth'), /额度/)
 })
 
+test('在途预留也计入阈值，不必等结算才申请', t => {
+  const store = new TeamStore(':memory:')
+  t.after(() => store.close())
+  const directory = store.directory
+  const member = directory.create({ ...draft, dailyTokenLimit: 1000, totalTokenLimit: 0, thresholdPercent: 80, maxTokens: 1000 })
+  assert.equal(directory.requests().length, 0)
+  assert.equal(directory.beginUsage(member.assistantId, 'reserve-all').maxTokens, 1000)
+  const quota = directory.quota(member.assistantId)
+  assert.equal(quota.dailyUsed, 0, '还没有结算')
+  assert.equal(quota.dailyReserved, 1000)
+  assert.equal(directory.requests().filter(item => item.state === 'pending').length, 1, '预留已占满阈值就应先申请')
+})
+
 test('半套模型配置拒绝，关闭日限额仍受总限额约束', t => {
   const store = new TeamStore(':memory:')
   t.after(() => store.close())

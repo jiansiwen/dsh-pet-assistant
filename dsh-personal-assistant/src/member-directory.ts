@@ -27,6 +27,12 @@ export function migrateMemberDirectory(db: DatabaseSync): void {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_member_session ON assistant_profiles(json_extract(data, '$.sessionId'))
       WHERE json_extract(data, '$.sessionId') IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS member_channel_sessions (
+      assistant_id TEXT NOT NULL REFERENCES assistants(assistant_id),
+      scope TEXT NOT NULL,
+      session_id TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (assistant_id, scope)
+    );
     CREATE TABLE IF NOT EXISTS member_quota_accounts (
       assistant_id TEXT PRIMARY KEY REFERENCES assistants(assistant_id),
       revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0)
@@ -216,7 +222,8 @@ export class MemberDirectory {
       const current = this.require(id)
       if (current.revision !== expectedRevision) throw new Error('成员修订冲突，请刷新后重试')
       this.validateUnique(normalized, id)
-      const permissionsChanged = !sameSet(current.capabilities, normalized.capabilities) || !sameSet(current.allowedTools, normalized.allowedTools)
+      const permissionsChanged = current.permissionMode !== normalized.permissionMode
+        || !sameSet(current.capabilities, normalized.capabilities) || !sameSet(current.allowedTools, normalized.allowedTools)
         || current.toolPolicy.mode !== 'read-only'
       const next: MemberProfile = { ...current, ...normalized, revision: current.revision + 1,
         toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: permissionsChanged ? null : current.sessionId }
@@ -225,6 +232,7 @@ export class MemberDirectory {
         JSON.stringify(next.toolPolicy), next.revision, id, expectedRevision)
       if (Number(changed.changes) !== 1) throw new Error('成员修订冲突，请刷新后重试')
       this.saveExtra(next)
+      if (permissionsChanged) this.db.prepare('DELETE FROM member_channel_sessions WHERE assistant_id = ?').run(id)
       if (current.dailyTokenLimit !== next.dailyTokenLimit || current.totalTokenLimit !== next.totalTokenLimit
         || current.thresholdPercent !== next.thresholdPercent || current.timezone !== next.timezone) {
         this.advanceQuota(id, this.quotaRevision(id))
@@ -245,7 +253,7 @@ export class MemberDirectory {
       const profile = this.require(id)
       if (profile.revision !== expectedRevision) throw new Error('成员修订冲突，请刷新后重试')
       if (this.hasInFlight(id)) throw new Error('成员仍有进行中的请求，结算前不能删除')
-      for (const table of ['member_usage', 'member_quota_requests', 'member_quota_resets', 'member_quota_accounts', 'assistant_profiles']) {
+      for (const table of ['member_channel_sessions', 'member_usage', 'member_quota_requests', 'member_quota_resets', 'member_quota_accounts', 'assistant_profiles']) {
         this.db.prepare(`DELETE FROM ${table} WHERE assistant_id = ?`).run(id)
       }
       const changed = this.db.prepare('DELETE FROM assistants WHERE assistant_id = ? AND revision = ?').run(id, expectedRevision)
@@ -261,7 +269,35 @@ export class MemberDirectory {
       if (sessionId !== null && this.list().some(member => member.assistantId !== id && member.sessionId === sessionId)) {
         throw new Error('成员必须使用独立会话，不能共用其他成员的会话')
       }
+      if (sessionId !== null && this.db.prepare('SELECT 1 FROM member_channel_sessions WHERE session_id = ?').get(sessionId)) {
+        throw new Error('成员桌面会话不能与渠道会话共用')
+      }
       this.saveExtra({ ...profile, sessionId })
+      // 记忆撤销或修订会调用 setSession(null)：渠道历史同样可能包含旧记忆，引用必须一起失效。
+      if (sessionId === null) this.db.prepare('DELETE FROM member_channel_sessions WHERE assistant_id = ?').run(id)
+    })
+  }
+
+  /** 只保存不可逆的渠道范围摘要与会话引用，不复制或删除旧会话正文。 */
+  getChannelSession(id: string, scope: string): string | null {
+    this.require(id)
+    if (!/^[a-f0-9]{64}$/u.test(scope)) throw new Error('渠道会话范围无效')
+    const row = this.db.prepare('SELECT session_id FROM member_channel_sessions WHERE assistant_id = ? AND scope = ?').get(id, scope) as Row | undefined
+    return row ? String(row.session_id) : null
+  }
+
+  setChannelSession(id: string, scope: string, sessionId: string): void {
+    if (!/^[a-f0-9]{64}$/u.test(scope)) throw new Error('渠道会话范围无效')
+    sessionId = text(sessionId, '会话编号', 256, true)
+    this.transaction(() => {
+      this.require(id)
+      const previous = this.getChannelSession(id, scope)
+      if (previous !== null) {
+        if (previous !== sessionId) throw new Error('渠道会话已变化，不能覆盖')
+        return
+      }
+      if (this.list().some(member => member.sessionId === sessionId)) throw new Error('渠道会话不能与成员桌面会话共用')
+      this.db.prepare('INSERT INTO member_channel_sessions(assistant_id, scope, session_id) VALUES (?, ?, ?)').run(id, scope, sessionId)
     })
   }
 
@@ -313,14 +349,22 @@ export class MemberDirectory {
     const remaining = Math.max(0, Math.min(profile.maxTokens,
       profile.dailyTokenLimit === 0 ? MAX : profile.dailyTokenLimit - dailyUsed - dailyReserved,
       profile.totalTokenLimit === 0 ? MAX : profile.totalTokenLimit - totalUsed - totalReserved))
-    return { view: { day, dailyUsed, totalUsed, dailyTokenLimit: profile.dailyTokenLimit, totalTokenLimit: profile.totalTokenLimit,
-      thresholdPercent: profile.thresholdPercent, unknown, blocked: !profile.enabled || unknown || remaining < 1, revision: this.quotaRevision(id) }, remaining }
+    return { view: { day, dailyUsed, totalUsed, dailyReserved, totalReserved,
+      dailyTokenLimit: profile.dailyTokenLimit, totalTokenLimit: profile.totalTokenLimit,
+      thresholdPercent: profile.thresholdPercent, unknown, blocked: !profile.enabled || unknown || remaining < 1, revision: this.quotaRevision(id) },
+    remaining }
   }
 
   private atThreshold(view: MemberQuotaView): boolean {
     // 用整数比较，避免安全整数附近乘百分比后丢精度。
-    return view.unknown || [[view.dailyUsed, view.dailyTokenLimit], [view.totalUsed, view.totalTokenLimit]]
-      .some(([used, limit]) => limit > 0 && BigInt(used) * 100n >= BigInt(limit) * BigInt(view.thresholdPercent))
+    // 在途预留也要算进去：只看到已结算量会等真正越线才提示，达不到“快用完先问本人”的目的。
+    if (view.unknown) return true
+    const pairs: Array<[number, number, number]> = [
+      [view.dailyUsed, view.dailyReserved, view.dailyTokenLimit],
+      [view.totalUsed, view.totalReserved, view.totalTokenLimit],
+    ]
+    return pairs.some(([used, reserved, limit]) => limit > 0 &&
+      (BigInt(used) + BigInt(reserved)) * 100n >= BigInt(limit) * BigInt(view.thresholdPercent))
   }
   private requestRow(row: Row): MemberQuotaRequest {
     return { requestId: String(row.request_id), assistantId: String(row.assistant_id), reason: String(row.reason),
@@ -382,6 +426,8 @@ export class MemberDirectory {
       if (error) return { error, maxTokens: 0 }
       this.db.prepare(`INSERT INTO member_usage(request_id, assistant_id, day, timezone, reserved, tokens, state, started_at)
         VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?)`).run(requestId, id, view.day, profile.timezone, remaining, timestamp(now))
+      // 预留一落库就重新看阈值：否则要等这次请求结算后才提示，可能已经越线。
+      this.notifyThreshold(id, this.measure(profile, now).view, now)
       return { error: null, maxTokens: remaining }
     })
     if (result.error) throw new Error(result.error)

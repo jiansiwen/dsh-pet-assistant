@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Personal computer assistant plugin for DeepSeek Harness: tracks daily computer activity, answers what the user did today, and generates daily reports with long-term preference memory",
   "type": "module",
-  "main": "dist/index-1029163301.js",
+  "main": "dist/index-1030152635.js",
   "license": "MIT",
   "engines": {
     "node": ">=22"
@@ -64,7 +64,7 @@
     "zod": "4.4.3"
   },
   "exports": {
-    ".": "./dist/index-1029163301.js",
+    ".": "./dist/index-1030152635.js",
     "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },

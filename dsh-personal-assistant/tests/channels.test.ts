@@ -107,6 +107,15 @@ test('绑定提醒会话后才允许主动送达，其他会话拒绝', async t 
   assert.equal(await f.manager.deliver('wecom:single:u2', '不该发'), false)
 })
 
+test('单聊本人绑定撤销后，即使旧提醒会话残留也不再发送', async t => {
+  const f = fixture(t, { allowedUserIds: ['u1'], deliverHere: ['wecom:single:u1'] })
+  assert.equal(f.manager.canDeliver('wecom:single:u1'), true)
+  f.settings().allowedUserIds.length = 0
+  assert.equal(f.manager.canDeliver('wecom:single:u1'), false)
+  assert.equal(await f.manager.deliver('wecom:single:u1', '不能发送'), false)
+  assert.deepEqual(f.sent, [])
+})
+
 test('重连只替换渠道连接，保留配对及会话，停用后不投递', async t => {
   const f = fixture(t, { allowedUserIds: ['u1'], deliverHere: ['wecom:single:u1'] })
   await f.manager.handle(inbound({ text: '你好' }).message)

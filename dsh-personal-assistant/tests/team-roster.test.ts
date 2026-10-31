@@ -108,7 +108,7 @@ describe('resolveSeats：配置里的名单 → 谁上台', () => {
   })
 })
 
-describe('ensureRoster：新库按配置建，老库只对齐 enabled', () => {
+describe('ensureRoster：新库按配置建，老库保留本人持久配置', () => {
   test('全新库里默认只启用三人', () => {
     const { team, writes } = makeTeam()
     const members = team.ensureRoster()
@@ -124,13 +124,13 @@ describe('ensureRoster：新库按配置建，老库只对齐 enabled', () => {
     assert.equal(team.ensureRoster().filter((member) => member.enabled).length, 5)
   })
 
-  test('老库改配置就能加人：只重写要改的那两个，其余一个字节都不碰', () => {
-    // 升级前的库：五个人都在，但只有三个 enabled（种子默认写进去的）。
+  test('老库已有成员时，名单变化不能覆盖已持久化的启用状态', () => {
     const rows = FIVE_IDS.map((id) => stored(id))
-    const { team, writes } = makeTeam(rows, ALL_FIVE)
+    const original = structuredClone(rows)
+    const { team, writes, table } = makeTeam(rows, ALL_FIVE)
     team.ensureRoster()
-    assert.deepEqual(writes.map((member) => member.assistantId).sort(), ['member-bailongma', 'member-shaseng'])
-    assert.equal(writes.every((member) => member.enabled), true)
+    assert.deepEqual(writes, [], '配置名单只用于初始化缺失席位')
+    assert.deepEqual([...table.values()], original, '任何已有成员字段都不能被启动配置覆盖')
   })
 
   test('用户改过的人设、形象与 revision 不会因为一次重启被种子值冲掉', () => {
@@ -147,12 +147,23 @@ describe('ensureRoster：新库按配置建，老库只对齐 enabled', () => {
     assert.equal(wukong?.revision, 7, '启用/停用不是换职责，不该提升 revision')
   })
 
-  test('名单里去掉一个人，他就从桌面上下来', () => {
+  test('名单缩减也不能擅自停用已持久化的成员', () => {
     const rows = FIVE_IDS.map((id) => stored(id, { enabled: true }))
-    const { team, table } = makeTeam(rows, ['tangseng', 'wukong'])
+    const { team, table, writes } = makeTeam(rows, ['tangseng', 'wukong'])
     team.ensureRoster()
-    assert.equal(table.get('member-bajie')?.enabled, false)
+    assert.deepEqual(writes, [])
+    assert.equal(table.get('member-bajie')?.enabled, true)
     assert.equal(table.get('member-tangseng')?.enabled, true)
+  })
+
+  test('旧库缺少席位时，只按当前名单初始化缺失成员', () => {
+    const existing = stored('member-tangseng', { enabled: false, persona: '本人配置' })
+    const { team, table, writes } = makeTeam([existing], ['tangseng', 'wukong'])
+    team.ensureRoster()
+    assert.equal(writes.length, 4)
+    assert.deepEqual(table.get(existing.assistantId), existing)
+    assert.equal(table.get('member-wukong')?.enabled, true)
+    assert.equal(table.get('member-bajie')?.enabled, false)
   })
 
   test('名单里认不出的名字会留一条 warn，而不是悄悄少一个人', () => {

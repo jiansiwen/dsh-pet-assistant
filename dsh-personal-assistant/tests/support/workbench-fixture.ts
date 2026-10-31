@@ -1,10 +1,11 @@
 /**
  * M3-03/04/05 测试夹具：真实 SQLite、真实工具注册、真实桥接 HTTP、真实助理与日报可信审批服务、
  * 真实工作台服务。只有采集器换成内存替身（采样"原文"是一组片段，可以被删除、也可以被"备份还原"）。
- * 不启动采样进程、模型或桌面；不读 ~/.dsh。临时目录落在 petsBak 对应项目目录，用完即删。
+ * 不启动采样进程、模型或桌面；不读 ~/.dsh。临时目录使用系统测试目录，用完即删。
  */
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { TestContext } from 'node:test'
 import { AssistantApprovalService } from '../../src/assistant-approval.ts'
@@ -23,7 +24,7 @@ import type { ActivityTracker } from '../../src/tracker.ts'
 import { WorkItemStore } from '../../src/work-items.ts'
 import { mountReportWorkbench, type ReportWorkbench } from '../../src/workbench.ts'
 
-export const scratch = path.resolve(import.meta.dirname, '../../../generated-videos/moved-from-assets/petsBak/dsh-personal-assistant')
+export const scratch = tmpdir()
 
 /** 今天的几段合成活动，全部早于"现在"（凌晨跑测试也一样）。最后一段视为仍在延续，不入观察库。 */
 export function timeline() {

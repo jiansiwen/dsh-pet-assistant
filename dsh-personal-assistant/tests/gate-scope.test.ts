@@ -113,7 +113,7 @@ async function gateHost(t: TestContext, root: string) {
     toolScope: 'side-effect', budgetTokens: 0, deadlineAt: null, dependsOn: [], status: 'running', revision: 1,
     artifacts: [], originRequestId: null, originChannel: null, createdAt: 1, updatedAt: 1 })
   const approvals = new ApprovalService(store, { ttlMs: 60_000, runtimeEpoch: 'test' })
-  installApprovalGate(scope.ctx, { taskId: 'task', assistantId: 'chief', inputRevision: 1, approvals, label: 'run', workspaceRoot: root })
+  installApprovalGate(key, { taskId: 'task', assistantId: 'chief', inputRevision: 1, approvals, label: 'run', workspaceRoot: root })
   const run = (args: unknown) => ctx.tools.execute({ callId: 'call' as never, name: 'write', arguments: args, agent: key, signal: new AbortController().signal })
   return { approvals, calls, run }
 }

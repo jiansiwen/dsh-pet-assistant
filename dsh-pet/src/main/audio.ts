@@ -53,13 +53,24 @@ export interface AudioState {
    * 否则唤醒刚拉起来就被紧随其后的听写申请停掉，System.Speech 白白起停一次。
    */
   readonly bargeHandover: boolean
+  /**
+   * 会议还在录。与 holder 分开记：插话交接时 holder 会临时变成 dictation，
+   * 但会议轨仍在订阅共享采集，结束后不能把设备交还给唤醒。
+   */
+  readonly meetingActive: boolean
+  /**
+   * 会议期间另开的插话监听。它与会议同时订阅同一路共享采集，不算第二个设备主人；
+   * 唤醒仍然关闭，避免把评委的话当指令。
+   */
+  readonly bargeInMeeting: boolean
 }
 
 export type AudioEvent =
   /** 壳起来了：按当前设置决定要不要开始听唤醒词。 */
   | { readonly type: 'boot' }
   | { readonly type: 'focus'; readonly on: boolean }
-  | { readonly type: 'dictation-requested' }
+  /** source=barge-in 是插话交接的听写；会议期间只有这一种允许。 */
+  | { readonly type: 'dictation-requested'; readonly source?: 'user' | 'barge-in' }
   | { readonly type: 'dictation-finished' }
   /**
    * 显式开一场会议录制。专注模式不阻止它（会议本来就是用户在专注场景里亲手开的），
@@ -74,7 +85,7 @@ export type AudioEvent =
   /** 唤醒引擎换了（System.Speech ↔ KWS）。在跑就重启到新引擎；视同用户重试，清掉粘住的失败。 */
   | { readonly type: 'wake-engine-changed' }
   /** 播放开始且"外放插话"开关打开：申请播放期间的受控收音。 */
-  | { readonly type: 'barge-in-requested' }
+  | { readonly type: 'barge-in-requested'; readonly allowInMeeting?: boolean }
   /** 插话已检出：设备保留给紧接着的听写。 */
   | { readonly type: 'barge-in-detected' }
   /**
@@ -94,6 +105,7 @@ export interface AudioTransition {
 
 export const INITIAL_AUDIO_STATE: AudioState = {
   holder: null, focus: false, wakeUnavailable: false, wakeEnabled: true, bargeHandover: false,
+  meetingActive: false, bargeInMeeting: false,
 }
 
 /** 空闲状态下能不能把唤醒监听拉起来。 */
@@ -105,9 +117,10 @@ function done(state: AudioState, effects: readonly AudioEffect[] = [], denied: s
   return { state, effects, denied }
 }
 
-/** 设备空出来了：能起唤醒就交还给唤醒。 */
+/** 设备空出来了：能起唤醒就交还给唤醒。会议还在录时不交还，会议轨仍要用设备。 */
 function release(state: AudioState, effects: AudioEffect[] = []): AudioTransition {
-  const idle: AudioState = { ...state, holder: null, bargeHandover: false }
+  const idle: AudioState = { ...state, holder: null, bargeHandover: false, bargeInMeeting: false }
+  if (idle.meetingActive) return done(idle, effects)
   if (canStartWake(idle)) return done({ ...idle, holder: 'wake' }, [...effects, 'start-wake'])
   return done(idle, effects)
 }
@@ -124,11 +137,15 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
       if (event.on) {
         // 正在听写的不掐断：这一次收音是用户自己刚按下去的，会议开始了也不该丢他半句话。
         if (state.holder === 'wake') return done({ ...focus, holder: null }, ['stop-wake'])
-        // 插话监听要掐：专注（会议 / 投屏）时旁人说话不能打断播报。交接中的除外 —— 那已经是用户开口了。
-        if (state.holder === 'barge-in' && !state.bargeHandover) return done({ ...focus, holder: null }, ['stop-barge-in'])
+        // 会议里的插话监听是给评委提问用的，不因专注停掉；其余场景旁人说话不能打断播报。
+        if (state.holder === 'barge-in' && !state.bargeHandover && !state.meetingActive) {
+          return done({ ...focus, holder: null }, ['stop-barge-in'])
+        }
         return done(focus)
       }
-      if (focus.holder === null && canStartWake(focus)) return done({ ...focus, holder: 'wake' }, ['start-wake'])
+      if (focus.holder === null && !focus.meetingActive && canStartWake(focus)) {
+        return done({ ...focus, holder: 'wake' }, ['start-wake'])
+      }
       return done(focus)
     }
 
@@ -139,40 +156,44 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
         return done(state, [], '正在听你说，这一次听完再按')
       }
       if (state.holder === 'meeting') {
-        // 会议与听写互斥：两者都要独占设备。会议是长事务，听写让路——
-        // 中途插进来一段听写，会把参会者的话喂给命令识别器。
-        return done(state, [], '正在录制会议，结束会议后再用听写')
+        // 会议期间只放插话交接的听写：那正是要听评审/评委说什么。
+        // 手动按键听写仍拒绝，免得把参会者的话喂给命令识别器。
+        if (event.source !== 'barge-in') return done(state, [], '正在录制会议，结束会议后再用听写')
+        return done({ ...state, holder: 'dictation', bargeHandover: false, bargeInMeeting: false },
+          state.bargeInMeeting ? ['stop-barge-in'] : [])
       }
       // 插话监听让路给听写：共享采集的设备不关，预滚动音频由渲染层交给听写。
       const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake']
         : state.holder === 'barge-in' ? ['stop-barge-in'] : []
-      return done({ ...state, holder: 'dictation', bargeHandover: false }, effects)
+      return done({ ...state, holder: 'dictation', bargeHandover: false, bargeInMeeting: false }, effects)
     }
 
     case 'dictation-finished': {
       // 超时和正常结束可能各触发一次收尾，第二次必须什么都不做 —— 否则会把刚拉起来的
       // 唤醒监听又停掉，用户下一次喊"小潘同学"没人应。
       if (state.holder !== 'dictation') return done(state)
+      // 会议还在录：设备交回会议，不启唤醒（参会者的话不是指令）。
+      if (state.meetingActive) return done({ ...state, holder: 'meeting', bargeHandover: false })
       return release(state)
     }
 
     case 'meeting-requested': {
-      if (state.holder === 'meeting') return done(state, [], '已经有一场会议在录制')
+      if (state.holder === 'meeting' || state.meetingActive) return done(state, [], '已经有一场会议在录制')
       if (state.holder === 'dictation') {
         // 听写最多二十秒就收尾，等它说完再开会议，不掐断用户已经说出口的话。
         return done(state, [], '正在听写，这一句收完再开会议')
       }
       // 专注模式不拦显式会议；唤醒在听就先停掉——会议期间参会者的话不是指令。
-      // 插话监听同理停掉：会议是用户亲手开的长事务，播报本身也会被会议开始打断。
       const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake']
         : state.holder === 'barge-in' ? ['stop-barge-in'] : []
-      return done({ ...state, holder: 'meeting', bargeHandover: false }, effects)
+      return done({ ...state, holder: 'meeting', meetingActive: true, bargeHandover: false, bargeInMeeting: false }, effects)
     }
 
     case 'meeting-finished': {
       // 与听写收尾同理：重复收尾必须幂等，否则会把唤醒监听错误地停掉。
-      if (state.holder !== 'meeting') return done(state)
-      return release(state)
+      const next: AudioState = { ...state, meetingActive: false, bargeInMeeting: false, bargeHandover: false }
+      if (state.holder !== 'meeting') return done(next)
+      return release(next, state.bargeInMeeting ? ['stop-barge-in'] : [])
     }
 
     case 'wake-lost': {
@@ -215,24 +236,38 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
     }
 
     case 'barge-in-requested': {
-      if (state.holder === 'barge-in') return done(state)
-      // 专注时不开插话监听；听写 / 会议占着设备时更不能抢。这几种都是静默拒绝 ——
+      if (state.holder === 'barge-in' || state.bargeInMeeting) return done(state)
+      // 会议中允许另开插话监听：共享采集本来就支持多消费者，会议轨不受影响。
+      // 这是评审/评委能自然插话的前提；唤醒仍然停着。
+      if (state.holder === 'meeting') {
+        if (!state.meetingActive || event.allowInMeeting !== true) {
+          return done(state, [], '麦克风正被占用，本次播放不监听插话')
+        }
+        return done({ ...state, bargeInMeeting: true }, ['start-barge-in'])
+      }
+      // 专注时不开插话监听；听写占着设备时更不能抢。这几种都是静默拒绝 ——
       // 播放照常进行，只是没有插话能力，不值得打扰用户。
       if (state.focus) return done(state, [], '专注模式下不监听插话')
-      if (state.holder === 'dictation' || state.holder === 'meeting') return done(state, [], '麦克风正被占用，本次播放不监听插话')
+      if (state.holder === 'dictation') return done(state, [], '麦克风正被占用，本次播放不监听插话')
       const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake', 'start-barge-in'] : ['start-barge-in']
       return done({ ...state, holder: 'barge-in', bargeHandover: false }, effects)
     }
 
     case 'barge-in-detected': {
-      if (state.holder !== 'barge-in') return done(state)
-      return done({ ...state, bargeHandover: true })
+      if (state.holder === 'barge-in' || state.bargeInMeeting) return done({ ...state, bargeHandover: true })
+      return done(state)
     }
 
     case 'barge-in-finished': {
+      if (state.bargeInMeeting && state.holder === 'meeting') {
+        if (state.bargeHandover && event.force !== true) return done(state)
+        return done({ ...state, bargeInMeeting: false, bargeHandover: false }, ['stop-barge-in'])
+      }
       if (state.holder !== 'barge-in') return done(state)
       // 检出后正等听写接手：播放结束不归还设备（force 是交接超时的兜底）。
       if (state.bargeHandover && event.force !== true) return done(state)
+      // 会议还在录：插话结束后把设备交回会议，不启唤醒。
+      if (state.meetingActive) return done({ ...state, holder: 'meeting', bargeHandover: false }, ['stop-barge-in'])
       return release(state, ['stop-barge-in'])
     }
   }

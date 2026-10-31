@@ -10,10 +10,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { Config, type Config as ConfigType } from '../src/config.ts'
 import * as plugin from '../src/index.ts'
+import { resolvePetDir } from '../src/pet-dir.ts'
 
 type Tool = { execute(args: unknown, exec?: unknown): Promise<string> }
 
@@ -68,8 +70,11 @@ function hostServices() {
   }
 }
 
-const quietConfig = (overrides: Partial<ConfigType> = {}): ConfigType =>
-  Config({ captureActivity: false, proactiveEnabled: false, migrateLegacy: false, petDir: '', ...overrides } as never)
+function quietConfig(home: string, overrides: Omit<Partial<ConfigType>, 'petDir'> = {}): ConfigType {
+  const petDir = path.join(home, 'nonexistent-dsh-pet')
+  assert.equal(existsSync(petDir), false, '夹具的桌宠路径必须不存在')
+  return Config({ captureActivity: false, proactiveEnabled: false, migrateLegacy: false, ...overrides, petDir } as never)
+}
 
 function bridgeClient(home: string) {
   const infoPath = path.join(home, 'personal-assistant', 'bridge.json')
@@ -129,6 +134,22 @@ function fakeAgentLoop() {
 
 const pluginShape = { name: plugin.name, inject: plugin.inject, apply: plugin.apply }
 
+test('petDir：同级桌宠存在时，夹具仍显式解析到新建临时目录内的不存在路径', t => {
+  const home = isolatedHome(t)
+  const missingPetDir = path.join(home, 'nonexistent-dsh-pet')
+  const missingEnvDir = path.join(home, 'nonexistent-env-pet')
+  const pluginDir = fileURLToPath(new URL('..', import.meta.url))
+  const siblingPetDir = path.resolve(pluginDir, '..', 'dsh-pet')
+  const exists = (dir: string) => path.resolve(dir) === siblingPetDir || existsSync(dir)
+  const config = quietConfig(home)
+  const expected = { dir: null, source: 'config', missing: missingPetDir }
+
+  assert.equal(existsSync(missingPetDir), false, '夹具的桌宠路径必须不存在')
+  assert.equal(existsSync(missingEnvDir), false, '测试环境路径必须不存在')
+  assert.deepEqual(resolvePetDir({ configured: config.petDir, pluginDir, exists }), expected)
+  assert.deepEqual(resolvePetDir({ configured: config.petDir, env: missingEnvDir, pluginDir, exists }), expected)
+})
+
 test('inject 只声明必需服务、不含 agents（cordis 4 的 inject 每一项都是必需依赖，见下一条的对照组）', () => {
   assert.deepEqual(plugin.inject, ['tools', 'storageDomain', 'systemPrompt'])
 })
@@ -145,7 +166,7 @@ test('真实 cordis：没有 agents 也加载并监听；agents 后装可现取�
   let controlApplied = 0
   const control = root.plugin({ name: 'control-needs-agents', inject: [...plugin.inject, 'agents'], apply: () => { controlApplied += 1 } })
 
-  const fiber = root.plugin(pluginShape, quietConfig())
+  const fiber = root.plugin(pluginShape, quietConfig(home))
   await fiber
   const bridge = bridgeClient(home)
   assert.ok(existsSync(bridge.infoPath), '加载即写出发现文件，不等召唤')
@@ -193,7 +214,7 @@ test('真实 cordis：没有 agents 也加载并监听；agents 后装可现取�
   assert.equal(existsSync(bridge.infoPath), false, '卸载删掉自己写的发现文件')
 
   // 重新加载：按 user_flags 里的记录尝试恢复；恢复失败就新建，并如实带回原因。
-  const reloaded = root.plugin(pluginShape, quietConfig())
+  const reloaded = root.plugin(pluginShape, quietConfig(home))
   await reloaded
   const second = await bridge.start()
   assert.equal(second.body.outcome, 'created')
@@ -215,7 +236,7 @@ test('假宿主连 ctx.get 都没有：插件照常加载、监听，开始会�
     effect(execute: () => () => unknown) { disposers.push(execute()) },
     on() {},
   }
-  await plugin.apply(ctx as never, quietConfig())
+  await plugin.apply(ctx as never, quietConfig(home))
   const bridge = bridgeClient(home)
   assert.equal((await bridge.health()).body.bound, false)
   const result = await bridge.start()
@@ -233,7 +254,7 @@ test('平台闸门：macOS 不再被拦（开启助理只待可信批准），Li
     try {
       const host = hostServices()
       await plugin.apply({ ...host.services, effect(execute: () => () => unknown) { disposers.push(execute()) }, on() {} } as never,
-        quietConfig({ captureActivity: true }))
+        quietConfig(home, { captureActivity: true }))
       const started = JSON.parse(await host.tool('personal_assistant_start').execute({}))
       if (expectation === 'pending') {
         assert.equal(started.pending, true, 'macOS 有采样实现：先走可信采集范围审批')

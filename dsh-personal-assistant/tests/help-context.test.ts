@@ -109,13 +109,9 @@ test('Git 项目返回只读状态与差异统计', async () => {
   const h = harness()
   try {
     writeFileSync(path.join(h.dir, 'work.txt'), 'hello\n')
-    try {
-      execFileSync('git', ['init', '-q'], { cwd: h.dir, windowsHide: true })
-      execFileSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', 'add', '.'], { cwd: h.dir, windowsHide: true })
-      execFileSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'base'], { cwd: h.dir, windowsHide: true })
-    } catch {
-      return
-    }
+    execFileSync('git', ['init', '-q'], { cwd: h.dir, windowsHide: true })
+    execFileSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', 'add', '.'], { cwd: h.dir, windowsHide: true })
+    execFileSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'base'], { cwd: h.dir, windowsHide: true })
     writeFileSync(path.join(h.dir, 'work.txt'), 'hello\nworld\n')
     await h.call('personal_assistant_help_context', { projectDir: h.dir })
     const evidence = await readProjectEvidence(h.dir)

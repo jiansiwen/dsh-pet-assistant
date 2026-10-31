@@ -27,11 +27,20 @@ export interface AssistantSubmission {
   execute(): unknown | Promise<unknown>
 }
 
+/** 可信执行器在任何外部效果发生前明确失败，可重新提交并重新审批。 */
+export class BeforeEffectError extends Error {}
+
 type Entry = {
   proposal: AssistantProposal
   submission: AssistantSubmission
-  state: 'pending' | 'running' | 'succeeded' | 'unknown'
+  state: 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown'
   result?: unknown
+}
+
+function matchesIntent(entry: Entry, subject: string, intentId: string): boolean {
+  const snapshot = entry.submission.snapshot
+  return entry.submission.subject === subject && snapshot !== null && typeof snapshot === 'object' && !Array.isArray(snapshot)
+    && (snapshot as { intentId?: unknown }).intentId === intentId
 }
 
 export function snapshotDigest(value: unknown): string {
@@ -64,6 +73,21 @@ export class AssistantApprovalService {
     }
   }
 
+  /** 仅供可信核对入口释放对应的未知操作，不代表外部效果已成功或失败。 */
+  acknowledgeUnknown(subject: string, intentId: string): boolean {
+    for (const [id, entry] of this.entries) {
+      if (entry.state === 'unknown' && matchesIntent(entry, subject, intentId)) {
+        this.entries.delete(id)
+        return true
+      }
+    }
+    return false
+  }
+
+  isIntentRunning(subject: string, intentId: string): boolean {
+    return [...this.entries.values()].some(entry => entry.state === 'running' && matchesIntent(entry, subject, intentId))
+  }
+
   pendingProposals(): AssistantProposal[] {
     const result: AssistantProposal[] = []
     for (const [id, entry] of this.entries) {
@@ -84,7 +108,7 @@ export class AssistantApprovalService {
       throw new Error('该操作正在执行或结果不明，必须人工核查，不可重试')
     }
     // 总容量包含执行中和结果不明项，不因换绑丢弃这些状态。
-    for (const [id, entry] of this.entries) if (entry.state === 'succeeded') this.entries.delete(id)
+    for (const [id, entry] of this.entries) if (entry.state === 'succeeded' || entry.state === 'failed') this.entries.delete(id)
     if (this.entries.size >= 64) throw new Error('待批或待核查操作已达上限')
     const content = `${submission.summary}\n\n操作：${submission.tool}\n目标：${submission.target}\n风险：${submission.risk}\n完整固定范围：\n${JSON.stringify(submission.snapshot, null, 2)}\n\n仅批准本次固定范围；拒绝不执行。批准后失败可能已有部分效果，结果不明时不可自动重试。`
     const proposal: AssistantProposal = {
@@ -119,6 +143,11 @@ export class AssistantApprovalService {
       entry.state = 'succeeded'
       return { ok: true, confirmed: true, state: entry.state, result: entry.result }
     } catch (error) {
+      if (error instanceof BeforeEffectError) {
+        entry.state = 'failed'
+        entry.result = error.message
+        return { ok: false, state: 'failed', retryable: true, error: entry.result }
+      }
       entry.state = 'unknown'
       entry.result = error instanceof Error ? error.message : String(error)
       return { ok: false, state: 'unknown', retryable: false, error: entry.result }
