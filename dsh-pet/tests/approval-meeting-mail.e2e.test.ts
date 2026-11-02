@@ -68,3 +68,29 @@ test('会议邮件批准后，真实审批入口分别提示待登记与未知�
     } finally { window.dispose() }
   }
 })
+
+test('屏幕观察批准后明确提醒尚未读取，并引导切回窗口继续', async () => {
+  dialogs.length = 0
+  noticeFails = false
+  let decisions = 0
+  const proposal = { kind: 'assistant' as const, proposalId: 'screen-1', revision: 1, digest: 'b'.repeat(64),
+    content: '固定全部屏幕、服务商和分析问题；批准只授予许可', target: '模拟窗口', epoch: 'e1', state: 'pending',
+    tool: 'personal_assistant_computer_look', risk: 'high', expiresAt: Date.now() + 60_000 }
+  const bridge = { getTeam: async () => ({ epoch: 'e1', proposals: [proposal], members: [] }),
+    decideApproval: async () => { decisions++; return { ok: true, confirmed: true } } }
+  const window = new ApprovalWindow(bridge as never)
+  window.registerIpc()
+  try {
+    assert.equal((await window.request(proposal.proposalId)).ok, true)
+    await new Promise<void>(resolve => setImmediate(resolve))
+    const current = FakeWindow.current
+    const event = { sender: current.webContents, senderFrame: current.webContents.mainFrame }
+    const result = await handlers.get('approval-card-decide')!(event, proposal.proposalId, 'approve') as { ok: boolean }
+    assert.equal(result.ok, true)
+    assert.equal(decisions, 1)
+    assert.equal(dialogs.length, 2)
+    assert.match(String(dialogs[0].message), /批准本身不会|尚未截屏/)
+    assert.match(String(dialogs[1].message), /尚未读取|尚未截屏/)
+    assert.match(String(dialogs[1].detail), /切回.*继续/s)
+  } finally { window.dispose() }
+})

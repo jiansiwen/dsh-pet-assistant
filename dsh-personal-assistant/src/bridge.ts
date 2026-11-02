@@ -632,6 +632,16 @@ export class SessionBridge {
     return this.agent !== null
   }
 
+  /** 电脑授权只跟随当前真实桌面绑定；会话重绑后旧令牌立即失效。 */
+  desktopBinding(agent: unknown): string | null {
+    return !this.closed && this.agent !== null && agent === this.agent && this.mirror.isActive() ? this.mirror.bindingId : null
+  }
+
+  /** 成员桌面请求在启动时锁定绑定，执行时仍须核对该绑定没有改变。 */
+  currentDesktopBinding(): string | null {
+    return this.desktopBinding(this.agent)
+  }
+
   get teamEnabled(): boolean {
     return this.team !== null
   }
@@ -639,6 +649,15 @@ export class SessionBridge {
   /** 该 agent 是否为经 /session/start 由本插件建出或恢复、仍归桥接所有的会话。 */
   ownsAgent(agent: unknown): boolean {
     return this.owned !== null && this.owned.handle.agent === agent
+  }
+
+  /** 发现文件仍指向本实例时，才可在数据库争用后继续调度。 */
+  isCurrentDiscovery(): boolean {
+    if (this.closed || !this.advertised || !this.server) return false
+    try {
+      const current = JSON.parse(readFileSync(this.infoPath, 'utf8')) as { epoch?: unknown; port?: unknown; pid?: unknown }
+      return current.epoch === this.epoch && current.port === this.port && current.pid === process.pid
+    } catch { return false }
   }
 
   /**

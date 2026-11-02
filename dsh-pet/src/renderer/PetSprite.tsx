@@ -26,6 +26,8 @@ const ONE_CYCLE_ACTIONS = new Set(['play', 'read', 'wave', 'jump'])
 const FAST_SWITCH_ACTIONS = new Set(['grab', 'drop', 'walk'])
 const FADE_MS = 140
 const FAST_FADE_MS = 90
+/** 本地视频承诺开始但没有实际推进时，不能永久停在第一帧。 */
+const VIDEO_START_TIMEOUT_MS = 2500
 
 /** 完成事件在计时器中发出，不在 React 状态更新器内发出，避免严格模式重复通知。 */
 function FrameSequence({ frames, fps, once, active, onComplete }: {
@@ -57,42 +59,85 @@ function FrameSequence({ frames, fps, once, active, onComplete }: {
  * 继续播放会让淡出的残影自己动起来，比静止残影明显得多。
  * 一次性动作由 ended 驱动，循环动作交给 video 的 loop。
  */
-function VideoSequence({ src, loop, active, fadeMs, onComplete, onReady }: {
-  src: string; loop: boolean; active: boolean; fadeMs: number; onComplete?: () => void; onReady?: () => void
+function VideoSequence({ src, loop, active, fadeMs, onComplete, onReady, onFailure }: {
+  src: string; loop: boolean; active: boolean; fadeMs: number; onComplete?: () => void; onReady?: () => void; onFailure?: () => void
 }) {
   const ref = useRef<HTMLVideoElement>(null)
   const completed = useRef(false)
   const callback = useRef(onComplete)
   const readyCallback = useRef(onReady)
+  const failureCallback = useRef(onFailure)
+  const activeRef = useRef(active)
+  const failed = useRef(false)
+  const playGeneration = useRef(0)
+  const moved = useRef(false)
+  const readyTimer = useRef<number>(0)
   const readySent = useRef(false)
   const [ready, setReady] = useState(false)
   callback.current = onComplete
   readyCallback.current = onReady
-  const markReady = () => {
-    if (readySent.current) return
+  failureCallback.current = onFailure
+  activeRef.current = active
+  const reportFailure = useCallback((generation?: number) => {
+    if (!activeRef.current || failed.current || (generation !== undefined && generation !== playGeneration.current)) return
+    failed.current = true
+    failureCallback.current?.()
+  }, [])
+  const play = useCallback((el: HTMLVideoElement) => {
+    if (!activeRef.current || failed.current) return
+    const generation = ++playGeneration.current
+    try { void el.play()?.catch(() => reportFailure(generation)) } catch { reportFailure(generation) }
+  }, [reportFailure])
+  const markReady = useCallback(() => {
+    if (!activeRef.current || failed.current || readySent.current) return
     readySent.current = true
     // 先让新层以 opacity 0 挂一帧，再开始淡入；否则会瞬间满亮，看起来像闪一下。
-    window.setTimeout(() => {
+    readyTimer.current = window.setTimeout(() => {
+      if (!activeRef.current || failed.current) { readySent.current = false; return }
       setReady(true)
       readyCallback.current?.()
     }, 40)
-  }
+  }, [])
   useEffect(() => {
     completed.current = false
+    failed.current = false
     readySent.current = false
     setReady(false)
     const el = ref.current
     if (!el) return
-    el.currentTime = 0
-    void el.play().catch(() => undefined)
-    return () => el.pause()
-  }, [src])
+    try { el.currentTime = 0 } catch { reportFailure() }
+    if (activeRef.current) play(el)
+    return () => {
+      playGeneration.current++
+      window.clearTimeout(readyTimer.current)
+      el.pause()
+    }
+  }, [src, play, reportFailure])
   useEffect(() => {
     const el = ref.current
     if (!el) return
-    if (active) void el.play().catch(() => undefined)
-    else el.pause()
-  }, [active])
+    if (active) {
+      if (el.readyState >= 2) markReady()
+      play(el)
+    } else {
+      playGeneration.current++
+      readySent.current = false
+      window.clearTimeout(readyTimer.current)
+      el.pause()
+    }
+  }, [active, markReady, play])
+  useEffect(() => {
+    const el = ref.current
+    if (!active || !el) return
+    moved.current = false
+    let live = true
+    const initialTime = el.currentTime
+    const timer = window.setTimeout(() => {
+      if (!live || !activeRef.current || failed.current || el.ended) return
+      if (!moved.current && (el.paused || !Number.isFinite(el.currentTime) || Math.abs(el.currentTime - initialTime) < 0.02)) reportFailure()
+    }, VIDEO_START_TIMEOUT_MS)
+    return () => { live = false; window.clearTimeout(timer) }
+  }, [src, active, reportFailure])
   return (
     <video
       ref={ref}
@@ -105,11 +150,16 @@ function VideoSequence({ src, loop, active, fadeMs, onComplete, onReady }: {
       style={{ opacity: ready ? 1 : 0, transition: `opacity ${fadeMs}ms linear` }}
       onLoadedData={markReady}
       onPlaying={markReady}
+      onTimeUpdate={() => {
+        const el = ref.current
+        if (activeRef.current && el && !el.paused && el.currentTime > 0.02) moved.current = true
+      }}
       onCanPlay={() => {
         markReady()
         const el = ref.current
-        if (el) void el.play().catch(() => undefined)
+        if (el && activeRef.current) play(el)
       }}
+      onError={() => reportFailure()}
       onEnded={() => {
         if (loop || !active || completed.current) return
         completed.current = true
@@ -119,9 +169,9 @@ function VideoSequence({ src, loop, active, fadeMs, onComplete, onReady }: {
   )
 }
 
-function renderPose(pose: Pose, active: boolean, fadeMs: number, onComplete?: () => void, onReady?: () => void) {
+function renderPose(pose: Pose, active: boolean, fadeMs: number, onComplete?: () => void, onReady?: () => void, onFailure?: () => void) {
   if (pose.kind === 'video') {
-    return <VideoSequence src={pose.src} loop={pose.loop} active={active} fadeMs={fadeMs} onComplete={onComplete} onReady={onReady} />
+    return <VideoSequence src={pose.src} loop={pose.loop} active={active} fadeMs={fadeMs} onComplete={onComplete} onReady={onReady} onFailure={onFailure} />
   }
   if (pose.kind === 'walk') {
     return <div className="pet-walk-frame"><img className="pet-walk-strip" src={pose.src} alt="" draggable={false} /></div>
@@ -133,7 +183,7 @@ function renderPose(pose: Pose, active: boolean, fadeMs: number, onComplete?: ()
 }
 
 /** 新层真正显示后才淡出旧层；避免切换时中间出现透明空档。 */
-function AnimatedPose({ pose, onComplete }: { pose: Pose; onComplete?: () => void }) {
+function AnimatedPose({ pose, onComplete, onVideoFailure }: { pose: Pose; onComplete?: () => void; onVideoFailure?: (src: string) => void }) {
   const [curr, setCurr] = useState(pose)
   const [prev, setPrev] = useState<Pose | null>(null)
   const [currReady, setCurrReady] = useState(true)
@@ -179,7 +229,8 @@ function AnimatedPose({ pose, onComplete }: { pose: Pose; onComplete?: () => voi
           : `pose-layer${currReady ? ' pose-out' : ''}${video ? ' pose-video' : ''}`
         return <div key={layer.id} className={className} data-pose-action={layer.action ?? ''}
           style={{ animationDuration: `${cut ? 0 : fadeMs}ms` }}>
-          {renderPose(layer, isCurr, cut ? 0 : fadeMs, isCurr ? onComplete : undefined, isCurr ? markReady : undefined)}
+          {renderPose(layer, isCurr, cut ? 0 : fadeMs, isCurr ? onComplete : undefined, isCurr ? markReady : undefined,
+            isCurr && layer.kind === 'video' ? () => onVideoFailure?.(layer.src) : undefined)}
         </div>
       })}
     </div>
@@ -243,18 +294,28 @@ export default function PetSprite({
   animationVersion?: number
   onComplete?: (action: string, version: number) => void
 }) {
+  const [failedVideos, setFailedVideos] = useState<ReadonlySet<string>>(() => new Set())
+  const onVideoFailure = useCallback((src: string) => {
+    setFailedVideos(previous => previous.has(src) ? previous : new Set([...previous, src]))
+  }, [])
   const p = PALETTES[skin]
   const isPanda = skin === 'panda'
-  const canGrab = Boolean(videos['grab'] || frames['grab']?.length)
+  const grabVideo = videos['grab'] && !failedVideos.has(videos['grab']) ? videos['grab'] : undefined
+  const canGrab = Boolean(grabVideo || frames['grab']?.length)
+  const grabFallback = dragging && !canGrab
   const effective = dragging && canGrab ? 'grab' : action
   const frameList = effective ? frames[effective] : undefined
-  const videoSrc = effective ? videos[effective] : undefined
+  const candidateVideo = effective ? videos[effective] : undefined
+  // 缺挣扎素材时优先用静态/帧素材做降级动画；只有视频时也保留可见形象。
+  const staticGrabFallback = grabFallback && Boolean(frameList?.length || images.idle)
+  const videoSrc = candidateVideo && !failedVideos.has(candidateVideo) && !staticGrabFallback ? candidateVideo : undefined
   const callback = useRef(onComplete)
   callback.current = onComplete
   // 没有该动作素材的备用皮肤沿用静态降级，但不能让交互状态永远卡住。
   useEffect(() => {
     if (dragging || frameList?.length || videoSrc || !action || (!oneShot(action) && action !== 'write')) return
-    const durations: Record<string, number> = { drop: 3900, lie: 5000, 'laptop-in': 3500, 'laptop-out': 2300, write: 1600, 'walk-stop': 300 }
+    const durations: Record<string, number> = { drop: 3900, lie: 5000, 'laptop-in': 3500, 'laptop-out': 2300, write: 1600,
+      'sleep-in': 1800, 'sleep-out': 2500, 'walk-stop': 300 }
     const timer = window.setInterval(() => callback.current?.(action, animationVersion), durations[action])
     return () => window.clearInterval(timer)
   }, [action, animationVersion, dragging, frameList, videoSrc])
@@ -272,8 +333,8 @@ export default function PetSprite({
 
   if (pose) {
     return (
-      <div className="pet-flip">
-        <AnimatedPose pose={pose} onComplete={!dragging && action ? () => onComplete?.(action, animationVersion) : undefined} />
+      <div className={grabFallback ? 'pet-flip pet-grab-fallback' : 'pet-flip'}>
+        <AnimatedPose pose={pose} onVideoFailure={onVideoFailure} onComplete={!dragging && action ? () => onComplete?.(action, animationVersion) : undefined} />
       </div>
     )
   }

@@ -9,6 +9,7 @@ import { hostAgentRegistry } from './host-agents.ts'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS } from './gate.ts'
 import type { MemberProfile, MemberQuotaView } from './member-contract.ts'
 import { MEMORY_KINDS, type MemoryKind } from './memory.ts'
+import { registerMeetingPresentationTools } from './meeting-presentation-tools.ts'
 
 /** 结构契约：目录拥有持久配置与请求账本；运行时不修改额度、日期或批准状态。 */
 export interface MemberDirectory {
@@ -37,7 +38,7 @@ export interface MemberRuntimeOptions {
     propose(id: string, input: { kind: MemoryKind; topic: string; text: string; sourceRefs?: string[] }): unknown
   }
   /** 宿主 → 桌宠的一次性命令；没有它时会议/文档能力不注册任何桌面工具。 */
-  desktop?: { request(command: string, payload: Record<string, unknown>, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> }
+  desktop?: { binding?(): string | null; request(command: string, payload: Record<string, unknown>, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> }
   /** 只读未读邮件；手动检查用，不标记已读、不发送。 */
   mailUnread?(limit?: number): Promise<{ uidValidity: string; messages: Array<{ uid: number; subject: string; from: string; date: string; text: string }> }>
   onChange?: () => void
@@ -59,8 +60,8 @@ const MEETING_TOOLS = ['companion_meeting_start', 'companion_meeting_stop', 'com
 const DOCUMENT_TOOLS = ['companion_document_list', 'companion_document_read'] as const
 const MAIL_TOOLS = ['companion_mail_unread'] as const
 const MEETING_MAIL_TOOLS = ['personal_assistant_meeting_artifacts', 'personal_assistant_send_meeting_minutes'] as const
-const PRESENTATION_TOOLS = ['personal_assistant_start_meeting_presentation', 'personal_assistant_meeting_presentation_status',
-  'personal_assistant_finish_meeting_presentation'] as const
+const PRESENTATION_TOOLS = ['personal_assistant_meeting_presentation_status', 'personal_assistant_finish_meeting_presentation'] as const
+const DOCUMENT_PRESENTATION_TOOL = 'personal_assistant_document_presentation'
 /** 自动审批 / 完全访问时放行的宿主副作用工具；不含再委派与权限配置。 */
 const SIDE_EFFECT_ALLOW_TOOLS = ['bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'job_kill']
 
@@ -133,6 +134,7 @@ export class MemberRuntime {
     signal.throwIfAborted()
     const profile = this.available(memberId)
     const effectiveOrigin: MemberOrigin = channelKey ? 'wecom' : origin
+    const desktopBinding = effectiveOrigin === 'desktop' ? this.options.desktop?.binding?.() ?? null : null
     if (channelKey && !profile.capabilities.includes('wecom')) throw new Error('成员未获企业微信路由能力')
     if (channelKey && (!channelScope || !/^[a-f0-9]{64}$/u.test(channelScope))) throw new Error('企业微信来源缺少可核验的会话范围')
     if (effectiveOrigin === 'wecom' && !channelKey && !taskId) throw new Error('企业微信任务缺少独立任务标识')
@@ -229,7 +231,7 @@ export class MemberRuntime {
       const quotaLimited = profile.dailyTokenLimit > 0 || profile.totalTokenLimit > 0
       // 纪要生成走共享桌面会话，不进成员用量账本；有限额的成员不能借这条路径绕开停线。
       if (quotaLimited) allowed.delete('companion_meeting_minutes')
-      if (quotaLimited) allowed.delete('personal_assistant_start_meeting_presentation')
+      if (documentAllowed && !quotaLimited && desktopBinding) allowed.add(DOCUMENT_PRESENTATION_TOOL)
       // 自动邮件值守是分析任务：不发送、不执行、不读其他资料。邮件正文不能反向扩权。
       const analysisOnly = effectiveOrigin === 'mail'
       if (analysisOnly) { allowed.clear(); sideEffect.clear() }
@@ -243,9 +245,14 @@ export class MemberRuntime {
         if (!admitted || ended !== undefined || runSignal.aborted || exec.signal.aborted || !this.options.enabled()) return '成员请求已停止'
         if (((MEETING_TOOLS as readonly string[]).includes(exec.name) || (DOCUMENT_TOOLS as readonly string[]).includes(exec.name)
           || (MAIL_TOOLS as readonly string[]).includes(exec.name) || (MEETING_MAIL_TOOLS as readonly string[]).includes(exec.name)
-          || (PRESENTATION_TOOLS as readonly string[]).includes(exec.name))
+          || (PRESENTATION_TOOLS as readonly string[]).includes(exec.name) || exec.name === DOCUMENT_PRESENTATION_TOOL)
           && (effectiveOrigin !== 'desktop' || channelKey)) return '桌面文档/邮件/会议工具只接受桌面本人的请求'
         if (!allowed.has(exec.name) && !sideEffect.has(exec.name)) return `成员未获 ${exec.name} 权限，禁止副作用扩权或再委派`
+        if (exec.name === DOCUMENT_PRESENTATION_TOOL) {
+          const current = this.options.directory.get(memberId)
+          if (!current?.enabled || !current.capabilities.includes('document')) return '成员文档能力已撤销'
+          if (current.dailyTokenLimit > 0 || current.totalTokenLimit > 0) return '成员有额度限制，不能使用共享桌面模型讲解'
+        }
         // 额度已停线或用量未知时，连工具动作也不继续；额度申请本身必须仍然可达。
         if (exec.name !== 'companion_member_request_quota') {
           try { this.options.directory.checkAvailable(memberId) }
@@ -308,6 +315,13 @@ export class MemberRuntime {
         },
       }))
       const desktop = this.options.desktop
+      if (allowed.has(DOCUMENT_PRESENTATION_TOOL) && desktop && desktopBinding) {
+        registerMeetingPresentationTools(ctx as never, {
+          binding: subject => owns(subject as Agent) && admitted && ended === undefined && !runSignal.aborted
+            && this.options.enabled() && desktop.binding?.() === desktopBinding ? desktopBinding : null,
+          request: (command, payload, options) => desktop.request(command, payload, options),
+        }, [DOCUMENT_PRESENTATION_TOOL])
+      }
       const runDesktop = async (exec: { agent?: Agent; signal: AbortSignal }, command: string,
         payload: Record<string, unknown>, timeoutMs: number): Promise<string> => {
         if (!owns(exec.agent) || !admitted || ended !== undefined || runSignal.aborted || exec.signal.aborted) throw new Error('成员请求已停止')
@@ -316,8 +330,15 @@ export class MemberRuntime {
         try { return JSON.stringify(await desktop.request(command, payload, { signal: exec.signal, timeoutMs })) }
         catch (error) { return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) }
       }
+      const runBoundRecording = async (exec: { agent?: Agent; signal: AbortSignal }, command: string,
+        payload: Record<string, unknown>, timeoutMs: number): Promise<string> => {
+        if (!desktopBinding || desktop?.binding?.() !== desktopBinding) return JSON.stringify({ ok: false, error: '桌面会话已变化，未操作录音' })
+        const result = await runDesktop(exec, command, { bindingId: desktopBinding, ...payload }, timeoutMs)
+        if (desktop.binding?.() !== desktopBinding) return JSON.stringify({ ok: false, error: '桌面会话已变化，录音结果请在会议页核查，不自动重试' })
+        return result
+      }
       if (meetingAllowed && desktop) {
-        ctx.tools.register(defineTool({ name: 'companion_meeting_start', description: '在桌面开始一场会议录音，默认同时录麦克风与系统回环；会打开会议页并立即开录。只有用户在当前桌面会话明确要求开始会议/录音时才能调用；调用后必须提醒用户正在录音。',
+        ctx.tools.register(defineTool({ name: 'companion_meeting_start', description: '在当前绑定的桌面申请开始会议录音，按桌面设置自动审批或由本人确认；默认同时录麦克风与系统回环。不会启动文档讲解。只有用户明确要求录音时才能调用；开始后必须提醒用户正在录音。',
           parameters: { name: { type: 'string', required: true, description: '会议名称，1-80 字' },
             sources: { type: 'string', enum: ['mic', 'mic+loopback'], description: '默认 mic+loopback；用户明确只录本机麦克风时才用 mic' },
             retentionDays: { type: 'number', description: '录音保留天数 1-3650，默认 30' } }, output: toolOutput,
@@ -327,12 +348,12 @@ export class MemberRuntime {
             const sources = args.sources === 'mic' ? 'mic' : 'mic+loopback'
             const retentionDays = typeof args.retentionDays === 'number' && Number.isSafeInteger(args.retentionDays) ? args.retentionDays : 30
             if (retentionDays < 1 || retentionDays > 3650) return JSON.stringify({ ok: false, error: '录音保留天数必须是 1-3650 的整数' })
-            return runDesktop(exec, 'meeting.start', { name, sources, retentionDays }, 25_000)
+            return runBoundRecording(exec, 'meeting.recording.start', { name, sources, retentionDays }, 75_000)
           },
         }))
-        ctx.tools.register(defineTool({ name: 'companion_meeting_stop', description: '停止当前或指定会议的录音并等桌面完成最后一段冲刷；只有用户明确要求结束录音时才能调用。',
+        ctx.tools.register(defineTool({ name: 'companion_meeting_stop', description: '在当前绑定的桌面申请停止录音，按桌面设置自动审批或由本人确认并等待冲刷；不会停止独立文档讲解。只有用户明确要求结束录音时才能调用。',
           parameters: { meetingId: { type: 'string', description: '可选；不填则停当前正在录的那场' } }, output: toolOutput,
-          execute: async (args: { meetingId?: unknown }, exec) => runDesktop(exec, 'meeting.stop',
+          execute: async (args: { meetingId?: unknown }, exec) => runBoundRecording(exec, 'meeting.recording.stop',
             args.meetingId ? { meetingId: String(args.meetingId) } : {}, 45_000),
         }))
         ctx.tools.register(defineTool({ name: 'companion_meeting_minutes', description: '为已结束的会议生成模型纪要。会先弹原生授权框说明将发送哪些会议文字；用户拒绝时纪要保持本地模板版。只有用户明确要求生成纪要时才能调用。',

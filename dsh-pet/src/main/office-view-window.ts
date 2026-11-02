@@ -15,7 +15,7 @@ export const OFFICE_VIEW_CHANNELS = { session: 'office-view-session', bytes: 'of
   fullscreen: 'office-view-fullscreen', fullscreenChanged: 'office-view-fullscreen-changed',
   command: 'office-view-command' } as const
 export const OFFICE_VIEW_PARTITION = 'dsh-office-view'
-export type OfficeFormat = 'docx' | 'pptx'
+export type OfficeFormat = 'docx' | 'pptx' | 'markdown'
 
 export interface OfficeSection {
   readonly index: number
@@ -84,14 +84,14 @@ export class OfficeViewWindow {
       this.win.show(); this.win.focus()
       return { ok: true }
     }
-    this.create()
-    return { ok: true }
+    return await this.create()
   }
 
   /** 讲解链同步翻页；只发段落/页码，不重新授权，视图会在换页时自行 check。 */
   gotoSection(index: number, pageNumber: number | null): void {
     if (!Number.isInteger(index) || index < 0) return
     this.initialSection = { index, pageNumber }
+    if (this.session) this.session = { ...this.session, initialSection: this.initialSection }
     const win = this.win
     if (win && !win.isDestroyed()) win.webContents.send(OFFICE_VIEW_CHANNELS.command, { type: 'goto-section', sectionIndex: index, pageNumber })
   }
@@ -160,7 +160,7 @@ export class OfficeViewWindow {
     }
   }
 
-  private create(): void {
+  private async create(): Promise<{ ok: boolean; error?: string }> {
     const win = new BrowserWindow({
       width: 1200, height: 800, minWidth: 720, minHeight: 520, fullscreenable: true,
       title: this.session?.name ?? '逐页阅读', show: false, autoHideMenuBar: true, backgroundColor: '#14161a',
@@ -188,9 +188,14 @@ export class OfficeViewWindow {
       if (this.win !== win) return
       this.win = null; this.doc = null; this.session = null
     })
-    void win.loadFile(this.pagePath).catch(error => {
+    try {
+      await win.loadFile(this.pagePath)
+      if (this.win !== win || win.isDestroyed()) return { ok: false, error: '阅读窗口已关闭' }
+      return { ok: true }
+    } catch (error) {
       console.log('[dsh-pet] Office 阅读窗口加载失败:', error instanceof Error ? error.message : String(error))
-      if (this.win === win) { this.win = null; this.doc = null; this.session = null }
-    })
+      if (this.win === win) { this.win = null; this.doc = null; this.session = null; if (!win.isDestroyed()) win.close() }
+      return { ok: false, error: '阅读窗口加载失败，请检查桌宠文件' }
+    }
   }
 }

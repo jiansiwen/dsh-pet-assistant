@@ -420,7 +420,7 @@ export class ReportWorkbench implements WorkbenchHandler {
     return {
       items: visible.map(item => ({
         id: item.id, kind: item.kind, scope: scopeLabel(item.scope, {}), topic: item.topic, text: item.text,
-        status: item.status, sourceRefs: item.sourceRefs, updatedAt: item.updatedAt, imported: item.importBatch !== null,
+        status: item.status, revision: item.revision, sourceRefs: item.sourceRefs, updatedAt: item.updatedAt, imported: item.importBatch !== null,
       })),
       hiddenProjectMemories: hidden,
     }
@@ -537,6 +537,8 @@ export class ReportWorkbench implements WorkbenchHandler {
   private editMemory(input: Record<string, unknown>) {
     const memoryId = optionalText(input.memoryId, '记忆编号', 200)
     if (!memoryId) throw new InputError('没有指定要改写的记忆')
+    const expectedRevision = integer(input.expectedRevision, '页面看到的记忆版本', 1)
+    if (!Number.isSafeInteger(expectedRevision)) throw new InputError('页面看到的记忆版本无效')
     const text = typeof input.text === 'string' ? input.text.trim() : ''
     if (!text) throw new InputError('改写后的内容不能为空；要撤销这条记忆请用删除')
     if (text.length > MAX_TEXT) throw new InputError('改写后的内容太长')
@@ -544,6 +546,9 @@ export class ReportWorkbench implements WorkbenchHandler {
     const now = this.now()
     const record = this.deps.memories.get(memoryId, now)
     if (!record) return fail(404, 'not_found', '找不到这条记忆，可能已被删除')
+    if (record.revision !== expectedRevision) {
+      return fail(409, 'stale_revision', '这条记忆在你开始编辑后已发生变化，请保留草稿、刷新并重新核对')
+    }
     if (record.status === 'expired') return fail(409, 'expired', '这条记忆已失效，不能改写')
     // 项目范围记忆须授权仍有效，否则用户看到的是"别人项目里的规则"，不该在这里改。
     const visible = new Set((this.deps.helpContexts?.list() ?? [])

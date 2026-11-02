@@ -39,6 +39,14 @@ export function parseInterruptPhrase(text: string): InterruptPhrase {
   return { matched: true, rest: trimmed.slice(match[0].length).trim() }
 }
 
+/** 讲解插话可以直接提问；单独的停止口令需要接着听问题。 */
+export function planInterruptInput(text: string, direct: boolean):
+  { action: 'ignore' | 'direct' | 'listen' } | { action: 'send'; text: string } {
+  const phrase = parseInterruptPhrase(text)
+  if (!phrase.matched) return { action: direct ? 'direct' : 'ignore' }
+  return phrase.rest ? { action: 'send', text: phrase.rest } : { action: 'listen' }
+}
+
 /** 只管理本地语音生命周期；不拥有模型或共享会话的取消权。 */
 export class VoiceConversation {
   phase: VoicePhase = 'stopped'

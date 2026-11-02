@@ -20,6 +20,19 @@ const limitLabel = (limit: number): string => limit === 0 ? '不限' : limit.toL
 type DraftForm = Omit<MemberDraft, 'maxTokens' | 'dailyTokenLimit' | 'totalTokenLimit' | 'thresholdPercent'> & {
   maxTokens: string; dailyTokenLimit: string; totalTokenLimit: string; thresholdPercent: string
 }
+const COMPARE_FIELDS: ReadonlyArray<readonly [keyof DraftForm, string]> = [
+  ['displayName', '名称'], ['description', '职责'], ['personality', '性格'], ['persona', '工作要求'],
+  ['permissionMode', '权限'], ['skinId', '形象'], ['enabled', '启用状态'], ['capabilities', '能力'],
+  ['provider', '模型服务商'], ['model', '模型'], ['maxTokens', '单次最大输出量'], ['dailyTokenLimit', '日额度'],
+  ['totalTokenLimit', '总额度'], ['thresholdPercent', '申请阈值'], ['timezone', '时区'],
+]
+function displayDraftValue(key: keyof DraftForm, value: DraftForm[keyof DraftForm]): string {
+  if (key === 'permissionMode' && typeof value === 'string') return MEMBER_PERMISSION_LABELS[value as MemberPermissionMode]?.title ?? value
+  if (key === 'skinId' && typeof value === 'string') return SKINS.find(([id]) => id === value)?.[1] ?? value
+  if (Array.isArray(value)) return value.length ? value.map(item => MEMBER_CAPABILITY_LABELS[item as MemberCapability] ?? item).join('、') : '（无）'
+  if (typeof value === 'boolean') return value ? '已启用' : '未启用'
+  return String(value) || '（空）'
+}
 interface Note { id: number; role: 'user' | 'assistant'; text: string; error?: boolean }
 
 function localTimezone(): string {
@@ -88,6 +101,11 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
   const nextNote = useRef(1)
   const busy = pending || !!latest?.busy
   const stale = !!member && (!latest || latest.profile.revision !== revision)
+  const latestForm = latest ? initialForm(latest) : null
+  const differences = latestForm ? COMPARE_FIELDS.flatMap(([key, label]) => {
+    const saved = displayDraftValue(key, latestForm[key]), draft = displayDraftValue(key, form[key])
+    return saved === draft ? [] : [{ label, saved, draft }]
+  }) : []
   const set = <K extends keyof DraftForm>(key: K, value: DraftForm[K]): void => { if (!busy) setForm(previous => ({ ...previous, [key]: value })) }
   const push = (role: Note['role'], value: string, isError = false): void => {
     setNotes(previous => [...previous, { id: nextNote.current++, role, text: value, error: isError }])
@@ -162,8 +180,16 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
     </section>
 
     {stale && <div className="editor-warning" role="alert">
-      <span>这个成员刚在别处被改过。你的草稿还在；保存前会再核一次版本。</span>
-      <button type="button" className="editor-secondary" disabled={busy || !latest} onClick={() => setRevision(latest?.profile.revision)}>采用最新版本</button>
+      <div className="editor-conflict">
+        <strong>这个成员刚在别处被改过，你的草稿仍在。</strong>
+        {latest ? <>
+          <p>最新配置是版本 {latest.profile.revision}。选择覆盖会用你的草稿替换下面所有不同字段；之后仍需保存并在原生窗口确认。</p>
+          {differences.length ? <dl>{differences.map(item => <div key={item.label} className="editor-conflict-item">
+            <dt>{item.label}</dt><dd><span>最新配置</span><pre>{item.saved}</pre><span>你的草稿</span><pre>{item.draft}</pre></dd>
+          </div>)}</dl> : <p>当前可见字段相同，但版本已变化；请核对后继续。</p>}
+          <button type="button" className="editor-secondary" disabled={busy} onClick={() => setRevision(latest.profile.revision)}>已核对差异，按草稿覆盖…</button>
+        </> : <p>暂时读不到最新配置；请保留草稿，关闭并重新打开后核对。</p>}
+      </div>
     </div>}
 
     <section className="editor-card" aria-label="身份与职责">

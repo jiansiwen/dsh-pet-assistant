@@ -218,8 +218,10 @@ test('文档库保留物理页及空页，提示词引用真实页码而不是�
   assert.equal(outline.sections[1].text, '')
   assert.match(describeOutline(outline), /第 2 页 · 无可提取文字/)
   assert.match(explainPrompt('合成.PDF', outline, 2), /第 3 页（物理页/)
-  assert.match(askPrompt('合成.PDF', outline, 2, '这一页是什么'), /第 3 页/)
-  assert.doesNotMatch(askPrompt('合成.PDF', outline, 2, '这一页是什么'), /First page/)
+  const asked = askPrompt('合成.PDF', outline, 2, '这一页是什么')
+  assert.match(asked, /第 3 页/)
+  assert.match(asked, /该段原文：\nThird page/, '问的是哪一页，本段原文就必须是哪一页')
+  assert.match(asked, /整份文档全文（短文档，共 3 段，一次给全）/, '短文档附全文，跨页追问有原文可查')
   assert.match(askPrompt('合成.PDF', outline, 1, '空页'), /不要推测/)
   const relocated = { ...outline, sections: [{ ...outline.sections[2], index: 0, pageNumber: 9 }] }
   assert.match(explainPrompt('合成.PDF', relocated, 0), /第 9 页/)

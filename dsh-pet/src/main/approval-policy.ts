@@ -597,7 +597,10 @@ export function confirmDialogSpec(
 
   return {
     title: '需要你确认这个操作',
-    message: `${who}请求执行「${view.toolLabel}」，这一步批准后就会真的动手。`,
+    message: view.assistant && ['personal_assistant_computer_look', 'personal_assistant_computer_click',
+      'personal_assistant_computer_type', 'personal_assistant_computer_key', 'personal_assistant_computer_scroll'].includes(view.tool)
+      ? `${who}请求「${view.toolLabel}」的单次许可；批准本身不会读取、截屏或输入，仍需切回目标并继续。`
+      : `${who}请求执行「${view.toolLabel}」，这一步批准后就会真的动手。`,
     detail: lines.join('\n'),
     approveLabel: '我确认，批准',
     cancelLabel: '先不批准',

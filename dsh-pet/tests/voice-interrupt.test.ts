@@ -6,7 +6,14 @@
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseInterruptPhrase } from '../src/voice-conversation.ts'
+import { parseInterruptPhrase, planInterruptInput } from '../src/voice-conversation.ts'
+
+test('讲解插话的停一下进入后续听写，口令后直接带问题时只发送问题', () => {
+  assert.deepEqual(planInterruptInput('停一下', true), { action: 'listen' })
+  assert.deepEqual(planInterruptInput('停一下，这段什么意思？', true), { action: 'send', text: '这段什么意思？' })
+  assert.deepEqual(planInterruptInput('这里是什么意思？', true), { action: 'direct' })
+  assert.deepEqual(planInterruptInput('普通环境声', false), { action: 'ignore' })
+})
 
 describe('parseInterruptPhrase', () => {
   for (const word of ['停一下', '等等', '等一下', '打断一下', '暂停', '停下来', '别说了', '先别说', '安静一下', '停', '停！']) {

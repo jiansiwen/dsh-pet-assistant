@@ -109,3 +109,27 @@ test('空正文、内容没变、已失效、编号不存在都如实拒绝', as
   assert.match(String(same.body.message), /没有变化/)
   assert.equal((await f.rt.editMemory('mem-不存在', '新内容')).status, 404)
 })
+
+test('工作台必须提交页面看到的记忆版本，旧页面不能覆盖其他修改', async t => {
+  for (const approvalMode of ['manual', 'auto'] as const) {
+    const f = workbenchFixture(t, { approvalMode })
+    await f.rt.bind()
+    const saved = await f.rt.call('remember_preference', { text: `保留否定-${approvalMode}`, topic: '口径' })
+    if (approvalMode === 'manual') assert.equal((await f.rt.decide(saved.proposalId)).ok, true)
+    const view = await f.rt.view(f.line.date)
+    const seen = view.memories.items.find((item: { text: string }) => item.text === `保留否定-${approvalMode}`)
+    assert.ok(seen)
+    assert.equal(seen.revision, 1, '视图应包含用户看到的版本')
+    const changed = f.rt.memories.revise(seen.id, {
+      text: '另一处已经更新', actor: { id: 'desktop-shell', isUser: true }, expectedRevision: seen.revision,
+    }, Date.now())
+    assert.ok(changed)
+    const old = await f.rt.http('POST', '/workbench/memories/edit', { memoryId: seen.id, expectedRevision: seen.revision, text: '旧页面的草稿' })
+    assert.equal(old.status, 409)
+    assert.equal(old.body.code, 'stale_revision')
+    assert.equal(f.rt.memories.get(seen.id, Date.now())?.text, '另一处已经更新')
+    const missing = await f.rt.http('POST', '/workbench/memories/edit', { memoryId: seen.id, text: '未带版本' })
+    assert.equal(missing.status, 400)
+    assert.equal(f.rt.memories.get(seen.id, Date.now())?.text, '另一处已经更新')
+  }
+})

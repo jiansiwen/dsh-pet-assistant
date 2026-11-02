@@ -118,7 +118,17 @@ export function registerAssistantSettings(options: Options): () => void {
     if (result.status === 409) return failure('conflict', '配置已被其他操作更新，请刷新后重新核对并保存。')
     if (result.status === 400 || result.status === 422) return failure('invalid_input', '保存未完成，请核对输入范围；更换机器人编号时需要同时填写新密钥。')
     if (result.status < 200 || result.status >= 300) {
-      return failure('unavailable', section ? '保存未确认，请刷新核对配置与连接状态；不会自动重发。' : '读取失败，请确认配置服务和本机凭据可用后刷新。')
+      const code = result.body && typeof result.body === 'object' && !Array.isArray(result.body)
+        ? (result.body as Record<string, unknown>).code : undefined
+      if (result.status === 503 && code === 'DEVICE_OFFLINE') {
+        return failure('unavailable', section ? '任务运行时尚未就绪或已停止；保存未确认，请刷新核对，不会自动重发。'
+          : '任务运行时尚未就绪或已停止，请检查运行时后刷新。')
+      }
+      if (result.status === 0 && code === 'NO_OWNER_CREDENTIAL') {
+        return failure('unavailable', section ? '本机确认凭据不可用；保存未确认，请刷新核对，不会自动重发。'
+          : '本机确认凭据不可用，请检查助理连接后刷新。')
+      }
+      return failure('unavailable', section ? '保存未确认，请刷新核对配置与连接状态；不会自动重发。' : '读取失败：配置服务暂时不可用或连接异常，请检查后刷新。')
     }
     try {
       const body = record(result.body)

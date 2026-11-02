@@ -22,7 +22,7 @@ import { ObservationStore } from './observation.ts'
 import { resolvePetDir } from './pet-dir.ts'
 import { reconcilePublishedFile, ReportStore } from './report.ts'
 import { ReportApprovalService } from './report-approval.ts'
-import { platformCaptureBlockedReason, pruneSampleFiles, readLastSample, readSamples, sampleFileOf, samplerScriptName } from './sampler.ts'
+import { platformCaptureBlockedReason, readLastSample, readSamples, sampleFileOf, samplerScriptName } from './sampler.ts'
 import { buildSpansFrom } from './spans.ts'
 import { ProactiveHelpFlow, type ProactiveConfig } from './proactive.ts'
 import { ASSISTANT_SCHEMA_VERSION, getUserFlag, openAssistantStore, setUserFlag } from './store.ts'
@@ -44,7 +44,8 @@ import { MemberAssistant } from './member-assistant.ts'
 import { MemberManagement } from './member-management.ts'
 import { MailWatcher, mailWatchAccountKey, readMailImapConfig, readUnreadMail } from './mail-watch.ts'
 import { registerComputerTools } from './computer.ts'
-import { localDateOf, retentionStartDate, startOfLocalDate } from './time.ts'
+import { localDateOf } from './time.ts'
+import { applyRetention, startRetention } from './retention.ts'
 import { registerAssistantTools } from './tools.ts'
 import { ActivityTracker } from './tracker.ts'
 import { WorkItemStore } from './work-items.ts'
@@ -326,6 +327,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const memories = new MemoryStore(db)
   const observations = new ObservationStore(db)
   const reports = new ReportStore(db)
+  const workItems = new WorkItemStore(db)
   const migrations = new MigrationStore(db)
   ctx.effect(() => () => db.close(), 'personal-assistant:store')
 
@@ -414,19 +416,20 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   })
 
   // 保留期清理排在迁移之后：先搬再删，反过来会把还没搬进新库的原文直接删掉。
-  const retention = applyRetention({
-    sampleDir,
-    observations,
-    memories,
-    retentionDays: Math.max(1, Math.floor(config.retentionActivityDays)),
-    now: Date.now(),
-  })
-  if (retention.prunedSampleDays > 0 || retention.prunedSpans > 0 || retention.expiredMemories > 0) {
-    log(
-      `retention（保留 ${retention.keepFromDate} 起）：采样原文删除 ${retention.prunedSampleDays} 天、`
-      + `活动片段 ${retention.prunedSpans} 条、过期记忆 ${retention.expiredMemories} 条失效 / ${retention.deletedMemories} 条删除`,
-    )
+  const runRetention = () => {
+    if (migration && !migration.complete) return
+    const retention = applyRetention({ db, sampleDir, observations, memories, reports, workItems,
+      retentionDays: Math.max(1, Math.floor(config.retentionActivityDays)), now: Date.now() })
+    if (retention.prunedSampleDays || retention.prunedSpans || retention.expiredMemories || retention.deletedMemories || retention.remainingSampleDays.length) {
+      log(`retention（保留 ${retention.keepFromDate} 起）：采样原文删除 ${retention.prunedSampleDays} 天，`
+        + `活动片段 ${retention.prunedSpans} 条，过期记忆 ${retention.expiredMemories} 条失效 / ${retention.deletedMemories} 条删除；`
+        + `仍有 ${retention.remainingSampleDays.length} 天的文件未删，下次继续重试`)
+    }
   }
+  const retentionError = (error: unknown) => log(`[warn] 到期清理未完成，下次重试：${error instanceof Error ? error.message : String(error)}`)
+  if (!config.retentionAutoDelete) log('[warn] 活动和记忆自动到期清理已暂停；未经本人明确同意不会启动。')
+  const stopRetention = startRetention(config.retentionAutoDelete === true, runRetention, retentionError)
+  ctx.effect(() => stopRetention, 'personal-assistant:retention')
 
   // 会话桥接：宠物消息经 agent.followup 注入召唤它的那个会话，
   // 历史与模型与主会话一致，凭据直接复用，宠物端无需配置 API key。
@@ -484,7 +487,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const memberRuntime = new MemberRuntime({
     ctx: ctx as never, directory: teamStore.directory, defaultModel: () => resolveDefaultModel(home),
     enabled: () => teamRuntime !== null, memories: memberMemories,
-    desktop: { request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options) },
+    desktop: { binding: () => bridge.currentDesktopBinding(),
+      request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options) },
     mailUnread: async limit => {
       const config = readMailImapConfig(home)
       if (!config) throw new Error('邮箱值守还没有配置 IMAP，请先运行 setup-mail.mjs')
@@ -513,6 +517,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   })
   const companionRuntime = new CompanionTaskRuntime(teamStore, teamApprovals, {
     epoch: bridge.epoch,
+    log,
+    canRetryBusy: () => bridge.isCurrentDiscovery(),
     onChange: () => bridge.notifyApprovalSnapshot(),
     activeMailAccount: () => {
       const mail = readMailImapConfig(home)
@@ -523,7 +529,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   bridge.attachCompanion(companionRuntime, teamApprovals)
   bridge.setChatContextProvider(() => companionRuntime.consumeContextForChat())
   companionRuntime.start()
-  ctx.effect(() => registerCompanionTools(ctx as never, companionRuntime), 'personal-assistant:companion-tools')
+  ctx.effect(() => registerCompanionTools(ctx as never, companionRuntime, bridge), 'personal-assistant:companion-tools')
   try {
     const assets = path.join(pluginDir, 'assets')
     ctx.effect(() => registerComputerTools(ctx as never, {
@@ -659,6 +665,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }
   try {
     ctx.effect(() => registerMeetingPresentationTools(ctx as never, {
+      binding: agent => bridge.desktopBinding(agent),
       request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options),
     }), 'personal-assistant:meeting-presentation-tools')
   } catch (error) {
@@ -842,7 +849,6 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }, 'personal-assistant:team')
 
   // 工作事项与导入材料各一份：对话工具、日报工作台和删除传播读写同一处，不各自建一份副本。
-  const workItems = new WorkItemStore(db)
   const materials = new MaterialStore(db)
   // 外部证据收件（会议纪要 / 窗口文本）：桌面壳经 POST /evidence/intake 送进来。
   // 校验与入库都在 `intakeEvidence` 里，这里只把资料库与时钟接上。
@@ -988,14 +994,6 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   log(`loaded (store: ${storePath}, sampleDir: ${sampleDir}, reportDir: ${reportDir}, team: ${config.teamEnabled})`)
 }
 
-interface RetentionDeps {
-  sampleDir: string
-  observations: ObservationStore
-  memories: MemoryStore
-  retentionDays: number
-  now: number
-}
-
 /**
  * 一次团队挂载的全部运行时所有物。
  * dispose 按「先子代理静止 → 对账未完成态 → 关库」的顺序释放；前面任何一步失败
@@ -1084,38 +1082,6 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
       team.recoverInterruptedTasks()
       unregisterTools?.()
     },
-  }
-}
-
-interface RetentionOutcome {
-  keepFromDate: string
-  prunedSampleDays: number
-  prunedSpans: number
-  expiredMemories: number
-  deletedMemories: number
-}
-
-/**
- * 按保留期清理原始活动。
- *
- * 只对 activity_span 生效：旧记录里的语义事项和用户笔记是已经确认过的成果，
- * 按 design.md 的保留期限候选，它们留到用户自己删为止，不该被保留期悄悄抹掉。
- *
- * 采样原文必须真删文件。原始活动里最敏感的就是窗口标题，只删库里的派生观察、
- * 把 JSONL 留在磁盘上，"保留 N 天"就是一句空话。磁盘上的日期边界和库里的时间戳
- * 边界由同一个 keepFromDate 推出来，两边不会差出一天。
- */
-function applyRetention(deps: RetentionDeps): RetentionOutcome {
-  const keepFromDate = retentionStartDate(deps.now, deps.retentionDays)
-  const prunedSamples = pruneSampleFiles(deps.sampleDir, keepFromDate)
-  const prunedSpans = deps.observations.deleteRange('activity_span', startOfLocalDate(keepFromDate))
-  const memoryRetention = deps.memories.applyRetention(deps.now)
-  return {
-    keepFromDate,
-    prunedSampleDays: prunedSamples.length,
-    prunedSpans,
-    expiredMemories: memoryRetention.expired,
-    deletedMemories: memoryRetention.deleted,
   }
 }
 

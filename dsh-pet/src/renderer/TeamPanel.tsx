@@ -114,7 +114,7 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval, bindi
   const nothing = !view.teamEnabled && view.tasks.length === 0 && view.proposals.length === 0
 
   return (
-    <div className="team-page" id="panel-page-team" role="tabpanel" aria-labelledby="panel-tab-team">
+    <div className="team-page" id="panel-page-team" role="region" aria-labelledby="panel-tab-team">
       {nothing ? (
         /*
           不给一个空面板：空白会让人分不清"没有任务"和"没连上"。

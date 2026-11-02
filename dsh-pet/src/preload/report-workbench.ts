@@ -58,7 +58,7 @@ export type ReportWorkbenchApi = {
    * 与"请求发布"同一性质：页面只说"这一条改成什么"，插件那边生成待批提案，
    * 主进程随后打开专用审批窗口。这里没有直接写库的接口。
    */
-  editMemory(payload: { memoryId: string; text: string; topic?: string }): Promise<WorkbenchReply>
+  editMemory(payload: { memoryId: string; expectedRevision: number; text: string; topic?: string }): Promise<WorkbenchReply>
   onChanged(callback: () => void): void
 }
 

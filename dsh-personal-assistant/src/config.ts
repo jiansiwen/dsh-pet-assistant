@@ -51,6 +51,8 @@ export interface Config {
   excludedTitleKeywords: string[]
   /** 原始活动（采样片段与观察记录）保留天数，超期由保留期清理删除；最小 1。 */
   retentionActivityDays: number
+  /** 自动清理默认关闭；只有本人明确同意后才可启用。 */
+  retentionAutoDelete: boolean
   /**
    * 注入系统提示词的记忆条数上限（按优先级取前 N 条）。
    * 限制的是注入而不是存储：存多了不花钱，全塞进提示词会把上下文挤爆。
@@ -124,6 +126,7 @@ export const Config: Schema<Config> = Schema.object({
   excludedProcesses: Schema.array(Schema.string()).default(['KeePass', 'KeePassXC', '1Password', 'Bitwarden']),
   excludedTitleKeywords: Schema.array(Schema.string()).default(['密码管理', '支付密码', '银行卡', '网上银行', 'password manager']),
   retentionActivityDays: Schema.number().default(7),
+  retentionAutoDelete: Schema.boolean().default(false),
   maxInjectedMemories: Schema.number().default(40),
   migrateLegacy: Schema.boolean().default(true),
   deleteLegacyAfterMigration: Schema.boolean().default(false),

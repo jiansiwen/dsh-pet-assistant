@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { ApprovalError, ApprovalService, digestOf } from './approval.ts'
 import {
@@ -17,7 +17,47 @@ const reschedulePayload = z.object({
 
 const intervalPayload = z.object({ repeatEverySeconds: z.number().int().min(60).max(604_800) }).strict()
 const mailNoticeReceiptSchema = reminderReceiptSchema.extend({ attemptId: z.string().uuid() })
+const meetingTodoSchema = z.object({
+  meetingId: z.string().min(1).max(200), itemId: z.string().regex(/^action-\d{1,3}$/), meetingName: z.string().trim().min(1).max(80),
+  revision: z.number().int().positive().safe(), digest: z.string().regex(/^[a-f0-9]{64}$/), confirmedAt: z.number().int().nonnegative().safe(),
+  text: z.string().trim().min(1).max(400), owner: z.string().trim().max(400).nullable(), due: z.string().trim().max(400).nullable(),
+  sourceRefs: z.array(z.string().max(80)).min(1).max(40),
+}).strict().superRefine((value, context) => {
+  const tag = createHash('sha256').update(value.meetingId, 'utf8').digest('hex').slice(0, 6)
+  const prefix = `M${tag}-R${value.revision}-S`
+  if (new Set(value.sourceRefs).size !== value.sourceRefs.length
+    || value.sourceRefs.some(ref => !ref.startsWith(prefix) || !/^\d{1,8}$/.test(ref.slice(prefix.length)))) {
+    context.addIssue({ code: 'custom', message: '行动项来源不属于这场会议的当前转写版本' })
+  }
+})
 type Action = 'create' | 'pause' | 'resume' | 'cancel' | 'complete' | 'reschedule' | 'respond' | 'set-interval'
+
+/** 仅标记尚未进入业务调度、且事务能够回滚的数据库争用。 */
+class RetryableTickBusy extends Error {
+  readonly sqliteCode: number
+  constructor(sqliteCode: number) { super('数据库暂时繁忙'); this.sqliteCode = sqliteCode }
+}
+
+function sqliteErrorCode(error: unknown): number | null {
+  try {
+    const value = error as { code?: unknown; errcode?: unknown } | null
+    return value?.code === 'ERR_SQLITE_ERROR' && typeof value.errcode === 'number'
+      && Number.isInteger(value.errcode) && value.errcode >= 0 && value.errcode <= 65_535 ? value.errcode : null
+  } catch { return null }
+}
+
+function retryBeforeDispatch(error: unknown): never {
+  const code = sqliteErrorCode(error)
+  if (code !== null && (code & 0xff) === 5) throw new RetryableTickBusy(code)
+  throw error
+}
+
+function errorKind(error: unknown): string {
+  try {
+    const name = error instanceof Error ? error.name : ''
+    return /^[A-Za-z][A-Za-z0-9]{0,40}$/.test(name) ? name : '未知'
+  } catch { return '未知' }
+}
 
 export class CompanionTaskRuntime {
   readonly principalId: string
@@ -27,12 +67,15 @@ export class CompanionTaskRuntime {
   private readonly epoch: string
   private readonly now: () => number
   private readonly onChange: () => void
+  private readonly log: (message: string) => void
+  private readonly canRetryBusy: () => boolean
   private readonly activeMailAccount: () => { accountKey: string; memberId: string } | null
   private readonly reminders: CompanionReminders
   private readonly unregister: () => void
   private accepting = true
   private disposed = false
   private started = false
+  private retryingBusy = false
   private timer: ReturnType<typeof setInterval> | undefined
   private memberManagement: { request(method: string, pathname: string, body: unknown): Promise<CompanionHttpResult> } | null = null
   private settings: {
@@ -44,7 +87,7 @@ export class CompanionTaskRuntime {
   private channelAccountKey: () => string | null = () => null
 
   constructor(store: TeamStore, approvals: ApprovalService, options: {
-    epoch: string; now?: () => number; onChange?: () => void
+    epoch: string; now?: () => number; onChange?: () => void; log?: (message: string) => void; canRetryBusy?: () => boolean
     acceptsRecipient?: (channel: 'desktop' | 'wecom', recipientRef: string) => boolean
     activeMailAccount?: () => { accountKey: string; memberId: string } | null
   }) {
@@ -54,6 +97,8 @@ export class CompanionTaskRuntime {
     this.epoch = options.epoch
     this.now = options.now ?? Date.now
     this.onChange = options.onChange ?? (() => {})
+    this.log = options.log ?? (() => {})
+    this.canRetryBusy = options.canRetryBusy ?? (() => true)
     this.activeMailAccount = options.activeMailAccount ?? (() => null)
     const identity = store.companionIdentity()
     this.principalId = identity.principalId
@@ -204,6 +249,14 @@ export class CompanionTaskRuntime {
     try { this.onChange() } catch { }
   }
 
+  private logStatus(message: string): void {
+    try { this.log(message) } catch { }
+  }
+
+  private mayRetryBusy(): boolean {
+    try { return this.canRetryBusy() === true } catch { return false }
+  }
+
   start(): void {
     if (this.started || !this.accepting || this.disposed) return
     this.started = true
@@ -218,7 +271,32 @@ export class CompanionTaskRuntime {
     })
     this.tick()
     this.timer = setInterval(() => {
-      try { this.tick() } catch { this.stopAccepting() }
+      if (this.retryingBusy && !this.mayRetryBusy()) {
+        this.logStatus('[warn] 桥接归属已变化，旧任务运行时停止接单。')
+        this.stopAccepting()
+        return
+      }
+      try {
+        this.tick()
+        if (this.retryingBusy) {
+          this.retryingBusy = false
+          this.logStatus('普通任务数据库已恢复，调度继续。')
+        }
+      } catch (error) {
+        if (error instanceof RetryableTickBusy) {
+          if (!this.mayRetryBusy()) {
+            this.logStatus('[warn] 数据库繁忙且当前运行时不再拥有桥接，已停止接单。')
+            this.stopAccepting()
+            return
+          }
+          if (!this.retryingBusy) this.logStatus(`[warn] 普通任务数据库繁忙（SQLite 码 ${error.sqliteCode}），稍后再检查。`)
+          this.retryingBusy = true
+          return
+        }
+        const code = sqliteErrorCode(error)
+        this.logStatus(`[warn] 普通任务调度异常（类型 ${errorKind(error)}${code === null ? '' : `，SQLite 码 ${code}`}），已停止接单。`)
+        this.stopAccepting()
+      }
     }, 1000)
     this.timer.unref?.()
   }
@@ -244,9 +322,11 @@ export class CompanionTaskRuntime {
 
   private tick(): void {
     if (!this.accepting || this.disposed) return
-    const cursor = this.store.companionEventCursor(this.principalId)
+    let cursor: number
+    try { cursor = this.store.companionEventCursor(this.principalId) } catch (error) { retryBeforeDispatch(error) }
     this.store.transaction(() => {
-      this.store.pruneCompanionContexts(this.now() - 24 * 60 * 60_000)
+      // 这是事务的第一条写入：尚未推进任务或通知等待者，争用时回滚后才可安全重试。
+      try { this.store.pruneCompanionContexts(this.now() - 24 * 60 * 60_000) } catch (error) { retryBeforeDispatch(error) }
       for (const followup of this.store.pendingMeetingMailFollowups()) this.ensureMeetingMailReminder(followup.intentId)
       for (const task of this.store.listTasks({ runtimeScope: 'companion', status: 'queued' })) {
         const meta = this.store.getCompanionMeta(task.taskId)!
@@ -288,6 +368,39 @@ export class CompanionTaskRuntime {
     return taskId
   }
 
+  /** 只接收桌面本人核对后的行动项；原来源即使任务完成或取消也不再创建第二条。 */
+  private importMeetingTodo(raw: unknown): CompanionHttpResult {
+    const input = meetingTodoSchema.parse(raw)
+    const itemDigest = digestOf({ text: input.text, owner: input.owner, due: input.due, sourceRefs: input.sourceRefs })
+    return this.store.transaction(() => {
+      const previous = this.store.getMeetingTodoSource(this.principalId, this.deviceId, input.meetingId, input.itemId)
+      if (previous) {
+        const task = this.store.getTask(previous.taskId)
+        if (!task || previous.itemDigest !== itemDigest) throw new CompanionError('MEETING_SOURCE_CHANGED', '这个行动项已导入过，但来源或内容已变化；请到任务页核对，不自动覆盖或新建')
+        return { status: 200, body: { duplicate: true, task: this.view(task), source: previous,
+          sourceChanged: previous.minuteDigest !== input.digest || previous.revision !== input.revision,
+          message: '已导入过，保留原任务及其原始会议版本；未创建新任务。' } }
+      }
+      const description = [`会议：${input.meetingName}`, `行动项：${input.text}`, `负责人：${input.owner || '待确认'}`,
+        `期限：${input.due || '待确认'}`, `会议版本：转写第 ${input.revision} 版`, `纪要摘要：${input.digest}`,
+        `来源：${input.sourceRefs.join('、')}`, `纪要确认时间：${new Date(input.confirmedAt).toISOString()}`,
+        '只登记人工待办；会议后续修改不会自动覆盖任务，提醒需要单独设置。'].join('\n')
+      const taskInput = companionInputSchema.parse({ kind: 'agent', executionMode: 'manual', description })
+      const inputRef = randomUUID(), at = this.now()
+      this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input: taskInput, digest: digestOf(taskInput), createdAt: at })
+      const task = this.insertTask(input.text, inputRef, null, [], 'awaiting-user', `meeting-todo-${randomUUID()}`)
+      const source = { principalId: this.principalId, deviceId: this.deviceId, meetingId: input.meetingId, itemId: input.itemId,
+        revision: input.revision, minuteDigest: input.digest, itemDigest, confirmedAt: input.confirmedAt, createdAt: at, taskId: task.taskId }
+      this.store.saveMeetingTodoSource(source)
+      const operationId = randomUUID()
+      this.store.insertOperation({ operationId, taskId: task.taskId, approvalId: null, kind: 'meeting.todo.import', state: 'succeeded',
+        resultDigest: digestOf({ taskId: task.taskId, source }), startedAt: at, endedAt: at, executedAt: at,
+        assistantId: 'executor:companion', target: input.meetingId, paramsDigest: digestOf(input), resultDetail: '本人在桌面确认后登记会议行动项' })
+      return { status: 201, body: { duplicate: false, task: this.view(task), source,
+        message: '已登记为人工待办；不会自动执行，也不会自动设置提醒。' } }
+    })
+  }
+
   private ownedTask(taskId: string): Task {
     const meta = this.store.getCompanionMeta(taskId)
     const task = this.store.getTask(taskId)
@@ -313,6 +426,29 @@ export class CompanionTaskRuntime {
       const acceptedAt = this.store.getMailSendIntent(followup.intentId)?.acceptedAt
       return acceptedAt == null ? [] : [{ intentId: followup.intentId, acceptedAt: new Date(acceptedAt).toISOString() }]
     }) }))
+  }
+
+  /** 精确相同的本人完成事项才列候选；没有步骤证据时不推断可自动执行。 */
+  skillCandidates(): { ok: true; candidates: Array<{ id: string; title: string; description: string; count: number; taskIds: string[]; enabled: false }>; notice: string } {
+    if (this.disposed || !this.accepting) throw new CompanionError('DEVICE_OFFLINE', '任务运行时已停止', 503)
+    const groups = new Map<string, { id: string; title: string; description: string; count: number; taskIds: string[]; enabled: false }>()
+    for (const task of this.store.listTasks({ runtimeScope: 'companion', status: 'done' })) {
+      const meta = this.store.getCompanionMeta(task.taskId)
+      if (!meta || meta.principalId !== this.principalId || meta.deviceId !== this.deviceId || meta.kind !== 'agent'
+        || !this.store.hasOwnerCompletion(task.taskId, this.principalId)) continue
+      const record = this.store.getCompanionInput(meta.inputRef)
+      if (!record || record.principalId !== this.principalId || record.digest !== digestOf(record.input) || record.input.kind !== 'agent') continue
+      const title = task.goal.trim(), description = record.input.description.trim()
+      if (!title || !description) continue
+      const id = digestOf({ title, description })
+      let group = groups.get(id)
+      if (!group) { group = { id, title, description, count: 0, taskIds: [], enabled: false }; groups.set(id, group) }
+      group.count++
+      if (group.taskIds.length < 10) group.taskIds.push(task.taskId)
+    }
+    return { ok: true, candidates: [...groups.values()].filter(item => item.count >= 2)
+      .sort((a, b) => b.count - a.count || a.title.localeCompare(b.title)).slice(0, 20),
+    notice: '候选仅表示本人多次标记相同人工事项完成，并不证明记录了操作步骤；尚未试跑，不能启用或自动处理邮件。' }
   }
 
   /**
@@ -451,6 +587,14 @@ export class CompanionTaskRuntime {
         if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '设置仅接受宠物面板中的本人操作', 403)
         if (!this.accepting || !this.settings) throw new CompanionError('DEVICE_OFFLINE', '配置服务尚未就绪', 503)
         return await this.settings.request(method, pathname, body)
+      }
+      if (pathname === '/companion/v1/meeting-actions/import') {
+        if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '会议行动项只接受本机本人确认后的交接', 403)
+        if (method !== 'POST') throw new CompanionError('NOT_FOUND', '接口不存在', 404)
+        if (!this.accepting) throw new CompanionError('DEVICE_OFFLINE', '运行时已停止接单', 503)
+        const result = this.importMeetingTodo(body)
+        this.changed()
+        return result
       }
       if (method === 'GET') {
         if (pathname === '/companion/v1/reminder-defaults') {

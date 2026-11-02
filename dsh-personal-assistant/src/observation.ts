@@ -99,6 +99,12 @@ export class ObservationStore {
         deleted_at INTEGER NOT NULL,
         PRIMARY KEY (from_ms, to_ms)
       );
+
+      CREATE TABLE IF NOT EXISTS activity_retention_boundary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        before_ms INTEGER NOT NULL,
+        recorded_at INTEGER NOT NULL
+      );
     `)
   }
 
@@ -117,9 +123,25 @@ export class ObservationStore {
   }
 
   deletedRanges(): Array<{ from: number; to: number; reason: string; deletedAt: number }> {
-    return (this.db.prepare('SELECT * FROM deleted_activity_ranges ORDER BY from_ms').all() as Row[]).map(row => ({
+    const ranges = (this.db.prepare('SELECT * FROM deleted_activity_ranges ORDER BY from_ms').all() as Row[]).map(row => ({
       from: Number(row.from_ms), to: Number(row.to_ms), reason: String(row.reason), deletedAt: Number(row.deleted_at),
     }))
+    const boundary = this.db.prepare('SELECT before_ms, recorded_at FROM activity_retention_boundary WHERE id = 1').get() as Row | undefined
+    if (boundary && Number(boundary.before_ms) > 0) ranges.push({ from: 0, to: Number(boundary.before_ms), reason: '活动记录到期', deletedAt: Number(boundary.recorded_at) })
+    return ranges
+  }
+
+  /** 记录不可回填的到期边界；保留期后来变长也不能复活已清理的历史。 */
+  recordRetentionBoundary(before: number, now: number): void {
+    this.db.prepare(`INSERT INTO activity_retention_boundary (id, before_ms, recorded_at) VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET recorded_at = CASE WHEN excluded.before_ms > before_ms THEN excluded.recorded_at ELSE recorded_at END,
+        before_ms = MAX(before_ms, excluded.before_ms)`)
+      .run(before, now)
+  }
+
+  retentionBoundary(): number | null {
+    const row = this.db.prepare('SELECT before_ms FROM activity_retention_boundary WHERE id = 1').get() as Row | undefined
+    return row ? Number(row.before_ms) : null
   }
 
   /** [start, end) 是否与任一已删除区间重叠。 */
@@ -139,6 +161,7 @@ export class ObservationStore {
   put(observation: Observation): boolean {
     const rejection = validateObservation(observation)
     if (rejection) throw new Error(`observation rejected: ${rejection}`)
+    if (observation.source === 'activity_span' && this.overlapsDeleted(observation.startAt, observation.endAt)) return false
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO observations
@@ -180,6 +203,14 @@ export class ObservationStore {
     return rows.map(rowToObservation)
   }
 
+  /** 只查询明确归属该项目且与区间重叠的活动观察；全局窗口观察不因名称相似而归入项目。 */
+  listProjectOverlap(projectDir: string, from: number, to: number, limit: number): Observation[] {
+    const rows = this.db.prepare(`SELECT * FROM observations WHERE scope_kind = 'project' AND scope_id = ?
+      AND source = 'activity_span' AND start_at < ? AND end_at > ? ORDER BY start_at, observation_id LIMIT ?`)
+      .all(projectDir, to, from, limit) as Row[]
+    return rows.map(rowToObservation)
+  }
+
   /** 某个来源在某个区间里已经导入过没有——迁移时用来判断能不能跳过整天。 */
   hasInRange(source: ObservationSource, from: number, to: number): boolean {
     const row = this.db
@@ -194,6 +225,13 @@ export class ObservationStore {
       .prepare('DELETE FROM observations WHERE source = ? AND end_at < ?')
       .run(source, before)
     return Number(result.changes)
+  }
+
+  /** 到期清理先取来源编号，才能传播给记忆和工作事项。 */
+  listBefore(source: ObservationSource, before: number): Observation[] {
+    const rows = this.db.prepare('SELECT * FROM observations WHERE source = ? AND end_at < ? ORDER BY start_at, observation_id')
+      .all(source, before) as Row[]
+    return rows.map(rowToObservation)
   }
 
   /** 删除与 [from, to) 重叠的观察，返回删掉的行数。用户删除某时间段原始记录用。 */

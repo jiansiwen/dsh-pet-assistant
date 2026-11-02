@@ -10,7 +10,7 @@ import ChatOverlay from './ChatOverlay.js'
 import PetSettingsPanel, { PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
 import { EnvironmentCheck } from './FirstRunSettings.js'
 import { useSession } from './useSession.js'
-import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, parseInterruptPhrase } from '../voice-conversation.ts'
+import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, planInterruptInput } from '../voice-conversation.ts'
 import type { VoiceTurn } from '../session-types.js'
 import {
   clearStageHitboxes,
@@ -53,6 +53,7 @@ import './pet-anim.css'
 import './portal.css'
 import './team.css'
 import './hud.css'
+import './settings-surface.css'
 
 const QUICK_COMMANDS = ['开启个人助理模式', '我今天干了啥？', '总结今日工作内容']
 
@@ -69,7 +70,7 @@ const PROACTIVE_BUBBLE_TTL_MS = 30 * 60_000
  * 插件与宠物都是**进程内加载 + 模块缓存**，重建磁盘文件对已运行的进程毫无影响。
  * 看一眼这个标记就知道，不用再靠猜。
  */
-const UI_BUILD = '0923-hud1'
+const UI_BUILD = '1031-settings2'
 
 /** 语音唤醒命中时的应答。角色被隐藏时这句要等舞台挂回来再补说，所以提成常量。 */
 const WAKE_GREETING = '我在呢！找我什么事？'
@@ -128,6 +129,7 @@ export default function App() {
   const [voiceConversation, setVoiceConversation] = useState(false)
   const [continuousVoice, setContinuousVoice] = useState(false)
   const [readReplies, setReadReplies] = useState(false)
+  const [meetingDocumentAutoApprove, setMeetingDocumentAutoApprove] = useState<boolean | null>(null)
   /** 会话框停靠方式与尺寸；默认固定在头顶，尺寸 440×560。 */
   const [chatDock, setChatDock] = useState<'top' | 'auto'>('top')
   const [chatSize, setChatSize] = useState<{ width: number; height: number }>({ width: 440, height: 560 })
@@ -324,6 +326,7 @@ export default function App() {
       setVoiceConversation(state.voiceConversation === true)
       setContinuousVoice(state.continuousVoice === true)
       setReadReplies(state.readReplies === true)
+      setMeetingDocumentAutoApprove(state.meetingDocumentAutoApprove === true)
       setChatDock(state.chatDock === 'auto' ? 'auto' : 'top')
       if (state.chatSize && Number.isFinite(state.chatSize.width) && Number.isFinite(state.chatSize.height)) {
         setChatSize({ width: state.chatSize.width, height: state.chatSize.height })
@@ -700,23 +703,36 @@ export default function App() {
     let directMode = false
     const accept = async (text: string): Promise<void> => {
       if (cancelled()) return
-      if (gateInterrupt && !directMode) {
-        const phrase = parseInterruptPhrase(text)
-        if (!phrase.matched) return
-        window.petApi.stopSpeech()
-        if (conversation.active) stopContinuous(false)
-        if (phrase.rest.length > 0) {
-          // 口令后面还带了问题：当场回答，不用再说一遍。
-          voiceRoundRef.current = true
-          setInput(phrase.rest)
-          if (!busyRef.current) void send(phrase.rest)
-          else showToast('上一条消息尚未提交完成，语音已保留在输入框')
+      if (gateInterrupt) {
+        const plan = planInterruptInput(text, directMode)
+        if (plan.action === 'ignore') return
+        if (plan.action === 'send' || plan.action === 'listen') {
+          if (!directMode) window.petApi.stopSpeech()
+          if (conversation.active) {
+            stopContinuous(false)
+            // 这是主动从连续对话转入插话，不是用户取消下一次听写。
+            dictationCancelled.current = false
+          }
+          if (plan.action === 'send') {
+            // 口令后面还带了问题：当场回答，不用再说一遍。
+            voiceRoundRef.current = true
+            setInput(plan.text)
+            if (!busyRef.current) void send(plan.text)
+            else showToast('上一条消息尚未提交完成，语音已保留在输入框')
+            return
+          }
+          // 只说了口令：等本次听写释放后再听问题；会议内仍按插话来源申请。
+          showToast('已停下，请说你的问题')
+          const binding = currentBinding.current
+          const resumeGeneration = dictationGeneration.current
+          window.setTimeout(() => {
+            if (!dictationCancelled.current && dictationGeneration.current === resumeGeneration
+              && !exitingRef.current && binding && currentBinding.current === binding) {
+              void startListen(true, false, undefined, true, true)
+            }
+          }, 150)
           return
         }
-        // 只说了口令：停下，再开一次麦听你要问什么。
-        showToast('已停下，请说你的问题')
-        window.setTimeout(() => { void startListen(true) }, 150)
-        return
       }
       // 插话时自己念了唤醒词：那是"停下"的意思，不是要发出去的一句话，也不重新进入唤醒流程。
       if (takeHandover && isWakePhraseOnly(text)) {
@@ -1415,6 +1431,23 @@ export default function App() {
                 }}
                 showToast={showToast}
               />
+              <section className="management-section" aria-label="会议与文档审批">
+                <h3>会议与文档审批</h3>
+                <label className="management-voice">
+                  <input type="checkbox" checked={meetingDocumentAutoApprove === true} disabled={meetingDocumentAutoApprove === null}
+                    onChange={async event => {
+                      const enabled = event.target.checked
+                      try {
+                        const result = await window.petApi.saveSettings({ meetingDocumentAutoApprove: enabled })
+                        if (result.ok) setMeetingDocumentAutoApprove(enabled)
+                        else showToast('会议与文档审批设置未保存')
+                      } catch { showToast('会议与文档审批设置未保存') }
+                    }} />
+                  会议录音与文档讲解自动审批（默认开启）
+                </label>
+                <p className="management-hint">开启后，当前桌面请求可不经逐次弹窗开始或停止会议录音、讲解授权目录内的文档。录音会采集麦克风和所选系统音频，讲解会把文档片段发送给当前模型服务商；请确保参会者知情。关闭后恢复逐次确认。邮件、纪要及其他操作仍按各自规则审批。</p>
+                <p className="management-hint">讲解期间会监听麦克风以支持插话；语音识别使用当前配置的识别服务，可能将插话音频发送给该服务。</p>
+              </section>
               <EnvironmentCheck showToast={showToast} />
               <WorkEvidenceSettings showToast={showToast} />
               <PresentationSettings active={presentation} />
@@ -1439,7 +1472,6 @@ export default function App() {
             </div>
           ) : settingsPage === 'team' ? (
             <>
-              <h3 className="management-page-title" id="panel-tab-team">团队管理</h3>
               {banner && (
                 <div className="approval-banner" role="status">
                   <span className="approval-banner-dot" aria-hidden />
@@ -1480,7 +1512,6 @@ export default function App() {
             <AssistantSettings key={settingsPage} section={settingsPage} />
           ) : (
             <>
-              <h3 className="management-page-title" id="panel-tab-doc">文档管理</h3>
               <section className="management-doc-results" aria-label="文档操作结果">
                 <h4>最近结果</h4>
                 <p className="management-hint">文档讲解与问答显示在这里，不进入原生会话。</p>

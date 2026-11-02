@@ -359,7 +359,8 @@ export class ReportStore {
   invalidationBlocker(dates: readonly string[]): string | null {
     for (const reportId of [...new Set(dates)].map(date => makeReportId('daily', date))) {
       if (this.db.prepare(`SELECT 1 FROM publish_jobs
-        WHERE report_id = ? AND state IN ('running', 'unknown')`).get(reportId)) {
+        WHERE report_id = ? AND state IN ('running', 'unknown')`).get(reportId)
+        || this.db.prepare(`SELECT 1 FROM reports WHERE report_id = ? AND state = 'publishing'`).get(reportId)) {
         return '日报正在发布或发布结果未知，暂时不能删除来源；请先核对发布结果'
       }
     }

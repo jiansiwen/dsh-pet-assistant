@@ -128,6 +128,16 @@
   transform: scaleX(-1);
 }
 
+/* 挣扎视频和序列帧都不可用时，仍给被拖住的静态形象一个可见的反馈。 */
+.pet-flip.pet-grab-fallback {
+  transform-origin: 50% 12%;
+  animation: pa-grab-fallback 0.45s ease-in-out infinite alternate;
+}
+@keyframes pa-grab-fallback {
+  from { rotate: -7deg; translate: -2px -2px; }
+  to { rotate: 7deg; translate: 2px 2px; }
+}
+
 /* 默认隐藏的部件 */
 .p-eye-closed,
 .p-zzz,

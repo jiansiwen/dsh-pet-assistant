@@ -50,6 +50,7 @@ const uiEvents = new EventEmitter()
 let fakeMeetingTranscription = false
 let confirmMeetingPresentation: () => Promise<{ response: number }> = async () => ({ response: 1 })
 let claimDesktopCommand: () => Promise<{ status: number; body: unknown }> = async () => ({ status: 200, body: { claimed: true } })
+let desktopResultStatus = 200
 const meetingPresentationDialogs: Array<Record<string, unknown>> = []
 const session: SessionSnapshot = {
   sessionId: '测试会话', bindingId: '测试绑定', cursor: 0, title: '入口回归', status: 'idle', entries: [], hasMore: false,
@@ -57,6 +58,7 @@ const session: SessionSnapshot = {
   capabilities: { prompt: true, cancel: true, models: false, permissions: false, history: true },
 }
 let bridgeCallbacks: BridgeCallbacks
+let initialAutoApproval: unknown
 const sessionCommands: SessionCommand[] = []
 const desktopReplies: Array<{ id: string; ok: boolean; result?: unknown; error?: string }> = []
 const chats: Array<{
@@ -88,7 +90,7 @@ class FakeBridge {
   async companionRequest(_method: string, route: string, body: { id: string; ok?: boolean; result?: unknown; error?: string }): Promise<{ status: number; body: unknown }> {
     if (route === '/companion/v1/desktop/claim') return claimDesktopCommand()
     desktopReplies.push(body as { id: string; ok: boolean; result?: unknown; error?: string })
-    return { status: 200, body: {} }
+    return { status: desktopResultStatus, body: {} }
   }
   // 提醒投递定时器每 3 秒轮询一次；文档测试没有普通任务库，永远领不到东西。
   async nextDesktopReminder(): Promise<null> { return null }
@@ -116,6 +118,27 @@ mock.module('../src/main/harness.ts', {
   },
 })
 const wpsOpens: string[] = []
+const readingViews: Array<{ path: string; format: string; content: string; sections: number[] }> = []
+mock.module('../src/main/office-view-window.ts', {
+  namedExports: { OfficeViewWindow: class {
+    private doc: { path: string; fingerprint: string; format: string } | null = null
+    private options: { open(target: string): Promise<any>; read(doc: any): Promise<Uint8Array> }
+    constructor(options: { open(target: string): Promise<any>; read(doc: any): Promise<Uint8Array> }) { this.options = options }
+    async show(target: string, start?: { index: number }) {
+      const result = await this.options.open(target)
+      if (!result.ok) return result
+      this.doc = result.doc
+      const content = Buffer.from(await this.options.read(result.doc)).toString('utf8')
+      readingViews.push({ path: target, format: result.doc.format, content, sections: start ? [start.index] : [] })
+      return { ok: true }
+    }
+    gotoSection(index: number) { readingViews.at(-1)?.sections.push(index) }
+    isOpen() { return this.doc !== null }
+    isShowing(target: string, fingerprint: string) { return this.doc?.path === target && this.doc.fingerprint === fingerprint }
+    close() { this.doc = null }
+    registerIpc() { return () => {} }
+  } },
+})
 mock.module('../src/main/wps-control.ts', {
   namedExports: {
     // 端到端不得拉起真实 WPS 辅助脚本：替身一律报"未安装"，只记录被要求打开的真实路径。
@@ -190,6 +213,13 @@ function fakeAudio(opened: (event: TtsWorkerEvent) => void): TtsTransport {
     close() { playing = null },
   }
 }
+let playbackMode: (() => string) | null = null
+mock.module('../src/main/tts-renderer-transport.ts', {
+  namedExports: {
+    RendererPlayback: class { open = fakeAudio; receipt() {} },
+    createSwitchingTransport: (select: () => string) => { playbackMode = select; return fakeAudio },
+  },
+})
 let narrator: FakeNarrator
 class FakeNarrator extends Narrator {
   requests: SpeechRequest[] = []
@@ -388,6 +418,7 @@ before(async () => {
   await nextTurn()
   assert.equal(windows, 1, '真实装配创建一个替身舞台，不加载真实宠物界面')
   assert.ok(narrator.callbacks.onSpoken, '使用真实主进程注册的播出记录回调')
+  initialAutoApproval = (await invoke<{ meetingDocumentAutoApprove?: boolean }>('get-state')).meetingDocumentAutoApprove
 })
 beforeEach(async () => {
   writeFileSync(documentPath, paragraphs.join('\n\n'), 'utf8')
@@ -403,10 +434,13 @@ beforeEach(async () => {
   narrator.requests.length = 0
   narrator.interrupts.length = 0
   audioCommands.length = 0
-  confirmMeetingPresentation = async () => ({ response: 1 })
+  confirmMeetingPresentation = async () => ({ response: 0 })
   claimDesktopCommand = async () => ({ status: 200, body: { claimed: true } })
+  desktopResultStatus = 200
   meetingPresentationDialogs.length = 0
+  readingViews.length = 0
   fakeMeetingTranscription = false
+  await invoke('save-settings', { meetingDocumentAutoApprove: false })
 })
 afterEach(async () => {
   await prompt('结束讲解')
@@ -810,6 +844,394 @@ test('桌面停录工具必须依据真实冲刷回执，不能因停止状态�
   }
 })
 
+async function independentCommand(id: string, command: string, payload: Record<string, unknown> = {}) {
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command, payload: { bindingId: session.bindingId, ...payload }, expiresAt: Date.now() + 10_000 } })
+  for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  const reply = desktopReplies.find(item => item.id === id)
+  assert.ok(reply, `桌面命令 ${id} 未返回回执`)
+  return reply
+}
+
+test('独立录音须本人确认，只启动录音，不读取或讲解文档', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  let meetingId = ''
+  try {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '独立录音', command: 'meeting.recording.start',
+      payload: { bindingId: session.bindingId, name: '单独录音', sources: 'mic', retentionDays: 30 }, expiresAt: Date.now() + 10_000 } })
+    for (let i = 0; i < 100 && sent('meeting-command').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(meetingPresentationDialogs.length, 1, '实际开麦前必须有本人确认')
+    const request = sent<{ requestId: string; consent: typeof meetingConsent }>('meeting-command').at(-1)!
+    const started = await invoke<{ ok: boolean; meetingId: string }>('meeting-start', request.consent, request.requestId)
+    assert.equal(started.ok, true)
+    meetingId = started.meetingId
+    await invoke('meeting-chunk', meetingId, Buffer.alloc(1600, 3).toString('base64'),
+      { track: 'mic', seq: 0, startMs: 0, sampleRate: 16_000, frames: 800 })
+    for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === '独立录音'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(desktopReplies.find(item => item.id === '独立录音')?.ok, true)
+    assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, true)
+    assert.equal(narrator.requests.length, 0)
+    assert.equal(chats.length, 0)
+    assert.equal(sent<DocState>('doc-state').some(state => state.kind === 'outline'), false)
+  } finally { if (meetingId) await finishAudioMeeting(meetingId) }
+})
+
+test('会议和文档自动审批默认开启，可关闭；开启时桌面请求不再弹确认框', async () => {
+  assert.equal(initialAutoApproval, true)
+  assert.equal((await invoke<{ meetingDocumentAutoApprove?: boolean }>('get-state')).meetingDocumentAutoApprove, false)
+  const save = ipcHandlers.get('save-settings')!
+  assert.equal((await save({ sender: {}, senderFrame: {} }, { meetingDocumentAutoApprove: true }) as { ok: boolean }).ok, false)
+  assert.equal((await invoke<{ meetingDocumentAutoApprove?: boolean }>('get-state')).meetingDocumentAutoApprove, false)
+  assert.equal((await invoke<{ ok: boolean }>('save-settings', { meetingDocumentAutoApprove: true })).ok, true)
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '自动开录', command: 'meeting.recording.start',
+    payload: { bindingId: session.bindingId, name: '自动审批会议', sources: 'mic', retentionDays: 30 }, expiresAt: Date.now() + 10_000 } })
+  for (let i = 0; i < 100 && sent('meeting-command').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(meetingPresentationDialogs.length, 0)
+  assert.equal(sent('meeting-command').length, 1)
+  bridgeCallbacks.onEvent?.({ type: 'desktop/cancel', payload: { id: '自动开录' } })
+  const result = await independentCommand('自动讲解', 'document.presentation.start', { documentPath })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(meetingPresentationDialogs.length, 0)
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+})
+
+test('单动作语音文档讲解也遵循审批开关，拒绝时不播放或请求模型', async () => {
+  confirmMeetingPresentation = async () => ({ response: 1 })
+  const denied = await prompt('讲讲讲解样本', true)
+  assert.equal(denied.ok, false)
+  assert.match(denied.error ?? '', /未同意/u)
+  assert.equal(chats.length, 0)
+  assert.equal(narrator.requests.length, 0)
+  await invoke('save-settings', { meetingDocumentAutoApprove: true })
+  const approved = await prompt('讲讲讲解样本', true)
+  assert.equal(approved.ok, true, approved.error)
+  assert.equal(meetingPresentationDialogs.length, 1, '自动审批时不再弹第二次窗口')
+  assert.ok(playing)
+})
+
+test('关闭自动审批后，尚未开始的自动录音和讲解不能继续', async () => {
+  await invoke('save-settings', { meetingDocumentAutoApprove: true })
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '待开录自动会议', command: 'meeting.recording.start',
+    payload: { bindingId: session.bindingId, name: '测试', sources: 'mic', retentionDays: 30 }, expiresAt: Date.now() + 10_000 } })
+  for (let i = 0; i < 100 && sent('meeting-command').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  const command = sent<{ requestId: string; consent: typeof meetingConsent }>('meeting-command').at(-1)!
+  await invoke('save-settings', { meetingDocumentAutoApprove: false })
+  assert.equal((await invoke<{ ok: boolean }>('meeting-start', command.consent, command.requestId)).ok, false)
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+  await invoke('save-settings', { meetingDocumentAutoApprove: true })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  assert.equal((await independentCommand('待开讲自动文档', 'document.presentation.start', { documentPath })).ok, true)
+  await invoke('save-settings', { meetingDocumentAutoApprove: false })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(narrator.requests.length, 0)
+  assert.equal(chats.length, 0)
+})
+
+test('独立文档讲解不打开录音，并等当前会话空闲才开始', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  const reply = await independentCommand('独立讲解', 'document.presentation.start', { documentPath })
+  assert.equal(reply.ok, true, reply.error)
+  assert.equal((reply.result as { state: string }).state, 'waiting-to-present')
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+  assert.equal(narrator.requests.length, 0)
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing, '仅在用户确认且会话空闲后才开始讲解')
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+  assert.equal((await invoke<AudioGrantsPayload>('audio-sync')).bargeIn, true, '本人允许讲解期间监听插话')
+  assert.equal(playbackMode?.(), 'renderer', '讲解插话必须走能提供播放时钟的渲染层播放器')
+  assert.equal((await independentCommand('结束独立讲解', 'document.presentation.control', { action: 'stop' })).ok, true)
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+})
+
+test('已有录音时单独讲解可组合，停止讲解不停止录音', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  const started = await invoke<{ ok: boolean; meetingId: string }>('meeting-start', meetingConsent)
+  assert.equal(started.ok, true)
+  try {
+    const reply = await independentCommand('录音期间讲解', 'document.presentation.start', { documentPath })
+    assert.equal(reply.ok, true, reply.error)
+    for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(playing)
+    assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, true)
+    assert.equal((await invoke<AudioGrantsPayload>('audio-sync')).bargeIn, true, '已有会议录音时不禁用该会议的插话能力')
+    assert.equal((await independentCommand('只停讲解', 'document.presentation.control', { action: 'stop' })).ok, true)
+    assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, true)
+    assert.equal(sent('meeting-stopping').length, 0)
+  } finally { await finishAudioMeeting(started.meetingId) }
+})
+
+test('停止独立录音不停止正在进行的独立文档讲解', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  const started = await invoke<{ ok: boolean; meetingId: string }>('meeting-start', meetingConsent)
+  assert.equal(started.ok, true)
+  try {
+    await invoke('meeting-chunk', started.meetingId, Buffer.alloc(1600, 3).toString('base64'),
+      { track: 'mic', seq: 0, startMs: 0, sampleRate: 16_000, frames: 800 })
+    assert.equal((await independentCommand('开始同时讲解', 'document.presentation.start', { documentPath })).ok, true)
+    for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(playing)
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '只停录音', command: 'meeting.recording.stop',
+      payload: { bindingId: session.bindingId, meetingId: started.meetingId }, expiresAt: Date.now() + 10_000 } })
+    for (let i = 0; i < 100 && sent('meeting-stopping').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(sent('meeting-stopping').length, 1)
+    await invoke('meeting-flush-done', started.meetingId, { tracks: { mic: { sent: 0, acknowledged: 0 } }, errors: [] })
+    for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === '只停录音'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(desktopReplies.find(item => item.id === '只停录音')?.ok, true)
+    assert.ok(playing, '停录不能停止文档播报')
+    assert.equal(outline().kind, 'outline')
+  } finally { await finishAudioMeeting(started.meetingId) }
+})
+
+test('独立工具拒绝换绑、取消和被拒绝的确认，不启动录音或讲解', async () => {
+  confirmMeetingPresentation = async () => ({ response: 1 })
+  const denied = await independentCommand('拒绝独立录音', 'meeting.recording.start', { name: '不能开录', sources: 'mic', retentionDays: 30 })
+  assert.equal(denied.ok, false)
+  assert.match(denied.error ?? '', /未同意/u)
+  assert.equal(meetingPresentationDialogs.length, 1)
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+  assert.equal(sent('meeting-command').length, 0)
+  const wrong = await independentCommand('错误绑定', 'document.presentation.start', { bindingId: '旧绑定', documentPath })
+  assert.equal(wrong.ok, false)
+  const pending = deferred<{ response: number }>()
+  confirmMeetingPresentation = () => pending.promise
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '取消独立讲解', command: 'document.presentation.start',
+    payload: { bindingId: session.bindingId, documentPath }, expiresAt: Date.now() + 10_000 } })
+  for (let i = 0; i < 100 && meetingPresentationDialogs.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  bridgeCallbacks.onEvent?.({ type: 'desktop/cancel', payload: { id: '取消独立讲解' } })
+  pending.resolve({ response: 0 })
+  await nextTurn(); await nextTurn()
+  assert.equal(narrator.requests.length, 0)
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+})
+
+test('独立讲解拒绝确认或确认期间文档变化时不向模型发送内容', async () => {
+  confirmMeetingPresentation = async () => ({ response: 1 })
+  const rejected = await independentCommand('拒绝文档', 'document.presentation.start', { documentPath })
+  assert.equal(rejected.ok, false)
+  assert.match(rejected.error ?? '', /未同意/u)
+  const pending = deferred<{ response: number }>()
+  confirmMeetingPresentation = () => pending.promise
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '确认中变更文档', command: 'document.presentation.start',
+    payload: { bindingId: session.bindingId, documentPath }, expiresAt: Date.now() + 10_000 } })
+  for (let i = 0; i < 100 && meetingPresentationDialogs.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  writeFileSync(documentPath, '确认期间内容已变更。', 'utf8')
+  pending.resolve({ response: 0 })
+  for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === '确认中变更文档'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(desktopReplies.find(item => item.id === '确认中变更文档')?.ok, false)
+  assert.equal(chats.length, 0)
+  assert.equal(narrator.requests.length, 0)
+})
+
+test('等待时文档变化或会话换绑不会启动独立讲解', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  assert.equal((await independentCommand('等待文档变化', 'document.presentation.start', { documentPath })).ok, true)
+  writeFileSync(documentPath, '等待期间内容已变更。', 'utf8')
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  const status = await independentCommand('变更后状态', 'document.presentation.control', { action: 'status' })
+  assert.equal((status.result as { state: string }).state, 'failed')
+  assert.equal(chats.length, 0)
+  assert.equal(narrator.requests.length, 0)
+  writeFileSync(documentPath, paragraphs.join('\n\n'), 'utf8')
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  assert.equal((await independentCommand('等待时换绑', 'document.presentation.start', { documentPath })).ok, true)
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, bindingId: '新的会话绑定', status: 'idle' } })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(chats.length, 0)
+  assert.equal(narrator.requests.length, 0)
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session } })
+})
+
+test('讲解启动回执未获接受时不自动播放或外发', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  desktopResultStatus = 409
+  assert.equal((await independentCommand('回执失败', 'document.presentation.start', { documentPath })).ok, true)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(chats.length, 0)
+  assert.equal(narrator.requests.length, 0)
+  desktopResultStatus = 200
+  const status = await independentCommand('回执失败状态', 'document.presentation.control', { action: 'status' })
+  assert.equal((status.result as { state: string }).state, 'failed')
+})
+
+test('忙碌时暂停独立讲解，空闲后不会偷跑，明确继续才播放', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  assert.equal((await independentCommand('等待后暂停', 'document.presentation.start', { documentPath })).ok, true)
+  const paused = await independentCommand('暂停等待', 'document.presentation.control', { action: 'pause' })
+  assert.equal((paused.result as { state: string }).state, 'paused')
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(narrator.requests.length, 0)
+  assert.equal((await independentCommand('恢复等待', 'document.presentation.control', { action: 'resume' })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+})
+
+test('独立讲解只从中间段开始时，播放回执不能冒充整份文档讲完', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('从第二段讲', 'document.presentation.start', { documentPath, from: 1 })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  finishSentence()
+  for (let index = 0; index < 2; index++) {
+    await answer(await chatAt(index), `这是讲解片段 ${index + 1}。`)
+    finishSentence()
+  }
+  await nextTurn()
+  const status = await independentCommand('查询中段讲解', 'document.presentation.control', { action: 'status' })
+  assert.equal((status.result as { state: string }).state, 'partial')
+  assert.deepEqual((status.result as { completed: number[] }).completed, [1, 2])
+  assert.match(sent<string>('doc-notice').at(-1) ?? '', /部分/u)
+})
+
+test('独立讲解完整播出每段之后才报告完成', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('完整独立讲解', 'document.presentation.start', { documentPath })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  finishSentence()
+  for (let index = 0; index < paragraphs.length; index++) {
+    await answer(await chatAt(index), `这是第 ${index + 1} 段。`)
+    const before = await independentCommand(`播放前状态${index}`, 'document.presentation.control', { action: 'status' })
+    assert.equal((before.result as { state: string }).state, 'presenting')
+    finishSentence()
+  }
+  await nextTurn()
+  const status = await independentCommand('完整讲解状态', 'document.presentation.control', { action: 'status' })
+  assert.equal((status.result as { state: string }).state, 'completed')
+  assert.deepEqual((status.result as { completed: number[] }).completed, [0, 1, 2])
+})
+
+test('短文档讲解随提示附全文，插话问其他段时模型手里有原文', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('短文档全文', 'document.presentation.start', { documentPath })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  finishSentence()
+  const first = await chatAt(0)
+  assert.match(first.text, /整份文档全文（短文档，共 3 段，一次给全）/)
+  assert.match(first.text, /第二段原文：缓存根据内容摘要失效。/)
+  assert.match(first.text, /第三段原文：播出完成才推进位置。/)
+  assert.match(first.text, /不要因为看得到后续内容就提前讲/)
+})
+
+test('讲解中明确说“直接开始下一段”由桌面端跳段，不把命令当成普通聊天发给模型', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('换段独立讲解', 'document.presentation.start', { documentPath })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  finishSentence()
+  await answer(await chatAt(0), '第一段讲解。')
+  assert.ok(playing)
+  assert.equal(chats.length, 1)
+  const moved = await prompt('直接开始下一段吧', true)
+  assert.equal(moved.ok, true, moved.error)
+  assert.match(String(moved.reply ?? ''), /从第 2 段/)
+  const second = await chatAt(1)
+  assert.match(second.text, /第 2 段/)
+  assert.ok(!chats.some(chat => chat.text.includes('直接开始下一段吧')), '换段命令不能被当成普通聊天交给模型')
+})
+
+test('Markdown 讲解打开包含完整原文的阅读窗口，逐段讲解时同步定位', async () => {
+  const file = path.join(authorized, '讲解跟随.md')
+  const content = '# 第一节\n第一节内容。\n\n# 第二节\n第二节内容。\n```\n代码原文\n```\n'
+  writeFileSync(file, content, 'utf8')
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('讲解 Markdown', 'document.presentation.start', { documentPath: file })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(readingViews.at(-1)?.format, 'markdown')
+  assert.equal(readingViews.at(-1)?.content, content)
+  finishSentence()
+  await answer(await chatAt(0), '第一节讲解。')
+  assert.deepEqual(readingViews.at(-1)?.sections, [0, 0])
+  finishSentence()
+  await answer(await chatAt(1), '第二节讲解。')
+  assert.deepEqual(readingViews.at(-1)?.sections, [0, 0, 1])
+  finishSentence()
+})
+
+test('独立讲解的插话可交接听写、识别并发送，回答播完后才续讲', async () => {
+  const wiring = meetingAudioWiring()
+  try {
+    confirmMeetingPresentation = async () => ({ response: 0 })
+    fakeMeetingTranscription = true
+    await nextTurn()
+    assert.equal((await independentCommand('插话独立讲解', 'document.presentation.start', { documentPath })).ok, true)
+    for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(playing)
+    assert.equal(playbackMode?.(), 'renderer')
+    await wiring.play()
+    for (let i = 0; i < 40; i++) wiring.pump(0.01)
+    for (let i = 0; i < 12 && wiring.handovers.length === 0; i++) wiring.pump(0.1)
+    assert.equal(wiring.handovers.length, 1)
+    const granted = await invoke<{ ok: boolean; direct?: boolean }>('asr-begin', { bargeIn: true })
+    assert.equal(granted.ok, true)
+    assert.equal(granted.direct, true)
+    assert.ok((wiring.handovers[0]()?.frames.length ?? 0) > 0)
+    await new Promise(resolve => setTimeout(resolve, 1500))
+    assert.equal(narrator.isSpeaking(), false, '识别过程中不能抢先续讲')
+    const recognized = await invoke<{ ok: boolean; text?: string }>('asr-transcribe', Buffer.from('隔离音频').toString('base64'))
+    assert.equal(recognized.ok, true)
+    const asking = prompt(recognized.text!, true)
+    const question = await chatAt(0)
+    assert.ok(question.text.endsWith(recognized.text!), '识别结果必须交给当前会话')
+    await answer(question, '隔离回答。')
+    assert.equal((await asking).ok, true)
+    assert.equal(finishSentence(), '隔离回答。')
+    await new Promise(resolve => setTimeout(resolve, 1800))
+    await answer(await chatAt(1), '继续原来的文档。')
+    assert.ok(playing, '回答实际播完后续讲')
+  } finally { wiring.dispose() }
+})
+
+test('播放中暂停再继续只控制讲解，迟到的旧讲解结果不能复活', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('开始可暂停讲解', 'document.presentation.start', { documentPath })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  finishSentence()
+  const old = await chatAt(0)
+  const paused = await independentCommand('暂停进行中讲解', 'document.presentation.control', { action: 'pause' })
+  assert.equal((paused.result as { state: string }).state, 'paused')
+  assert.equal(old.signal?.aborted, true)
+  await answer(old, '迟到的旧讲解。')
+  assert.equal(playing, null)
+  assert.equal((await independentCommand('继续暂停的讲解', 'document.presentation.control', { action: 'resume' })).ok, true)
+  const fresh = await chatAt(1)
+  await answer(fresh, '重新讲解。')
+  assert.ok(playing)
+  const state = await independentCommand('查询继续的讲解', 'document.presentation.control', { action: 'status' })
+  assert.equal((state.result as { state: string }).state, 'presenting')
+  assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, false)
+})
+
+test('语音会话调用停止讲解时，不得取消正在发出该指令的语音会话', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  assert.equal((await independentCommand('开始语音控制讲解', 'document.presentation.start', { documentPath })).ok, true)
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  const asking = prompt('请停止文档讲解并告诉我录音状态', true)
+  const active = await chatAt(0)
+  try {
+    assert.equal(active.signal?.aborted, false)
+    const stopped = await independentCommand('语音工具停止讲解', 'document.presentation.control', { action: 'stop' })
+    assert.equal(stopped.ok, true)
+    assert.equal(active.signal?.aborted, false, '不能取消发起工具调用的语音回复')
+    active.resolve({ ok: true, reply: '讲解已停止。' })
+    assert.equal((await asking).ok, true)
+    assert.ok(playing, '语音回复应继续播出')
+    finishSentence()
+  } finally {
+    active.resolve({ ok: false, error: '测试收尾' })
+    await asking
+  }
+})
+
 test('桌面开会命令必须匹配本次请求和原始参数，取消后迟到的开始不能开录', async () => {
   bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: {
     id: '开会请求甲', command: 'meeting.start', payload: { name: '指定会议', sources: 'mic+loopback', retentionDays: 30 }, expiresAt: Date.now() + 10_000,
@@ -894,6 +1316,7 @@ test('桌面开会只有两轨真实落块才回成功；等就绪时取消会�
 })
 
 test('会议讲解须本人原生确认；拒绝或确认时文档已变化均不开录', async () => {
+  confirmMeetingPresentation = async () => ({ response: 1 })
   const command = (id: string) => bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: {
     id, command: 'meeting.presentation.start', payload: { name: '讲解会议', documentPath }, expiresAt: Date.now() + 10_000,
   } })
@@ -1196,6 +1619,40 @@ test('双轨就绪后文档变化使讲解失效，不使用旧批准悄悄开�
       payload: { presentationId: prepared.presentationId }, expiresAt: Date.now() + 5000 } })
     for (let i = 0; i < 30 && !desktopReplies.some(item => item.id === '查文档变更'); i++) await new Promise(resolve => setTimeout(resolve, 10))
     assert.equal((desktopReplies.find(item => item.id === '查文档变更')?.result as { state: string }).state, 'failed')
+  } finally { await finishAudioMeeting(prepared.meetingId) }
+})
+
+test('会议讲解中被评委要求“直接开始下一段”时，桌面端跳段且录音不中断', async () => {
+  const prepared = await prepareMeetingPresentation('准备换段会议')
+  try {
+    bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+    for (let i = 0; i < 50 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(playing)
+    finishSentence()
+    await answer(await chatAt(0), explanation)
+    assert.equal(finishSentence(), '先说明授权范围。')
+    send('barge-in-detected')
+    await nextTurn()
+    const before = chats.length
+    const moved = await prompt('直接开始下一段吧', true)
+    assert.equal(moved.ok, true, moved.error)
+    assert.match(String(moved.reply ?? ''), /从第 2 段/)
+    const second = await chatAt(before)
+    assert.match(second.text, /第 2 段/)
+    assert.ok(!chats.some(chat => chat.text.includes('直接开始下一段吧')), '换段命令不能被交给模型')
+    assert.match(second.text, /整份文档全文（短文档，共 3 段，一次给全）/)
+    assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, true)
+    await answer(second, '这是第二段的讲解。')
+    finishSentence()
+    await answer(await chatAt(before + 1), '这是第三段的讲解。')
+    finishSentence()
+    await nextTurn()
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '查换段讲解', command: 'meeting.presentation.status',
+      payload: { presentationId: prepared.presentationId }, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 30 && !desktopReplies.some(item => item.id === '查换段讲解'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    const status = desktopReplies.find(item => item.id === '查换段讲解')?.result as { state: string; completed: number[] }
+    assert.equal(status.state, 'completed')
+    assert.deepEqual(status.completed, [1, 2], '被跳过的第一段不能冒充已讲完')
   } finally { await finishAudioMeeting(prepared.meetingId) }
 })
 
@@ -1693,9 +2150,9 @@ test('生成与播放分开：只有本段最后一句完整播出才标已讲�
   assert.equal(first.assistantId, '讲解助理')
   assert.ok(first.signal instanceof AbortSignal)
   assert.equal(first.signal.aborted, false)
-  assert.match(first.text, /第 1 段/)
+  assert.match(first.text, /^请讲解《讲解样本\.txt》的第 1 段。/)
   assert.ok(first.text.includes(paragraphs[0]))
-  assert.ok(!first.text.includes(paragraphs[1]))
+  assert.match(first.text, /整份文档全文（短文档，共 3 段，一次给全）/, '短文档一次给全文，插话问别段时模型有原文')
   assertProgress(0)
   await answer(first)
   assert.deepEqual(sent('doc-reply'), [{ index: 0, text: explanation }])
@@ -1708,9 +2165,8 @@ test('生成与播放分开：只有本段最后一句完整播出才标已讲�
   assert.equal(finishSentence(), '最后补充撤销方式。')
   assertProgress(1, [0])
   const second = await chatAt(1)
-  assert.match(second.text, /第 2 段/)
+  assert.match(second.text, /^请讲解《讲解样本\.txt》的第 2 段。/)
   assert.ok(second.text.includes(paragraphs[1]))
-  assert.ok(!second.text.includes(paragraphs[0]))
   await answer(second, '这是第二段的解释。')
   finishSentence()
   assertProgress(2, [0, 1])
@@ -1771,8 +2227,9 @@ test('追问先暂停并清队列；继续复用原回答，从未完整播出�
   const question = await chatAt(1)
   assert.equal(question.assistantId, '问答助理')
   assert.match(question.text, /为什么限制目录/)
+  assert.match(question.text, /关于《讲解样本\.txt》第 1 段/)
   assert.ok(question.text.includes(paragraphs[0]))
-  assert.ok(!question.text.includes(paragraphs[1]))
+  assert.match(question.text, /整份文档全文/, '短文档追问附全文，能回答跨段问题')
   const requestCount = narrator.requests.length
   await answer(question, '仅限授权目录才能避免误读。')
   const result = await asking
@@ -2093,6 +2550,8 @@ test('评委插话打断讲解：回答播完后自动接着讲，不用再说�
   send('barge-in-detected')
   await nextTurn()
   assert.equal(narrator.isSpeaking(), false, '插话要先停掉正在播的讲解')
+  await new Promise(resolve => setTimeout(resolve, 1500))
+  assert.equal(narrator.isSpeaking(), false, '等待问题时不能提前续讲')
 
   const before = narrator.requests.length
   const asking = prompt('这个目录为什么只读？', true)

@@ -478,9 +478,10 @@ export function planMemoryDeletion(deps: DeletionDeps, args: { id: string; reaso
   const report = preview
     ? deletionReport(preview, { ...external, legacyDomain: deps.legacyCopiesRetained && preview.deleted.some(item => item.importBatch !== null) })
     : null
+  const tidyCount = (preview?.deleted ?? []).reduce((count, item) => count + deps.memories.tidyHistoryCount(item.id), 0)
   const impact = impactOf('memory', {
     scope: { 记忆: target ? memoryLabel(target) : args.id, 原因: args.reason ?? '用户要求不再记住这条' },
-    willDelete: report?.deleted ?? [],
+    willDelete: [...(report?.deleted ?? []), ...(tidyCount ? [`相关记忆的整理历史 ${tidyCount} 条（含仍保留的可撤回旧正文）`] : [])],
     willInvalidate: report?.invalidated ?? [],
     retained: [...(report?.retained ?? []), '活动原文、导入资料、日报版本与导出文件不受影响'],
     uncontrolled: report?.uncontrolled ?? [],
@@ -506,6 +507,7 @@ export function planMemoryDeletion(deps: DeletionDeps, args: { id: string; reaso
           // 这里宁可多说一份追不回的副本，也不替用户猜"应该没发过吧"。
           sentToProvider: true,
         })
+        if (tidyCount) result.deleted.push(`相关记忆的整理历史 ${tidyCount} 条（含仍保留的可撤回旧正文）已删除`)
         const receiptId = recordReceipt(deps.reports, {
           category: 'memory', label: DELETION_CATEGORY_LABEL.memory, scope: impact.scope, at: deps.now(),
           deleted: result.deleted, invalidated: result.invalidated, retained: result.retained, uncontrolled: result.uncontrolled, failures: [],

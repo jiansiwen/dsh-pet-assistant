@@ -194,18 +194,20 @@ export function sanitizeImportMeta(raw: unknown): Record<string, unknown> | null
 }
 
 /**
- * 改写记忆的请求体：只收编号、正文与可选分类，多余字段一律丢掉。
+ * 改写记忆的请求体：只收编号、页面所见版本、正文与可选分类，多余字段一律丢掉。
  * 页面说不出记忆的作用范围（全局/项目）、也说不出旧正文——那些由插件按编号读出来核对。
  */
-export function sanitizeMemoryEdit(raw: unknown): { memoryId: string; text: string; topic?: string } | null {
+export function sanitizeMemoryEdit(raw: unknown): { memoryId: string; expectedRevision: number; text: string; topic?: string } | null {
   const input = plain(raw)
   if (!input) return null
   const memoryId = str(input.memoryId, 200)
   const text = typeof input.text === 'string' ? input.text.trim() : ''
-  if (!memoryId || !text || text.length > MAX_TEXT) return null
-  if (input.topic === undefined) return { memoryId, text }
+  const expectedRevision = input.expectedRevision
+  if (!memoryId || !text || text.length > MAX_TEXT || typeof expectedRevision !== 'number'
+    || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) return null
+  if (input.topic === undefined) return { memoryId, expectedRevision, text }
   const topic = str(input.topic, 120)
-  return topic === null ? null : { memoryId, text, topic: topic.trim() }
+  return topic === null ? null : { memoryId, expectedRevision, text, topic: topic.trim() }
 }
 
 function decodeText(bytes: Buffer): string | null {
@@ -347,7 +349,7 @@ export function registerReportWorkbench(options: ReportWorkbenchOptions): Report
   ipcMain.handle(REPORT_WORKBENCH_CHANNELS.editMemory, async (event, raw: unknown) => {
     if (!allowed(event)) return denied
     const body = sanitizeMemoryEdit(raw)
-    if (!body) return rejected('改写记忆必须带上记忆编号与非空正文')
+    if (!body) return rejected('改写记忆必须带上记忆编号、页面看到的版本与非空正文')
     // 与请求发布同一条路：插件生成待批提案，这里只打开专用审批窗口，不直接写库。
     const result = await client.editMemory(body)
     if (!result.ok || typeof result.data?.proposalId !== 'string') return result

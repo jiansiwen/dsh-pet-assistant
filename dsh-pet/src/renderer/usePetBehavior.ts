@@ -77,6 +77,9 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   const frozenRef = useRef(false)
   const actionRef = useRef(action)
   actionRef.current = action
+  // 编制外成员的台词对象可能每次重渲染都重建；只更新内容，不重置生活计时器。
+  const linesRef = useRef(lines)
+  linesRef.current = lines
   const optionsRef = useRef({ working, sceneBound, quiet, idleSleepMinutes, sleepMinutes })
   optionsRef.current = { working, sceneBound, quiet, idleSleepMinutes, sleepMinutes }
   const xRef = useRef(x)
@@ -209,6 +212,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
         // happy / drop / walk-stop 都是**一次性演出**，各自带回落定时器，
         // 演出期间不能被这一拍换掉 —— 否则「摔到一半突然开始走路」。
         const oneShotPlaying = cur === 'happy' || cur === 'drop' || cur === 'walk-stop'
+        const currentLines = linesRef.current
         if (!interactionProtected(interactionRef.current) && !optionsRef.current.sceneBound && !inActivity && !walking && !oneShotPlaying) {
           if (optionsRef.current.working) {
             const act = pick(['write', 'read'] as PetAction[])
@@ -217,7 +221,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
               const writeMs = Math.random() < 0.5 ? 3000 : 4500
               startActivity('write', writeMs, writeMs)
             }
-            if (Math.random() < 0.3) chatter(pick(lines.work))
+            if (Math.random() < 0.3) chatter(pick(currentLines.work))
           } else {
             const r = Math.random()
             if (r < 0.30) setAction('idle')
@@ -230,16 +234,16 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
             } else if (r < 0.60) startActivity('jump', 5000, 5000)
             else if (r < 0.66) {
               startActivity('wave', 5700, 5700)
-              if (Math.random() < 0.5) chatter(pick(lines.greet))
+              if (Math.random() < 0.5) chatter(pick(currentLines.greet))
             } else {
               // sit 的素材是“坐下面对电脑”的静态图，属于对话里的 laptop-in 弧线，
               // 不适合当随机环境活动；这里只用 read/play 这类自洽的循环动作。
               const act = pick(['read', 'play'] as PetAction[])
               if (act === 'read') startActivity('read', 6400, 6400)
               else startActivity('play', 6600, 6600)
-              if (Math.random() < 0.3) chatter(pick(lines.activity))
+              if (Math.random() < 0.3) chatter(pick(currentLines.activity))
             }
-            if (Math.random() < 0.22) chatter(pick(assistantActive ? lines.work : lines.idle))
+            if (Math.random() < 0.22) chatter(pick(assistantActive ? currentLines.work : currentLines.idle))
           }
         }
         schedule()
@@ -247,7 +251,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
     }
     schedule()
     return () => { alive = false; window.clearTimeout(timer) }
-  }, [assistantActive, lines, chatter, startActivity])
+  }, [assistantActive, chatter, startActivity])
 
   const poke = useCallback(() => {
     if (frozenRef.current) return
@@ -275,10 +279,15 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   }, [])
   const force = useCallback((act: PetAction) => {
     if (!frozenRef.current && interactionProtected(interactionRef.current)) return
+    // 完成态和场景也会强制开心动作；它只演一轮，不能永久挡住随机调度。
+    if (act === 'happy' && !frozenRef.current) {
+      startActivity('happy', 1100, 1100)
+      return
+    }
     busyUntilRef.current = 0
     window.clearTimeout(holdTimer.current)
     setAction(act)
-  }, [])
+  }, [startActivity])
   const dragMove = useCallback((clientX: number, clientY: number) => {
     if (!draggingRef.current) return
     if (!dragOriginRef.current) dragOriginRef.current = { x: clientX, y: clientY }

@@ -150,3 +150,37 @@ button, input, textarea, select { font: inherit; color: inherit; }
   .editor-grid { grid-template-columns: 1fr; }
   .editor-hero { flex-direction: column; }
 }
+
+/* 与桌宠设置面板保持同一套安静的浅色与青绿色。 */
+:root { --ink: #20333b; --muted: #526a72; --line: #d7e3e1; --soft: #f5f8f6; --brand: #176a67; --brand-dark: #105651; }
+html { scroll-padding-bottom: 96px; }
+body { background: #f5f8f6; }
+.editor-shell { width: min(820px, calc(100vw - 40px)); padding-top: 28px; }
+.editor-hero { padding: 2px 3px 6px; }
+.editor-hero h1 { font-size: 25px; }
+.editor-kicker { color: var(--brand); }
+.editor-badge { border-color: #b7d9d2; background: #e8f4f0; color: #155c56; }
+.editor-card { border-radius: 14px; border-color: var(--line); box-shadow: 0 3px 12px rgba(31, 65, 60, .04); }
+.editor-ai { background: #fff; border-color: #b7d9d2; }
+.editor-field :is(input, textarea, select) { border-color: #c4d6d1; background: #fbfdfc; }
+.editor-field :is(input, textarea, select):focus { border-color: #76aaa0; box-shadow: 0 0 0 3px rgba(23, 106, 103, .14); }
+.editor-examples button { border-color: #a7cfc4; color: #245853; }
+.editor-examples button:hover:not(:disabled) { background: #eef7f3; }
+.editor-secondary { border-color: #bdd1cc; color: #245853; }
+.editor-secondary:hover:not(:disabled) { background: #eef7f3; }
+.editor-chat { background: #f5f9f7; border-color: var(--line); }
+.editor-capabilities label.is-selected, .editor-permissions label.is-selected { border-color: #82b8aa; background: #eef8f3; box-shadow: inset 0 0 0 1px #c5e1d7; }
+.editor-advanced summary { color: #245853; }
+.editor-actions { background: linear-gradient(180deg, rgba(245, 248, 246, 0), #f5f8f6 38%); }
+.editor-shell :is(button, input, select, textarea, summary):focus-visible { outline: 3px solid #137b72; outline-offset: 2px; }
+.editor-shell :is(input[type='checkbox'], input[type='radio']) { accent-color: var(--brand); }
+.editor-conflict { min-width: 0; width: 100%; }
+.editor-conflict p { margin: 6px 0 10px; }
+.editor-conflict dl { display: grid; gap: 8px; margin: 10px 0; }
+.editor-conflict-item { padding: 9px; border: 1px solid #ecd6a6; border-radius: 8px; background: #fffdfa; }
+.editor-conflict-item dt { font-weight: 700; }
+.editor-conflict-item dd { margin: 4px 0 0; }
+.editor-conflict-item dd span { display: block; font-size: 11px; font-weight: 600; }
+.editor-conflict-item pre { max-height: 120px; overflow: auto; margin: 2px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: var(--ink); }
+@media (max-width: 640px) { .editor-shell { width: calc(100vw - 24px); padding-top: 14px; } }
+@media (prefers-reduced-motion: reduce) { .editor-shell :is(input, textarea, select) { transition: none; } }

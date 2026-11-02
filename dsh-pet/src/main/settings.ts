@@ -26,6 +26,8 @@ export interface PetSettings {
   continuousVoice?: boolean
   /** 朗读回复：打开后，打字发出的消息也把回答念出来（原来只有语音发起的那一轮会念）。 */
   readReplies?: boolean
+  /** 本人请求的会议录音与文档讲解是否跳过逐次原生确认。 */
+  meetingDocumentAutoApprove?: boolean
   /** 分钟，范围 1–120；缺省分别为 2 和 20。 */
   idleSleepMinutes?: number
   sleepMinutes?: number
@@ -90,6 +92,7 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.voiceConversation = merged.voiceConversation === true
   merged.continuousVoice = merged.continuousVoice === true
   merged.readReplies = merged.readReplies === true
+  merged.meetingDocumentAutoApprove = typeof raw.meetingDocumentAutoApprove === 'boolean' ? raw.meetingDocumentAutoApprove : true
   for (const [key, fallback] of [['idleSleepMinutes', 2], ['sleepMinutes', 20]] as const) {
     const value = merged[key]
     if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 120) merged[key] = fallback

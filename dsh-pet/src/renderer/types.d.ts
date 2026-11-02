@@ -34,6 +34,7 @@ import type {
 } from '../main/first-run-service.js'
 import type { DownloadConfirmation } from '../main/model-resources.js'
 import type { EvidenceIntakeOutcome } from '../evidence-types.js'
+import type { MeetingTodoRequest, MeetingTodoResult } from '../main/meeting-todo.js'
 import type { FirstRunReport, FirstRunStep } from '../main/first-run.js'
 import type { SessionCommand, SessionResult, SessionUpdate } from '../session-types.js'
 import type { Box } from './stage-layout.js'
@@ -79,6 +80,7 @@ export interface PetState {
   voiceConversation?: boolean
   continuousVoice?: boolean
   readReplies?: boolean
+  meetingDocumentAutoApprove?: boolean
   idleSleepMinutes?: number
   sleepMinutes?: number
   chatDock?: 'top' | 'auto'
@@ -96,6 +98,7 @@ export interface PetSettingsPatch {
   voiceConversation?: boolean
   continuousVoice?: boolean
   readReplies?: boolean
+  meetingDocumentAutoApprove?: boolean
   idleSleepMinutes?: number
   sleepMinutes?: number
   bounds?: PetPosition
@@ -654,6 +657,8 @@ export interface PetApi extends MemberApi {
   meetingMinutesUseLocal(meetingId: string): Promise<SimpleOkResult>
   /** 确认纪要。只有用户亲手点这个按钮才会置 confirmed；段修订过、或 digest 与预览对不上会被拒；重复确认幂等。 */
   meetingMinutesConfirm(meetingId: string, digest?: string): Promise<MeetingEditResult>
+  /** 只传当前确认版和条目编号；主进程重新读取并弹出原生确认。 */
+  meetingTodoImport(request: MeetingTodoRequest): Promise<MeetingTodoResult>
   /** 会议开始：渲染层收到后开 getUserMedia 采音并逐块推 meetingChunk。 */
   onMeetingStarted(callback: (payload: MeetingStartedPayload) => void): void
   /** 主进程请求停流：渲染层停轨、冲刷最后一块后调 meetingFlushDone。 */

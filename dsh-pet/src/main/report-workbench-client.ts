@@ -38,7 +38,7 @@ export interface WorkbenchClientLike {
   importMaterial(body: Record<string, unknown>): Promise<WorkbenchCallResult>
   shareRequest(body: { materialId: string }): Promise<WorkbenchCallResult>
   /** 改写一条长期记忆：插件那边只生成待批提案，不直接落库。 */
-  editMemory(body: { memoryId: string; text: string; topic?: string }): Promise<WorkbenchCallResult>
+  editMemory(body: { memoryId: string; expectedRevision: number; text: string; topic?: string }): Promise<WorkbenchCallResult>
 }
 
 export class ReportWorkbenchClient implements WorkbenchClientLike {
@@ -80,7 +80,7 @@ export class ReportWorkbenchClient implements WorkbenchClientLike {
     return this.call('POST', '/workbench/materials/share-request', body)
   }
 
-  editMemory(body: { memoryId: string; text: string; topic?: string }) {
+  editMemory(body: { memoryId: string; expectedRevision: number; text: string; topic?: string }) {
     return this.call('POST', '/workbench/memories/edit', body)
   }
 

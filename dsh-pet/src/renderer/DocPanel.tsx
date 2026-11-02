@@ -69,7 +69,7 @@ export default function DocPanel({
   }, [busy, onAsk, outline, question, selected])
 
   return (
-    <div className="doc-page" id="panel-page-doc" role="tabpanel" aria-labelledby="panel-tab-doc">
+    <div className="doc-page" id="panel-page-doc" role="region" aria-labelledby="panel-tab-doc">
       {state.kind === 'choose' && (
         <section className="doc-section">
           <h3 className="doc-section-title">

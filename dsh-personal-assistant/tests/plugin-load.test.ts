@@ -6,16 +6,19 @@
  * 不启动模型、不拉采样器、不碰真实 ~/.dsh。
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { DatabaseSync } from 'node:sqlite'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { Config, type Config as ConfigType } from '../src/config.ts'
 import * as plugin from '../src/index.ts'
 import { resolvePetDir } from '../src/pet-dir.ts'
+import { ObservationStore } from '../src/observation.ts'
+import { openAssistantStore } from '../src/store.ts'
 
 type Tool = { execute(args: unknown, exec?: unknown): Promise<string> }
 
@@ -133,6 +136,81 @@ function fakeAgentLoop() {
 }
 
 const pluginShape = { name: plugin.name, inject: plugin.inject, apply: plugin.apply }
+
+test('工作区构建产物可在隔离宿主中装配并注册本轮工具，不启动真实桌宠', async t => {
+  const root = new Context()
+  const home = isolatedHome(t, () => root.fiber.dispose())
+  const host = hostServices()
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { main: string }
+  assert.match(pkg.main, /^dist\/index-[a-zA-Z0-9-]+\.js$/)
+  const isolatedBundle = process.env.DSH_TEST_PLUGIN_BUNDLE
+  const built = await import(isolatedBundle ? pathToFileURL(isolatedBundle).href : new URL(`../${pkg.main}`, import.meta.url).href)
+  await root.plugin((ctx: Context) => {
+    ctx.provide('tools', host.services.tools)
+    ctx.provide('systemPrompt', host.services.systemPrompt)
+    ctx.provide('storageDomain', host.services.storageDomain)
+  })
+  const fiber = root.plugin({ name: built.name, inject: built.inject, apply: built.apply }, quietConfig(home))
+  await fiber
+  for (const name of ['personal_assistant_computer_look', 'personal_assistant_computer_apply', 'personal_assistant_project_timeline',
+    'personal_assistant_tidy_memory', 'personal_assistant_undo_memory_tidy', 'companion_skill_candidates']) assert.ok(host.tools.has(name), name)
+  if (isolatedBundle) {
+    assert.ok(host.tools.has('personal_assistant_meeting_recording'))
+    assert.ok(host.tools.has('personal_assistant_document_presentation'))
+    assert.equal(host.tools.has('personal_assistant_start_meeting_presentation'), false)
+  }
+  const look = host.tool('personal_assistant_computer_look') as Tool & { parameters: { properties: Record<string, { type?: string }> } }
+  assert.equal(look.parameters.properties.screenshot?.type, 'boolean')
+  assert.equal(look.parameters.properties.question?.type, 'string', '加载的 bundle 必须包含截图分析问题，而非旧版禁用截图的工具')
+  const denied = JSON.parse(await host.tool('companion_skill_candidates').execute({}, { agent: { id: 'unbound' }, signal: new AbortController().signal }))
+  assert.equal(denied.ok, false, '未绑定桌面会话不能读取技能候选')
+  assert.equal((await bridgeClient(home).health()).body.bound, false)
+})
+
+test('插件源码装配后主会话同时拥有独立录音和讲解工具', async t => {
+  const root = new Context()
+  const home = isolatedHome(t, () => root.fiber.dispose())
+  const host = hostServices()
+  await root.plugin((ctx: Context) => {
+    ctx.provide('tools', host.services.tools)
+    ctx.provide('systemPrompt', host.services.systemPrompt)
+    ctx.provide('storageDomain', host.services.storageDomain)
+  })
+  await root.plugin(pluginShape, quietConfig(home))
+  assert.ok(host.tools.has('personal_assistant_meeting_recording'))
+  assert.ok(host.tools.has('personal_assistant_document_presentation'))
+  assert.equal(host.tools.has('personal_assistant_start_meeting_presentation'), false)
+})
+
+test('默认加载插件不会清理隔离目录中的过期活动或原始采样', async t => {
+  const root = new Context()
+  const home = isolatedHome(t, () => root.fiber.dispose())
+  const dir = path.join(home, 'personal-assistant'), file = path.join(dir, 'assistant.sqlite'), samples = path.join(dir, 'samples')
+  mkdirSync(samples, { recursive: true })
+  const sample = path.join(samples, '2000-01-01.jsonl')
+  writeFileSync(sample, '隔离采样')
+  const db = openAssistantStore(file)
+  const observations = new ObservationStore(db)
+  observations.put({ id: 'preserved-activity', source: 'activity_span', scopeKind: 'global', scopeId: '',
+    startAt: Date.UTC(2000, 0, 1), endAt: Date.UTC(2000, 0, 1, 0, 1), timezone: 'UTC', summary: '隔离活动',
+    payloadRef: sample, sensitivity: 'normal', legacyId: null, importBatch: null })
+  db.close()
+  const host = hostServices()
+  await root.plugin((ctx: Context) => {
+    ctx.provide('tools', host.services.tools)
+    ctx.provide('systemPrompt', host.services.systemPrompt)
+    ctx.provide('storageDomain', host.services.storageDomain)
+  })
+  const config = quietConfig(home)
+  assert.equal(config.retentionAutoDelete, false)
+  await root.plugin(pluginShape, config)
+  const verify = new DatabaseSync(file, { readOnly: true })
+  try {
+    assert.equal(verify.prepare('SELECT COUNT(*) AS n FROM observations WHERE observation_id = ?').get('preserved-activity')?.n, 1)
+    assert.equal(verify.prepare('SELECT COUNT(*) AS n FROM activity_retention_boundary').get()?.n, 0)
+    assert.equal(existsSync(sample), true)
+  } finally { verify.close() }
+})
 
 test('petDir：同级桌宠存在时，夹具仍显式解析到新建临时目录内的不存在路径', t => {
   const home = isolatedHome(t)

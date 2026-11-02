@@ -269,6 +269,7 @@ const messages: Record<string, string> = {
   denied: '请求不是来自当前舞台或成员编辑窗口的原始本地主页面，未执行。', invalid_input: '输入字段、精确工具名或数值无效，请核对后重试。',
   conflict: '版本已变化，请刷新后核对；草稿保留，不会自动重发。', busy: '成员正忙或已有确认正在处理，请稍后刷新。',
   cancelled: '已取消，未执行修改。', unavailable: '连接或回执异常，结果可能未知；请刷新核对，不会自动重发。',
+  runtime_offline: '任务运行时尚未就绪或已停止，请检查运行时后刷新核对；不会自动重发。',
   invalid_response: '服务回包不完整，请刷新核对，不会自动重发。', preview_required: '请重新预览删除影响，再确认删除。',
   assist_failed: '这次没有生成可用配置，请换一种说法再试，或直接在下面填写。',
 }
@@ -315,6 +316,8 @@ export function registerMemberManagement(options: Options): () => void {
       }
       throw new Error('conflict')
     }
+    if (response.status === 503 && response.body && typeof response.body === 'object' && !Array.isArray(response.body)
+      && (response.body as RecordValue).code === 'DEVICE_OFFLINE') throw new Error('runtime_offline')
     if (response.status === 503 && path.endsWith('/assist')) throw new Error('assist_failed')
     if (response.status < 200 || response.status >= 300) throw new Error(response.status === 400 || response.status === 422 ? 'invalid_input' : 'unavailable')
     const result = record(response.body)

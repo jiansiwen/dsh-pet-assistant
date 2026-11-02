@@ -659,7 +659,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
   const showLive = live !== null && (recording || stopping || (live.meetingId === selectedId && segments.length === 0))
 
   return (
-    <div className="meeting-page" id="panel-page-meeting" role="tabpanel" aria-labelledby="panel-tab-meeting">
+    <div className="meeting-page" id="panel-page-meeting" role="region" aria-labelledby="panel-tab-meeting">
       {/* 录音中红色常显标识：只要还在录，无论切到哪一节都挂着。 */}
       {(recording || stopping) && (
         <div className={'meeting-rec-banner' + (stopping ? ' stopping' : '')} role="status">
@@ -675,7 +675,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
         </div>
       )}
 
-      {notice !== null && <p className="meeting-notice">{notice}</p>}
+      {notice !== null && <p className="meeting-notice" role="status">{notice}</p>}
 
       {(recording || stopping) && runtime !== null && (
         <section className="meeting-section">
@@ -878,6 +878,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
                       <span className="meeting-rename">
                         <input
                           type="text"
+                          aria-label={`${entry.label}的新名字`}
                           value={renameFor.label}
                           onChange={event => setRenameFor({ speaker: entry.speaker, label: event.target.value })}
                         />
@@ -913,6 +914,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
                     <label className="meeting-pick">
                       <input
                         type="checkbox"
+                        aria-label={`选择第 ${segment.idx + 1} 段转写`}
                         checked={picked.has(segment.idx)}
                         onChange={(event) => {
                           const next = new Set(picked)
@@ -939,6 +941,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
                 <span>拆分选中段为：</span>
                 <input
                   type="text"
+                  aria-label="拆分后的说话人名字"
                   placeholder="新说话人名字"
                   value={splitLabel}
                   onChange={event => setSplitLabel(event.target.value)}
@@ -957,13 +960,13 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
               </div>
               <div className="meeting-edit-row">
                 <span>合并：</span>
-                <select value={mergeFrom} onChange={event => setMergeFrom(event.target.value)}>
+                <select aria-label="要合并的说话人" value={mergeFrom} onChange={event => setMergeFrom(event.target.value)}>
                   <option value="">从…</option>
                   {speakers.map(entry => (
                     <option key={entry.speaker} value={entry.speaker}>{entry.label}</option>
                   ))}
                 </select>
-                <select value={mergeInto} onChange={event => setMergeInto(event.target.value)}>
+                <select aria-label="合并到的说话人" value={mergeInto} onChange={event => setMergeInto(event.target.value)}>
                   <option value="">到…</option>
                   {speakers.map(entry => (
                     <option key={entry.speaker} value={entry.speaker}>{entry.label}</option>

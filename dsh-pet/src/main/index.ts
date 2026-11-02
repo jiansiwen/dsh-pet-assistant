@@ -44,6 +44,8 @@ import {
   isPdfName,
   MAX_DOC_BYTES,
   mentionsDocs,
+  presentationContext,
+  sectionMoveIntent,
   stemOf,
   type DocFile,
   type OpenedDoc,
@@ -53,6 +55,7 @@ import {
 } from './document.ts'
 import { FirstRunService, toPlanView } from './first-run-service.ts'
 import { intakeMinutes, intakeWindow, type EvidenceConfirmView, type EvidenceIntakeDeps } from './evidence-intake.ts'
+import { createMeetingTodoHandler } from './meeting-todo.ts'
 import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
 import { createWinActions, type WinDesktopActions } from './win-actions.ts'
 import { settingsUri, type MediaAccessStatus } from './first-run.ts'
@@ -162,6 +165,7 @@ function acceptSession(update: SessionUpdate): void {
   const wasRunning = sessionState?.status === 'running' || sessionState?.status === 'waiting'
   const changed = sessionState?.bindingId !== update.bindingId
   if (sessionState && (changed || update.status === 'disconnected')) {
+    cancelIndependentDocument('会话已切换或断开，独立讲解不会继续。')
     cancelMeetingPresentation('会话已切换或断开，讲解不会继续')
     if (pendingMeetingStart) cancelDesktopCommand({ id: pendingMeetingStart.id })
     if (pendingMeetingReady) cancelDesktopCommand({ id: pendingMeetingReady.id })
@@ -174,7 +178,10 @@ function acceptSession(update: SessionUpdate): void {
   sessionRevision += 1
   if (changed || (wasRunning && update.status !== 'running' && update.status !== 'waiting')) dismissAfter = Date.now()
   sendToRenderer('session-update', update)
-  if (update.status !== 'running' && update.status !== 'waiting') void maybeStartMeetingPresentation()
+  if (update.status !== 'running' && update.status !== 'waiting') {
+    void maybeStartMeetingPresentation()
+    void maybeStartIndependentDocument()
+  }
 }
 
 function openSettings(page: SettingsPage): void {
@@ -843,6 +850,35 @@ function withInterruptedSpeech(text: string): string {
   return heard === null ? text : `（上一段讲解被打断了。${heard}。若我要你接着讲，请从这里往下。）\n${text}`
 }
 
+/**
+ * 讲解进行中的普通聊天（包括评委插话）带上文档上下文。
+ *
+ * 讲解链平时由桌面端逐段投递原文，模型手里只有当前段；用户插一句"下一段呢"时，模型没有
+ * 任何途径看到下一段，只能回答"没有原文"，这在演示现场是致命的。短文档随消息附全文，
+ * 长文档附当前段两侧滑窗，至少让它能如实回答关于相邻段的问题。
+ *
+ * 明确要求"讲下一段/第 N 段"的话不走这里：那是推进讲解，由 `moveDocTalk` 在本地完成。
+ */
+function presentationChatContext(): string {
+  const talk = docTalk
+  if (talk === null) return ''
+  const sections = talk.outline.sections
+  const section = sections[Math.min(Math.max(talk.next, 0), sections.length - 1)]
+  if (section === undefined) return ''
+  return [
+    `（讲解上下文，只作资料：正在讲解《${talk.name}》，共 ${sections.length} 段，当前定位第 ${section.index + 1} 段「${section.heading ?? '无标题'}」。下面附的内容不要朗读，也不要据此主动往下讲；只在回答我的问题时参考。）`,
+    presentationContext(talk.outline, section.index),
+    '',
+    '我的消息：',
+  ].join('\n')
+}
+
+function withPresentationContext(text: string): string {
+  const contextual = withInterruptedSpeech(text)
+  const context = presentationChatContext()
+  return context === '' ? contextual : `${context}\n${contextual}`
+}
+
 /** 语音/文字里的会议纪要指令。只在提到"会议"与"纪要/总结"时才命中，避免和普通总结混淆。 */
 const MEETING_MINUTES_INTENT = /(会议|开会|录音|转写)/u
 const MEETING_MINUTES_ACTION = /(纪要|总结|整理|归纳|摘要)/u
@@ -898,7 +934,7 @@ function meetingStatusView(): Record<string, unknown> | null {
     recent: state.recent.slice(0, 5).map(item => ({ id: item.id, name: item.name, startedAt: item.startedAt, state: item.state, integrity: item.integrity })) }
 }
 
-async function startMeetingFromDesktop(id: string, payload: Record<string, unknown>, expiresAt: number, presentationId?: string): Promise<void> {
+async function startMeetingFromDesktop(id: string, payload: Record<string, unknown>, expiresAt: number, presentationId?: string, confirmed: 'manual' | 'auto' | false = false): Promise<void> {
   const recorder = meetingRecorder
   if (!recorder) throw new Error('会议记录还没准备好')
   if (!win) throw new Error('舞台窗口不可用，不能打开会议页')
@@ -911,7 +947,7 @@ async function startMeetingFromDesktop(id: string, payload: Record<string, unkno
   if (retentionDays < 1 || retentionDays > 3650) throw new Error('录音保留天数必须是 1-3650 的整数')
   if (pendingMeetingStart || pendingMeetingReady) throw new Error('已有一条会议启动请求正在等待桌面处理')
   const consent: MeetingConsentInput = { name, sources, retentionDays, consented: true,
-    consentText: `本人于 ${new Date().toLocaleString('zh-CN')} ${presentationId ? '通过原生确认窗口同意' : '通过桌面指令要求'}开始本场会议录音；录音加密保存在本机，参会者应知情。` }
+    consentText: `本人于 ${new Date().toLocaleString('zh-CN')} ${confirmed === 'auto' ? '按会议和文档自动审批设置请求' : presentationId || confirmed ? '通过原生确认窗口同意' : '通过桌面指令要求'}开始本场会议录音；录音加密保存在本机，参会者应知情。` }
   const timer = setTimeout(() => {
     if (pendingMeetingStart?.id !== id) return
     pendingMeetingStart = null
@@ -919,23 +955,25 @@ async function startMeetingFromDesktop(id: string, payload: Record<string, unkno
     void replyDesktopCommand(id, false, undefined, '会议页没有在时限内开始录音')
   }, Math.max(1, Math.min(15_000, expiresAt - Date.now())))
   timer.unref?.()
-  pendingMeetingStart = { id, consent, timer, expiresAt, presentationId }
+  pendingMeetingStart = { id, consent, timer, expiresAt, presentationId, autoApproved: confirmed === 'auto' }
   openSettings('meeting')
   sendToRenderer('meeting-command', { requestId: id, consent })
 }
 
-async function stopMeetingFromDesktop(id: string, payload: Record<string, unknown>): Promise<void> {
+async function stopMeetingFromDesktop(id: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
   const recorder = meetingRecorder
   if (!recorder) throw new Error('会议记录还没准备好')
   const state = recorder.getState()
   const target = typeof payload.meetingId === 'string' && payload.meetingId ? payload.meetingId : state.meetingId ?? state.lastMeetingId
   if (!target) throw new Error('没有正在录制的会议')
   if (state.recording || state.stopping) {
+    signal?.throwIfAborted()
     const result = recorder.requestStop(target)
     if (!result.ok) throw new Error(result.error)
   }
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
+    signal?.throwIfAborted()
     const integrity = recorder.getRecordingIntegrity(target)
     if (integrity?.status === 'complete') {
       await replyDesktopCommand(id, true, { meetingId: target, transcribe: recorder.getState().transcribe, integrity })
@@ -947,6 +985,55 @@ async function stopMeetingFromDesktop(id: string, payload: Record<string, unknow
     await new Promise(resolve => setTimeout(resolve, 250))
   }
   throw new Error('已请求停止，但桌面没有在 30 秒内完成冲刷；请在会议页核对')
+}
+
+/** 新工具只接受发起时绑定的本人桌面会话，不把模型参数当成授权。 */
+function independentBinding(payload: Record<string, unknown>): string {
+  const bindingId = payload.bindingId
+  if (typeof bindingId !== 'string' || !bindingId || bindingId !== sessionState?.bindingId || sessionState.status === 'disconnected') {
+    throw new Error('桌面会话已变化或未连接，未执行操作')
+  }
+  return bindingId
+}
+
+async function startIndependentRecording(id: string, payload: Record<string, unknown>, expiresAt: number, signal: AbortSignal): Promise<void> {
+  const bindingId = independentBinding(payload)
+  const name = typeof payload.name === 'string' ? payload.name.trim() : ''
+  const sources = payload.sources
+  const days = payload.retentionDays
+  if (!name || name.length > 80 || /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(name)
+    || (sources !== 'mic' && sources !== 'mic+loopback') || typeof days !== 'number' || !Number.isSafeInteger(days) || days < 1 || days > 3650) {
+    throw new Error('录音名称、范围或保留天数无效')
+  }
+  if (!meetingRecorder || meetingRecorder.getState().recording || meetingRecorder.getState().stopping) throw new Error('会议录音不可用或已有会议正在录制')
+  const auto = loadSettings().meetingDocumentAutoApprove === true
+  const confirmed = auto ? { response: 0 } : await dialog.showMessageBox({ type: 'question', title: '开始会议录音？',
+    message: `开始录制 ${JSON.stringify(name)}？`,
+    detail: `将采集${sources === 'mic' ? '麦克风' : '麦克风和系统回环'}音频，加密保存在本机，保留 ${days} 天；请确认参会者已知情。不会因此打开或讲解文档。`,
+    buttons: ['同意开始', '取消'], defaultId: 1, cancelId: 1, noLink: true })
+  signal.throwIfAborted()
+  if (confirmed.response !== 0) throw new Error('本人未同意，录音没有开始')
+  if (Date.now() >= expiresAt || independentBinding(payload) !== bindingId) throw new Error('录音请求已过期或会话已变化，未开录')
+  await startMeetingFromDesktop(id, { name, sources, retentionDays: days }, expiresAt, undefined, auto ? 'auto' : 'manual')
+}
+
+async function stopIndependentRecording(id: string, payload: Record<string, unknown>, expiresAt: number, signal: AbortSignal): Promise<void> {
+  const bindingId = independentBinding(payload)
+  const recorder = meetingRecorder
+  const before = recorder?.getState()
+  if (!recorder || !before?.meetingId || (!before.recording && !before.stopping)) throw new Error('没有正在录制的会议')
+  if (payload.meetingId !== undefined && (typeof payload.meetingId !== 'string' || payload.meetingId !== before.meetingId)) {
+    throw new Error('会议编号已变化，未停止其他会议')
+  }
+  const confirmed = loadSettings().meetingDocumentAutoApprove === true ? { response: 0 } : await dialog.showMessageBox({ type: 'question', title: '停止会议录音？',
+    message: '停止当前会议录音并核验冲刷结果？', detail: '只停止录音，不会因此停止独立文档讲解；纪要和发送仍需单独确认。',
+    buttons: ['确认停录', '取消'], defaultId: 1, cancelId: 1, noLink: true })
+  signal.throwIfAborted()
+  if (confirmed.response !== 0) throw new Error('本人未同意停止，录音状态不变')
+  if (Date.now() >= expiresAt || independentBinding(payload) !== bindingId || recorder.getState().meetingId !== before.meetingId) {
+    throw new Error('停录请求已过期或会议已变化，未停止其他会议')
+  }
+  await stopMeetingFromDesktop(id, { meetingId: before.meetingId }, signal)
 }
 
 async function minutesFromDesktop(id: string, payload: Record<string, unknown>): Promise<void> {
@@ -1013,6 +1100,159 @@ async function documentReadFromDesktop(id: string, payload: Record<string, unkno
     truncated: outline.truncated || remaining <= 0, sections })
 }
 
+/** 文档讲解只确认文档和模型去向；不创建会议、不申请音轨。 */
+async function startIndependentDocument(id: string, payload: Record<string, unknown>, expiresAt: number, signal: AbortSignal): Promise<void> {
+  const bindingId = independentBinding(payload)
+  if (independentDocument && !['completed', 'partial', 'cancelled', 'failed'].includes(independentDocument.state)) {
+    throw new Error('已有独立讲解正在准备或进行，请先结束')
+  }
+  if (docTalk && !docTalk.stopped) throw new Error('已有文档讲解正在进行，请先结束')
+  const name = payload.documentName, file = payload.documentPath, from = payload.from ?? 0
+  if ((name !== undefined && (typeof name !== 'string' || !name.trim() || name.length > 4096))
+    || (file !== undefined && (typeof file !== 'string' || !file.trim() || file.length > 4096))
+    || (name !== undefined && file !== undefined) || typeof from !== 'number' || !Number.isSafeInteger(from) || from < 0) {
+    throw new Error('文档名称、路径或段号无效')
+  }
+  const presentation: IndependentDocumentPresentation = { id: randomUUID(), requestId: id, bindingId,
+    path: '', name: '', fingerprint: '', from, total: 0, next: from, completed: [], talkId: null,
+    expiresAt, receiptConfirmed: false, autoApproved: false, state: 'authorizing', error: null, timer: null }
+  independentDocument = presentation
+  const stillAuthorizing = () => independentDocument === presentation && presentation.state === 'authorizing'
+    && !signal.aborted && Date.now() < expiresAt && sessionState?.bindingId === bindingId && sessionState.status !== 'disconnected'
+  try {
+    const doc = await openDocumentFromDesktop({ ...(typeof file === 'string' ? { path: file } : {}), ...(typeof name === 'string' ? { name } : {}) })
+    if (!stillAuthorizing()) throw new Error('讲解请求已取消、过期或会话已变化')
+    if (doc.parsed.kind !== 'outline' || from >= doc.parsed.outline.sections.length) throw new Error('讲解段号不存在')
+    if (doc.parsed.outline.sections.length > 100) throw new Error('文档超过 100 段，请先拆分后再讲解')
+    const display = (value: string) => JSON.stringify(value).replace(/[\u202a-\u202e\u2066-\u2069]/gu,
+      character => `\\u${character.codePointAt(0)!.toString(16).padStart(4, '0')}`)
+    const auto = loadSettings().meetingDocumentAutoApprove === true
+    presentation.autoApproved = auto
+    const confirmed = auto ? { response: 0 } : await dialog.showMessageBox({ type: 'question', title: '讲解文档？',
+      message: `讲解 ${display(doc.name)}？`,
+      detail: `文档：${display(doc.path)}\n文档摘要：${doc.fingerprint}\n共 ${doc.parsed.outline.sections.length} 段。` +
+        '\n讲解会将文档片段发送给当前会话的模型服务商，并进入会话历史；逐段讲解和重试可能产生额外费用。讲解时会监听麦克风以支持插话，不会启动或停止会议录音。',
+      buttons: ['同意讲解', '取消'], defaultId: 1, cancelId: 1, noLink: true })
+    signal.throwIfAborted()
+    if (confirmed.response !== 0) throw new Error('本人未同意，文档讲解没有开始')
+    if (!stillAuthorizing()) throw new Error('讲解请求已取消、过期或会话已变化')
+    const current = await documents.open(doc.path)
+    signal.throwIfAborted()
+    if (!stillAuthorizing() || (auto && loadSettings().meetingDocumentAutoApprove !== true) || current.kind !== 'opened' || current.doc.fingerprint !== doc.fingerprint) {
+      throw new Error('文档、授权或会话已变化，未开始讲解')
+    }
+    presentation.path = doc.path
+    presentation.name = doc.name
+    presentation.fingerprint = doc.fingerprint
+    presentation.total = doc.parsed.outline.sections.length
+    presentation.state = 'waiting-to-present'
+    armIndependentDocumentDeadline(presentation)
+    const delivered = await replyDesktopCommand(id, true, { presentationId: presentation.id, state: presentation.state,
+      documentName: presentation.name, total: presentation.total,
+      notice: `${auto ? '已按设置自动审批' : '本人已确认'}；等待当前会话和播报结束后再开讲，不代表已经讲完。` })
+    if (!delivered) { failIndependentDocument(presentation, '讲解回执未确认，未自动开讲，请在桌面核查。'); return }
+    if (!signal.aborted && independentDocument === presentation && presentation.state === 'waiting-to-present') {
+      presentation.receiptConfirmed = true
+      void maybeStartIndependentDocument()
+    }
+  } catch (error) {
+    failIndependentDocument(presentation, error instanceof Error ? error.message : String(error))
+    throw error
+  }
+}
+
+function armIndependentDocumentDeadline(presentation: IndependentDocumentPresentation): void {
+  if (presentation.timer) clearTimeout(presentation.timer)
+  presentation.timer = setTimeout(() => failIndependentDocument(presentation, '等待讲解的确认已过期，请重新发起。'),
+    Math.max(1, presentation.expiresAt - Date.now()))
+  presentation.timer.unref?.()
+}
+
+/** 等当前模型轮次和播报结束；录音状态不参与讲解准入。 */
+async function maybeStartIndependentDocument(): Promise<void> {
+  const presentation = independentDocument
+  if (!presentation || !presentation.receiptConfirmed || (presentation.state !== 'waiting-to-present' && presentation.state !== 'waiting-to-resume')) return
+  if (Date.now() >= presentation.expiresAt || sessionState?.bindingId !== presentation.bindingId || sessionState.status === 'disconnected'
+    || (presentation.autoApproved && loadSettings().meetingDocumentAutoApprove !== true)) {
+    failIndependentDocument(presentation, '讲解请求已过期或会话已变化，未继续。')
+    return
+  }
+  if (sessionState.status !== 'idle' || submissionCount > 0 || spokenRound || narrator.isSpeaking()) return
+  const resuming = presentation.state === 'waiting-to-resume'
+  presentation.state = 'starting'
+  const allowed = () => independentDocument === presentation && presentation.state === 'starting'
+    && Date.now() < presentation.expiresAt && sessionState?.bindingId === presentation.bindingId && sessionState.status === 'idle'
+    && submissionCount === 0 && !spokenRound && !narrator.isSpeaking()
+    && (!presentation.autoApproved || loadSettings().meetingDocumentAutoApprove === true)
+  try {
+    const result = resuming ? await resumeDocTalk(true)
+      : await explainDocByPath(presentation.path, presentation.from, true, undefined, true, 'reading',
+        { fingerprint: presentation.fingerprint, allowed })
+    if (independentDocument !== presentation || presentation.state !== 'starting') return
+    if (!result.ok || !docTalk || docTalk.path !== presentation.path || docTalk.fingerprint !== presentation.fingerprint) {
+      failIndependentDocument(presentation, result.error ?? '文档讲解未能开始，请在桌面核查。')
+      return
+    }
+    presentation.talkId = docTalk.sessionId
+    presentation.state = 'presenting'
+    if (presentation.timer) clearTimeout(presentation.timer)
+    presentation.timer = null
+  } catch (error) { failIndependentDocument(presentation, `文档讲解未能开始：${error instanceof Error ? error.message : String(error)}`) }
+}
+
+function independentDocumentStatus(): Record<string, unknown> {
+  const presentation = independentDocument
+  if (!presentation) return { state: 'idle', notice: '当前没有通过独立工具发起的讲解。' }
+  const talk = presentation.talkId && docTalk?.sessionId === presentation.talkId ? docTalk : null
+  return { presentationId: presentation.id, documentName: presentation.name,
+    state: talk?.stopped && presentation.state === 'presenting' ? 'paused' : presentation.state,
+    next: talk?.next ?? presentation.next, total: presentation.total,
+    completed: talk ? [...talk.completed].sort((a, b) => a - b) : presentation.completed, error: presentation.error,
+    notice: '开始或等待状态不代表已完整播放；录音状态独立。' }
+}
+
+async function controlIndependentDocument(id: string, payload: Record<string, unknown>, expiresAt: number, signal: AbortSignal): Promise<void> {
+  const bindingId = independentBinding(payload)
+  const action = payload.action
+  if (!['pause', 'resume', 'stop', 'status'].includes(String(action))) throw new Error('讲解操作无效')
+  const presentation = independentDocument
+  if (payload.presentationId !== undefined && (typeof payload.presentationId !== 'string' || !payload.presentationId
+    || payload.presentationId.length > 200 || payload.presentationId !== presentation?.id)) throw new Error('讲解编号不匹配')
+  if (presentation && presentation.bindingId !== bindingId) throw new Error('讲解属于旧会话，不能继续')
+  signal.throwIfAborted()
+  if (action === 'status') { await replyDesktopCommand(id, true, independentDocumentStatus()); return }
+  if (!presentation || ['completed', 'partial', 'cancelled', 'failed'].includes(presentation.state)) throw new Error('没有可控制的独立文档讲解')
+  if (action === 'stop') {
+    cancelIndependentDocument('本人已结束独立讲解；会议录音状态不变。')
+  } else if (action === 'pause') {
+    if (presentation.state === 'authorizing') cancelIndependentDocument('本人已取消等待确认的讲解。')
+    else {
+      presentation.state = 'paused'
+      clearDocAutoResume()
+      if (presentation.talkId && docTalk?.sessionId === presentation.talkId) {
+        if (!docTalk.stopped) { if (spokenRound) pauseDocTalk(); else interruptSpeech(false) }
+        pushDocState()
+      }
+    }
+  } else {
+    if (presentation.state !== 'paused') throw new Error('讲解没有处于暂停状态')
+    if (!presentation.talkId && Date.now() >= presentation.expiresAt) throw new Error('原讲解确认已过期，请重新发起')
+    if (presentation.talkId) presentation.expiresAt = expiresAt
+    presentation.receiptConfirmed = false
+    presentation.state = presentation.talkId ? 'waiting-to-resume' : 'waiting-to-present'
+    armIndependentDocumentDeadline(presentation)
+  }
+  const delivered = await replyDesktopCommand(id, true, independentDocumentStatus())
+  if (action === 'resume' && independentDocument === presentation) {
+    if (delivered && !signal.aborted && (presentation.state === 'waiting-to-present' || presentation.state === 'waiting-to-resume')) {
+      presentation.receiptConfirmed = true
+      void maybeStartIndependentDocument()
+    } else if (presentation.state === 'waiting-to-present' || presentation.state === 'waiting-to-resume') {
+      presentation.state = 'paused'
+    }
+  }
+}
+
 /** 原生确认锁定会议与文档；音轨就绪前只开启采集，不开讲。 */
 async function startMeetingPresentationFromDesktop(id: string, payload: Record<string, unknown>, expiresAt: number, signal: AbortSignal): Promise<void> {
   if (!meetingRecorder || !sessionState || sessionState.status === 'disconnected') throw new Error('会议或助理会话尚未就绪')
@@ -1044,7 +1284,8 @@ async function startMeetingPresentationFromDesktop(id: string, payload: Record<s
       character => `\\u${character.codePointAt(0)!.toString(16).padStart(4, '0')}`)
     const outline = doc.parsed.kind === 'outline' ? doc.parsed.outline : null
     const limited = outline && (outline.truncated || outline.sections.some(section => section.text.trim() === '' || section.hasCode))
-    const confirmed = await dialog.showMessageBox({ type: 'question', title: '开始会议并讲解文档？',
+    const auto = loadSettings().meetingDocumentAutoApprove === true
+    const confirmed = auto ? { response: 0 } : await dialog.showMessageBox({ type: 'question', title: '开始会议并讲解文档？',
       message: `开始录制 ${display(name)} 并讲解 ${display(doc.name)}？`,
       detail: `将采集麦克风和系统回环音频，加密保存在本机，保留 ${retentionDays} 天；请确认参会者已知情。\n` +
         `文档共 ${doc.parsed.outline.sections.length} 段，预计 ${doc.parsed.outline.estMinutes} 分钟；逐段讲解、重试和插话可能多次调用模型。\n` +
@@ -1055,15 +1296,15 @@ async function startMeetingPresentationFromDesktop(id: string, payload: Record<s
     signal.throwIfAborted()
     if (meetingPresentation !== presentation || presentation.state !== 'authorizing') throw new Error('会议讲解请求已取消')
     if (confirmed.response !== 0) { cancelMeetingPresentation('本人未同意，会议没有开始'); throw new Error('本人未同意，会议没有开始') }
-    if (Date.now() >= expiresAt || !stillBound()) throw new Error('会议请求已过期或会话已切换')
+    if (Date.now() >= expiresAt || !stillBound() || (auto && loadSettings().meetingDocumentAutoApprove !== true)) throw new Error('会议请求已过期、会话已切换或自动审批已关闭')
     const current = await documents.open(doc.path)
     signal.throwIfAborted()
     if (meetingPresentation !== presentation || presentation.state !== 'authorizing') throw new Error('会议讲解请求已取消')
     if (current.kind !== 'opened' || current.doc.fingerprint !== doc.fingerprint) throw new Error('文档或授权在确认期间已变化，会议没有开始')
-    if (Date.now() >= expiresAt || !stillBound()) throw new Error('会议请求已过期或会话已切换')
+    if (Date.now() >= expiresAt || !stillBound() || (auto && loadSettings().meetingDocumentAutoApprove !== true)) throw new Error('会议请求已过期、会话已切换或自动审批已关闭')
     presentation.state = 'opening'
     if (!persistMeetingPresentation(presentation)) throw new Error(presentation.error ?? '会议讲解状态无法保存')
-    await startMeetingFromDesktop(id, { name, sources: 'mic+loopback', retentionDays }, expiresAt, presentation.id)
+    await startMeetingFromDesktop(id, { name, sources: 'mic+loopback', retentionDays }, expiresAt, presentation.id, auto ? 'auto' : 'manual')
   } catch (error) {
     failMeetingPresentation(presentation.id, error instanceof Error ? error.message : String(error))
     throw error
@@ -1145,7 +1386,7 @@ async function finishMeetingPresentationFromDesktop(id: string, payload: Record<
   presentation.finishRequestId = id
   let stopRequested = false
   try {
-    const confirmed = await dialog.showMessageBox({ type: 'question', title: '结束会议录音？',
+    const confirmed = loadSettings().meetingDocumentAutoApprove === true ? { response: 0 } : await dialog.showMessageBox({ type: 'question', title: '结束会议录音？',
       message: `停止「${presentation.meetingName}」的录音并转写？`,
       detail: `${presentation.state === 'completed' ? '' : '当前讲解未完整完成，停录后不会自动续讲。\n'}将先冲刷并核验两条音轨，再等待转写。纪要需要本人审阅确认；不会自动保存文件或发送邮件。`,
       buttons: ['停止并转写', '取消'], defaultId: 1, cancelId: 1, noLink: true })
@@ -1233,6 +1474,10 @@ async function handleDesktopCommand(raw: unknown): Promise<void> {
       || controller.signal.aborted || value.expiresAt <= Date.now()) return
     switch (value.command) {
       case 'meeting.start': await startMeetingFromDesktop(value.id, payload, value.expiresAt); return
+      case 'meeting.recording.start': await startIndependentRecording(value.id, payload, value.expiresAt, controller.signal); return
+      case 'meeting.recording.stop': await stopIndependentRecording(value.id, payload, value.expiresAt, controller.signal); return
+      case 'document.presentation.start': await startIndependentDocument(value.id, payload, value.expiresAt, controller.signal); return
+      case 'document.presentation.control': await controlIndependentDocument(value.id, payload, value.expiresAt, controller.signal); return
       case 'meeting.presentation.start': await startMeetingPresentationFromDesktop(value.id, payload, value.expiresAt, controller.signal); return
       case 'meeting.presentation.finish': await finishMeetingPresentationFromDesktop(value.id, payload, value.expiresAt, controller.signal); return
       case 'meeting.presentation.status': {
@@ -1281,9 +1526,9 @@ async function handleDesktopCommand(raw: unknown): Promise<void> {
 }
 
 async function sendChatReply(text: string, bindingId: string, spoken: boolean, assistantId?: string,
-  voiceTurn?: import('../session-types.ts').VoiceTurn, preserveOriginal = false): Promise<ChatReply> {
+  voiceTurn?: import('../session-types.ts').VoiceTurn, preserveOriginal = false, withDocContext = true): Promise<ChatReply> {
   interruptSpeech()
-  const contextual = withInterruptedSpeech(text)
+  const contextual = withDocContext ? withPresentationContext(text) : withInterruptedSpeech(text)
   // 复合委托必须按原话交接；仍消费旧中断上下文，避免它污染下一条请求。
   const outgoing = preserveOriginal ? text : contextual
   const round: SpokenRound | null = spoken ? { cancelled: false, controller: new AbortController(),
@@ -1302,7 +1547,10 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
       fedChars += delta.length
       narrator.feed(round.utteranceId, delta)
     } : undefined, bindingId)
-    if (!reply.ok) failMeetingPresentationForReply(bindingId, '发起会话或插话回答失败，会议讲解不会自动推进；请在会议页核查录音。')
+    if (!reply.ok) {
+      failMeetingPresentationForReply(bindingId, '发起会话或插话回答失败，会议讲解不会自动推进；请在会议页核查录音。')
+      failIndependentDocumentForReply(bindingId, '发起会话失败，文档讲解不会自动开始。')
+    }
     if (bindingId !== sessionState?.bindingId || sessionState.status === 'disconnected') {
       return { ok: false, error: '会话已改变，原会话的回复已丢弃' }
     }
@@ -1315,9 +1563,14 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
         interruptSpeech()
       }
     }
+    if (reply.ok && reply.reply && docAutoResume?.bindingId === bindingId) {
+      docAutoResumeAwaitingAnswer = false
+      if (!narrator.isSpeaking()) scheduleDocAutoResume()
+    }
     return reply
   } catch (error) {
     failMeetingPresentationForReply(bindingId, '会话回复异常，会议讲解不会自动推进；请在会议页核查录音。')
+    failIndependentDocumentForReply(bindingId, '发起会话异常，文档讲解不会自动开始。')
     if (round && current()) interruptSpeech()
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   } finally {
@@ -1354,8 +1607,11 @@ function receiptNotice(receipts: readonly CancelReceipt[]): string {
 async function cancelCommand(command: Extract<SessionCommand, { kind: 'cancel' }>): Promise<SessionResult> {
   const scope = command.scope ?? 'run'
   if (!command.taskId && !command.requestId) {
-    if (scope === 'pause' || scope === 'mute') pauseMeetingPresentation()
-    else if (scope !== 'resume') cancelMeetingPresentation('讲解已取消；若会议仍在录音，请在会议页明确停录。')
+    if (scope === 'pause' || scope === 'mute') { pauseMeetingPresentation(); pauseWaitingIndependentDocument() }
+    else if (scope !== 'resume') {
+      cancelMeetingPresentation('讲解已取消；若会议仍在录音，请在会议页明确停录。')
+      cancelIndependentDocument('讲解已取消，录音状态不变。')
+    }
   }
   if (command.taskId) {
     const receipt = await bridge.cancelTeamTask(command.taskId)
@@ -1422,7 +1678,7 @@ const officeView = new OfficeViewWindow({
     if (opened.kind === 'unreadable') return { ok: false, error: `文档读不出来：${opened.reason}` }
     if (opened.doc.parsed.kind !== 'outline') return { ok: false, error: '文档里没有可阅读的文字' }
     const extension = extensionOf(opened.doc.name)
-    if (extension !== '.docx' && extension !== '.pptx') return { ok: false, error: '逐页阅读目前只支持 docx 和 pptx' }
+    if (extension !== '.docx' && extension !== '.pptx' && extension !== '.md' && extension !== '.markdown') return { ok: false, error: '阅读视图不支持该文档格式' }
     const sections = opened.doc.parsed.outline.sections.map(section => ({ index: section.index, heading: section.heading,
       text: section.text.slice(0, 200), pageNumber: section.pageNumber ?? null }))
     if (extension === '.pptx') {
@@ -1436,7 +1692,7 @@ const officeView = new OfficeViewWindow({
       }
     }
     return { ok: true, doc: { path: opened.doc.path, name: opened.doc.name, fingerprint: opened.doc.fingerprint,
-      format: extension === '.docx' ? 'docx' : 'pptx', mode: 'library', sections,
+      format: extension === '.docx' ? 'docx' : extension === '.pptx' ? 'pptx' : 'markdown', mode: 'library', sections,
       pageCount: extension === '.pptx' ? opened.doc.parsed.outline.sections.length : null } }
   },
   read: async doc => {
@@ -1464,7 +1720,7 @@ let presentedSessionId: string | null = null
 let presentedView: DocViewController | null = null
 /** 当前讲解链同步到的 Office 逐页窗口；与 PDF/WPS 的 presentedSessionId 互斥使用。 */
 let presentedOfficeSessionId: string | null = null
-const OFFICE_DOC_EXTENSIONS = new Set(['.docx', '.pptx'])
+const OFFICE_DOC_EXTENSIONS = new Set(['.docx', '.pptx', '.md', '.markdown'])
 const isOfficeDoc = (name: string): boolean => OFFICE_DOC_EXTENSIONS.has(extensionOf(name))
 
 /**
@@ -1513,9 +1769,88 @@ let docRevision = 0
 let docRequest: AbortController | null = null
 let meetingRecorder: MeetingRecorder | null = null
 let assistantSpeechStartedAt: number | null = null
-let pendingMeetingStart: { id: string; consent: MeetingConsentInput; timer: NodeJS.Timeout; expiresAt: number; presentationId?: string } | null = null
+let pendingMeetingStart: { id: string; consent: MeetingConsentInput; timer: NodeJS.Timeout; expiresAt: number; presentationId?: string; autoApproved: boolean } | null = null
 let pendingMeetingReady: { id: string; meetingId: string; presentationId?: string } | null = null
 const desktopCommandControllers = new Map<string, AbortController>()
+
+type IndependentDocumentState = 'authorizing' | 'waiting-to-present' | 'waiting-to-resume' | 'starting'
+  | 'presenting' | 'paused' | 'completed' | 'partial' | 'cancelled' | 'failed'
+interface IndependentDocumentPresentation {
+  id: string
+  requestId: string
+  bindingId: string
+  path: string
+  name: string
+  fingerprint: string
+  from: number
+  total: number
+  next: number
+  completed: number[]
+  talkId: string | null
+  expiresAt: number
+  receiptConfirmed: boolean
+  autoApproved: boolean
+  state: IndependentDocumentState
+  error: string | null
+  timer: NodeJS.Timeout | null
+}
+let independentDocument: IndependentDocumentPresentation | null = null
+
+function failIndependentDocument(presentation: IndependentDocumentPresentation, reason: string): void {
+  if (independentDocument !== presentation || ['completed', 'partial', 'cancelled', 'failed'].includes(presentation.state)) return
+  presentation.state = 'failed'
+  presentation.error = reason
+  if (presentation.timer) clearTimeout(presentation.timer)
+  presentation.timer = null
+  sendToRenderer('doc-notice', reason)
+}
+
+function failIndependentDocumentForReply(bindingId: string, reason: string): void {
+  const presentation = independentDocument
+  if (presentation?.bindingId === bindingId && ['waiting-to-present', 'waiting-to-resume', 'starting'].includes(presentation.state)) {
+    failIndependentDocument(presentation, reason)
+  }
+}
+
+/** 只取消讲解本身，绝不改变当前会议录音。 */
+function cancelIndependentDocument(reason: string): void {
+  const presentation = independentDocument
+  if (!presentation || ['completed', 'partial', 'cancelled', 'failed'].includes(presentation.state)) return
+  const awaitingConfirmation = presentation.state === 'authorizing'
+  presentation.state = 'cancelled'
+  presentation.error = reason
+  if (presentation.timer) clearTimeout(presentation.timer)
+  presentation.timer = null
+  if (awaitingConfirmation) {
+    desktopCommandControllers.get(presentation.requestId)?.abort(reason)
+    void replyDesktopCommand(presentation.requestId, false, undefined, reason)
+  }
+  if (presentation.talkId && docTalk?.sessionId === presentation.talkId) {
+    // 插话已暂停讲解时，正在播报的可能是发出本指令的语音回复，不能把它一并取消。
+    if (!docTalk.stopped && !spokenRound) interruptSpeech(false)
+    stopDocTalk()
+    pushDocState()
+  }
+}
+
+/** 等待开讲也可以暂停；再次继续时仍须重新核对文档和会话。 */
+function pauseWaitingIndependentDocument(): void {
+  const presentation = independentDocument
+  if (presentation?.state === 'authorizing') { cancelIndependentDocument('本人已取消等待确认的讲解。'); return }
+  if (presentation && ['waiting-to-present', 'waiting-to-resume', 'starting'].includes(presentation.state)) presentation.state = 'paused'
+}
+
+function resumeWaitingIndependentDocument(): ChatReply | null {
+  const presentation = independentDocument
+  if (!presentation || presentation.state !== 'paused' || presentation.talkId) return null
+  if (Date.now() >= presentation.expiresAt || sessionState?.bindingId !== presentation.bindingId) {
+    failIndependentDocument(presentation, '等待讲解的确认已过期或会话已变化，请重新发起。')
+    return { ok: false, error: '等待讲解的确认已过期或会话已变化，请重新发起。' }
+  }
+  presentation.state = 'waiting-to-present'
+  presentation.receiptConfirmed = true
+  return { ok: true, reply: '已恢复等待，当前回复结束后将重新核验文档再讲解。' }
+}
 
 interface MeetingPresentation {
   id: string
@@ -1666,6 +2001,7 @@ function cancelDesktopCommand(raw: unknown): void {
   if (meetingPresentation?.requestId === id || meetingPresentation?.finishRequestId === id) {
     cancelMeetingPresentation('会议讲解请求已取消；若会议仍在录音，请在会议页核查并明确停录。')
   }
+  if (independentDocument?.requestId === id) cancelIndependentDocument('文档讲解请求已取消，录音状态不变。')
 }
 
 /**
@@ -1673,10 +2009,12 @@ function cancelDesktopCommand(raw: unknown): void {
  * 用户明确暂停 / 换文档 / 结束讲解都会把这份“待续讲”清掉，不能靠自动续讲覆盖人的决定。
  */
 let docAutoResume: DocTalk | null = null
+let docAutoResumeAwaitingAnswer = false
 let docAutoResumeTimer: NodeJS.Timeout | null = null
 
 function clearDocAutoResume(): void {
   docAutoResume = null
+  docAutoResumeAwaitingAnswer = false
   if (docAutoResumeTimer) {
     clearTimeout(docAutoResumeTimer)
     docAutoResumeTimer = null
@@ -1684,7 +2022,7 @@ function clearDocAutoResume(): void {
 }
 
 function markDocTalkForAutoResume(): void {
-  if (docTalk !== null && docTalk.spoken) docAutoResume = docTalk
+  if (docTalk !== null && docTalk.spoken) { docAutoResume = docTalk; docAutoResumeAwaitingAnswer = true }
 }
 
 function scheduleDocAutoResume(attempt = 0): void {
@@ -1694,6 +2032,7 @@ function scheduleDocAutoResume(attempt = 0): void {
   docAutoResumeTimer = setTimeout(() => {
     docAutoResumeTimer = null
     if (docAutoResume !== talk || docTalk !== talk) { docAutoResume = null; return }
+    if (docAutoResumeAwaitingAnswer) return
     // 回答还有句子在播、或者生成还没结束：等下一次静音再说，别在答一半时抢话。
     if (narrator.isSpeaking()) { if (attempt < 50) scheduleDocAutoResume(attempt + 1); return }
     if (spokenRound !== null && !spokenRound.generationDone) { if (attempt < 50) scheduleDocAutoResume(attempt + 1); return }
@@ -1708,6 +2047,7 @@ function scheduleDocAutoResume(attempt = 0): void {
 
 function pauseDocTalk(): void {
   docRevision += 1
+  if (docTalk && independentDocument?.talkId === docTalk.sessionId && independentDocument.state === 'presenting') independentDocument.state = 'paused'
   if (docTalk !== null) docTalk.stopped = true
   docRequest?.abort()
   docRequest = null
@@ -1718,6 +2058,14 @@ function pauseDocTalk(): void {
 
 function stopDocTalk(): void {
   const talk = docTalk
+  if (talk && independentDocument?.talkId === talk.sessionId) {
+    independentDocument.next = talk.next
+    independentDocument.completed = [...talk.completed].sort((a, b) => a - b)
+    if (!['completed', 'partial', 'cancelled', 'failed'].includes(independentDocument.state)) {
+      independentDocument.state = 'cancelled'
+      independentDocument.error = '讲解已停止或文档已切换；录音状态不变。'
+    }
+  }
   if (talk && meetingPresentation?.talkId === talk.sessionId) {
     meetingPresentation.next = talk.next
     meetingPresentation.completed = [...talk.completed].sort((a, b) => a - b)
@@ -1789,6 +2137,9 @@ function onDocViewEvent(event: DocViewHostEvent): void {
  * 由调用方停下来问用户，不能静默换成阅读视图后报 WPS 成功。
  */
 async function presentDocView(talk: DocTalk): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (talk.via === 'wps' && (extensionOf(talk.path) === '.md' || extensionOf(talk.path) === '.markdown')) {
+    return { ok: false, error: 'WPS 同步讲解目前只支持 PDF，Markdown 可使用内置阅读视图' }
+  }
   if (isOfficeDoc(talk.path)) {
     const section = talk.outline.sections[talk.next]
     const start = { index: talk.next, pageNumber: section?.pageNumber ?? null }
@@ -1954,7 +2305,15 @@ async function advanceDocTalk(verified?: DocTalk): Promise<void> {
       return
     }
     if (docTalk === talk && !talk.stopped) {
-      const partial = talk.outline.truncated || talk.outline.sections.some(section => section.text.trim() === '' || section.hasCode)
+      const startedMidway = independentDocument?.talkId === talk.sessionId && independentDocument.from > 0
+      const partial = startedMidway || talk.outline.truncated || talk.outline.sections.some(section => section.text.trim() === '' || section.hasCode)
+      if (independentDocument?.talkId === talk.sessionId && independentDocument.state === 'presenting') {
+        independentDocument.state = partial ? 'partial' : 'completed'
+        independentDocument.next = talk.next
+        independentDocument.completed = [...talk.completed].sort((a, b) => a - b)
+        independentDocument.error = startedMidway ? '从中间段开始，之前的段落未讲解。'
+          : partial ? '文档含截断、不可提取段落或代码，仅完成可提取文字的讲解。' : null
+      }
       if (meetingPresentation?.talkId === talk.sessionId && meetingPresentation.state === 'presenting') {
         meetingPresentation.state = partial ? 'partial' : 'completed'
         meetingPresentation.lectureOutcome = partial ? 'partial' : 'completed'
@@ -2115,6 +2474,19 @@ async function explainDocByPath(
   if (strictSection && (!Number.isInteger(from) || from < 0 || from >= outline.sections.length)) {
     return { ok: false, error: `段号 ${String(from)} 不存在：本文共 ${outline.sections.length} 段，请重新选择。` }
   }
+  if (speak && via === 'wps' && !isPdfName(target)) return { ok: false, error: 'WPS 同步讲解目前只支持 PDF' }
+  const autoApproved = speak && !expected && loadSettings().meetingDocumentAutoApprove === true
+  if (speak && !expected && !autoApproved) {
+    const confirmed = await dialog.showMessageBox({ type: 'question', title: '讲解文档？',
+      message: `讲解 ${JSON.stringify(opened.doc.name)}？`,
+      detail: `文档：${JSON.stringify(opened.doc.path)}\n文档摘要：${opened.doc.fingerprint}\n讲解会向当前会话模型发送文档片段，讲解期间会监听麦克风以支持插话。`,
+      buttons: ['同意讲解', '取消'], defaultId: 1, cancelId: 1, noLink: true })
+    if (confirmed.response !== 0) return { ok: false, error: '本人未同意，文档讲解没有开始' }
+    if (bindingId !== sessionState?.bindingId || revision !== docRevision) return { ok: false, error: '会话或讲解状态已变化，未开始讲解' }
+    const current = await documents.open(target)
+    if (bindingId !== sessionState?.bindingId || revision !== docRevision || current.kind !== 'opened'
+      || current.doc.fingerprint !== opened.doc.fingerprint) return { ok: false, error: '文档、授权或会话已变化，未开始讲解' }
+  }
   const talk: DocTalk = {
     path: opened.doc.path,
     name: opened.doc.name,
@@ -2133,7 +2505,8 @@ async function explainDocByPath(
   // 视图先装上新讲解计划再装链：装链会停掉旧链，停的只能是旧视图会话（见 presentedSessionId）。
   if (speak || isOfficeDoc(talk.path)) {
     const shown = await presentDocView(talk)
-    if (bindingId !== sessionState?.bindingId || revision !== docRevision || (expected && !expected.allowed())) {
+    if (bindingId !== sessionState?.bindingId || revision !== docRevision || (expected && !expected.allowed())
+      || (autoApproved && loadSettings().meetingDocumentAutoApprove !== true)) {
       if (presentedSessionId === talk.sessionId) { presentedView?.stop('replaced'); presentedSessionId = null }
       if (presentedOfficeSessionId === talk.sessionId) presentedOfficeSessionId = null
       return { ok: false, error: '会话已改变或讲解已停止，未开始原文档讲解' }
@@ -2218,9 +2591,49 @@ async function resumeDocTalk(spoken: boolean): Promise<ChatReply> {
     meetingPresentation.state = 'presenting'
     if (!persistMeetingPresentation(meetingPresentation)) { stopDocTalk(); return { ok: false, error: '讲解状态无法保存，请在会议页核查。' } }
   }
+  if (independentDocument?.talkId === talk.sessionId && independentDocument.state === 'paused') independentDocument.state = 'presenting'
   void advanceDocTalk(talk)
   return { ok: true, reply: `继续《${talk.name}》，从上次未完整播放的句子接着讲。` }
 }
+
+/**
+ * 用户明确要求"下一段"或"跳到第 N 段"。
+ *
+ * 讲解链由桌面端逐段推进，模型手里只有当前段；这类话一旦当成普通聊天发出去，模型就只能
+ * 回答"没有原文"。这里直接接管：定位到目标段，再走 `resumeDocTalk` 的重新授权、双轨核验
+ * 与播报路径，避免另开一条绕过校验的捷径。
+ *
+ * `target` 是 0 起的段号；省略表示跳过当前待讲的那一段。
+ */
+async function moveDocTalk(target?: number, spoken = false): Promise<ChatReply> {
+  const talk = docTalk
+  if (talk === null) return { ok: false, error: '现在没有正在讲解的文档，请先选择文档。' }
+  if (meetingPresentation?.talkId === talk.sessionId && !['presenting', 'paused'].includes(meetingPresentation.state)) {
+    return { ok: false, error: '会议讲解已失效或结束，请在会议页核查。' }
+  }
+  if (independentDocument?.talkId === talk.sessionId && !['presenting', 'paused'].includes(independentDocument.state)) {
+    return { ok: false, error: '文档讲解已失效或结束，请重新发起。' }
+  }
+  const total = talk.outline.sections.length
+  if (total === 0) return { ok: false, error: '这份文档没有可讲解的段落。' }
+  // next 指向的是"下一段要讲的位置"：它已经开始讲（或正在生成）才算当前段，跳过去；
+  // 还没开始才说明用户说的"下一段"就是它。
+  const currentStarted = narrator.isSpeaking() || docTalkBusy || talk.explanations.has(talk.next)
+  let index = target === undefined ? talk.next + (currentStarted ? 1 : 0) : clampSection(target, total)
+  index = Math.min(index, total)
+  clearDocAutoResume()
+  interruptSpeech(false)
+  if (index >= total) {
+    talk.next = total
+    const result = await resumeDocTalk(spoken)
+    return result.ok ? { ...result, reply: `《${talk.name}》已经讲到最后一段了。` } : result
+  }
+  talk.next = index
+  const result = await resumeDocTalk(spoken)
+  if (!result.ok) return result
+  return { ...result, reply: `好，从第 ${index + 1} 段「${talk.outline.sections[index].heading ?? '无标题'}」开始讲。` }
+}
+
 
 async function askAboutDoc(target: string, index: number, question: string, assistantId?: string, spoken = false): Promise<ChatReply> {
   const talk = docTalk
@@ -2242,7 +2655,7 @@ async function askAboutDoc(target: string, index: number, question: string, assi
   const prompt = askPrompt(opened.doc.name, opened.doc.parsed.outline, index, question)
   try {
     const result = spoken && bindingId
-      ? await sendChatReply(prompt, bindingId, true, assistantId)
+      ? await sendChatReply(prompt, bindingId, true, assistantId, undefined, false, false)
       : await bridge.chat(withInterruptedSpeech(prompt), assistantId, request.signal, undefined, bindingId)
     if (request.signal.aborted || bindingId !== sessionState?.bindingId || docTalk !== talk) {
       return { ok: false, error: '追问已停止或会话已切换，旧回答已丢弃。' }
@@ -2337,7 +2750,8 @@ const rendererPlayback = new RendererPlayback(
   { log: message => console.log('[dsh-pet] ' + message) },
 )
 const openTtsTransport = createSwitchingTransport<'process' | 'renderer'>(
-  () => (audioPrefs().bargeIn ? 'renderer' : 'process'),
+  () => (audioPrefs().bargeIn || (docTalk !== null && docTalk.spoken && !docTalk.stopped)
+    || meetingRecorder?.getState().recording === true ? 'renderer' : 'process'),
   { process: deliver => spawnTtsEdgeWorker(deliver), renderer: rendererPlayback.open },
 )
 
@@ -2350,10 +2764,9 @@ const bargeMetrics: Array<{ onsetToDetectMs: number; detectToSilenceMs: number |
 function noteSpeakingForBargeIn(speaking: boolean): void {
   if (speaking) {
     if (bargeReleaseTimer) { clearTimeout(bargeReleaseTimer); bargeReleaseTimer = null }
-    // 会议演讲 / 文档讲解时必须能接评委提问：这两种场景默认也开插话监听，
-    // 不要求用户先去设置里打开实验开关。
     const inMeeting = meetingRecorder?.getState().recording === true
     const presenting = docTalk !== null && docTalk.spoken && !docTalk.stopped
+    // 本人明确允许讲解期间监听插话；设置页说明麦克风与识别服务的数据去向。
     if (audioPrefs().bargeIn || inMeeting || presenting) {
       applyAudio({ type: 'barge-in-requested', allowInMeeting: inMeeting })
     }
@@ -2446,6 +2859,7 @@ const narrator = new Narrator(playbackTap.wrap(openTtsTransport), {
       void advanceDocTalk()
       scheduleDocAutoResume()
       void maybeStartMeetingPresentation()
+      void maybeStartIndependentDocument()
     }
   },
   onVoice: voice => console.log('[dsh-pet] 语音合成音色：', voice),
@@ -2610,7 +3024,7 @@ async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' 
     voiceTurn = undefined
   }
   if (assistantId || docTalk || command.text.trim().startsWith('/')
-    || /^(继续讲解|接着讲|继续讲|停止讲解|暂停讲解|结束讲解)/u.test(command.text.trim())) exclude()
+    || /^(继续讲解|接着讲|继续讲|继续往下讲|接着往下讲|往下讲|停止讲解|暂停讲解|结束讲解)/u.test(command.text.trim())) exclude()
   if (command.text.trim().startsWith('/')) return bridge.sessionCommand({ ...command, voiceTurn: undefined, spoken: false })
   const current = () => command.bindingId === sessionState?.bindingId && sessionState.status !== 'disconnected'
   const text = command.text.trim().replace(/[。！!，,\s]+$/u, '')
@@ -2632,15 +3046,22 @@ async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' 
   const compound = !explanationQuestion && actions > 1
   let local: ChatReply | null = null
   if (!assistantId && !compound) {
-    if (text === '继续' && docTalk !== null && interruptedChat && interruptedSpeech !== null) {
+    const move = docTalk === null ? null : sectionMoveIntent(text)
+    if (move !== null) {
+      // 明确要求换段：由桌面端推进讲解链，不能把这句话当普通聊天交给模型。
+      exclude()
+      local = await moveDocTalk(move.target, command.spoken === true)
+    } else if (text === '继续' && docTalk !== null && interruptedChat && interruptedSpeech !== null) {
       // 两件事都停在半路：讲解和刚才的回答。只有一件时才替用户接着做。
       local = { ok: true, reply: `有两件被打断的事：《${docTalk.name}》的讲解，和刚才的回答。说“继续讲解”接着讲文档，说“接着说”继续刚才的回答。` }
-    } else if (/^(继续讲解|接着讲|继续讲)$/.test(text) || (text === '继续' && docTalk !== null)) {
+    } else if (/^(继续讲解|接着讲|继续讲|继续往下讲|接着往下讲|往下讲)$/.test(text) || (text === '继续' && docTalk !== null)) {
       interruptedChat = false
-      local = resumeWaitingMeetingPresentation() ?? await resumeDocTalk(command.spoken === true)
+      local = resumeWaitingIndependentDocument() ?? resumeWaitingMeetingPresentation() ?? await resumeDocTalk(command.spoken === true)
     } else if (/^(停止讲解|暂停讲解|结束讲解)$/.test(text) || (text === '停一下' && docTalk !== null)) {
-      if (text === '结束讲解') cancelMeetingPresentation('讲解已结束；若会议仍在录音，请明确停录。')
-      else pauseMeetingPresentation()
+      if (text === '结束讲解') {
+        cancelMeetingPresentation('讲解已结束；若会议仍在录音，请明确停录。')
+        cancelIndependentDocument('讲解已结束，录音状态不变。')
+      } else { pauseMeetingPresentation(); pauseWaitingIndependentDocument() }
       interruptSpeech()
       if (text === '结束讲解') stopDocTalk()
       pushDocState()
@@ -2691,7 +3112,7 @@ async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' 
     return sendChatReply(command.text, command.bindingId, command.spoken === true || readReplies, assistantId, voiceTurn, compound)
   }
   interruptSpeech()
-  const contextual = withInterruptedSpeech(command.text)
+  const contextual = withPresentationContext(command.text)
   return bridge.sessionCommand({ ...command, text: compound ? command.text : contextual, spoken: false })
 }
 
@@ -2757,6 +3178,7 @@ function registerIpc(): void {
       if (!stageSender(event as Electron.IpcMainInvokeEvent) || !pending || pending.id !== requestId || pending.expiresAt <= Date.now()) {
         return '会议启动请求已取消、过期或来源无效'
       }
+      if (pending.autoApproved && loadSettings().meetingDocumentAutoApprove !== true) return '自动审批已关闭，未开始录音'
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '会议参数与本次请求不一致'
       const consent = raw as Partial<MeetingConsentInput>
       const expected = pending.consent
@@ -2934,6 +3356,22 @@ function registerIpc(): void {
 
   ipcMain.handle('evidence-intake-window', (): Promise<EvidenceIntakeOutcome> => intakeWindow(evidenceDeps))
 
+  ipcMain.handle('meeting-todo-import', createMeetingTodoHandler<Electron.IpcMainInvokeEvent>({
+    binding: event => stageSender(event) && sessionState?.status !== 'disconnected' ? sessionState?.bindingId ?? null : null,
+    read: id => ({ name: meetingRecorder?.meetingName(id) ?? null,
+      view: meetingRecorder?.getMinutes(id) ?? { ok: false as const, error: '会议库尚未就绪' } }),
+    confirm: async item => {
+      const choice = await dialog.showMessageBox({ type: 'question', title: '将会议行动项记为待办？',
+        message: '请核对这条行动项和数据去向', buttons: ['取消', '确认加入待办'], defaultId: 0, cancelId: 0, noLink: true,
+        detail: [`会议：${item.meetingName}`, `行动项：${item.text}`, `负责人：${item.owner || '待确认'}`,
+          `期限：${item.due || '待确认'}`, `转写版本：${item.revision}`, `纪要摘要：${item.digest}`,
+          `来源：${item.sourceRefs.join('、')}`, '',
+          '这条内容将以明文复制到本机任务库，不会因此发信或设置提醒。会议后续修改不会自动更新已有待办。'].join('\n') })
+      return choice.response === 1
+    },
+    post: item => bridge.companionRequest('POST', '/companion/v1/meeting-actions/import', item, 'owner'),
+  }))
+
   meetingRecorder.sweepRetention()
   setInterval(() => meetingRecorder?.sweepRetention(), 6 * 3_600_000).unref()
 
@@ -3082,6 +3520,7 @@ function registerIpc(): void {
       voiceConversation: settings.voiceConversation === true,
       continuousVoice: settings.continuousVoice === true,
       readReplies: settings.readReplies === true,
+      meetingDocumentAutoApprove: settings.meetingDocumentAutoApprove === true,
       bounds: settings.bounds,
       positions: settings.positions,
       characters: settings.characters,
@@ -3095,8 +3534,9 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'save-settings',
-    (_event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number } }) => {
+    (event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; meetingDocumentAutoApprove?: boolean; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number } }) => {
       if (!patch || typeof patch !== 'object') return { ok: false }
+      if ('meetingDocumentAutoApprove' in patch && (!stageSender(event) || typeof patch.meetingDocumentAutoApprove !== 'boolean')) return { ok: false }
       // 设置只接受明确的整数分钟；不让无效输入被默默保存成默认值。
       for (const key of ['idleSleepMinutes', 'sleepMinutes'] as const) {
         if (!(key in patch)) continue
@@ -3113,11 +3553,18 @@ function registerIpc(): void {
         ...(typeof patch.voiceConversation === 'boolean' ? { voiceConversation: patch.voiceConversation } : {}),
         ...(typeof patch.continuousVoice === 'boolean' ? { continuousVoice: patch.continuousVoice } : {}),
         ...(typeof patch.readReplies === 'boolean' ? { readReplies: patch.readReplies } : {}),
+        ...(typeof patch.meetingDocumentAutoApprove === 'boolean' ? { meetingDocumentAutoApprove: patch.meetingDocumentAutoApprove } : {}),
         ...(patch.idleSleepMinutes !== undefined ? { idleSleepMinutes: patch.idleSleepMinutes } : {}),
         ...(patch.sleepMinutes !== undefined ? { sleepMinutes: patch.sleepMinutes } : {}),
         ...(patch.chatDock === 'top' || patch.chatDock === 'auto' ? { chatDock: patch.chatDock } : {}),
         ...(chatSize ? { chatSize } : {}),
       })
+      if (patch.meetingDocumentAutoApprove === false) {
+        if (pendingMeetingStart?.autoApproved) cancelDesktopCommand({ id: pendingMeetingStart.id })
+        if (independentDocument?.autoApproved && ['authorizing', 'waiting-to-present', 'waiting-to-resume', 'starting'].includes(independentDocument.state)) {
+          failIndependentDocument(independentDocument, '自动审批已关闭，尚未开始的文档讲解已取消。')
+        }
+      }
       if (patch.voiceConversation === false || patch.continuousVoice === false) {
         sendToRenderer('voice-conversation-stop', null)
         if (spokenRound?.voiceTurn) interruptSpeech()
@@ -3188,6 +3635,7 @@ function registerIpc(): void {
       submissionCount -= 1
       dismissAfter = Date.now()
       void maybeStartMeetingPresentation()
+      void maybeStartIndependentDocument()
     }
   })
 
@@ -3204,6 +3652,7 @@ function registerIpc(): void {
       submissionCount -= 1
       dismissAfter = Date.now()
       void maybeStartMeetingPresentation()
+      void maybeStartIndependentDocument()
     }
   })
 
@@ -3211,6 +3660,7 @@ function registerIpc(): void {
     // 用户主动停播（按钮或“停一下”口令）：不要再用自动续讲把讲解接回去。
     clearDocAutoResume()
     pauseMeetingPresentation()
+    pauseWaitingIndependentDocument()
     interruptSpeech()
     pushDocState()
   })
@@ -3909,6 +4359,7 @@ if (!gotLock) {
           for (const id of desktopCommandControllers.keys()) cancelDesktopCommand({ id })
           if (pendingMeetingStart) cancelDesktopCommand({ id: pendingMeetingStart.id })
           if (pendingMeetingReady) cancelDesktopCommand({ id: pendingMeetingReady.id })
+          cancelIndependentDocument('连接已断开，独立讲解不会继续。')
           cancelMeetingPresentation('连接已断开，讲解不会继续；请在会议页核查录音。')
         }
         if (status === 'disconnected' && sessionState) {

@@ -214,7 +214,8 @@ function openRuntime(dir: string, tracker: FakeTracker, options: FixtureOptions)
     },
     /** 工作台改写一条记忆：页面只说"这一条改成什么"。 */
     editMemory(memoryId: string, text: string, topic?: string) {
-      return runtime.http('POST', '/workbench/memories/edit', { memoryId, text, ...(topic === undefined ? {} : { topic }) })
+      const expectedRevision = memories.get(memoryId, Date.now())?.revision ?? 1
+      return runtime.http('POST', '/workbench/memories/edit', { memoryId, expectedRevision, text, ...(topic === undefined ? {} : { topic }) })
     },
     close() {
       bridge.dispose()

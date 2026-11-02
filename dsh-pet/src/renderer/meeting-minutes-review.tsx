@@ -160,13 +160,20 @@ export default function MeetingMinutesReview({ api, meetingId, result, revision,
             修改
           </button>
         )}
+        {item.kind === 'action' && item.status === 'kept' && minutes?.state === 'confirmed' && !stale && (
+          <button type="button" className="meeting-btn" disabled={generating}
+            onClick={() => void run(() => api.meetingTodoImport({ meetingId, itemId: item.id, revision: minutes.revision, digest: minutes.digest }),
+              outcome => outcome.message ?? '已登记，请到任务与提醒中核对。')}>
+            加入人工待办…
+          </button>
+        )}
         {isEditing && editing !== null && (
           <div className="meeting-mitem-edit">
-            <textarea value={editing.text} maxLength={400} onChange={event => setEditing({ ...editing, text: event.target.value })} />
+            <textarea aria-label="纪要条目内容" value={editing.text} maxLength={400} onChange={event => setEditing({ ...editing, text: event.target.value })} />
             {item.kind === 'action' && (
               <>
-                <input type="text" placeholder="负责人（留空 = 待确认）" value={editing.owner} maxLength={400} onChange={event => setEditing({ ...editing, owner: event.target.value })} />
-                <input type="text" placeholder="期限（留空 = 待确认）" value={editing.due} maxLength={400} onChange={event => setEditing({ ...editing, due: event.target.value })} />
+                <input type="text" aria-label="负责人" placeholder="负责人（留空 = 待确认）" value={editing.owner} maxLength={400} onChange={event => setEditing({ ...editing, owner: event.target.value })} />
+                <input type="text" aria-label="期限" placeholder="期限（留空 = 待确认）" value={editing.due} maxLength={400} onChange={event => setEditing({ ...editing, due: event.target.value })} />
               </>
             )}
             <button type="button" className="meeting-btn" disabled={editing.text.trim() === ''} onClick={saveEdit}>保存</button>
@@ -234,6 +241,7 @@ export default function MeetingMinutesReview({ api, meetingId, result, revision,
           {stale && <p className="meeting-error">转写在纪要生成后被修订，这份纪要的来源已失效，请重新生成。</p>}
           {structured !== null && !stale && (
             <>
+              {minutes.state === 'confirmed' && <p className="meeting-hint">行动项可逐条转成待办；内容将保存到本机任务库，提醒需另行设置，会议后续修改不会自动覆盖任务。</p>}
               {(['summary', 'decision', 'action'] as const).map(kind => {
                 const list = kept.filter(item => item.kind === kind)
                 return (

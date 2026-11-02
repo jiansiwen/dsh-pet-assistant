@@ -79,6 +79,16 @@ test('直接对象快照逐字段投影，密钥与扩展字段不混入', async
   assert.deepEqual(await read(), { ok: true, state: safe })
   assert.deepEqual(requests, [{ method: 'GET', path: ROOT, body: undefined, subject: 'owner' }])
 })
+test('团队运行时离线显示明确状态，不泄露服务端消息', async () => {
+  mount()
+  respond = async () => ({ status: 503, body: { code: 'DEVICE_OFFLINE', message: '内部测试信息不能外传' } })
+  const result = await read()
+  assert.equal(code(result), 'runtime_offline')
+  if (!result.ok) {
+    assert.match(result.error.message, /运行时.*(?:停止|未就绪)/u)
+    assert.doesNotMatch(result.error.message, /内部测试信息/u)
+  }
+})
 test('邮件通知核查投影只包含状态与摘要，不暴露扩展字段', async () => {
   mount()
   const safe = snapshot()

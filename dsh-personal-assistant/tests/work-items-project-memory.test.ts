@@ -1,6 +1,6 @@
 /** M3-01 工作事项与证据关联、M3-06 项目范围记忆：真实工具、真实库与审批服务；不启动采集或模型。 */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
@@ -275,4 +275,78 @@ test('授权撤销或链接改指后，项目记忆不可读写，旧待批不�
   const commit = await f.call('commit_events', { events: [{ start: base, end: base, summary: '改了 x', status: 'direct', sources: [{ kind: 'project_evidence', ref: read.evidenceId }] }] })
   assert.equal(commit.committed, 0, '授权失效的项目证据不能再被引用')
   assert.match(commit.error, /授权已撤销或实际路径已改指/)
+})
+
+test('项目时间线只返回授权项目内的来源与记忆，并明确未覆盖的时间', async t => {
+  const f = fixture(t)
+  const project = path.join(f.dir, 'timeline-project')
+  mkdirSync(project)
+  await f.authorize(project)
+  await f.remember({ text: '不要在日报中写私聊内容', topic: '口径', projectDir: project })
+  const evidence = f.workItems.recordProjectEvidence({ projectDir: project, git: true, branch: 'main', changedFiles: [' M a.ts'], diffStat: [' a.ts | 1 +'], recentCommits: [], entries: [], truncated: false }, base)
+  const committed = await f.call('commit_events', { events: [{ start: base + 15_000, end: base + 20_000,
+    summary: '修改项目文件', project, status: 'direct', sources: [{ kind: 'project_evidence', ref: evidence.evidenceId }] }] })
+  assert.equal(committed.committed, 1)
+  for (const [id, scopeKind, scopeId, startAt, endAt, summary] of [
+    ['obs-a', 'project', project, base + 10_000, base + 20_000, '项目内采样 A'],
+    ['obs-b', 'project', project, base + 30_000, base + 40_000, '项目内采样 B'],
+    ['obs-other', 'global', '', base + 21_000, base + 29_000, '其他窗口隐私'],
+  ] as const) f.observations.put({ id, source: 'activity_span', scopeKind, scopeId, startAt, endAt,
+    timezone: 'Asia/Shanghai', summary, payloadRef: null, sensitivity: 'normal', legacyId: null, importBatch: null })
+  const timeline = await f.call('project_timeline', { projectDir: project, from: base, to: base + 60_000 })
+  assert.equal(timeline.ok, true, JSON.stringify(timeline))
+  assert.deepEqual(timeline.observations.map((item: { id: string }) => item.id), ['obs-a', 'obs-b'])
+  assert.deepEqual(timeline.gaps, [
+    { from: base, to: base + 10_000 }, { from: base + 20_000, to: base + 30_000 }, { from: base + 40_000, to: base + 60_000 },
+  ])
+  assert.equal(timeline.workItems[0].status, 'direct')
+  assert.equal(timeline.workItems[0].sources[0].ref, evidence.evidenceId)
+  assert.equal(timeline.memories[0].text, '不要在日报中写私聊内容')
+  assert.doesNotMatch(JSON.stringify(timeline), /其他窗口隐私/)
+  assert.match(timeline.coverageNote, /不代表连续|不能证明连续/)
+  f.observations.put({ id: 'obs-confirmed', source: 'activity_span', scopeKind: 'global', scopeId: '', startAt: base + 45_000,
+    endAt: base + 50_000, timezone: 'Asia/Shanghai', summary: '本人确认归属的窗口活动', payloadRef: null,
+    sensitivity: 'normal', legacyId: null, importBatch: null })
+  const inferred = await f.call('commit_events', { events: [{ start: base + 45_000, end: base + 50_000, summary: '查看项目界面',
+    project, status: 'inferred', sources: [{ kind: 'activity_observation', ref: 'obs-confirmed' }] }] })
+  const itemId = inferred.items[0].id
+  const notConfirmed = await f.call('project_timeline', { projectDir: project, from: base, to: base + 60_000 })
+  assert.equal(notConfirmed.observations.some((item: { id: string }) => item.id === 'obs-confirmed'), false, '模型自报项目归属不算授权')
+  const confirmation = await f.call('confirm_work_items', { ids: [itemId] })
+  assert.equal((await f.decide(confirmation.proposalId)).ok, true)
+  const confirmed = await f.call('project_timeline', { projectDir: project, from: base, to: base + 60_000 })
+  assert.equal(confirmed.observations.find((item: { id: string }) => item.id === 'obs-confirmed').association, 'user-confirmed')
+  assert.equal(confirmed.workItems.find((item: { id: string }) => item.id === itemId).status, 'user_confirmed')
+  assert.doesNotMatch(JSON.stringify(confirmed), /其他窗口隐私/)
+  const id = f.helpContexts.list().find(item => item.projectDir === project)!.id
+  f.helpContexts.remove(id)
+  const denied = await f.call('project_timeline', { projectDir: project, from: base, to: base + 60_000 })
+  assert.equal(denied.ok, false)
+  assert.doesNotMatch(JSON.stringify(denied), /不要在日报中写私聊内容|项目内采样/)
+})
+
+test('时间线拒绝单文件授权和过大的时间范围；截断时不伪造空缺', async t => {
+  const f = fixture(t)
+  const project = path.join(f.dir, 'file-scope')
+  mkdirSync(project)
+  const file = path.join(project, 'only.ts')
+  writeFileSync(file, 'export {}')
+  const pending = await f.call('help_context', { projectDir: project, currentFile: file })
+  assert.equal((await f.decide(pending.proposalId)).ok, true)
+  const fileOnly = await f.call('project_timeline', { projectDir: project, from: base, to: base + 1000 })
+  assert.equal(fileOnly.ok, false)
+  assert.match(fileOnly.error, /单文件授权/)
+  assert.equal((await f.call('project_timeline', { projectDir: project, from: base, to: base + 367 * 86_400_000 })).ok, false)
+  f.helpContexts.remove(f.helpContexts.list().find(item => item.projectDir === project)!.id)
+  await f.authorize(project)
+  for (let index = 0; index < 201; index++) f.observations.put({
+    id: `obs-${index}`, source: 'activity_span', scopeKind: 'project', scopeId: project,
+    startAt: base + index * 2, endAt: base + index * 2 + 1, timezone: 'Asia/Shanghai', summary: '采样',
+    payloadRef: null, sensitivity: 'normal', legacyId: null, importBatch: null,
+  })
+  const result = await f.call('project_timeline', { projectDir: project, from: base, to: base + 1000 })
+  assert.equal(result.ok, true)
+  assert.equal(result.truncated, true)
+  assert.equal(result.observations.length, 200)
+  assert.equal(result.gaps, null, '观察截断时无法算出完整空缺')
 })

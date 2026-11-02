@@ -12,6 +12,8 @@ interface Props {
 
 export default function PetSettingsPanel({ page, onPage, onClose, children, quotaPending = 0 }: Props) {
   const panel = useRef<HTMLDivElement | null>(null)
+  const content = useRef<HTMLDivElement | null>(null)
+  useLayoutEffect(() => { if (content.current) content.current.scrollTop = 0 }, [page])
   useLayoutEffect(() => {
     const element = panel.current
     if (!element) return
@@ -26,15 +28,33 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__settings__') }
   }, [])
 
+  const pages = [
+    ['general', '通用', '调整桌面伙伴的行为、语音与隐私。'],
+    ['team', '团队', '管理成员、额度与等待处理的任务。'],
+    ['doc', '文档', '管理授权目录、阅读和讲解。'],
+    ['meeting', '会议', '查看录音状态，整理并核对会议纪要。'],
+    ['wecom', '渠道', '配置企业微信连接和已配对会话。'],
+    ['reminders', '提醒', '设置默认催办间隔，查看任务与提醒。'],
+  ] as const
+  const current = pages.find(([id]) => id === page)!
+
   return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台">
-    <header className="management-header"><h2>小潘桌面伙伴控制台</h2><button onClick={onClose} aria-label="关闭设置">×</button></header>
+    <header className="management-header">
+      <div className="management-brand" aria-hidden="true">潘</div>
+      <div className="management-brand-copy"><span>小潘 · 桌面伙伴</span><h2>设置与管理</h2></div>
+      <button type="button" onClick={onClose} aria-label="关闭设置">×</button>
+    </header>
     <nav className="management-tabs" aria-label="设置分类">
-      {([['general', '通用'], ['team', '团队'], ['doc', '文档'], ['meeting', '会议'], ['wecom', '渠道'], ['reminders', '提醒']] as const).map(([id, title]) =>
-        <button key={id} type="button" aria-current={page === id ? 'page' : undefined} onClick={() => onPage(id)}>{title}
+      {pages.map(([id, title], index) =>
+        <button key={id} id={`panel-tab-${id}`} type="button" aria-current={page === id ? 'page' : undefined} onClick={() => onPage(id)}>
+          <span className="management-tab-index" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span><span>{title}</span>
           {id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
         </button>)}
     </nav>
-    <div className="management-content">{children}</div>
+    <div className="management-content" ref={content}>
+      <div className="management-intro"><span className="management-eyebrow">设置 / {current[1]}</span><h3>{current[1]}</h3><p>{current[2]}</p></div>
+      {children}
+    </div>
   </section>
 }
 

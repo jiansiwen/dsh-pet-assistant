@@ -14,7 +14,8 @@ function channelKeyFromExec(exec: unknown): string | null {
   } catch { return null }
 }
 
-export function registerCompanionTools(host: { tools: { register(definition: unknown): () => void } }, runtime: CompanionTaskRuntime): () => void {
+export function registerCompanionTools(host: { tools: { register(definition: unknown): () => void } }, runtime: CompanionTaskRuntime,
+  desktop?: { desktopBinding(agent: unknown): string | null }): () => void {
   const disposers: Array<() => void> = []
   const dispose = () => { while (disposers.length) disposers.pop()!() }
   const output = { schema: { type: 'string' } as const,
@@ -123,6 +124,16 @@ export function registerCompanionTools(host: { tools: { register(definition: unk
       parameters: { taskId: { type: 'string', description: '可选的确切任务编号' } }, output,
       async execute(args: { taskId?: string }) {
         return JSON.stringify(await runtime.request('GET', args.taskId ? `/companion/v1/tasks/${encodeURIComponent(args.taskId)}` : '/companion/v1/tasks', null, 'client'))
+      },
+    })))
+    disposers.push(host.tools.register(defineTool({
+      name: 'companion_skill_candidates',
+      description: '只在本机桌面会话列出本人多次确认完成、标题和内容完全相同的人工工作，作为技能候选线索；没有步骤证据时不能声称已试跑或启用，不安装、不执行、不自动触发。',
+      parameters: {}, output,
+      async execute(_args, exec) {
+        if (!desktop?.desktopBinding(exec?.agent) || !exec?.signal || exec.signal.aborted) return JSON.stringify({ ok: false, error: '技能候选只在本人当前桌面会话中查看' })
+        try { return JSON.stringify(runtime.skillCandidates()) }
+        catch (error) { return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) }
       },
     })))
   } catch (error) { dispose(); throw error }

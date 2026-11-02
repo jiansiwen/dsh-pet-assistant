@@ -166,7 +166,7 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
           {state.wecom.allowedUserIds.length ? <ul className="assistant-settings-list">{state.wecom.allowedUserIds.map((id, index) => <li key={`${index}-${id}`}>{id}</li>)}</ul> : <p className="management-hint">暂无已配对用户。</p>}
           <h4>提醒会话（只读）</h4>
           {state.wecom.deliverHere.length ? <ul className="assistant-settings-list">{state.wecom.deliverHere.map((id, index) => <li key={`${index}-${id}`}>{id}</li>)}</ul> : <p className="management-hint">暂无提醒会话。</p>}
-          <p className="management-hint">邮件自动收信尚未实现，这里不提供启用选项。</p>
+          <p className="management-hint">邮件值守由具备邮件能力的团队成员处理，需先配置邮箱并启用团队；发送邮件仍需本人确认。</p>
           <p className="management-hint">成员的职责、模型、权限和独立记忆已统一移到“团队 → 团队成员”，可为通用成员绑定企业微信接收能力。</p>
         </>}
         {section === 'reminders' && <button type="button" className="management-button" disabled={openingTasks}

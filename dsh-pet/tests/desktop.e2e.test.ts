@@ -412,7 +412,7 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'evidence-intake-minutes', 'evidence-intake-window',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
     'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
-    'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
+    'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-todo-import',
     'audio-sync', 'residency-state', 'residency-set',
     // 成员目录、成员编辑窗口与额度（团队管理）。
     'members-state', 'member-command', 'member-memories', 'member-assist',

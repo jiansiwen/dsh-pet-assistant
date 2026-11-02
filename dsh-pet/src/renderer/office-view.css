@@ -32,6 +32,8 @@ body {
   background: radial-gradient(circle at 50% 0, #262c33 0, #14161a 62%);
 }
 .office-stage.is-fullscreen { padding: 8px; }
+.office-markdown { width: min(100%, 980px); padding: 36px; background: #fff; color: #20252b; box-shadow: 0 8px 30px rgba(0, 0, 0, .45); }
+.office-markdown pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 15px/1.7 Consolas, 'Microsoft YaHei', monospace; }
 
 /* docx-preview 生成的页面：一次只显示一页，zoom 由脚本按窗口大小计算。 */
 .office-stage .docx-wrapper { background: transparent !important; padding: 0 !important; display: contents; }

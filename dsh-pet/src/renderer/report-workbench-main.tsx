@@ -43,7 +43,7 @@ interface View {
   lines: Line[]; stats: { entries: number; pendingEntries: number }
   workItems: Item[]; evidenceRemoved: { count: number }
   materials: Material[]
-  memories: { items: Array<{ id: string; kind: string; scope: string; topic: string; text: string; status: string }>; hiddenProjectMemories: number }
+  memories: { items: Array<{ id: string; kind: string; scope: string; topic: string; text: string; status: string; revision: number }>; hiddenProjectMemories: number }
   history: Array<{ revision: number; state: string; createdAt: number; digest: string; revokedReason: string | null; change: string | null; targetPath: string | null }>
   pendingApproval: { proposalId: string; revision: number; expiresAt: number; target: string } | null
   lastPublish: { revision: number; at: number | null; ok?: boolean; confirmed?: boolean; savedPath?: string; modeExited?: boolean; message?: string; error?: string } | null
@@ -100,7 +100,7 @@ function App() {
   const [importMeta, setImportMeta] = useState({ kind: 'chat_excerpt', objectLabel: '', from: '', to: '' })
   const [range, setRange] = useState({ from: '', to: '', reason: '' })
   /** 正在改写的那条记忆：id → 编辑中的正文与分类。null 表示没有在改。 */
-  const [memoryEdit, setMemoryEdit] = useState<{ id: string; text: string; topic: string; original: string } | null>(null)
+  const [memoryEdit, setMemoryEdit] = useState<{ id: string; revision: number; text: string; topic: string; original: string } | null>(null)
   const knownReceipt = useRef<string | null>(null)
 
   const load = useCallback(async (wanted?: string | null) => {
@@ -254,7 +254,7 @@ function App() {
     const text = memoryEdit.text.trim()
     if (!text) { setNotice({ tone: 'warn', text: '改写后的内容不能为空；要撤销这条记忆请用"删除…"' }); return }
     const result = await reply(api.editMemory({
-      memoryId: memoryEdit.id, text,
+      memoryId: memoryEdit.id, expectedRevision: memoryEdit.revision, text,
       ...(memoryEdit.topic.trim() ? { topic: memoryEdit.topic.trim() } : {}),
     }))
     if (!result.ok) return
@@ -516,7 +516,7 @@ function App() {
               {memoryEdit?.id === memory.id ? (
                 <div className="wb-memory-edit">
                   {memory.topic && <label>分类<input value={memoryEdit.topic} onChange={event => setMemoryEdit({ ...memoryEdit, topic: event.target.value })} /></label>}
-                  <textarea rows={3} value={memoryEdit.text} onChange={event => setMemoryEdit({ ...memoryEdit, text: event.target.value })} />
+                  <textarea aria-label="记忆正文" rows={3} value={memoryEdit.text} onChange={event => setMemoryEdit({ ...memoryEdit, text: event.target.value })} />
                   <div className="wb-actions">
                     <button className="wb-btn primary" disabled={busy || memoryEdit.text.trim() === memoryEdit.original.trim()} onClick={() => void saveMemoryEdit()}>提交改写</button>
                     <button className="wb-btn quiet" disabled={busy} onClick={() => setMemoryEdit(null)}>取消</button>
@@ -525,7 +525,7 @@ function App() {
               ) : (
                 <>
                   <span>{memory.topic ? `「${memory.topic}」` : ''}{memory.text}</span>
-                  <button className="wb-btn quiet" disabled={busy} onClick={() => setMemoryEdit({ id: memory.id, text: memory.text, topic: memory.topic, original: memory.text })}>改写…</button>
+                  <button className="wb-btn quiet" disabled={busy} onClick={() => setMemoryEdit({ id: memory.id, revision: memory.revision, text: memory.text, topic: memory.topic, original: memory.text })}>改写…</button>
                   <button className="wb-btn quiet" disabled={busy} onClick={() => openDeletion('memory', `删除记忆「${memory.text.slice(0, 20)}」`, { memoryId: memory.id })}>删除…</button>
                 </>
               )}

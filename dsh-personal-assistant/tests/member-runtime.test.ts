@@ -12,6 +12,7 @@ import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import { ApprovalService } from '../src/approval.ts'
 import type { MemberDraft } from '../src/member-contract.ts'
 import { MemberRuntime, type MemberDirectory } from '../src/member-runtime.ts'
+import { registerMeetingPresentationTools } from '../src/meeting-presentation-tools.ts'
 import { TeamStore } from '../src/team-domain.ts'
 import { TeamService, watchReplyDeltas } from '../src/team.ts'
 import { registerTeamTools } from '../src/team-tools.ts'
@@ -127,6 +128,7 @@ async function fixture(t: TestContext, file?: string) {
   for (const plugin of plugins) await plugin
   const store = new TeamStore(file ?? ':memory:')
   let enabled = true
+  let desktopBinding: string | null = '当前桌面绑定'
   let notifications = 0
   const memories = new Map<string, string>()
   const proposals: Array<{ id: string; input: unknown }> = []
@@ -152,6 +154,8 @@ async function fixture(t: TestContext, file?: string) {
     output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
     execute: async () => { bodies.push(name); return name === 'personal_assistant_send_mail' ? '待本人审批' : '测试回执' },
   }))
+  registerMeetingPresentationTools(root as never, { binding: () => null, request: async () => { throw new Error('不能借用主会话身份') } },
+    ['personal_assistant_document_presentation'])
   root.systemPrompt.variable('personal_assistant_preferences', () => '总助理私有偏好')
   root.systemPrompt.variable('personal_assistant_memory_conflicts', () => '总助理私有冲突')
   root.systemPrompt.section({ name: '共享记忆模板', order: 100, text: '{{personal_assistant_preferences}}\n{{personal_assistant_memory_conflicts}}' })
@@ -188,7 +192,8 @@ async function fixture(t: TestContext, file?: string) {
   const options = { ctx, directory: store.directory as MemberDirectory, enabled: () => enabled,
     defaultModel: () => ({ provider: '默认提供方', model: '默认模型' }),
     memories: { injectable: (id: string) => memories.get(id) ?? '', propose: (id: string, input: unknown) => { proposals.push({ id, input }); return { status: 'candidate' } } },
-    desktop: { request: async (command: string, payload: Record<string, unknown>) => { desktopCalls.push({ command, payload }); return { ok: true, command } } },
+    desktop: { binding: () => desktopBinding,
+      request: async (command: string, payload: Record<string, unknown>) => { desktopCalls.push({ command, payload }); return { ok: true, command } } },
     mailUnread: async (limit?: number) => { mailReads.push(limit ?? 5); return { uidValidity: '1', messages: [{ uid: 1, subject: '主题', from: 'a@example.com', date: '', text: '正文' }] } },
     onChange: () => { notifications++ },
   }
@@ -203,7 +208,7 @@ async function fixture(t: TestContext, file?: string) {
   })
   return { root, store, calls, drivers, logs, memories, proposals, desktopCalls, mailReads, bodies, options,
     get runtime() { return runtime }, restart() { runtime = new MemberRuntime(options); return runtime },
-    notifications: () => notifications, setEnabled: (value: boolean) => { enabled = value },
+    notifications: () => notifications, setEnabled: (value: boolean) => { enabled = value }, setDesktopBinding: (value: string | null) => { desktopBinding = value },
     failResume: () => { failResume = true }, beforeSetup: (callback: (driver: Driver) => void) => { beforeSetup = callback },
     allowChannelFollowup: () => { channelFollowup = true },
     next: () => arrivals.length ? Promise.resolve(arrivals.shift()!) : new Promise<Driver>(resolve => waiters.push(resolve)),
@@ -362,10 +367,18 @@ test('会议能力只在桌面来源注册工具，并驱动一次性桌面命�
   await h.next()
   const started = await first.driver.tool('companion_meeting_start', { name: '周会' })
   assert.equal(started.isError, false)
-  assert.deepEqual(h.desktopCalls[0], { command: 'meeting.start', payload: { name: '周会', sources: 'mic+loopback', retentionDays: 30 } })
+  assert.deepEqual(h.desktopCalls[0], { command: 'meeting.recording.start',
+    payload: { bindingId: '当前桌面绑定', name: '周会', sources: 'mic+loopback', retentionDays: 30 } })
+  const stopped = await first.driver.tool('companion_meeting_stop')
+  assert.equal(stopped.isError, false)
+  assert.deepEqual(h.desktopCalls[1], { command: 'meeting.recording.stop', payload: { bindingId: '当前桌面绑定' } })
   const status = await first.driver.tool('companion_meeting_status')
   assert.equal(status.isError, false)
   assert.match(JSON.stringify(status), /meeting.status/)
+  h.setDesktopBinding('已切换绑定')
+  const stale = await first.driver.tool('companion_meeting_start', { name: '旧绑定不能开录' })
+  assert.match(JSON.stringify(stale), /桌面会话已变化/u)
+  assert.equal(h.desktopCalls.length, 3)
   await complete(first.driver)
   await first.activation.dispose()
 
@@ -373,7 +386,7 @@ test('会议能力只在桌面来源注册工具，并驱动一次性桌面命�
   const driver = await h.next()
   const denied = await driver.tool('companion_meeting_start', { name: '不该开' })
   assert.equal(denied.isError, true)
-  assert.equal(h.desktopCalls.length, 2)
+  assert.equal(h.desktopCalls.length, 3)
   await complete(driver)
   await second.activation.dispose()
 })
@@ -394,26 +407,45 @@ test('会议邮件交接只向同时具备会议和邮件能力的桌面成员�
   await complete(driver); await remote.activation.dispose()
 })
 
-test('会议讲解使用共享桌面模型，有限额成员不能借此绕过软额度；非桌面来源不能启动', async t => {
+test('独立文档讲解只对不限额且具有文档能力的桌面成员开放，换绑和远程来源均不能执行', async t => {
   const h = await fixture(t)
-  const limited = h.store.directory.create(draft('有限额讲解成员', { capabilities: ['meeting', 'document'], dailyTokenLimit: 500 }))
+  const limited = h.store.directory.create(draft('有限额讲解成员', { capabilities: ['document'], dailyTokenLimit: 500 }))
   const first = await h.start(limited.assistantId)
   await h.next()
-  assert.equal((await first.driver.tool('personal_assistant_start_meeting_presentation')).isError, true)
-  assert.equal((await first.driver.tool('personal_assistant_meeting_presentation_status')).isError, false)
-  assert.equal((await first.driver.tool('personal_assistant_finish_meeting_presentation')).isError, false)
+  assert.equal((await first.driver.tool('personal_assistant_document_presentation', { action: 'start', documentName: '方案.md' })).isError, true)
   await complete(first.driver); await first.activation.dispose()
-  const unlimited = h.store.directory.create(draft('不限额讲解成员', { capabilities: ['meeting', 'document'], dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  const unlimited = h.store.directory.create(draft('不限额讲解成员', { capabilities: ['document'], dailyTokenLimit: 0, totalTokenLimit: 0 }))
   const second = await h.start(unlimited.assistantId)
   await h.next()
-  assert.equal((await second.driver.tool('personal_assistant_start_meeting_presentation')).isError, false)
+  assert.equal((await second.driver.tool('personal_assistant_document_presentation', { action: 'start', documentName: '方案.md' })).isError, false)
+  assert.deepEqual(h.desktopCalls, [{ command: 'document.presentation.start', payload: { bindingId: '当前桌面绑定', documentName: '方案.md' } }])
+  const changed = h.store.directory.update(unlimited.assistantId, unlimited.revision,
+    draft('不限额讲解成员', { capabilities: ['document'], dailyTokenLimit: 500, totalTokenLimit: 0 }))
+  assert.equal((await second.driver.tool('personal_assistant_document_presentation', { action: 'start', documentName: '方案.md' })).isError, true)
+  h.store.directory.update(unlimited.assistantId, changed.revision,
+    draft('不限额讲解成员', { capabilities: ['document'], dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  assert.equal(h.desktopCalls.length, 1, '成员额度发生变化后不能继续借用共享模型')
+  h.setDesktopBinding('换绑后的桌面')
+  const stale = await second.driver.tool('personal_assistant_document_presentation', { action: 'start', documentName: '方案.md' })
+  assert.match(JSON.stringify(stale), /只接受当前本人桌面会话/)
+  assert.equal(h.desktopCalls.length, 1)
   await complete(second.driver); await second.activation.dispose()
   h.allowChannelFollowup()
   const remote = await h.runtime.start(unlimited.assistantId, [{ type: 'text', text: '企微任务' }], new AbortController().signal, '企微讲解任务', 'wecom')
   const driver = await h.next()
-  assert.equal((await driver.tool('personal_assistant_start_meeting_presentation')).isError, true)
+  assert.equal((await driver.tool('personal_assistant_document_presentation', { action: 'start', documentName: '方案.md' })).isError, true)
   assert.equal((await driver.tool('personal_assistant_finish_meeting_presentation')).isError, true)
   await complete(driver); await remote.activation.dispose()
+})
+
+test('旧组合任务仅向同时具有会议和文档能力的桌面成员提供状态与收尾', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('历史任务成员', { capabilities: ['meeting', 'document'], dailyTokenLimit: 500 }))
+  const { driver, activation } = await h.start(member.assistantId)
+  assert.equal((await driver.tool('personal_assistant_start_meeting_presentation')).isError, true)
+  assert.equal((await driver.tool('personal_assistant_meeting_presentation_status')).isError, false)
+  assert.equal((await driver.tool('personal_assistant_finish_meeting_presentation')).isError, false)
+  await complete(driver); await activation.dispose()
 })
 
 test('有限额成员不能借共享会话生成纪要，其他会议工具仍可用', async t => {

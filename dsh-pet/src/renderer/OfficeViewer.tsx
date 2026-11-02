@@ -3,6 +3,7 @@ import { renderAsync } from 'docx-preview'
 import { init as initPptx } from 'pptx-preview'
 import type { OfficeSession } from '../main/office-view-window.ts'
 import type { OfficeViewApi } from '../preload/office-view.ts'
+import { markdownBlocks } from './markdown-view.ts'
 
 declare global {
   interface Window { readonly officeView: OfficeViewApi }
@@ -30,6 +31,7 @@ export default function OfficeViewer() {
   const stageRef = useRef<HTMLDivElement | null>(null)
   const docxPages = useRef<HTMLElement[]>([])
   const docxSectionPages = useRef<number[]>([])
+  const markdownSections = useRef<HTMLElement[]>([])
   const pptx = useRef<PptxViewer | null>(null)
   const imageUrls = useRef<string[]>([])
   const sessionRef = useRef<OfficeSession | null>(null)
@@ -42,6 +44,7 @@ export default function OfficeViewer() {
     for (const current of docxPages.current) current.style.display = ''
     docxPages.current = []
     docxSectionPages.current = []
+    markdownSections.current = []
     try { pptx.current?.destroy() } catch { /* 已销毁 */ }
     pptx.current = null
     for (const url of imageUrls.current) URL.revokeObjectURL(url)
@@ -109,19 +112,35 @@ export default function OfficeViewer() {
     pageRef.current = target
   }, [])
 
+  const showMarkdownSection = useCallback(async (number: number, verify: boolean) => {
+    const current = sessionRef.current
+    const nodes = markdownSections.current
+    if (!current || nodes.length === 0) return
+    const target = Math.min(Math.max(number, 1), nodes.length)
+    if (verify) {
+      const checked = await api.check(current.token, current.fingerprint).catch(() => ({ ok: false as const, error: '授权检查失败' }))
+      if (!checked.ok) { setError(checked.error); return }
+      if (sessionRef.current !== current) return
+    }
+    nodes[target - 1].scrollIntoView({ block: 'start', behavior: 'smooth' })
+    setPage(target)
+    pageRef.current = target
+  }, [])
+
   const gotoPage = useCallback(async (number: number, verify = true) => {
     const current = sessionRef.current
-    if (current?.format === 'pptx' && current.mode === 'images') await showImagePage(number, verify)
+    if (current?.format === 'markdown') await showMarkdownSection(number, verify)
+    else if (current?.format === 'pptx' && current.mode === 'images') await showImagePage(number, verify)
     else if (current?.format === 'pptx') await showPptxPage(number, verify)
     else await showDocxPage(number, verify)
-  }, [showDocxPage, showImagePage, showPptxPage])
+  }, [showDocxPage, showImagePage, showPptxPage, showMarkdownSection])
 
   /** 讲解链传段落号：PPTX 直接对幻灯片，DOCX 用页内文字匹配；匹配不到就按段号近似。 */
   const gotoSection = useCallback(async (sectionIndex: number, pageNumber: number | null) => {
     const current = sessionRef.current
     if (!current) return
     const count = pageCount ?? current.pageCount ?? 1
-    const page = current.format === 'pptx'
+    const page = current.format === 'markdown' ? sectionIndex + 1 : current.format === 'pptx'
       ? (pageNumber ?? sectionIndex + 1)
       : (docxSectionPages.current[sectionIndex] ?? Math.min(sectionIndex + 1, count))
     await gotoPage(page, true)
@@ -158,7 +177,22 @@ export default function OfficeViewer() {
       if (seq !== loadSeq.current) return
       const stage = stageRef.current
       if (!stage) return
-      if (current.format === 'docx') {
+      if (current.format === 'markdown') {
+        const container = document.createElement('div')
+        container.className = 'office-markdown'
+        const blocks = markdownBlocks(new TextDecoder().decode(bytes), current.sections)
+        markdownSections.current = blocks.map(text => {
+          const block = document.createElement('pre')
+          block.textContent = text
+          container.appendChild(block)
+          return block
+        })
+        stage.appendChild(container)
+        setPageCount(blocks.length)
+        const latest = await api.session()
+        if (seq !== loadSeq.current || latest?.token !== current.token) return
+        await showMarkdownSection((latest.initialSection?.index ?? 0) + 1, false)
+      } else if (current.format === 'docx') {
         await renderAsync(bytes, stage, undefined, { breakPages: true, ignoreLastRenderedPageBreak: false,
           inWrapper: true, useBase64URL: true, renderHeaders: true, renderFooters: true, experimental: true } as never)
         if (seq !== loadSeq.current) return
@@ -195,7 +229,7 @@ export default function OfficeViewer() {
     } catch (cause) {
       if (seq === loadSeq.current) setError(cause instanceof Error ? cause.message : '文档渲染失败')
     } finally { if (seq === loadSeq.current) setLoading(false) }
-  }, [clearViewer, fitPptx, showDocxPage])
+  }, [clearViewer, fitPptx, showDocxPage, showMarkdownSection])
 
   useEffect(() => {
     void load()
@@ -235,14 +269,14 @@ export default function OfficeViewer() {
   }, [next, prev, toggleFullscreen])
 
   const close = (): void => { void api.close() }
-  const pageLabel = pageCount === null ? '正在排版…' : `第 ${page} / ${pageCount} ${session?.format === 'pptx' ? '张' : '页'}`
+  const pageLabel = pageCount === null ? '正在排版…' : `第 ${page} / ${pageCount} ${session?.format === 'pptx' ? '张' : session?.format === 'markdown' ? '段' : '页'}`
 
   return <main className="office-shell">
     <header className="office-toolbar">
       <strong className="office-title" title={session?.name}>{session?.name ?? '逐页阅读'}</strong>
       <span className="office-page" role="status">{pageLabel}</span>
-      <button type="button" className="office-btn" onClick={prev} disabled={loading || page <= 1}>上一页</button>
-      <button type="button" className="office-btn" onClick={next} disabled={loading || pageCount === null || page >= pageCount}>下一页</button>
+      <button type="button" className="office-btn" onClick={prev} disabled={loading || page <= 1}>{session?.format === 'markdown' ? '上一段' : '上一页'}</button>
+      <button type="button" className="office-btn" onClick={next} disabled={loading || pageCount === null || page >= pageCount}>{session?.format === 'markdown' ? '下一段' : '下一页'}</button>
       <button type="button" className="office-btn" onClick={() => void toggleFullscreen()}>{fullscreen ? '退出全屏' : '全屏演示'}</button>
       <button type="button" className="office-btn ghost" onClick={close}>关闭</button>
     </header>

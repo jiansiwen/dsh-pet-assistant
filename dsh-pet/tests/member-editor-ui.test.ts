@@ -138,7 +138,7 @@ test('编辑窗口也能删除成员，按当前配置版本提交', async () =>
   } finally { view.dispose() }
 })
 
-test('外部版本变化不覆盖草稿，确认后才能按新版本保存', async () => {
+test('外部版本变化先展示最新配置与草稿差异，明确选择覆盖后才能保存', async () => {
   const initial = member(3)
   const latest = member(4); latest.profile.description = '外部改动'
   const view = mount(initial, latest)
@@ -147,7 +147,10 @@ test('外部版本变化不覆盖草稿，确认后才能按新版本保存', as
     view.submit()
     assert.equal(view.saved.length, 0)
     assert.match(view.text, /刚在别处被改过/)
-    view.click('采用最新版本')
+    assert.match(view.text, /最新配置/)
+    assert.match(view.text, /外部改动/)
+    assert.match(view.text, /未保存的草稿/)
+    view.click('已核对差异，按草稿覆盖…')
     view.submit()
     await view.flush()
     assert.equal(view.saved[0]!.expectedRevision, 4)

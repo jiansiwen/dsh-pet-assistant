@@ -235,6 +235,20 @@ export interface MeetingMailFollowup {
   taskId: string | null
 }
 
+/** 会议行动项交接账本：保留来源版本，不保存纪要正文。 */
+export interface MeetingTodoSource {
+  principalId: string
+  deviceId: string
+  meetingId: string
+  itemId: string
+  revision: number
+  minuteDigest: string
+  itemDigest: string
+  confirmedAt: number
+  createdAt: number
+  taskId: string
+}
+
 export const ROLE_IDS = ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma', 'custom'] as const
 export type RoleId = (typeof ROLE_IDS)[number]
 
@@ -1179,6 +1193,19 @@ export class TeamStore {
         task_id TEXT UNIQUE REFERENCES tasks(task_id)
       );
       CREATE INDEX IF NOT EXISTS idx_meeting_mail_revision ON meeting_mail_followups(meeting_id, revision);
+      CREATE TABLE IF NOT EXISTS meeting_todo_sources (
+        principal_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        meeting_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        minute_digest TEXT NOT NULL,
+        item_digest TEXT NOT NULL,
+        confirmed_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
+        PRIMARY KEY(principal_id, device_id, meeting_id, item_id)
+      );
     `)
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
@@ -1206,7 +1233,10 @@ export class TeamStore {
       this.db.exec('COMMIT')
       return result
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      try { this.db.exec('ROLLBACK') } catch (rollbackError) {
+        // 回滚结果不明时不能把原始写锁错误当作安全可重试的事务。
+        throw new AggregateError([error, rollbackError], '团队事务回滚失败')
+      }
       throw error
     } finally {
       this.transactionDepth = 0
@@ -2191,6 +2221,14 @@ export class TeamStore {
     return artifactId
   }
 
+  /** 只认可由已结算的本机任务操作产生的本人完成回执。 */
+  hasOwnerCompletion(taskId: string, principalId: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM artifacts a JOIN operations o ON o.operation_id = a.operation_id
+      WHERE a.task_id = ? AND o.task_id = a.task_id AND o.kind = 'manage_companion_task' AND o.state = 'succeeded'
+      AND json_valid(a.evidence) AND json_extract(a.evidence, '$.kind') = 'owner-confirmation'
+      AND json_extract(a.evidence, '$.principalId') = ? LIMIT 1`).get(taskId, principalId)
+  }
+
   companionEventCursor(principalId: string): number {
     const row = this.db.prepare(`SELECT MAX(e.seq) AS cursor FROM events_outbox e
       JOIN task_meta m ON m.id = e.task_id WHERE m.principal_id = ? AND m.runtime_scope = 'companion'
@@ -2493,6 +2531,21 @@ export class TeamStore {
     const updated = this.db.prepare(`UPDATE mail_send_intents SET state = 'acknowledged', resolution_of = ?, updated_at = ?
       WHERE intent_id = ? AND account_key = ? AND state = ?`).run(expectedState, at, intentId, accountKey, expectedState)
     return Number(updated.changes) === 1
+  }
+
+  getMeetingTodoSource(principalId: string, deviceId: string, meetingId: string, itemId: string): MeetingTodoSource | null {
+    const row = this.db.prepare(`SELECT * FROM meeting_todo_sources WHERE principal_id = ? AND device_id = ? AND meeting_id = ? AND item_id = ?`)
+      .get(principalId, deviceId, meetingId, itemId) as Row | undefined
+    return row ? { principalId: String(row.principal_id), deviceId: String(row.device_id), meetingId: String(row.meeting_id),
+      itemId: String(row.item_id), revision: Number(row.revision), minuteDigest: String(row.minute_digest),
+      itemDigest: String(row.item_digest), confirmedAt: Number(row.confirmed_at), createdAt: Number(row.created_at), taskId: String(row.task_id) } : null
+  }
+
+  saveMeetingTodoSource(input: MeetingTodoSource): void {
+    this.db.prepare(`INSERT INTO meeting_todo_sources (principal_id, device_id, meeting_id, item_id, revision, minute_digest,
+      item_digest, confirmed_at, created_at, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(input.principalId, input.deviceId, input.meetingId, input.itemId, input.revision, input.minuteDigest,
+        input.itemDigest, input.confirmedAt, input.createdAt, input.taskId)
   }
 
   private meetingMailFollowupRow(row: Row): MeetingMailFollowup {

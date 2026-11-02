@@ -8,6 +8,7 @@ import type { MemberAction, MemberCommandInputs, MemberDraft, MemberResult, Memo
 import type { FirstRunDownloadResult, FirstRunReportResult } from '../main/first-run-service.js'
 import type { DownloadConfirmation } from '../main/model-resources.js'
 import type { EvidenceIntakeOutcome } from '../evidence-types.js'
+import type { MeetingTodoRequest, MeetingTodoResult } from '../main/meeting-todo.js'
 import type {
   BridgeEventPayload,
   CharacterMenuTarget,
@@ -296,6 +297,8 @@ contextBridge.exposeInMainWorld('petApi', {
     ipcRenderer.invoke('meeting-minutes', meetingId, { action: 'use-local' }) as Promise<SimpleOkResult>,
   meetingMinutesConfirm: (meetingId: string, digest?: string) =>
     ipcRenderer.invoke('meeting-minutes-confirm', meetingId, digest) as Promise<MeetingEditResult>,
+  meetingTodoImport: (request: MeetingTodoRequest) =>
+    ipcRenderer.invoke('meeting-todo-import', request) as Promise<MeetingTodoResult>,
   /**
    * 把已确认的会议纪要交给个人助理，成为日报可引用的证据。
    * 主进程会先弹原生对话框（显示正文预览与去向）；用户取消则一个请求都不发。

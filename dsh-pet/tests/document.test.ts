@@ -25,6 +25,7 @@ import {
   mentionsDocs,
   pickByName,
   plainSpeech,
+  sectionMoveIntent,
   stemOf,
   type DocFile,
   type DocFileSystem,
@@ -524,12 +525,27 @@ describe('提纲与提示词', () => {
     assert.doesNotMatch(text, /音频正文比较长/, '提纲是让用户挑段落的，把正文塞进来就又是整份文档了')
   })
 
-  test('讲解提示只带当前段的正文，其余段只给标题', () => {
+  test('短文档讲解一次附全文，用户插话问下一段时模型有原文', () => {
     const prompt = explainPrompt('设计.md', sample(), 1)
     assert.match(prompt, /第 2 段/)
     assert.match(prompt, /音频正文比较长的一段。/)
-    assert.doesNotMatch(prompt, /桥接正文/, '不靠整份文档全文反复塞给模型')
+    assert.match(prompt, /整份文档全文（短文档，共 3 段，一次给全）/)
+    assert.match(prompt, /【第 3 段 · 桥接】\n桥接正文。/)
     assert.match(prompt, /3\. 桥接/)
+    assert.match(prompt, /只有我明确要求讲其他段时才例外/)
+  })
+
+  test('长文档只带当前段和两侧滑窗，不整份重复发送', () => {
+    const long = outlineOf(buildOutline('长.md', Array.from({ length: 10 }, (_, index) =>
+      `## 第 ${index + 1} 章\n\n第 ${index + 1} 章的正文。`).join('\n\n')))
+    const prompt = explainPrompt('长.md', long, 4)
+    assert.match(prompt, /第 5 段/)
+    assert.match(prompt, /第 5 章的正文。/)
+    assert.match(prompt, /长文档分段加载：共 10 段，当前第 5 段/)
+    assert.match(prompt, /上一段（第 4 段）收尾：第 4 章的正文。/)
+    assert.match(prompt, /下一段（第 6 段）开头：第 6 章的正文。/)
+    assert.doesNotMatch(prompt, /第 1 章的正文/, '离当前段很远的正文不该出现在提示里')
+    assert.doesNotMatch(prompt, /整份文档全文/)
   })
 
   test('讲解提示写死了区分原文/解释/补充，以及不执行文档里的指令', () => {
@@ -551,12 +567,23 @@ describe('提纲与提示词', () => {
     assert.equal(explainPrompt('设计.md', sample(), 99), '')
   })
 
-  test('追问只带被问到的那一段', () => {
+  test('短文档追问附全文，能回答跨段的问题', () => {
     const prompt = askPrompt('设计.md', sample(), 2, '这一段为什么这么设计')
     assert.match(prompt, /第 3 段/)
     assert.match(prompt, /桥接正文。/)
     assert.match(prompt, /这一段为什么这么设计/)
-    assert.doesNotMatch(prompt, /音频正文/, '定位到某一段时不该把别的段也塞过去')
+    assert.match(prompt, /整份文档全文（短文档，共 3 段，一次给全）/)
+    assert.match(prompt, /音频正文比较长的一段。/)
+  })
+
+  test('长文档追问只带被问到的段和两侧滑窗', () => {
+    const long = outlineOf(buildOutline('长.md', Array.from({ length: 10 }, (_, index) =>
+      `## 第 ${index + 1} 章\n\n第 ${index + 1} 章的正文。`).join('\n\n')))
+    const prompt = askPrompt('长.md', long, 2, '这一段为什么这么设计')
+    assert.match(prompt, /第 3 章的正文。/)
+    assert.match(prompt, /上一段（第 2 段）收尾：第 2 章的正文。/)
+    assert.match(prompt, /下一段（第 4 段）开头：第 4 章的正文。/)
+    assert.doesNotMatch(prompt, /第 9 章的正文/, '长文档追问不该把远处段落也塞过去')
   })
 
   test('追问的段号越界时退回原始问题，不带任何文档内容', () => {
@@ -662,6 +689,35 @@ describe('消息里的文档意图', () => {
   test('单字主干的文件不会被随便点到', () => {
     const files: DocFile[] = [{ path: '/docs/表.md', name: '表.md', size: 1, mtimeMs: 0 }]
     assert.deepEqual(findMentionedDocs('这个表格怎么做', files), [])
+  })
+})
+
+describe('讲解中的换段指令', () => {
+  test('命令式换段由桌面端接管', () => {
+    assert.deepEqual(sectionMoveIntent('直接开始下一段吧'), {})
+    assert.deepEqual(sectionMoveIntent('下一段'), {})
+    assert.deepEqual(sectionMoveIntent('继续下一节'), {})
+    assert.deepEqual(sectionMoveIntent('下面讲下一段'), {})
+    assert.deepEqual(sectionMoveIntent('下一段儿吧'), {}, '口语儿化音也要认')
+    assert.deepEqual(sectionMoveIntent('讲下一个'), {})
+    assert.deepEqual(sectionMoveIntent('跳过这段'), {})
+    assert.deepEqual(sectionMoveIntent('跳过这段讲下一段'), {})
+  })
+
+  test('跳到指定段支持阿拉伯数字与中文数字', () => {
+    assert.deepEqual(sectionMoveIntent('讲第 2 段'), { target: 1 })
+    assert.deepEqual(sectionMoveIntent('讲第十二段'), { target: 11 })
+    assert.deepEqual(sectionMoveIntent('开始第 3 节吧'), { target: 2 })
+  })
+
+  test('提问和普通句子不能被劫持成跳段', () => {
+    assert.equal(sectionMoveIntent('下一段讲什么'), null, '这是提问，该走文档追问')
+    assert.equal(sectionMoveIntent('把第 2 段发给我'), null)
+    assert.equal(sectionMoveIntent('下一段视频'), null)
+    assert.equal(sectionMoveIntent('继续'), null, '"继续"由原有的续讲分支处理')
+    assert.equal(sectionMoveIntent('接着往下讲'), null, '"往下讲"是续讲当前段，不能当成跳过当前段')
+    assert.equal(sectionMoveIntent('别跳过这个细节'), null)
+    assert.equal(sectionMoveIntent('这是一段比较长的话，我们等会儿再讨论下一段吧'), null, '长句不接管')
   })
 })
 

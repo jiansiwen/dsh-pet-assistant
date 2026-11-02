@@ -221,6 +221,11 @@ export class ApprovalWindow {
         try { await dialog.showMessageBox({ type: 'info', title: '会议邮件与提醒结果', message: notice.message,
           detail: notice.detail, buttons: ['知道了'], noLink: true }) } catch { /* 结果仍可在任务页和团队页核查 */ }
       }
+      if (result.ok && result.confirmed === true && decision === 'approve' && proposal.tool === 'personal_assistant_computer_look') {
+        try { await dialog.showMessageBox({ type: 'info', title: '电脑观察已授权', message: '已授予一次观察许可，尚未读取或截屏。',
+          detail: '请切回刚才核对的前台窗口，然后在当前会话说“继续”。许可自申请起最多有效两分钟；窗口、显示器或模型变化时会停止。',
+          buttons: ['知道了'], noLink: true }) } catch { /* 提案内容也说明了继续方式，提示失败不伪造读取结果。 */ }
+      }
       if (result.ok) this.retire(proposal.proposalId)
       return result
     } catch (error) {

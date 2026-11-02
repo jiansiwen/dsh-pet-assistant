@@ -14,6 +14,7 @@
  * 这样 node --test 能直接跑，不需要把 cordis 或文件系统拖进测试。
  */
 import type { DatabaseSync } from 'node:sqlite'
+import { randomUUID } from 'node:crypto'
 import { dryRun, inTransaction, sha256, text, type Row } from './store.ts'
 
 /** 记忆的六类。design.md §2.6。 */
@@ -73,6 +74,24 @@ export interface MemoryRecord {
   expiresAt: number | null
   /** 非空表示这是从旧数据迁移进来的，不是本系统原生观察到的。 */
   importBatch: string | null
+}
+
+export interface MemoryTidyPreview {
+  memoryId: string
+  revision: number
+  before: string
+  after: string
+  topic: string
+  sourceRefs: string[]
+  expiresAt: number | null
+}
+export interface MemoryTidyHistory {
+  tidyId: string
+  memoryId: string
+  appliedRevision: number
+  state: 'applied' | 'undone'
+  createdAt: number
+  undoneAt: number | null
 }
 
 /** 查询记忆时的当前上下文；缺哪一维就看不到那一维的范围记忆。 */
@@ -339,6 +358,17 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_memories_visible ON memories (scope_kind, scope_id, status);
       CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories (kind, scope_kind, scope_id, topic);
       CREATE INDEX IF NOT EXISTS idx_memory_sources_derived ON memory_sources (derived_id);
+      CREATE TABLE IF NOT EXISTS memory_tidy_history (
+        tidy_id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        before_text TEXT NOT NULL,
+        after_signature TEXT NOT NULL,
+        applied_revision INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('applied', 'undone')),
+        created_at INTEGER NOT NULL,
+        undone_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_tidy_history_memory ON memory_tidy_history (memory_id, created_at);
     `)
   }
 
@@ -579,8 +609,74 @@ export class MemoryStore {
            WHERE memory_id = ? AND revision = ?`,
         )
         .run(nextText, topic, now, input.actor.id, id, input.expectedRevision)
-      return result.changes === 1 ? this.get(id, now) : null
+      if (result.changes !== 1) return null
+      this.db.prepare(`UPDATE memory_tidy_history SET before_text = '' WHERE memory_id = ? AND state = 'applied'`).run(id)
+      return this.get(id, now)
     })
+  }
+
+  /** 仅删除相邻完全相同的行；其余字句、顺序、期限和来源均不变。 */
+  previewTidy(id: string, now: number): MemoryTidyPreview | null {
+    const record = this.get(id, now)
+    if (!record || record.status !== 'confirmed') return null
+    const lines = record.text.split('\n')
+    const after = lines.filter((line, index) => index === 0 || line !== lines[index - 1]).join('\n')
+    if (after === record.text || !after || after.trim() !== after) return null
+    return { memoryId: id, revision: record.revision, before: record.text, after, topic: record.topic,
+      sourceRefs: record.sourceRefs, expiresAt: record.expiresAt }
+  }
+
+  /** 调用方须在可信审批中给出预览的完整原样，事务里再次比较。 */
+  applyTidy(preview: MemoryTidyPreview, actor: MemoryActor, now: number): MemoryTidyHistory | null {
+    if (!actor.isUser || !preview || typeof preview.memoryId !== 'string') return null
+    return inTransaction(this.db, () => {
+      const current = this.previewTidy(preview.memoryId, now)
+      if (!current || JSON.stringify(current) !== JSON.stringify(preview)) return null
+      const updated = this.revise(preview.memoryId, { text: preview.after, actor, expectedRevision: preview.revision }, now)
+      if (!updated) return null
+      const result: MemoryTidyHistory = { tidyId: randomUUID(), memoryId: preview.memoryId,
+        appliedRevision: updated.revision, state: 'applied', createdAt: now, undoneAt: null }
+      this.db.prepare(`INSERT INTO memory_tidy_history (tidy_id, memory_id, before_text, after_signature, applied_revision, state, created_at)
+        VALUES (?, ?, ?, ?, ?, 'applied', ?)`)
+        .run(result.tidyId, result.memoryId, preview.before, tidySignature(updated), updated.revision, now)
+      return result
+    })
+  }
+
+  previewTidyUndo(tidyId: string, now: number): MemoryTidyPreview | null {
+    const row = this.db.prepare(`SELECT * FROM memory_tidy_history WHERE tidy_id = ? AND state = 'applied'`).get(tidyId) as Row | undefined
+    if (!row) return null
+    const current = this.get(String(row.memory_id), now)
+    if (!current || current.status !== 'confirmed' || current.revision !== Number(row.applied_revision)
+      || tidySignature(current) !== String(row.after_signature)) return null
+    return { memoryId: current.id, revision: current.revision, before: current.text, after: String(row.before_text),
+      topic: current.topic, sourceRefs: current.sourceRefs, expiresAt: current.expiresAt }
+  }
+
+  undoTidy(tidyId: string, expectedRevision: number, actor: MemoryActor, now: number): MemoryRecord | null {
+    if (!actor.isUser || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) return null
+    return inTransaction(this.db, () => {
+      const preview = this.previewTidyUndo(tidyId, now)
+      if (!preview || preview.revision !== expectedRevision) return null
+      const updated = this.revise(preview.memoryId, { text: preview.after, actor, expectedRevision }, now)
+      if (!updated) return null
+      this.db.prepare(`UPDATE memory_tidy_history SET state = 'undone', undone_at = ?, before_text = '' WHERE tidy_id = ? AND state = 'applied'`).run(now, tidyId)
+      return updated
+    })
+  }
+
+  tidyHistory(memoryId?: string): MemoryTidyHistory[] {
+    const rows = (memoryId === undefined
+      ? this.db.prepare('SELECT * FROM memory_tidy_history ORDER BY created_at DESC, tidy_id LIMIT 200').all()
+      : this.db.prepare('SELECT * FROM memory_tidy_history WHERE memory_id = ? ORDER BY created_at DESC, tidy_id LIMIT 200').all(memoryId)) as Row[]
+    return rows.map(row => ({ tidyId: String(row.tidy_id), memoryId: String(row.memory_id), appliedRevision: Number(row.applied_revision),
+      state: String(row.state) as 'applied' | 'undone', createdAt: Number(row.created_at),
+      undoneAt: row.undone_at === null || row.undone_at === undefined ? null : Number(row.undone_at) }))
+  }
+
+  tidyHistoryCount(memoryId: string): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM memory_tidy_history WHERE memory_id = ?').get(memoryId) as Row
+    return Number(row.n)
   }
 
   /** 只校验身份已明确指定的目标，不根据文本或主题猜测替换关系。 */
@@ -603,6 +699,7 @@ export class MemoryStore {
          WHERE memory_id = ?`,
       )
       .run(status, now, text(confirmedBy), id)
+    this.db.prepare(`UPDATE memory_tidy_history SET before_text = '' WHERE memory_id = ? AND state = 'applied'`).run(id)
   }
 
   /**
@@ -701,6 +798,7 @@ export class MemoryStore {
         this.db.prepare(`UPDATE memories SET status = ?, confirmed_by = NULL,
           revision = revision + 1, updated_at = ? WHERE memory_id = ?`)
           .run(record.status === 'expired' ? 'expired' : 'candidate', now, derivedId)
+        this.db.prepare(`UPDATE memory_tidy_history SET before_text = '' WHERE memory_id = ? AND state = 'applied'`).run(derivedId)
         weakened.push(this.get(derivedId, now)!)
       }
 
@@ -765,6 +863,7 @@ export class MemoryStore {
     // 级联闭包在 dependentsOf 里已经提前算完，这里删边不会丢路径。
     this.db.prepare('DELETE FROM memory_sources WHERE derived_id = ?').run(record.id)
     this.db.prepare('DELETE FROM memory_sources WHERE source_id = ?').run(record.id)
+    this.db.prepare('DELETE FROM memory_tidy_history WHERE memory_id = ?').run(record.id)
     this.db.prepare('DELETE FROM memories WHERE memory_id = ?').run(record.id)
   }
 
@@ -795,29 +894,35 @@ export class MemoryStore {
    * 因为"已确认成果与偏好直到用户删除"——到期不等于用户想让它消失。
    */
   applyRetention(now: number): { deleted: number; expired: number } {
-    const rows = this.db
-      .prepare('SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?')
-      .all(now) as Row[]
-    let deleted = 0
-    let expired = 0
-    for (const row of rows) {
-      const record = rowToMemory(row, this.sourcesOf(String(row.memory_id)))
-      if (record.status === 'expired') continue
-      if (record.kind === 'ephemeral_chat') {
-        this.removeRow(record, '临时对话到期', now)
-        deleted += 1
-      } else {
-        this.setStatus(record.id, 'expired', now, null)
-        expired += 1
+    return inTransaction(this.db, () => {
+      const rows = this.db.prepare('SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?').all(now) as Row[]
+      let deleted = 0
+      let expired = 0
+      for (const row of rows) {
+        const id = String(row.memory_id)
+        if (row.status === 'expired' || !this.get(id, now)) continue
+        if (row.kind === 'ephemeral_chat') {
+          deleted += this.delete(id, '临时对话到期', now).deleted.length
+        } else {
+          deleted += this.deleteSource(id, '记忆来源到期', now).deleted.length
+          this.setStatus(id, 'expired', now, null)
+          expired += 1
+        }
       }
-    }
-    return { deleted, expired }
+      return { deleted, expired }
+    })
   }
 
   count(): number {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM memories').get() as Row
     return Number(row.n)
   }
+}
+
+function tidySignature(record: MemoryRecord): string {
+  return sha256(JSON.stringify({ id: record.id, kind: record.kind, scope: record.scope, topic: record.topic,
+    text: record.text, status: record.status, sensitivity: record.sensitivity, sourceRefs: record.sourceRefs,
+    confirmedBy: record.confirmedBy, expiresAt: record.expiresAt }))
 }
 
 function ledgerKey(record: MemoryRecord): string {

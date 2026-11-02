@@ -345,6 +345,14 @@ export class WorkItemStore {
     return rows.map(row => this.toItem(row))
   }
 
+  /** 项目及时间必须精确匹配；包含跨越查询起点的事项和有明确时间的瞬时事项。 */
+  listProjectOverlap(project: string, from: number, to: number, limit: number): WorkItem[] {
+    const rows = this.db.prepare(`SELECT * FROM work_items WHERE project = ? AND start_at < ?
+      AND (end_at > ? OR (start_at = end_at AND start_at >= ?)) ORDER BY start_at, item_id LIMIT ?`)
+      .all(project, to, from, from, limit) as Row[]
+    return rows.map(row => this.toItem(row))
+  }
+
   /** 引用了任一给定来源的事项；删除影响快照用。 */
   referencing(kind: WorkItemSourceKind, refs: readonly string[]): WorkItem[] {
     const ids = new Set<string>()

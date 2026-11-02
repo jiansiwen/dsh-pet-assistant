@@ -198,6 +198,30 @@ test('版本冲突、网络异常、服务错误和坏回包均不回显输入�
   assert.ok(!JSON.stringify(await read()).includes(secret))
 })
 
+test('运行时离线不误报凭据问题，也不回显服务端的内部消息', async () => {
+  mount()
+  response = { status: 503, body: { code: 'DEVICE_OFFLINE', message: '内部测试信息不能外传' } }
+  const result = await read()
+  assert.equal(result.ok, false)
+  assert.match(result.message ?? '', /运行时.*(?:停止|未就绪)/u)
+  assert.doesNotMatch(result.message ?? '', /凭据|内部测试信息/u)
+  const saved = await save('reminders', { expectedRevision: 7, repeatEverySeconds: 60 })
+  assert.equal(saved.ok, false)
+  assert.match(saved.message ?? '', /运行时.*(?:停止|未就绪)/u)
+  assert.doesNotMatch(saved.message ?? '', /内部测试信息/u)
+})
+
+test('只有本机凭据确实缺失时才提示凭据不可用', async () => {
+  mount()
+  response = { status: 0, body: { code: 'NO_OWNER_CREDENTIAL', message: '内部测试信息不能外传' } }
+  const missing = await read()
+  assert.match(missing.message ?? '', /凭据不可用/u)
+  assert.doesNotMatch(missing.message ?? '', /内部测试信息/u)
+  response = { status: 503, body: { code: 'SETTINGS_UNAVAILABLE', message: '内部测试信息不能外传' } }
+  const other = await read()
+  assert.doesNotMatch(other.message ?? '', /凭据|内部测试信息/u)
+})
+
 test('保存期间拒绝重复写入，完成后释放；注销后删除两条通道', async () => {
   const dispose = mount()
   let resolve!: (value: typeof response) => void
