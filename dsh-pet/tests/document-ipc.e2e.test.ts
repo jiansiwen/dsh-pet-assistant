@@ -48,6 +48,7 @@ writeFileSync(outsidePath, '这份文档没有获得授权。', 'utf8')
 const chatEvents = new EventEmitter()
 const uiEvents = new EventEmitter()
 let fakeMeetingTranscription = false
+let fakeAsrText = '测试会议转写'
 let confirmMeetingPresentation: () => Promise<{ response: number }> = async () => ({ response: 1 })
 let claimDesktopCommand: () => Promise<{ status: number; body: unknown }> = async () => ({ status: 200, body: { claimed: true } })
 let desktopResultStatus = 200
@@ -59,6 +60,8 @@ const session: SessionSnapshot = {
 }
 let bridgeCallbacks: BridgeCallbacks
 let initialAutoApproval: unknown
+/** 主进程讲解前会查一次成员目录；测试按需返回“小会”。 */
+let presentationMembers: { enabled: boolean; members: Array<{ profile: Record<string, unknown> }> } = { enabled: true, members: [] }
 const sessionCommands: SessionCommand[] = []
 const desktopReplies: Array<{ id: string; ok: boolean; result?: unknown; error?: string }> = []
 const chats: Array<{
@@ -89,6 +92,8 @@ class FakeBridge {
   async reportPetState(): Promise<void> {}
   async companionRequest(_method: string, route: string, body: { id: string; ok?: boolean; result?: unknown; error?: string }): Promise<{ status: number; body: unknown }> {
     if (route === '/companion/v1/desktop/claim') return claimDesktopCommand()
+    // 讲解/纪要会先查有没有会议+文档成员；默认没有，按用例返回。
+    if (route === '/companion/v1/members') return { status: 200, body: presentationMembers }
     desktopReplies.push(body as { id: string; ok: boolean; result?: unknown; error?: string })
     return { status: desktopResultStatus, body: {} }
   }
@@ -118,6 +123,7 @@ mock.module('../src/main/harness.ts', {
   },
 })
 const wpsOpens: string[] = []
+let wpsInstalled = false
 const readingViews: Array<{ path: string; format: string; content: string; sections: number[] }> = []
 mock.module('../src/main/office-view-window.ts', {
   namedExports: { OfficeViewWindow: class {
@@ -144,6 +150,9 @@ mock.module('../src/main/wps-control.ts', {
     // 端到端不得拉起真实 WPS 辅助脚本：替身一律报"未安装"，只记录被要求打开的真实路径。
     createWpsController: () => ({
       platform: 'win32', unverifiedOnDevice: false,
+      locate: async () => wpsInstalled
+        ? { ok: true, value: { platform: 'win32', executable: 'C:\\WPS\\wps.exe', installDir: 'C:\\WPS', source: 'test' }, evidence: {} }
+        : { ok: false, error: { code: 'not-installed', message: '未安装 WPS', guidance: '请先安装 WPS' }, evidence: {} },
       open: async (file: string) => {
         wpsOpens.push(file)
         return { ok: false, error: { code: 'not-installed', message: '未安装 WPS', guidance: '请先安装 WPS' }, evidence: {} }
@@ -166,7 +175,7 @@ mock.module('../src/main/asr.ts', {
     createStreamingSession: () => { throw new Error('隔离测试不得加载真实识别模型') },
     pcm16Base64ToFloat32: () => new Float32Array(0),
     streamingAvailable: () => false,
-    transcribeWav: async () => fakeMeetingTranscription ? { ok: true, text: '测试会议转写' } : { ok: false, error: '隔离测试不调用识别模型' },
+    transcribeWav: async () => fakeMeetingTranscription ? { ok: true, text: fakeAsrText } : { ok: false, error: '隔离测试不调用识别模型' },
     warmSenseVoiceAsr: () => false,
     warmStreamingAsr: () => false,
   },
@@ -364,10 +373,10 @@ async function invoke<T = ChatReply>(channel: string, ...args: unknown[]): Promi
 function prompt(text: string, spoken = false): Promise<SessionResult & { reply?: string }> {
   return invoke('session-command', { kind: 'prompt', bindingId: session.bindingId, text, spoken })
 }
-function send(channel: string): void {
+function send(channel: string, ...args: unknown[]): void {
   const listener = ipcListeners.get(channel)
   assert.ok(listener, `真实主进程未注册 ${channel}`)
-  listener({ sender: stage.webContents, senderFrame: stage.webContents.mainFrame })
+  listener({ sender: stage.webContents, senderFrame: stage.webContents.mainFrame }, ...args)
 }
 function sent<T>(channel: string): T[] {
   return messages.filter(message => message.channel === channel).map(message => message.payload as T)
@@ -437,6 +446,9 @@ beforeEach(async () => {
   confirmMeetingPresentation = async () => ({ response: 0 })
   claimDesktopCommand = async () => ({ status: 200, body: { claimed: true } })
   desktopResultStatus = 200
+  presentationMembers = { enabled: true, members: [] }
+  wpsInstalled = false
+  wpsOpens.length = 0
   meetingPresentationDialogs.length = 0
   readingViews.length = 0
   fakeMeetingTranscription = false
@@ -1171,22 +1183,30 @@ test('独立讲解的插话可交接听写、识别并发送，回答播完后�
     assert.equal(wiring.handovers.length, 1)
     const granted = await invoke<{ ok: boolean; direct?: boolean }>('asr-begin', { bargeIn: true })
     assert.equal(granted.ok, true)
-    assert.equal(granted.direct, true)
+    // 讲解中也要先听到明确口令才打断；任何声音都不再直接当成提问。
+    assert.equal(granted.direct, false)
     assert.ok((wiring.handovers[0]()?.frames.length ?? 0) > 0)
+    // 检出人声本身不停讲解；识别出“停一下”后才停这一句。
+    assert.equal(narrator.isSpeaking(), true, '还没听到口令时讲解应继续')
+    send('speech-stop', true)
+    await nextTurn()
     await new Promise(resolve => setTimeout(resolve, 1500))
     assert.equal(narrator.isSpeaking(), false, '识别过程中不能抢先续讲')
+    fakeAsrText = '停一下，测试会议转写'
     const recognized = await invoke<{ ok: boolean; text?: string }>('asr-transcribe', Buffer.from('隔离音频').toString('base64'))
     assert.equal(recognized.ok, true)
-    const asking = prompt(recognized.text!, true)
+    // 渲染层把口令剥掉后再发问；这里模拟它交给会话的那一句。
+    const asking = prompt('测试会议转写', true)
     const question = await chatAt(0)
-    assert.ok(question.text.endsWith(recognized.text!), '识别结果必须交给当前会话')
+    assert.ok(question.text.endsWith('测试会议转写'), '口令后的内容必须交给当前会话')
+    assert.ok(!question.text.includes('停一下'), '口令本身不能当成提问发出去')
     await answer(question, '隔离回答。')
     assert.equal((await asking).ok, true)
     assert.equal(finishSentence(), '隔离回答。')
     await new Promise(resolve => setTimeout(resolve, 1800))
     await answer(await chatAt(1), '继续原来的文档。')
     assert.ok(playing, '回答实际播完后续讲')
-  } finally { wiring.dispose() }
+  } finally { wiring.dispose(); fakeAsrText = '测试会议转写' }
 })
 
 test('播放中暂停再继续只控制讲解，迟到的旧讲解结果不能复活', async () => {
@@ -1666,6 +1686,10 @@ test('会议讲解中插话先停播，回答结束后从未播完的原句续�
     await answer(await chatAt(0), explanation)
     assert.equal(finishSentence(), '先说明授权范围。')
     send('barge-in-detected')
+    await nextTurn()
+    assert.equal(narrator.isSpeaking(), true, '只检出人声不能停讲解')
+    // 识别出“停一下”后停这一句；带问题继续，回答结束从原句续讲。
+    send('speech-stop', true)
     await nextTurn()
     assert.equal(narrator.isSpeaking(), false)
     assert.equal((await invoke<{ recording: boolean }>('meeting-state')).recording, true)
@@ -2542,14 +2566,18 @@ test('讲解暂停后又打断了一次回答：一句“继续”不替用户�
   assert.ok(playing, '明确说继续讲解后从原句接着讲')
 })
 
-test('评委插话打断讲解：回答播完后自动接着讲，不用再说“继续讲解”', async () => {
+test('评委插话：检出人声不停，明确口令才打断；回答播完后自动接着讲', async () => {
   await answer(await startExplanation())
   assert.equal(finishSentence(), '先说明授权范围。')
   // 第 2 段正在播：讲解场景下主进程据此开插话监听
   assert.ok(narrator.isSpeaking())
   send('barge-in-detected')
   await nextTurn()
-  assert.equal(narrator.isSpeaking(), false, '插话要先停掉正在播的讲解')
+  assert.ok(narrator.isSpeaking(), '只检出人声、还没听到明确口令时不能停讲解')
+  // 命中“停一下，问题…”：停这一句，但保留自动续讲。
+  send('speech-stop', true)
+  await nextTurn()
+  assert.equal(narrator.isSpeaking(), false, '明确口令后才停掉正在播的讲解')
   await new Promise(resolve => setTimeout(resolve, 1500))
   assert.equal(narrator.isSpeaking(), false, '等待问题时不能提前续讲')
 
@@ -2569,4 +2597,29 @@ test('评委插话打断讲解：回答播完后自动接着讲，不用再说�
   finishSentence()
   send('speech-stop')
   await nextTurn()
+})
+
+test('没点名成员时，讲解与追问自动交给会议+文档子助理', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  const result = await invoke('doc-explain', documentPath, 0, true)
+  assert.equal(result.ok, true, result.error)
+  finishSentence()
+  const chat = await chatAt(0)
+  assert.equal(chat.assistantId, 'member-bailongma', '讲解默认交给会议+文档子助理')
+  await answer(chat)
+  const asking = invoke('doc-ask', documentPath, 0, '为什么限制目录？')
+  const question = await chatAt(1)
+  assert.equal(question.assistantId, 'member-bailongma', '追问沿用同一个成员')
+  await answer(question, '避免误读。')
+  assert.equal((await asking).ok, true)
+})
+
+test('没点名视图且没装 WPS 时，讲解照常进行且不尝试打开 WPS', async () => {
+  const result = await invoke('doc-explain', documentPath, 0, true)
+  assert.equal(result.ok, true, result.error)
+  assert.equal(wpsOpens.length, 0, '没装 WPS 时不应尝试打开 WPS')
+  finishSentence()
+  await prompt('结束讲解')
 })

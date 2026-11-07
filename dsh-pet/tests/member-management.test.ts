@@ -44,10 +44,10 @@ function stage() {
 let win: ReturnType<typeof stage> | null
 let state: MemberSnapshot
 let records: MemoryRecord[]
-let requests: Array<{ method: string; path: string; body: unknown; subject: string }>
+let requests: Array<{ method: string; path: string; body: unknown; subject: string; timeoutMs?: number }>
 let respond: (method: string, path: string, body: unknown) => Promise<{ status: number; body: unknown }>
 function mount() { return registerMemberManagement({ getStageWindow: () => win as never, pagePath,
-  request: async (method, path, body, subject) => { requests.push({ method, path, body, subject }); return respond(method, path, body) } }) }
+  request: async (method, path, body, subject, timeoutMs) => { requests.push({ method, path, body, subject, ...(timeoutMs === undefined ? {} : { timeoutMs }) }); return respond(method, path, body) } }) }
 function event() { return { sender: win!.webContents, senderFrame: win!.webContents.mainFrame } }
 function read(sender: unknown = event()) { return handlers.get(MEMBER_CHANNELS.state)!(sender) }
 function memories(value: unknown = id, sender: unknown = event()) { return handlers.get(MEMBER_CHANNELS.memories)!(sender, value) }
@@ -243,7 +243,7 @@ test('AI 草稿只返回候选项，失败给出可读错误且不写配置', as
   assert.equal((result.data as { notes: string }).notes, '已填好')
   assert.deepEqual((result.data as { draft: MemberDraft }).draft, draft)
   assert.ok(!JSON.stringify(result).includes('秘密'))
-  assert.deepEqual(requests.at(-1), { method: 'POST', path: `${ROOT}/assist`, body: { request: '每天整理日报', current: draft }, subject: 'owner' })
+  assert.deepEqual(requests.at(-1), { method: 'POST', path: `${ROOT}/assist`, body: { request: '每天整理日报', current: draft }, subject: 'owner', timeoutMs: 120000 }, 'AI 填表要走 120 秒超时，不能沿用 10 秒的审批超时')
   assert.equal(dialogs.length, 0)
   assert.equal(code(await assist({ request: '日报', secret: '秘密' })), 'invalid_input')
   respond = async (method, path, body) => path.endsWith('/assist')

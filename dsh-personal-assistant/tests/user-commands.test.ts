@@ -93,6 +93,14 @@ test('召唤命令绑定当前会话并拉起桌宠', async () => {
   assert.deepEqual(events, ['bind', 'launch'])
 })
 
+test('团队模式下召唤仍兜底拉起桌宠，不把启动留给不存在的桌面壳', async () => {
+  const { command, events } = harness({ teamEnabled: true })
+  const result = await command('summon-pet').handler({ agent: { id: 'agent-1' } })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /已请求启动桌宠/)
+  assert.deepEqual(events, ['bind', 'launch'])
+})
+
 test('召唤命令失败时如实返回错误，不假装成功', async () => {
   const { command } = harness({ bind: async () => { throw new Error('bind failed') } })
   const result = await command('summon-pet').handler({ agent: { id: 'agent-1' } })

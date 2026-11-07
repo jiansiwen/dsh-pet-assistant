@@ -355,7 +355,7 @@ function defaults() {
     permissionMode: "ask",
     provider: "",
     model: "",
-    maxTokens: 4096,
+    maxTokens: 16384,
     capabilities: [],
     allowedTools: [],
     dailyTokenLimit: 0,
@@ -493,7 +493,7 @@ function normalize(draft2) {
     enabled: draft2.enabled,
     provider: text(draft2.provider, "\u6A21\u578B\u63D0\u4F9B\u65B9", 200),
     model: text(draft2.model, "\u6A21\u578B\u540D\u79F0", 200),
-    maxTokens: integer(draft2.maxTokens, "\u5355\u6B21\u8F93\u51FA\u989D\u5EA6", 1, 32768),
+    maxTokens: integer(draft2.maxTokens, "\u5355\u6B21\u8F93\u51FA\u989D\u5EA6", 1, 131072),
     capabilities: [...new Set(draft2.capabilities)],
     allowedTools: [...new Set(draft2.allowedTools)],
     dailyTokenLimit: integer(draft2.dailyTokenLimit, "\u65E5\u989D\u5EA6"),
@@ -1562,7 +1562,11 @@ var TeamStore = class {
       this.db.exec("COMMIT");
       return result;
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      try {
+        this.db.exec("ROLLBACK");
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], "\u56E2\u961F\u4E8B\u52A1\u56DE\u6EDA\u5931\u8D25");
+      }
       throw error;
     } finally {
       this.transactionDepth = 0;
@@ -3880,6 +3884,8 @@ var SessionMirror = class {
   status = "disconnected";
   title = "";
   model = null;
+  /** 宠物侧刚选中的模型；宿主还没有把新值写回 agent.options 时先用它显示。 */
+  modelSelected = null;
   models = [];
   modelError;
   modelsAt = -Infinity;
@@ -3917,7 +3923,10 @@ var SessionMirror = class {
   observe(event, index) {
     this.projection.apply(event, index);
     if (event.type === "session/title") this.title = text3(event.data.title);
-    if (event.type === "request/header") this.modelsAt = -Infinity;
+    if (event.type === "request/header") {
+      this.modelsAt = -Infinity;
+      this.modelSelected = null;
+    }
   }
   metadata() {
     const presets = this.service("permissionPresets");
@@ -3931,6 +3940,7 @@ var SessionMirror = class {
     const permission = text3(projected.currentValue) || this.agent && presets?.current(events ?? []) || null;
     const available = this.active && this.sessionId() !== null;
     const agent = this.agent;
+    const controller = this.service("sessionController");
     return {
       sessionId: this.sessionId(),
       bindingId: this.bindingId,
@@ -3947,8 +3957,8 @@ var SessionMirror = class {
         prompt: available && typeof agent?.followup === "function",
         cancel: available && typeof agent?.cancel === "function",
         history: available,
-        // 当前宿主只提供模型目录，不提供这里的会话模型切换接口。
-        models: false,
+        // 宿主注册了 sessionController.selectModel 才能切；没有就保持只读，不伪造成可选。
+        models: available && typeof controller?.selectModel === "function",
         permissions: available && !!presets && !!commands?.find(this.agent, "permission")
       },
       ...this.modelError ? { error: this.modelError } : {}
@@ -3985,8 +3995,9 @@ var SessionMirror = class {
     const llm = this.service("llm");
     this.modelsPending = (async () => {
       const readCurrent = () => {
+        const header = this.agent?.session?.requestHeader?.()?.config;
         const options = this.agent?.options;
-        this.model = options ? this.asModel(options) : null;
+        this.model = this.modelSelected ?? (header ? this.asModel(header) : options ? this.asModel(options) : null);
       };
       readCurrent();
       if (llm?.listProviders && llm.listModels) {
@@ -4076,7 +4087,28 @@ var SessionMirror = class {
           break;
         }
         case "model": {
-          throw new Error("\u5F53\u524D\u5BBF\u4E3B\u4E0D\u652F\u6301\u4ECE\u5BA0\u7269\u4FA7\u5207\u6362\u6A21\u578B\uFF0C\u8BF7\u5728\u5E94\u7528\u7684\u6A21\u578B\u8BBE\u7F6E\u91CC\u5207\u6362");
+          const controller = this.service("sessionController");
+          if (!controller?.selectModel) throw new Error("\u5F53\u524D\u5BBF\u4E3B\u4E0D\u652F\u6301\u4ECE\u5BA0\u7269\u4FA7\u5207\u6362\u6A21\u578B\uFF0C\u8BF7\u5728\u5E94\u7528\u7684\u6A21\u578B\u8BBE\u7F6E\u91CC\u5207\u6362");
+          if (typeof value.provider !== "string" || typeof value.model !== "string" || !value.provider.trim() || !value.model.trim() || value.provider.length > 128 || value.model.length > 256) throw new Error("\u6A21\u578B\u53C2\u6570\u65E0\u6548");
+          const sessionId = this.sessionId();
+          if (sessionId === null) throw new Error("\u4F1A\u8BDD\u8FD8\u672A\u5C31\u7EEA\uFF0C\u4E0D\u80FD\u5207\u6362\u6A21\u578B");
+          const reasoningEffort = typeof value.reasoningEffort === "string" && value.reasoningEffort.length <= 64 ? value.reasoningEffort : void 0;
+          await controller.selectModel({
+            sessionId,
+            provider: value.provider.trim(),
+            model: value.model.trim(),
+            ...reasoningEffort === void 0 ? {} : { reasoningEffort }
+          });
+          const provider = value.provider.trim();
+          const model = value.model.trim();
+          this.modelSelected = {
+            provider,
+            model,
+            label: this.models.find((item) => item.provider === provider && item.model === model)?.label ?? model,
+            ...reasoningEffort === void 0 ? {} : { reasoningEffort }
+          };
+          this.model = this.modelSelected;
+          break;
         }
         case "permission": {
           if (!capabilities.permissions) throw new Error("\u5BBF\u4E3B\u6743\u9650\u5207\u6362\u4E0D\u53EF\u7528");
@@ -4571,12 +4603,26 @@ var SessionBridge = class {
   desktopBinding(agent) {
     return !this.closed && this.agent !== null && agent === this.agent && this.mirror.isActive() ? this.mirror.bindingId : null;
   }
+  /** 成员桌面请求在启动时锁定绑定，执行时仍须核对该绑定没有改变。 */
+  currentDesktopBinding() {
+    return this.desktopBinding(this.agent);
+  }
   get teamEnabled() {
     return this.team !== null;
   }
   /** 该 agent 是否为经 /session/start 由本插件建出或恢复、仍归桥接所有的会话。 */
   ownsAgent(agent) {
     return this.owned !== null && this.owned.handle.agent === agent;
+  }
+  /** 发现文件仍指向本实例时，才可在数据库争用后继续调度。 */
+  isCurrentDiscovery() {
+    if (this.closed || !this.advertised || !this.server) return false;
+    try {
+      const current = JSON.parse(readFileSync2(this.infoPath, "utf8"));
+      return current.epoch === this.epoch && current.port === this.port && current.pid === process.pid;
+    } catch {
+      return false;
+    }
   }
   /**
    * 插件加载即监听：服务处于未绑定状态，/health 如实报 bound:false，对话与审批一律拒绝。
@@ -13974,6 +14020,34 @@ var meetingTodoSchema = z4.object({
     context.addIssue({ code: "custom", message: "\u884C\u52A8\u9879\u6765\u6E90\u4E0D\u5C5E\u4E8E\u8FD9\u573A\u4F1A\u8BAE\u7684\u5F53\u524D\u8F6C\u5199\u7248\u672C" });
   }
 });
+var RetryableTickBusy = class extends Error {
+  sqliteCode;
+  constructor(sqliteCode) {
+    super("\u6570\u636E\u5E93\u6682\u65F6\u7E41\u5FD9");
+    this.sqliteCode = sqliteCode;
+  }
+};
+function sqliteErrorCode(error) {
+  try {
+    const value = error;
+    return value?.code === "ERR_SQLITE_ERROR" && typeof value.errcode === "number" && Number.isInteger(value.errcode) && value.errcode >= 0 && value.errcode <= 65535 ? value.errcode : null;
+  } catch {
+    return null;
+  }
+}
+function retryBeforeDispatch(error) {
+  const code = sqliteErrorCode(error);
+  if (code !== null && (code & 255) === 5) throw new RetryableTickBusy(code);
+  throw error;
+}
+function errorKind(error) {
+  try {
+    const name2 = error instanceof Error ? error.name : "";
+    return /^[A-Za-z][A-Za-z0-9]{0,40}$/.test(name2) ? name2 : "\u672A\u77E5";
+  } catch {
+    return "\u672A\u77E5";
+  }
+}
 var CompanionTaskRuntime = class {
   principalId;
   deviceId;
@@ -13982,12 +14056,15 @@ var CompanionTaskRuntime = class {
   epoch;
   now;
   onChange;
+  log;
+  canRetryBusy;
   activeMailAccount;
   reminders;
   unregister;
   accepting = true;
   disposed = false;
   started = false;
+  retryingBusy = false;
   timer;
   memberManagement = null;
   settings = null;
@@ -14001,6 +14078,9 @@ var CompanionTaskRuntime = class {
     this.now = options.now ?? Date.now;
     this.onChange = options.onChange ?? (() => {
     });
+    this.log = options.log ?? (() => {
+    });
+    this.canRetryBusy = options.canRetryBusy ?? (() => true);
     this.activeMailAccount = options.activeMailAccount ?? (() => null);
     const identity = store.companionIdentity();
     this.principalId = identity.principalId;
@@ -14156,6 +14236,19 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
     } catch {
     }
   }
+  logStatus(message) {
+    try {
+      this.log(message);
+    } catch {
+    }
+  }
+  mayRetryBusy() {
+    try {
+      return this.canRetryBusy() === true;
+    } catch {
+      return false;
+    }
+  }
   start() {
     if (this.started || !this.accepting || this.disposed) return;
     this.started = true;
@@ -14170,9 +14263,30 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
     });
     this.tick();
     this.timer = setInterval(() => {
+      if (this.retryingBusy && !this.mayRetryBusy()) {
+        this.logStatus("[warn] \u6865\u63A5\u5F52\u5C5E\u5DF2\u53D8\u5316\uFF0C\u65E7\u4EFB\u52A1\u8FD0\u884C\u65F6\u505C\u6B62\u63A5\u5355\u3002");
+        this.stopAccepting();
+        return;
+      }
       try {
         this.tick();
-      } catch {
+        if (this.retryingBusy) {
+          this.retryingBusy = false;
+          this.logStatus("\u666E\u901A\u4EFB\u52A1\u6570\u636E\u5E93\u5DF2\u6062\u590D\uFF0C\u8C03\u5EA6\u7EE7\u7EED\u3002");
+        }
+      } catch (error) {
+        if (error instanceof RetryableTickBusy) {
+          if (!this.mayRetryBusy()) {
+            this.logStatus("[warn] \u6570\u636E\u5E93\u7E41\u5FD9\u4E14\u5F53\u524D\u8FD0\u884C\u65F6\u4E0D\u518D\u62E5\u6709\u6865\u63A5\uFF0C\u5DF2\u505C\u6B62\u63A5\u5355\u3002");
+            this.stopAccepting();
+            return;
+          }
+          if (!this.retryingBusy) this.logStatus(`[warn] \u666E\u901A\u4EFB\u52A1\u6570\u636E\u5E93\u7E41\u5FD9\uFF08SQLite \u7801 ${error.sqliteCode}\uFF09\uFF0C\u7A0D\u540E\u518D\u68C0\u67E5\u3002`);
+          this.retryingBusy = true;
+          return;
+        }
+        const code = sqliteErrorCode(error);
+        this.logStatus(`[warn] \u666E\u901A\u4EFB\u52A1\u8C03\u5EA6\u5F02\u5E38\uFF08\u7C7B\u578B ${errorKind(error)}${code === null ? "" : `\uFF0CSQLite \u7801 ${code}`}\uFF09\uFF0C\u5DF2\u505C\u6B62\u63A5\u5355\u3002`);
         this.stopAccepting();
       }
     }, 1e3);
@@ -14196,9 +14310,18 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
   }
   tick() {
     if (!this.accepting || this.disposed) return;
-    const cursor = this.store.companionEventCursor(this.principalId);
+    let cursor;
+    try {
+      cursor = this.store.companionEventCursor(this.principalId);
+    } catch (error) {
+      retryBeforeDispatch(error);
+    }
     this.store.transaction(() => {
-      this.store.pruneCompanionContexts(this.now() - 24 * 60 * 6e4);
+      try {
+        this.store.pruneCompanionContexts(this.now() - 24 * 60 * 6e4);
+      } catch (error) {
+        retryBeforeDispatch(error);
+      }
       for (const followup of this.store.pendingMeetingMailFollowups()) this.ensureMeetingMailReminder(followup.intentId);
       for (const task of this.store.listTasks({ runtimeScope: "companion", status: "queued" })) {
         const meta = this.store.getCompanionMeta(task.taskId);
@@ -15829,7 +15952,7 @@ function registerMeetingMailTools(host, deps) {
 
 // src/meeting-presentation-tools.ts
 import { defineTool as defineTool6 } from "@deepseek-ai/dsh-tools";
-function registerMeetingPresentationTools(host, desktop) {
+function registerMeetingPresentationTools(host, desktop, include) {
   const disposers = [];
   const output = { schema: { type: "string" }, render: (_args, value) => [{ type: "text", text: value }] };
   const run = async (command, payload, exec, timeoutMs) => {
@@ -15842,50 +15965,117 @@ function registerMeetingPresentationTools(host, desktop) {
       return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
     }
   };
+  const record2 = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  const validText = (value, max) => typeof value === "string" && !!value.trim() && value.length <= max && !/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(value);
+  const only = (value, keys) => Object.keys(value).every((key) => keys.includes(key));
+  const runIndependent = async (command, payload, exec, timeoutMs) => {
+    const bindingId = desktop.binding?.(exec?.agent);
+    if (!bindingId || !(exec?.signal instanceof AbortSignal) || exec.signal.aborted) {
+      return JSON.stringify({ ok: false, error: "\u53EA\u63A5\u53D7\u5F53\u524D\u672C\u4EBA\u684C\u9762\u4F1A\u8BDD\u4E2D\u7684\u660E\u786E\u8BF7\u6C42" });
+    }
+    try {
+      const result = await desktop.request(command, { bindingId, ...payload }, { signal: exec.signal, timeoutMs });
+      exec.signal.throwIfAborted();
+      if (desktop.binding?.(exec.agent) !== bindingId) throw new Error("\u4F1A\u8BDD\u5DF2\u53D8\u5316\uFF0C\u64CD\u4F5C\u7ED3\u679C\u8BF7\u5728\u684C\u9762\u6838\u67E5\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u91CD\u8BD5");
+      return JSON.stringify({ ok: true, result });
+    } catch (error) {
+      return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  };
   try {
-    disposers.push(host.tools.register(defineTool6({
-      name: "personal_assistant_start_meeting_presentation",
-      description: "\u6309\u7528\u6237\u660E\u786E\u8981\u6C42\u51C6\u5907\u4F1A\u8BAE\u53CA\u6587\u6863\u8BB2\u89E3\uFF1A\u6587\u6863\u6700\u591A 100 \u6BB5\uFF0C\u684C\u9762\u7531\u672C\u4EBA\u786E\u8BA4\u9EA6\u514B\u98CE\u3001\u7CFB\u7EDF\u97F3\u9891\u548C\u56FA\u5B9A\u6587\u6863\uFF0C\u518D\u7B49\u5F85\u53CC\u8F68\u5C31\u7EEA\u3002waiting-to-present \u4EC5\u8868\u793A\u7B49\u5F85\u5F53\u524D\u56DE\u590D\u7ED3\u675F\u540E\u5F00\u8BB2\uFF0C\u4E0D\u662F\u8BB2\u5B8C\uFF1B\u4E0D\u8981\u5728\u540C\u4E00\u8F6E\u963B\u585E\u8F6E\u8BE2\u3002",
-      parameters: {
-        name: { type: "string", required: true, description: "\u4F1A\u8BAE\u540D\u79F0" },
-        documentName: { type: "string", description: "\u5DF2\u6388\u6743\u76EE\u5F55\u4E2D\u7684\u6587\u6863\u540D\uFF1B\u4E0E documentPath \u4E8C\u9009\u4E00" },
-        documentPath: { type: "string", description: "\u5DF2\u6388\u6743\u76EE\u5F55\u4E2D\u7684\u6587\u6863\u8DEF\u5F84\uFF1B\u4E0E documentName \u4E8C\u9009\u4E00" },
-        retentionDays: { type: "number", description: "\u5F55\u97F3\u4FDD\u7559\u5929\u6570\uFF0C\u9ED8\u8BA4 30" }
-      },
-      output,
-      async execute(args, exec) {
-        const name2 = typeof args.name === "string" ? args.name.trim() : "";
-        const documentName = typeof args.documentName === "string" ? args.documentName.trim() : "";
-        const documentPath = typeof args.documentPath === "string" ? args.documentPath.trim() : "";
-        const days = args.retentionDays === void 0 ? 30 : args.retentionDays;
-        if (!name2 || name2.length > 80 || !documentName && !documentPath || !!documentName && !!documentPath || documentName.length > 4096 || documentPath.length > 4096 || typeof days !== "number" || !Number.isSafeInteger(days) || days < 1 || days > 3650) return JSON.stringify({ ok: false, error: "\u4F1A\u8BAE\u540D\u79F0\u3001\u6587\u6863\u6216\u4FDD\u7559\u5929\u6570\u65E0\u6548" });
-        return run("meeting.presentation.start", { name: name2, ...documentPath ? { documentPath } : { documentName }, retentionDays: days }, exec, 75e3);
-      }
-    })));
-    disposers.push(host.tools.register(defineTool6({
-      name: "personal_assistant_meeting_presentation_status",
-      description: "\u67E5\u770B\u4F1A\u8BAE\u8BB2\u89E3\u7684\u771F\u5B9E\u72B6\u6001\u548C\u5DF2\u5B8C\u6574\u64AD\u51FA\u7684\u6BB5\u843D\uFF1B\u90E8\u5206\u3001\u6682\u505C\u3001\u5931\u8D25\u548C\u53D6\u6D88\u90FD\u4E0D\u7B49\u4E8E\u5B8C\u6574\u8BB2\u5B8C\u3002\u4E0D\u586B\u7F16\u53F7\u65F6\u67E5\u770B\u6700\u8FD1\u4E00\u6B21\uFF1B\u91CD\u542F\u540E\u5728\u9014\u6B65\u9AA4\u53EA\u62A5\u672A\u77E5\u3002",
-      parameters: { presentationId: { type: "string", description: "\u53EF\u9009\u8BB2\u89E3\u7F16\u53F7" } },
-      output,
-      async execute(args, exec) {
-        if (args.presentationId !== void 0 && (typeof args.presentationId !== "string" || !args.presentationId.trim() || args.presentationId.length > 200)) {
-          return JSON.stringify({ ok: false, error: "\u8BB2\u89E3\u7F16\u53F7\u65E0\u6548" });
+    if (!include || include.includes("personal_assistant_meeting_recording"))
+      disposers.push(host.tools.register(defineTool6({
+        name: "personal_assistant_meeting_recording",
+        description: "\u72EC\u7ACB\u63A7\u5236\u4F1A\u8BAE\u5F55\u97F3\uFF1Astart \u53EA\u5728\u7528\u6237\u660E\u786E\u8981\u6C42\u5F55\u97F3\u65F6\u4F7F\u7528\uFF0C\u6309\u684C\u9762\u8BBE\u7F6E\u81EA\u52A8\u5BA1\u6279\u6216\u7531\u672C\u4EBA\u786E\u8BA4\uFF1Bstop \u53EA\u505C\u6B62\u5F55\u97F3\uFF1Bstatus \u67E5\u8BE2\u72B6\u6001\u3002\u4E0D\u4F1A\u8BFB\u53D6\u6216\u8BB2\u89E3\u6587\u6863\u3002\u7528\u6237\u540C\u65F6\u8981\u6C42\u5F55\u97F3\u548C\u8BB2\u89E3\u65F6\uFF0C\u5206\u522B\u8C03\u7528\u672C\u5DE5\u5177\u548C\u6587\u6863\u8BB2\u89E3\u5DE5\u5177\u3002",
+        parameters: {
+          action: { type: "string", required: true, enum: ["start", "stop", "status"], description: "\u5F00\u59CB\u3001\u505C\u6B62\u6216\u67E5\u8BE2\u5F55\u97F3" },
+          name: { type: "string", description: "\u5F00\u59CB\u65F6\u7684\u4F1A\u8BAE\u540D\u79F0\uFF1B\u7701\u7565\u4E3A\u4F1A\u8BAE\u5F55\u97F3" },
+          sources: { type: "string", enum: ["mic", "mic+loopback"], description: "\u5F00\u59CB\u65F6\u7684\u5F55\u97F3\u8303\u56F4\uFF0C\u9ED8\u8BA4\u9EA6\u514B\u98CE\u548C\u7CFB\u7EDF\u97F3\u9891" },
+          retentionDays: { type: "number", description: "\u5F00\u59CB\u65F6\u7684\u5F55\u97F3\u4FDD\u7559\u5929\u6570\uFF0C\u9ED8\u8BA4 30" },
+          meetingId: { type: "string", description: "\u505C\u6B62\u65F6\u53EF\u9009\u7684\u5F53\u524D\u4F1A\u8BAE\u7F16\u53F7" }
+        },
+        output,
+        async execute(raw, exec) {
+          const args = record2(raw);
+          if (!args || !["start", "stop", "status"].includes(String(args.action))) return JSON.stringify({ ok: false, error: "\u5F55\u97F3\u64CD\u4F5C\u65E0\u6548" });
+          if (args.action === "start") {
+            if (!only(args, ["action", "name", "sources", "retentionDays"]) || args.name !== void 0 && !validText(args.name, 80) || args.sources !== void 0 && args.sources !== "mic" && args.sources !== "mic+loopback" || args.retentionDays !== void 0 && (typeof args.retentionDays !== "number" || !Number.isSafeInteger(args.retentionDays) || args.retentionDays < 1 || args.retentionDays > 3650)) return JSON.stringify({ ok: false, error: "\u5F55\u97F3\u540D\u79F0\u3001\u8303\u56F4\u6216\u4FDD\u7559\u5929\u6570\u65E0\u6548" });
+            return runIndependent("meeting.recording.start", {
+              name: args.name === void 0 ? "\u4F1A\u8BAE\u5F55\u97F3" : String(args.name).trim(),
+              sources: args.sources ?? "mic+loopback",
+              retentionDays: args.retentionDays ?? 30
+            }, exec, 75e3);
+          }
+          if (args.action === "stop") {
+            if (!only(args, ["action", "meetingId"]) || args.meetingId !== void 0 && !validText(args.meetingId, 200)) {
+              return JSON.stringify({ ok: false, error: "\u4F1A\u8BAE\u7F16\u53F7\u65E0\u6548" });
+            }
+            return runIndependent("meeting.recording.stop", args.meetingId === void 0 ? {} : { meetingId: String(args.meetingId).trim() }, exec, 45e3);
+          }
+          if (!only(args, ["action"])) return JSON.stringify({ ok: false, error: "\u5F55\u97F3\u72B6\u6001\u67E5\u8BE2\u53C2\u6570\u65E0\u6548" });
+          return runIndependent("meeting.status", {}, exec, 1e4);
         }
-        return run("meeting.presentation.status", args.presentationId ? { presentationId: String(args.presentationId) } : {}, exec, 1e4);
-      }
-    })));
-    disposers.push(host.tools.register(defineTool6({
-      name: "personal_assistant_finish_meeting_presentation",
-      description: "\u4EC5\u5728\u7528\u6237\u660E\u786E\u8981\u6C42\u7ED3\u675F\u4F1A\u8BAE\u65F6\u4F7F\u7528\uFF1A\u684C\u9762\u518D\u6B21\u786E\u8BA4\u540E\u505C\u5F55\uFF0C\u7B49\u5F85\u53CC\u8F68\u51B2\u5237\u4E0E\u8F6C\u5199\uFF0C\u6253\u5F00\u7EAA\u8981\u8349\u7A3F\u4F9B\u672C\u4EBA\u5BA1\u9605\u3002\u4E0D\u4F1A\u81EA\u52A8\u786E\u8BA4\u7EAA\u8981\u6216\u53D1\u9001\u90AE\u4EF6\u3002",
-      parameters: { presentationId: { type: "string", required: true, description: "\u5F00\u59CB\u4F1A\u8BAE\u65F6\u8FD4\u56DE\u7684\u8BB2\u89E3\u7F16\u53F7" } },
-      output,
-      async execute(args, exec) {
-        if (typeof args.presentationId !== "string" || !args.presentationId.trim() || args.presentationId.length > 200) {
-          return JSON.stringify({ ok: false, error: "\u8BB2\u89E3\u7F16\u53F7\u65E0\u6548" });
+      })));
+    if (!include || include.includes("personal_assistant_document_presentation"))
+      disposers.push(host.tools.register(defineTool6({
+        name: "personal_assistant_document_presentation",
+        description: "\u72EC\u7ACB\u8BB2\u89E3\u6388\u6743\u76EE\u5F55\u5185\u7684\u6587\u6863\uFF1Astart\u3001pause\u3001resume\u3001stop\u3001status \u5747\u4E0D\u521B\u5EFA\u4F1A\u8BAE\u3001\u4E0D\u542F\u52A8\u6216\u505C\u6B62\u5F55\u97F3\u3002\u8BB2\u89E3\u4F1A\u5411\u5F53\u524D\u4F1A\u8BDD\u6A21\u578B\u53D1\u9001\u6587\u6863\u7247\u6BB5\u5E76\u4EA7\u751F\u8D39\u7528\uFF0C\u6309\u684C\u9762\u8BBE\u7F6E\u81EA\u52A8\u5BA1\u6279\u6216\u7531\u672C\u4EBA\u786E\u8BA4\uFF1Bwaiting-to-present \u4EC5\u8868\u793A\u7B49\u5F85\u4F1A\u8BDD\u7A7A\u95F2\uFF0C\u4E0D\u4EE3\u8868\u8BB2\u5B8C\u3002\u5F55\u97F3\u548C\u8BB2\u89E3\u540C\u65F6\u9700\u8981\u65F6\u5206\u522B\u8C03\u7528\u4E24\u4E2A\u5DE5\u5177\u3002",
+        parameters: {
+          action: { type: "string", required: true, enum: ["start", "pause", "resume", "stop", "status"], description: "\u8BB2\u89E3\u64CD\u4F5C" },
+          documentName: { type: "string", description: "\u5F00\u59CB\u65F6\u7684\u5DF2\u6388\u6743\u6587\u6863\u540D\uFF1B\u4E0E\u8DEF\u5F84\u4E8C\u9009\u4E00" },
+          documentPath: { type: "string", description: "\u5F00\u59CB\u65F6\u7684\u5DF2\u6388\u6743\u6587\u6863\u8DEF\u5F84\uFF1B\u4E0E\u6587\u6863\u540D\u4E8C\u9009\u4E00" },
+          from: { type: "number", description: "\u5F00\u59CB\u65F6\u7684\u6BB5\u53F7\uFF0C\u4ECE 0 \u5F00\u59CB\uFF0C\u9ED8\u8BA4 0" },
+          presentationId: { type: "string", description: "\u63A7\u5236\u6216\u67E5\u8BE2\u65F6\u53EF\u9009\u7684\u8BB2\u89E3\u7F16\u53F7" }
+        },
+        output,
+        async execute(raw, exec) {
+          const args = record2(raw);
+          if (!args || !["start", "pause", "resume", "stop", "status"].includes(String(args.action))) return JSON.stringify({ ok: false, error: "\u8BB2\u89E3\u64CD\u4F5C\u65E0\u6548" });
+          if (args.action === "start") {
+            if (!only(args, ["action", "documentName", "documentPath", "from"]) || args.documentName !== void 0 && !validText(args.documentName, 4096) || args.documentPath !== void 0 && !validText(args.documentPath, 4096) || args.documentName !== void 0 && args.documentPath !== void 0 || args.from !== void 0 && (typeof args.from !== "number" || !Number.isSafeInteger(args.from) || args.from < 0)) {
+              return JSON.stringify({ ok: false, error: "\u6587\u6863\u540D\u79F0\u3001\u8DEF\u5F84\u6216\u6BB5\u53F7\u65E0\u6548" });
+            }
+            return runIndependent("document.presentation.start", {
+              ...args.documentName === void 0 ? {} : { documentName: String(args.documentName).trim() },
+              ...args.documentPath === void 0 ? {} : { documentPath: String(args.documentPath).trim() },
+              ...args.from === void 0 ? {} : { from: args.from }
+            }, exec, 75e3);
+          }
+          if (!only(args, ["action", "presentationId"]) || args.presentationId !== void 0 && !validText(args.presentationId, 200)) {
+            return JSON.stringify({ ok: false, error: "\u8BB2\u89E3\u63A7\u5236\u53C2\u6570\u65E0\u6548" });
+          }
+          return runIndependent("document.presentation.control", {
+            action: args.action,
+            ...args.presentationId === void 0 ? {} : { presentationId: String(args.presentationId).trim() }
+          }, exec, 15e3);
         }
-        return run("meeting.presentation.finish", { presentationId: args.presentationId }, exec, 36e4);
-      }
-    })));
+      })));
+    if (!include || include.includes("personal_assistant_meeting_presentation_status"))
+      disposers.push(host.tools.register(defineTool6({
+        name: "personal_assistant_meeting_presentation_status",
+        description: "\u4EC5\u67E5\u770B\u65E7\u7248\u7EC4\u5408\u4F1A\u8BAE\u8BB2\u89E3\u7684\u72B6\u6001\uFF0C\u7528\u4E8E\u5386\u53F2\u4EFB\u52A1\u6536\u5C3E\uFF1B\u65B0\u7684\u72EC\u7ACB\u8BB2\u89E3\u8BF7\u7528\u6587\u6863\u8BB2\u89E3\u5DE5\u5177\u67E5\u8BE2\u3002",
+        parameters: { presentationId: { type: "string", description: "\u53EF\u9009\u8BB2\u89E3\u7F16\u53F7" } },
+        output,
+        async execute(args, exec) {
+          if (args.presentationId !== void 0 && (typeof args.presentationId !== "string" || !args.presentationId.trim() || args.presentationId.length > 200)) {
+            return JSON.stringify({ ok: false, error: "\u8BB2\u89E3\u7F16\u53F7\u65E0\u6548" });
+          }
+          return run("meeting.presentation.status", args.presentationId ? { presentationId: String(args.presentationId) } : {}, exec, 1e4);
+        }
+      })));
+    if (!include || include.includes("personal_assistant_finish_meeting_presentation"))
+      disposers.push(host.tools.register(defineTool6({
+        name: "personal_assistant_finish_meeting_presentation",
+        description: "\u4EC5\u7528\u4E8E\u672C\u4EBA\u660E\u786E\u7ED3\u675F\u65E7\u7248\u7EC4\u5408\u4F1A\u8BAE\u4EFB\u52A1\uFF1B\u65B0\u7684\u72EC\u7ACB\u5F55\u97F3\u548C\u8BB2\u89E3\u8BF7\u5206\u522B\u4F7F\u7528\u5404\u81EA\u5DE5\u5177\u505C\u6B62\u3002",
+        parameters: { presentationId: { type: "string", required: true, description: "\u5F00\u59CB\u4F1A\u8BAE\u65F6\u8FD4\u56DE\u7684\u8BB2\u89E3\u7F16\u53F7" } },
+        output,
+        async execute(args, exec) {
+          if (typeof args.presentationId !== "string" || !args.presentationId.trim() || args.presentationId.length > 200) {
+            return JSON.stringify({ ok: false, error: "\u8BB2\u89E3\u7F16\u53F7\u65E0\u6548" });
+          }
+          return run("meeting.presentation.finish", { presentationId: args.presentationId }, exec, 36e4);
+        }
+      })));
   } catch (error) {
     while (disposers.length) disposers.pop()();
     throw error;
@@ -16041,7 +16231,7 @@ var agentShape = {
   persona: z5.string().max(8e3),
   provider: z5.string().max(128).trim(),
   model: z5.string().max(256).trim(),
-  maxTokens: z5.number().int().min(1).max(32768),
+  maxTokens: z5.number().int().min(1).max(131072),
   tokenBudget: z5.number().int().min(0).max(1e7)
 };
 var pairedModel = (value) => !!value.provider === !!value.model;
@@ -16072,7 +16262,7 @@ function defaults2() {
   return {
     revision: 0,
     reminder: { repeatEverySeconds: 300 },
-    agent: { name: "\u5C0F\u6F58", persona: "", provider: "", model: "", maxTokens: 4096, tokenBudget: 0 }
+    agent: { name: "\u5C0F\u6F58", persona: "", provider: "", model: "", maxTokens: 16384, tokenBudget: 0 }
   };
 }
 var SettingsError = class extends Error {
@@ -16625,11 +16815,8 @@ var MEETING_TOOLS = ["companion_meeting_start", "companion_meeting_stop", "compa
 var DOCUMENT_TOOLS = ["companion_document_list", "companion_document_read"];
 var MAIL_TOOLS = ["companion_mail_unread"];
 var MEETING_MAIL_TOOLS = ["personal_assistant_meeting_artifacts", "personal_assistant_send_meeting_minutes"];
-var PRESENTATION_TOOLS = [
-  "personal_assistant_start_meeting_presentation",
-  "personal_assistant_meeting_presentation_status",
-  "personal_assistant_finish_meeting_presentation"
-];
+var PRESENTATION_TOOLS = ["personal_assistant_meeting_presentation_status", "personal_assistant_finish_meeting_presentation"];
+var DOCUMENT_PRESENTATION_TOOL = "personal_assistant_document_presentation";
 var SIDE_EFFECT_ALLOW_TOOLS = ["bash", "pwsh", "write", "edit", "str_replace_editor", "job_kill"];
 function tokenCount(usage) {
   if (!usage) return null;
@@ -16686,6 +16873,7 @@ var MemberRuntime = class {
     signal.throwIfAborted();
     const profile = this.available(memberId);
     const effectiveOrigin = channelKey ? "wecom" : origin;
+    const desktopBinding = effectiveOrigin === "desktop" ? this.options.desktop?.binding?.() ?? null : null;
     if (channelKey && !profile.capabilities.includes("wecom")) throw new Error("\u6210\u5458\u672A\u83B7\u4F01\u4E1A\u5FAE\u4FE1\u8DEF\u7531\u80FD\u529B");
     if (channelKey && (!channelScope || !/^[a-f0-9]{64}$/u.test(channelScope))) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u6765\u6E90\u7F3A\u5C11\u53EF\u6838\u9A8C\u7684\u4F1A\u8BDD\u8303\u56F4");
     if (effectiveOrigin === "wecom" && !channelKey && !taskId) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u4EFB\u52A1\u7F3A\u5C11\u72EC\u7ACB\u4EFB\u52A1\u6807\u8BC6");
@@ -16785,7 +16973,7 @@ var MemberRuntime = class {
       if (meetingAllowed && documentAllowed) for (const name2 of PRESENTATION_TOOLS) allowed.add(name2);
       const quotaLimited = profile.dailyTokenLimit > 0 || profile.totalTokenLimit > 0;
       if (quotaLimited) allowed.delete("companion_meeting_minutes");
-      if (quotaLimited) allowed.delete("personal_assistant_start_meeting_presentation");
+      if (documentAllowed && !quotaLimited && desktopBinding) allowed.add(DOCUMENT_PRESENTATION_TOOL);
       const analysisOnly = effectiveOrigin === "mail";
       if (analysisOnly) {
         allowed.clear();
@@ -16801,8 +16989,13 @@ var MemberRuntime = class {
       ctx.tools.guard((exec) => {
         if (!owns(exec.agent)) return "\u6210\u5458\u5DE5\u5177\u6743\u9650\u4E0D\u80FD\u7EE7\u627F\u7ED9\u5176\u4ED6\u4EE3\u7406";
         if (!admitted || ended !== void 0 || runSignal.aborted || exec.signal.aborted || !this.options.enabled()) return "\u6210\u5458\u8BF7\u6C42\u5DF2\u505C\u6B62";
-        if ((MEETING_TOOLS.includes(exec.name) || DOCUMENT_TOOLS.includes(exec.name) || MAIL_TOOLS.includes(exec.name) || MEETING_MAIL_TOOLS.includes(exec.name) || PRESENTATION_TOOLS.includes(exec.name)) && (effectiveOrigin !== "desktop" || channelKey)) return "\u684C\u9762\u6587\u6863/\u90AE\u4EF6/\u4F1A\u8BAE\u5DE5\u5177\u53EA\u63A5\u53D7\u684C\u9762\u672C\u4EBA\u7684\u8BF7\u6C42";
+        if ((MEETING_TOOLS.includes(exec.name) || DOCUMENT_TOOLS.includes(exec.name) || MAIL_TOOLS.includes(exec.name) || MEETING_MAIL_TOOLS.includes(exec.name) || PRESENTATION_TOOLS.includes(exec.name) || exec.name === DOCUMENT_PRESENTATION_TOOL) && (effectiveOrigin !== "desktop" || channelKey)) return "\u684C\u9762\u6587\u6863/\u90AE\u4EF6/\u4F1A\u8BAE\u5DE5\u5177\u53EA\u63A5\u53D7\u684C\u9762\u672C\u4EBA\u7684\u8BF7\u6C42";
         if (!allowed.has(exec.name) && !sideEffect.has(exec.name)) return `\u6210\u5458\u672A\u83B7 ${exec.name} \u6743\u9650\uFF0C\u7981\u6B62\u526F\u4F5C\u7528\u6269\u6743\u6216\u518D\u59D4\u6D3E`;
+        if (exec.name === DOCUMENT_PRESENTATION_TOOL) {
+          const current = this.options.directory.get(memberId);
+          if (!current?.enabled || !current.capabilities.includes("document")) return "\u6210\u5458\u6587\u6863\u80FD\u529B\u5DF2\u64A4\u9500";
+          if (current.dailyTokenLimit > 0 || current.totalTokenLimit > 0) return "\u6210\u5458\u6709\u989D\u5EA6\u9650\u5236\uFF0C\u4E0D\u80FD\u4F7F\u7528\u5171\u4EAB\u684C\u9762\u6A21\u578B\u8BB2\u89E3";
+        }
         if (exec.name !== "companion_member_request_quota") {
           try {
             this.options.directory.checkAvailable(memberId);
@@ -16880,6 +17073,12 @@ ${memory}
         }
       }));
       const desktop = this.options.desktop;
+      if (allowed.has(DOCUMENT_PRESENTATION_TOOL) && desktop && desktopBinding) {
+        registerMeetingPresentationTools(ctx, {
+          binding: (subject) => owns(subject) && admitted && ended === void 0 && !runSignal.aborted && this.options.enabled() && desktop.binding?.() === desktopBinding ? desktopBinding : null,
+          request: (command, payload, options) => desktop.request(command, payload, options)
+        }, [DOCUMENT_PRESENTATION_TOOL]);
+      }
       const runDesktop = async (exec, command, payload, timeoutMs) => {
         if (!owns(exec.agent) || !admitted || ended !== void 0 || runSignal.aborted || exec.signal.aborted) throw new Error("\u6210\u5458\u8BF7\u6C42\u5DF2\u505C\u6B62");
         if (effectiveOrigin !== "desktop" || channelKey) throw new Error("\u684C\u9762\u6587\u6863/\u4F1A\u8BAE\u5DE5\u5177\u53EA\u63A5\u53D7\u684C\u9762\u672C\u4EBA\u7684\u8BF7\u6C42");
@@ -16890,10 +17089,16 @@ ${memory}
           return JSON.stringify({ ok: false, error: error2 instanceof Error ? error2.message : String(error2) });
         }
       };
+      const runBoundRecording = async (exec, command, payload, timeoutMs) => {
+        if (!desktopBinding || desktop?.binding?.() !== desktopBinding) return JSON.stringify({ ok: false, error: "\u684C\u9762\u4F1A\u8BDD\u5DF2\u53D8\u5316\uFF0C\u672A\u64CD\u4F5C\u5F55\u97F3" });
+        const result = await runDesktop(exec, command, { bindingId: desktopBinding, ...payload }, timeoutMs);
+        if (desktop.binding?.() !== desktopBinding) return JSON.stringify({ ok: false, error: "\u684C\u9762\u4F1A\u8BDD\u5DF2\u53D8\u5316\uFF0C\u5F55\u97F3\u7ED3\u679C\u8BF7\u5728\u4F1A\u8BAE\u9875\u6838\u67E5\uFF0C\u4E0D\u81EA\u52A8\u91CD\u8BD5" });
+        return result;
+      };
       if (meetingAllowed && desktop) {
         ctx.tools.register(defineTool7({
           name: "companion_meeting_start",
-          description: "\u5728\u684C\u9762\u5F00\u59CB\u4E00\u573A\u4F1A\u8BAE\u5F55\u97F3\uFF0C\u9ED8\u8BA4\u540C\u65F6\u5F55\u9EA6\u514B\u98CE\u4E0E\u7CFB\u7EDF\u56DE\u73AF\uFF1B\u4F1A\u6253\u5F00\u4F1A\u8BAE\u9875\u5E76\u7ACB\u5373\u5F00\u5F55\u3002\u53EA\u6709\u7528\u6237\u5728\u5F53\u524D\u684C\u9762\u4F1A\u8BDD\u660E\u786E\u8981\u6C42\u5F00\u59CB\u4F1A\u8BAE/\u5F55\u97F3\u65F6\u624D\u80FD\u8C03\u7528\uFF1B\u8C03\u7528\u540E\u5FC5\u987B\u63D0\u9192\u7528\u6237\u6B63\u5728\u5F55\u97F3\u3002",
+          description: "\u5728\u5F53\u524D\u7ED1\u5B9A\u7684\u684C\u9762\u7533\u8BF7\u5F00\u59CB\u4F1A\u8BAE\u5F55\u97F3\uFF0C\u6309\u684C\u9762\u8BBE\u7F6E\u81EA\u52A8\u5BA1\u6279\u6216\u7531\u672C\u4EBA\u786E\u8BA4\uFF1B\u9ED8\u8BA4\u540C\u65F6\u5F55\u9EA6\u514B\u98CE\u4E0E\u7CFB\u7EDF\u56DE\u73AF\u3002\u4E0D\u4F1A\u542F\u52A8\u6587\u6863\u8BB2\u89E3\u3002\u53EA\u6709\u7528\u6237\u660E\u786E\u8981\u6C42\u5F55\u97F3\u65F6\u624D\u80FD\u8C03\u7528\uFF1B\u5F00\u59CB\u540E\u5FC5\u987B\u63D0\u9192\u7528\u6237\u6B63\u5728\u5F55\u97F3\u3002",
           parameters: {
             name: { type: "string", required: true, description: "\u4F1A\u8BAE\u540D\u79F0\uFF0C1-80 \u5B57" },
             sources: { type: "string", enum: ["mic", "mic+loopback"], description: "\u9ED8\u8BA4 mic+loopback\uFF1B\u7528\u6237\u660E\u786E\u53EA\u5F55\u672C\u673A\u9EA6\u514B\u98CE\u65F6\u624D\u7528 mic" },
@@ -16906,17 +17111,17 @@ ${memory}
             const sources = args.sources === "mic" ? "mic" : "mic+loopback";
             const retentionDays = typeof args.retentionDays === "number" && Number.isSafeInteger(args.retentionDays) ? args.retentionDays : 30;
             if (retentionDays < 1 || retentionDays > 3650) return JSON.stringify({ ok: false, error: "\u5F55\u97F3\u4FDD\u7559\u5929\u6570\u5FC5\u987B\u662F 1-3650 \u7684\u6574\u6570" });
-            return runDesktop(exec, "meeting.start", { name: name2, sources, retentionDays }, 25e3);
+            return runBoundRecording(exec, "meeting.recording.start", { name: name2, sources, retentionDays }, 75e3);
           }
         }));
         ctx.tools.register(defineTool7({
           name: "companion_meeting_stop",
-          description: "\u505C\u6B62\u5F53\u524D\u6216\u6307\u5B9A\u4F1A\u8BAE\u7684\u5F55\u97F3\u5E76\u7B49\u684C\u9762\u5B8C\u6210\u6700\u540E\u4E00\u6BB5\u51B2\u5237\uFF1B\u53EA\u6709\u7528\u6237\u660E\u786E\u8981\u6C42\u7ED3\u675F\u5F55\u97F3\u65F6\u624D\u80FD\u8C03\u7528\u3002",
+          description: "\u5728\u5F53\u524D\u7ED1\u5B9A\u7684\u684C\u9762\u7533\u8BF7\u505C\u6B62\u5F55\u97F3\uFF0C\u6309\u684C\u9762\u8BBE\u7F6E\u81EA\u52A8\u5BA1\u6279\u6216\u7531\u672C\u4EBA\u786E\u8BA4\u5E76\u7B49\u5F85\u51B2\u5237\uFF1B\u4E0D\u4F1A\u505C\u6B62\u72EC\u7ACB\u6587\u6863\u8BB2\u89E3\u3002\u53EA\u6709\u7528\u6237\u660E\u786E\u8981\u6C42\u7ED3\u675F\u5F55\u97F3\u65F6\u624D\u80FD\u8C03\u7528\u3002",
           parameters: { meetingId: { type: "string", description: "\u53EF\u9009\uFF1B\u4E0D\u586B\u5219\u505C\u5F53\u524D\u6B63\u5728\u5F55\u7684\u90A3\u573A" } },
           output: toolOutput,
-          execute: async (args, exec) => runDesktop(
+          execute: async (args, exec) => runBoundRecording(
             exec,
-            "meeting.stop",
+            "meeting.recording.stop",
             args.meetingId ? { meetingId: String(args.meetingId) } : {},
             45e3
           )
@@ -17382,7 +17587,7 @@ function defaultDraft() {
     enabled: true,
     provider: "",
     model: "",
-    maxTokens: 2048,
+    maxTokens: 16384,
     capabilities: [],
     allowedTools: [],
     dailyTokenLimit: 0,
@@ -18687,6 +18892,16 @@ function scheduleRetention(run, onError, hooks) {
     active = false;
     (hooks?.clearInterval ?? ((value) => clearInterval(value)))(timer);
   };
+}
+function startRetention(enabled, run, onError, hooks) {
+  if (!enabled) return () => {
+  };
+  try {
+    run();
+  } catch (error) {
+    onError(error);
+  }
+  return scheduleRetention(run, onError, hooks);
 }
 
 // src/tools.ts
@@ -20059,14 +20274,14 @@ function registerAssistantTools(ctx, tracker, options) {
       const { port } = await options.bridge.bind(agent);
       const teamMode = options.bridge.teamEnabled;
       const petDir = options.bridge.petDir;
-      const launched = teamMode ? false : options.bridge.launchPet();
+      const launched = options.bridge.launchPet();
       return json4({
         ok: true,
         bridgePort: port,
         petLaunched: launched,
         petDir: petDir ?? null,
         teamMode,
-        message: teamMode ? "\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u56E2\u961F\u6A21\u5F0F\u5DF2\u5F00\u542F\uFF1B\u684C\u9762\u89D2\u8272\u7531\u684C\u9762\u58F3\u8D1F\u8D23\u542F\u52A8\u4E0E\u9644\u7740\uFF0C\u672C\u63D2\u4EF6\u4E0D\u4F1A\u53CD\u5411\u62C9\u8D77\u5B83" : launched ? "\u684C\u9762\u5BA0\u7269\u5DF2\u53EC\u5524\u5E76\u7ED1\u5B9A\u5230\u672C\u4F1A\u8BDD" : petDir ? `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u4F46\u62C9\u4E0D\u8D77\u684C\u9762\u5BA0\u7269\uFF08${petDir}\uFF09\uFF1A\u8BF7\u5728\u8BE5\u76EE\u5F55\u8FD0\u884C pnpm install && pnpm start\uFF1B\u542F\u52A8\u65E5\u5FD7\u5728 ~/.dsh/dsh-pet/launch.log` : "\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u4F46\u6CA1\u6709\u627E\u5230 dsh-pet\uFF1A\u628A dsh-pet \u76EE\u5F55\u653E\u5728\u63D2\u4EF6\u540C\u7EA7\uFF08\u4E0E dsh-personal-assistant \u5E76\u6392\uFF09\uFF0C\u6216\u5728 profile \u91CC\u7ED9 personal-assistant \u914D\u7F6E config.petDir\uFF0C\u6216\u624B\u52A8\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm start\uFF08\u542F\u52A8\u540E\u4F1A\u81EA\u52A8\u63A5\u5165\u6865\u63A5\uFF09"
+        message: teamMode ? launched ? "\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u56E2\u961F\u6A21\u5F0F\u5DF2\u5F00\u542F\uFF1B\u5DF2\u8BF7\u6C42\u542F\u52A8\u684C\u5BA0\uFF0C\u684C\u9762\u89D2\u8272\u4F1A\u9644\u7740\u5230\u5F53\u524D\u4F1A\u8BDD" : "\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u56E2\u961F\u6A21\u5F0F\u5DF2\u5F00\u542F\uFF1B\u4F46\u6CA1\u80FD\u62C9\u8D77\u684C\u5BA0\uFF0C\u8BF7\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm start" : launched ? "\u684C\u9762\u5BA0\u7269\u5DF2\u53EC\u5524\u5E76\u7ED1\u5B9A\u5230\u672C\u4F1A\u8BDD" : petDir ? `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u4F46\u62C9\u4E0D\u8D77\u684C\u9762\u5BA0\u7269\uFF08${petDir}\uFF09\uFF1A\u8BF7\u5728\u8BE5\u76EE\u5F55\u8FD0\u884C pnpm install && pnpm start\uFF1B\u542F\u52A8\u65E5\u5FD7\u5728 ~/.dsh/dsh-pet/launch.log` : "\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\u5230\u6865\u63A5\uFF0C\u4F46\u6CA1\u6709\u627E\u5230 dsh-pet\uFF1A\u628A dsh-pet \u76EE\u5F55\u653E\u5728\u63D2\u4EF6\u540C\u7EA7\uFF08\u4E0E dsh-personal-assistant \u5E76\u6392\uFF09\uFF0C\u6216\u5728 profile \u91CC\u7ED9 personal-assistant \u914D\u7F6E config.petDir\uFF0C\u6216\u624B\u52A8\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm start\uFF08\u542F\u52A8\u540E\u4F1A\u81EA\u52A8\u63A5\u5165\u6865\u63A5\uFF09"
       });
     }
   }));
@@ -22181,6 +22396,7 @@ var Config = Schema.object({
   excludedProcesses: Schema.array(Schema.string()).default(["KeePass", "KeePassXC", "1Password", "Bitwarden"]),
   excludedTitleKeywords: Schema.array(Schema.string()).default(["\u5BC6\u7801\u7BA1\u7406", "\u652F\u4ED8\u5BC6\u7801", "\u94F6\u884C\u5361", "\u7F51\u4E0A\u94F6\u884C", "password manager"]),
   retentionActivityDays: Schema.number().default(7),
+  retentionAutoDelete: Schema.boolean().default(false),
   maxInjectedMemories: Schema.number().default(40),
   migrateLegacy: Schema.boolean().default(true),
   deleteLegacyAfterMigration: Schema.boolean().default(false),
@@ -22297,15 +22513,15 @@ function mountUserCommands(ctx, deps) {
       async handler(invocation) {
         const agent = invocation.agent;
         if (!agent) {
-          const launched = bridge.teamEnabled ? false : bridge.launchPet();
+          const launched = bridge.launchPet();
           return launched ? { kind: "success", text: "\u684C\u9762\u5BA0\u7269\u5DF2\u542F\u52A8\uFF1B\u6253\u5F00\u4E00\u4E2A\u4F1A\u8BDD\u540E\u518D\u70B9\u4E00\u6B21\u5373\u53EF\u7ED1\u5B9A" } : { kind: "error", text: "\u6CA1\u6709\u53EF\u7ED1\u5B9A\u7684\u4F1A\u8BDD\uFF0C\u4E5F\u6CA1\u80FD\u542F\u52A8\u684C\u5BA0\uFF1B\u8BF7\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm start" };
         }
         try {
           const { port } = await bridge.bind(agent);
-          const launched = bridge.teamEnabled ? false : bridge.launchPet();
+          const launched = bridge.launchPet();
           return {
-            kind: "success",
-            text: bridge.teamEnabled ? `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09\uFF1B\u56E2\u961F\u6A21\u5F0F\u7684\u684C\u9762\u89D2\u8272\u7531\u684C\u9762\u58F3\u8D1F\u8D23` : launched ? "\u684C\u9762\u5BA0\u7269\u5DF2\u53EC\u5524\u5E76\u7ED1\u5B9A\u5230\u5F53\u524D\u4F1A\u8BDD" : `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09\uFF0C\u4F46\u6CA1\u80FD\u62C9\u8D77\u684C\u5BA0\uFF1B\u8BF7\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm install && pnpm start\uFF08\u65E5\u5FD7\uFF1A~/.dsh/dsh-pet/launch.log\uFF09`
+            kind: launched ? "success" : "error",
+            text: launched ? bridge.teamEnabled ? `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09\uFF1B\u56E2\u961F\u6A21\u5F0F\u4E0B\u684C\u9762\u89D2\u8272\u7531\u684C\u9762\u58F3\u9644\u7740\uFF0C\u672C\u6B21\u4E5F\u5DF2\u8BF7\u6C42\u542F\u52A8\u684C\u5BA0` : "\u684C\u9762\u5BA0\u7269\u5DF2\u53EC\u5524\u5E76\u7ED1\u5B9A\u5230\u5F53\u524D\u4F1A\u8BDD" : `\u4F1A\u8BDD\u5DF2\u7ED1\u5B9A\uFF08\u6865\u63A5\u7AEF\u53E3 ${port}\uFF09\uFF0C\u4F46\u6CA1\u80FD\u62C9\u8D77\u684C\u5BA0\uFF1B\u8BF7\u5728 dsh-pet \u76EE\u5F55\u8FD0\u884C pnpm install && pnpm start\uFF08\u65E5\u5FD7\uFF1A~/.dsh/dsh-pet/launch.log\uFF09`
           };
         } catch (error) {
           return { kind: "error", text: error instanceof Error ? error.message : String(error) };
@@ -22465,12 +22681,9 @@ async function apply(ctx, config) {
     }
   };
   const retentionError = (error) => log(`[warn] \u5230\u671F\u6E05\u7406\u672A\u5B8C\u6210\uFF0C\u4E0B\u6B21\u91CD\u8BD5\uFF1A${error instanceof Error ? error.message : String(error)}`);
-  try {
-    runRetention();
-  } catch (error) {
-    retentionError(error);
-  }
-  ctx.effect(() => scheduleRetention(runRetention, retentionError), "personal-assistant:retention");
+  if (!config.retentionAutoDelete) log("[warn] \u6D3B\u52A8\u548C\u8BB0\u5FC6\u81EA\u52A8\u5230\u671F\u6E05\u7406\u5DF2\u6682\u505C\uFF1B\u672A\u7ECF\u672C\u4EBA\u660E\u786E\u540C\u610F\u4E0D\u4F1A\u542F\u52A8\u3002");
+  const stopRetention = startRetention(config.retentionAutoDelete === true, runRetention, retentionError);
+  ctx.effect(() => stopRetention, "personal-assistant:retention");
   const sessionHost = {
     agents: () => hostAgents(ctx),
     readOwnedSessionId: () => getUserFlag(db, OWNED_SESSION_FLAG),
@@ -22519,7 +22732,10 @@ async function apply(ctx, config) {
     defaultModel: () => resolveDefaultModel(home),
     enabled: () => teamRuntime !== null,
     memories: memberMemories,
-    desktop: { request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options) },
+    desktop: {
+      binding: () => bridge.currentDesktopBinding(),
+      request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options)
+    },
     mailUnread: async (limit2) => {
       const config2 = readMailImapConfig(home);
       if (!config2) throw new Error("\u90AE\u7BB1\u503C\u5B88\u8FD8\u6CA1\u6709\u914D\u7F6E IMAP\uFF0C\u8BF7\u5148\u8FD0\u884C setup-mail.mjs");
@@ -22548,6 +22764,8 @@ async function apply(ctx, config) {
   });
   const companionRuntime = new CompanionTaskRuntime(teamStore, teamApprovals, {
     epoch: bridge.epoch,
+    log,
+    canRetryBusy: () => bridge.isCurrentDiscovery(),
     onChange: () => bridge.notifyApprovalSnapshot(),
     activeMailAccount: () => {
       const mail = readMailImapConfig(home);
@@ -22650,7 +22868,7 @@ async function apply(ctx, config) {
           persona: "\u56E2\u961F\u5173\u95ED\u65F6\uFF0C\u7531\u4F60\u76F4\u63A5\u5904\u7406\u7528\u6237\u4EA4\u529E\u7684\u5DE5\u4F5C\u3002",
           provider: "",
           model: "",
-          maxTokens: 4096,
+          maxTokens: 16384,
           tokenBudget: 0
         });
         const channelModel = resolveDefaultModel(home);
@@ -22714,6 +22932,7 @@ async function apply(ctx, config) {
   }
   try {
     ctx.effect(() => registerMeetingPresentationTools(ctx, {
+      binding: (agent) => bridge.desktopBinding(agent),
       request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options)
     }), "personal-assistant:meeting-presentation-tools");
   } catch (error) {

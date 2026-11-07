@@ -567,6 +567,55 @@ describe('meeting-store：保留期到点删录音，转写与纪要保留', () 
   })
 })
 
+describe('meeting-store：删除整场会议', () => {
+  test('录音、转写、纪要、助理播报与讲解记录一起清掉', () => {
+    const store = newStore()
+    const started = store.startMeeting(CONSENT)
+    if (!started.ok) throw new Error('start 失败')
+    const meetingId = started.meetingId
+    store.appendChunk(meetingId, Buffer.alloc(640, 1), 1_000)
+    store.replaceSegments(meetingId, [
+      { idx: 0, speaker: 's1', label: '发言人1', uncertain: true, startMs: 0, endMs: 1, text: '会被删掉的转写', source: 'asr' },
+    ])
+    store.saveMinutes(meetingId, '# 会被删掉的纪要\n', 1)
+    store.addAssistantSpeech(meetingId, 0, 1000)
+    const saved = store.saveMeetingPresentation({
+      id: 'presentation-1', requestId: 'request-1', bindingId: 'binding-1', meetingId,
+      meetingName: CONSENT.name, documentName: '样本.pdf', documentPath: path.resolve('样本.pdf'),
+      fingerprint: 'fingerprint-1', expiresAt: 0, state: 'completed', lectureOutcome: 'completed',
+      error: null, next: 0, total: 0, completed: [], revision: 1, updatedAt: 0,
+    }, 0)
+    assert.equal(saved.ok, true, saved.ok ? '' : saved.error)
+    store.stopMeeting(meetingId)
+
+    const deleted = store.deleteMeeting(meetingId)
+    assert.equal(deleted.ok, true, deleted.ok ? '' : deleted.error)
+    assert.equal(store.getMeeting(meetingId), null)
+    assert.deepEqual(store.listChunks(meetingId), [])
+    assert.deepEqual(store.getSegments(meetingId), [])
+    assert.equal(store.getMinutes(meetingId), null)
+    assert.deepEqual(store.listAssistantSpeech(meetingId), [])
+    assert.equal(store.getMeetingPresentation('presentation-1'), null)
+    assert.equal(existsSync(store.meetingDir(meetingId)), false)
+    store.close()
+  })
+
+  test('录音中拒绝删除；不存在或已删的会议给出明确错误', () => {
+    const store = newStore()
+    const started = store.startMeeting(CONSENT)
+    if (!started.ok) throw new Error('start 失败')
+    const recording = store.deleteMeeting(started.meetingId)
+    assert.equal(recording.ok, false)
+    assert.match(recording.ok ? '' : recording.error, /还在录制/u)
+    store.stopMeeting(started.meetingId)
+    assert.equal(store.deleteMeeting(started.meetingId).ok, true)
+    const again = store.deleteMeeting(started.meetingId)
+    assert.equal(again.ok, false)
+    assert.match(again.ok ? '' : again.error, /没有这场会议/u)
+    store.close()
+  })
+})
+
 describe('meeting-store：助理播报区间', () => {
   test('记录并按时序读出；endMs<=startMs 的坏区间不进库', () => {
     const store = newStore()

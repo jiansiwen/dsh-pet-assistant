@@ -43,7 +43,7 @@ function initialForm(member: MemberView | null): DraftForm {
   return {
     displayName: p?.displayName ?? '新成员', description: p?.description ?? '', personality: p?.personality ?? '',
     permissionMode: p?.permissionMode ?? 'ask', persona: p?.persona ?? '', skinId: p?.skinId ?? 'panda',
-    enabled: p?.enabled ?? true, provider: p?.provider ?? '', model: p?.model ?? '', maxTokens: String(p?.maxTokens ?? 2048),
+    enabled: p?.enabled ?? true, provider: p?.provider ?? '', model: p?.model ?? '', maxTokens: String(p?.maxTokens ?? 16384),
     capabilities: [...(p?.capabilities ?? [])], allowedTools: [], dailyTokenLimit: String(p?.dailyTokenLimit ?? 0),
     totalTokenLimit: String(p?.totalTokenLimit ?? 0), thresholdPercent: String(p?.thresholdPercent ?? 80),
     timezone: p?.timezone ?? localTimezone(),
@@ -61,7 +61,7 @@ function safeInteger(value: string, fallback: number, min = 0): number {
 function formDraft(form: DraftForm, member: MemberView | null): MemberDraft {
   return {
     ...form, displayName: form.displayName.trim() || '新成员', provider: form.provider.trim(), model: form.model.trim(),
-    maxTokens: safeInteger(form.maxTokens, member?.profile.maxTokens ?? 2048, 1),
+    maxTokens: safeInteger(form.maxTokens, member?.profile.maxTokens ?? 16384, 1),
     dailyTokenLimit: safeInteger(form.dailyTokenLimit, member?.profile.dailyTokenLimit ?? 0),
     totalTokenLimit: safeInteger(form.totalTokenLimit, member?.profile.totalTokenLimit ?? 0),
     thresholdPercent: safeInteger(form.thresholdPercent, member?.profile.thresholdPercent ?? 80, 1),
@@ -72,7 +72,7 @@ function validDraft(form: DraftForm): boolean {
   const numbers = ['maxTokens', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent'] as const
   if (numbers.some(key => !form[key].trim() || !Number.isSafeInteger(Number(form[key]))
     || Number(form[key]) < (key === 'maxTokens' || key === 'thresholdPercent' ? 1 : 0))) return false
-  if (Number(form.maxTokens) > 32768 || Number(form.thresholdPercent) > 100 || !form.displayName.trim()
+  if (Number(form.maxTokens) > 131072 || Number(form.thresholdPercent) > 100 || !form.displayName.trim()
     || !!form.model.trim() !== !!form.provider.trim() || !form.timezone.trim()) return false
   try { new Intl.DateTimeFormat('zh-CN', { timeZone: form.timezone }).format(); return true } catch { return false }
 }
@@ -133,7 +133,7 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
   async function save(): Promise<void> {
     if (busy || stale) return
     if (!validDraft(form)) {
-      setError('请核对名称、成对填写的服务商/模型、整数额度和有效时区；阈值为 1–100%，最大输出为 1–32768。')
+      setError('请核对名称、成对填写的服务商/模型、整数额度和有效时区；阈值为 1–100%，最大输出为 1–131072。')
       return
     }
     setError(''); setNotice('')
@@ -255,7 +255,7 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
         <label className="editor-field"><span>模型名称</span>
           <input autoComplete="off" maxLength={256} value={form.model} disabled={busy} onChange={event => set('model', event.target.value)} placeholder="留空用主默认" /></label>
         <label className="editor-field"><span>单次最大输出量</span>
-          <input type="number" required min={1} max={32768} step={1} value={form.maxTokens} disabled={busy} onChange={event => set('maxTokens', event.target.value)} /></label>
+          <input type="number" required min={1} max={131072} step={1} value={form.maxTokens} disabled={busy} onChange={event => set('maxTokens', event.target.value)} /></label>
         <label className="editor-field"><span>日额度</span>
           <input type="number" required min={0} step={1} value={form.dailyTokenLimit} disabled={busy} onChange={event => set('dailyTokenLimit', event.target.value)} /></label>
         <label className="editor-field"><span>总额度</span>

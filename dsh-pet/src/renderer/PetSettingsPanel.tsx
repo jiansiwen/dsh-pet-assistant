@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { arrayBufferToBase64, recordDictation } from './dictation.js'
 import type { ResidencyPatch, ResidencyState, SettingsPage } from './types.js'
 import { registerCharacterHitbox, unregisterCharacterHitbox } from './stage-layout.js'
 
@@ -97,6 +98,43 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
     return () => { cancelled = true; clearTimeout(timer) }
   }, [])
 
+  const [wakeNameDraft, setWakeNameDraft] = useState('')
+  useEffect(() => {
+    if (state !== null) setWakeNameDraft(state.wake.name)
+  }, [state?.wake.name])
+  const wakeNameProblem = /^[\u4e00-\u9fff]{2,5}$/u.test(wakeNameDraft.trim())
+    ? null : '唤醒词只能是 2–5 个汉字'
+  const [enrolling, setEnrolling] = useState(false)
+  const [enrollStep, setEnrollStep] = useState(0)
+
+  /** 录 3 次唤醒词；每次说完停一下自动收尾。录音只在内存里，交给主进程提取后即丢弃。 */
+  const enrollVoice = async (wakeName: string): Promise<void> => {
+    if (enrolling) return
+    setEnrolling(true)
+    const wavs: string[] = []
+    try {
+      for (let i = 0; i < 3; i++) {
+        setEnrollStep(i + 1)
+        // 留一拍让界面把"第几次"显示出来，用户看到提示再开口。
+        await new Promise(resolve => setTimeout(resolve, 900))
+        const granted = await window.petApi.asrBegin()
+        if (!granted.ok) { showToast(granted.error ?? '麦克风不可用'); return }
+        const { wav, error } = await recordDictation({ maxDurationMs: 4000, outputSampleRate: 16000 })
+        await window.petApi.asrStreamStop().catch(() => undefined)
+        if (!wav) { showToast(error ?? '没有录到声音，请靠近麦克风重试'); return }
+        wavs.push(arrayBufferToBase64(wav))
+      }
+      const result = await window.petApi.voiceprintEnroll(wavs)
+      if (!result.ok) { showToast(result.error ?? '声纹注册失败'); return }
+      showToast(`声纹已注册（${result.count ?? wavs.length} 段）；现在只认你的声音唤醒`)
+    } catch (cause) {
+      showToast(cause instanceof Error ? cause.message : '声纹注册失败')
+    } finally {
+      setEnrolling(false)
+      setEnrollStep(0)
+    }
+  }
+
   const apply = async (patch: ResidencyPatch, failure: string): Promise<void> => {
     setSaving(true)
     try {
@@ -133,10 +171,85 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
       <label className="management-voice">
         <input type="checkbox" checked={wake.enabled} disabled={saving || wake.engines.length === 0}
           onChange={event => void apply({ wakeEnabled: event.target.checked }, '唤醒设置未保存')} />
-        语音唤醒“小潘同学”
+        语音唤醒“{wake.name}”
         {state.platform === 'darwin' && '（开启后持续采集麦克风，菜单栏会一直显示麦克风占用标识）'}
       </label>
+      <label className="management-sleep">
+        <span>唤醒词</span>
+        <input
+          type="text"
+          value={wakeNameDraft}
+          maxLength={5}
+          disabled={saving}
+          placeholder="2–5 个汉字"
+          onChange={event => setWakeNameDraft(event.target.value)}
+        />
+        <button
+          className="management-button"
+          disabled={saving || wakeNameProblem !== null || wakeNameDraft.trim() === wake.name}
+          onClick={() => {
+            const wasVoiceprint = wake.voiceprint.enabled
+            void apply({
+              wakeName: wakeNameDraft.trim(),
+              wakeEngine: 'kws',
+              ...(wasVoiceprint ? { wakeVoiceprint: false } : {}),
+            }, '唤醒词未保存').then(() => {
+              if (wasVoiceprint) showToast('唤醒词已改：声纹是按旧唤醒词录的，请重新录制后再打开声纹唤醒')
+            })
+          }}
+        >
+          保存
+        </button>
+      </label>
+      {wakeNameProblem !== null && <p className="management-hint">{wakeNameProblem}</p>}
+      <p className="management-hint">
+        改名只对本地唤醒引擎（KWS）生效；System.Speech 仍只认“小潘同学”。保存后会重新加载唤醒模型。
+      </p>
       <p className="management-hint" role="status">唤醒状态：{wakeStatus}</p>
+      <div className="management-sleep">
+        <span>声纹唤醒</span>
+        <input
+          type="checkbox"
+          checked={wake.voiceprint.enabled}
+          disabled={saving || !wake.voiceprint.registered || enrolling}
+          onChange={event => void apply({ wakeVoiceprint: event.target.checked }, '声纹开关未保存')}
+        />
+        <select
+          value={[0.55, 0.65, 0.75].includes(wake.voiceprint.threshold) ? wake.voiceprint.threshold : 0.65}
+          disabled={saving || enrolling}
+          onChange={event => void apply({ wakeVoiceprintThreshold: Number(event.target.value) }, '声纹阈值未保存')}
+        >
+          <option value={0.55}>宽松</option>
+          <option value={0.65}>标准</option>
+          <option value={0.75}>严格</option>
+        </select>
+      </div>
+      <p className="management-hint">
+        {wake.voiceprint.problem ?? (wake.voiceprint.registered
+          ? `已注册 ${wake.voiceprint.count} 段声纹；只有你的声音喊「${wake.name}」才会应。`
+          : '未注册：先录 3 次唤醒词，才能打开“只认我的声纹”。')}
+      </p>
+      {enrollStep > 0 && (
+        <p className="management-hint" role="status">第 {enrollStep}/3 次：请说「{wake.name}」，说完停一下。</p>
+      )}
+      <button className="management-button" disabled={saving || enrolling} onClick={() => void enrollVoice(wake.name)}>
+        {enrolling ? '正在录制…' : wake.voiceprint.registered ? '重新录制声纹（3 次）' : '录制声纹（3 次）'}
+      </button>
+      {wake.voiceprint.registered && (
+        <button
+          className="management-button"
+          disabled={saving || enrolling}
+          onClick={() => void window.petApi.voiceprintClear().then(result => {
+            if (!result.ok) showToast(result.error ?? '声纹删除失败')
+            else showToast('声纹已删除')
+          }).catch(() => showToast('声纹删除失败'))}
+        >
+          删除声纹
+        </button>
+      )}
+      <p className="management-hint">
+        声纹只保存本地加密的声纹特征，不保存原始录音；它降低别人误唤醒，但不能防录音重放。
+      </p>
       {wake.engines.length > 1 && (
         <label className="management-sleep">
           <span>唤醒引擎</span>

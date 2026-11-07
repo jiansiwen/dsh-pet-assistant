@@ -37,6 +37,8 @@ public static class Native {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
   [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
@@ -88,6 +90,50 @@ public static class Native {
     int[] vks = { 0x10, 0x11, 0x12, 0x5B, 0x5C };
     foreach (int vk in vks) { if ((GetAsyncKeyState(vk) & 0x8000) != 0) return true; }
     return false;
+  }
+
+  /**
+   * 把目标窗口切到前台。Windows 的前台锁会拒绝普通后台进程直接 SetForegroundWindow：
+   * 桌面宠物在后台（用户刚在别处点过）时，WPS 已经被打开却切不到前台，讲解就会以
+   * “系统拒绝把目标窗口切到前台”停住。
+   *
+   * 依次尝试：附加到前台/目标窗口线程（AttachThreadInput）→ SetForegroundWindow；
+   * 仍失败时模拟一次 Alt 解除前台锁再试。只切换本脚本已核验过身份的目标窗口。
+   */
+  public static bool ForceForeground(IntPtr h) {
+    if (h == IntPtr.Zero) return false;
+    if (GetForegroundWindow() == h) return true;
+    IntPtr fg = GetForegroundWindow();
+    uint pid1, pid2;
+    uint fgThread = GetWindowThreadProcessId(fg, out pid1);
+    uint targetThread = GetWindowThreadProcessId(h, out pid2);
+    uint current = GetCurrentThreadId();
+    bool attachedFg = false, attachedTarget = false;
+    try {
+      if (fgThread != 0 && fgThread != current) attachedFg = AttachThreadInput(current, fgThread, true);
+      if (targetThread != 0 && targetThread != current && targetThread != fgThread) {
+        attachedTarget = AttachThreadInput(current, targetThread, true);
+      }
+      ShowWindow(h, 9); // SW_RESTORE
+      bool ok = SetForegroundWindow(h);
+      if (!ok) {
+        TapAlt();
+        ok = SetForegroundWindow(h);
+      }
+      return ok || GetForegroundWindow() == h;
+    } finally {
+      if (attachedTarget) AttachThreadInput(current, targetThread, false);
+      if (attachedFg) AttachThreadInput(current, fgThread, false);
+    }
+  }
+
+  /** 一次独立的 Alt 按下/释放：解除 Windows 的前台锁，不输入字符。 */
+  public static void TapAlt() {
+    var a = new INPUT[2];
+    ushort scan = (ushort)MapVirtualKeyW(0x12, 0);
+    a[0].type = 1; a[0].u.ki.wVk = 0x12; a[0].u.ki.wScan = scan; a[0].u.ki.dwFlags = 0;
+    a[1].type = 1; a[1].u.ki.wVk = 0x12; a[1].u.ki.wScan = scan; a[1].u.ki.dwFlags = 2u;
+    SendInput(2, a, Marshal.SizeOf(typeof(INPUT)));
   }
   // 只允许导航键；字符键在这里就被拒绝，不可能经由本脚本输入文本。
   static readonly ushort[] NavKeys = { 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28 };
@@ -183,7 +229,10 @@ function Get-Foreground([IntPtr]$target, $ownerPids) {
   if ($fg -ne [IntPtr]::Zero) {
     $snap.pid = [int][DshUia.Native]::Pid($fg)
     $root = [DshUia.Native]::GetAncestor($fg, 3)
-    $snap.isDialogOfTarget = (($fg -ne $target) -and ($root -eq $target))
+    # 只有真正的对话框才算“弹窗遮挡”：WPS 的浮动工具栏/气泡也是目标窗口的 owned popup，
+    # 但不会挡住讲解；把所有 owned popup 都当弹窗会让讲解在用户一碰工具栏时就暂停。
+    $realDialog = ([DshUia.Native]::ClassName($fg) -eq '#32770') -or (-not [DshUia.Native]::IsWindowEnabled($target))
+    $snap.isDialogOfTarget = ($fg -ne $target) -and ($root -eq $target) -and $realDialog
     $snap.isOwner = ($ownerPids -contains $snap.pid)
   }
   return $snap
@@ -193,7 +242,8 @@ function Get-Foreground([IntPtr]$target, $ownerPids) {
 function Get-DialogState([IntPtr]$h, $doc) {
   if (-not [DshUia.Native]::IsWindowEnabled($h)) { return 'main-disabled' }
   $popup = [DshUia.Native]::GetWindow($h, 6)
-  if ($popup -ne [IntPtr]::Zero -and $popup -ne $h -and [DshUia.Native]::IsWindowVisible($popup)) { return 'owned-popup' }
+  # 同样只认标准对话框；WPS 的工具栏、查找条等 owned popup 不是模态遮挡。
+  if ($popup -ne [IntPtr]::Zero -and $popup -ne $h -and [DshUia.Native]::IsWindowVisible($popup) -and [DshUia.Native]::ClassName($popup) -eq '#32770') { return 'owned-popup' }
   if ($doc -and $doc.hwnd -ne [IntPtr]::Zero -and -not [DshUia.Native]::IsWindowEnabled($doc.hwnd)) { return 'document-disabled' }
   return ''
 }
@@ -320,7 +370,8 @@ function Assert-Foreground($t, $ownerPids) {
   if ($fg.isDialogOfTarget) { return @{ snap = $fg; fail = (New-Fail 'dialog-blocking' '目标应用的弹窗在前台' 'foreground-dialog') } }
   if (-not $fg.isOwner) { return @{ snap = $fg; fail = (New-Fail 'focus-stolen' '前台是其他应用，未操作' 'foreground-other') } }
   if ([DshUia.Native]::IsIconic($t.hwnd)) { [void][DshUia.Native]::ShowWindow($t.hwnd, 9) }
-  [void][DshUia.Native]::SetForegroundWindow($t.hwnd)
+  # ForceForeground 内部已处理前台锁：后台进程直接 SetForegroundWindow 会被系统拒绝。
+  [void][DshUia.Native]::ForceForeground($t.hwnd)
   $sw = [Diagnostics.Stopwatch]::StartNew()
   while ($sw.ElapsedMilliseconds -lt 1500) {
     if ([DshUia.Native]::GetForegroundWindow() -eq $t.hwnd) { return @{ snap = $fg; reclaimed = $true } }

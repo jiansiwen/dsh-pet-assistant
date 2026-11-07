@@ -125,7 +125,11 @@ export class WpsViewTarget implements DocViewTarget {
       }
       return
     }
-    const text = `${PAUSE_TEXT[status.reason]}，讲解已暂停：${status.error.guidance ?? status.error.message}`
+    const detail = `${PAUSE_TEXT[status.reason]}，讲解已暂停：${status.error.guidance ?? status.error.message}`
+    // 弹窗/失焦是可恢复的暂停：必须把恢复方法说出来，否则用户只能看到“暂停”不知道下一步。
+    const text = status.reason === 'dialog' || status.reason === 'focus-lost'
+      ? `${detail}。关掉 WPS 弹窗并把 WPS 切回前台后，说“继续讲解”即可接着讲`
+      : detail
     this.options.notify(text)
     if (status.reason === 'closed' || status.reason === 'document-switched') {
       this.release()

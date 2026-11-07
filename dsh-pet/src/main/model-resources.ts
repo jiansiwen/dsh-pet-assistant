@@ -128,17 +128,17 @@ export const MODEL_MANIFEST: readonly ModelSpec[] = [
   },
   {
     id: 'diarization-embedding',
-    title: '声纹嵌入模型（3D-Speaker ERes2Net base）',
-    purpose: '会议分人时区分不同说话人的音色。只在同一场会议的同一条音轨内比较，不提取、不保存声纹，不建跨会议声纹库。',
-    whenMissing: '会议照常录音和转写，但不会自动分出说话人（纪要里标"未自动分人"）。',
+    title: '声纹嵌入模型（3D-Speaker ERes2NetV2）',
+    purpose: '会议分人时区分不同说话人的音色，唤醒时也用它验证是不是本人。声纹只在本机加密保存，不上传、不建跨会议发言人库。',
+    whenMissing: '会议照常录音和转写，但不会自动分出说话人（纪要里标"未自动分人"）；声纹唤醒不可用。',
     optional: true,
     files: [
-      { path: 'diarization/embedding.onnx', bytes: 39_593_761, sha256: '1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b' },
+      { path: 'diarization/embedding.onnx', bytes: 71_441_526, sha256: 'bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239' },
     ],
     source: {
-      url: `${GITHUB_RELEASES}/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx`,
+      url: `${GITHUB_RELEASES}/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx`,
       kind: 'file',
-      bytes: 39_593_761,
+      bytes: 71_441_526,
       license: 'Apache-2.0（modelscope/3D-Speaker）',
       licenseUrl: 'https://github.com/modelscope/3D-Speaker/blob/main/LICENSE',
     },

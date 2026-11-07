@@ -625,9 +625,15 @@ export type DiarizeResult =
   | { readonly ok: false; readonly reason: 'model-missing' | 'failed' | 'timeout'; readonly message: string }
 
 /** 分离一条音轨的时间轴（16k Int16，从会议 0ms 起）。recorder 依赖注入它，测试换成替身。 */
-export type DiarizeFn = (samples: Int16Array, userDataDir: string) => Promise<DiarizeResult>
+export type DiarizeFn = (samples: Int16Array, userDataDir: string, options?: DiarizeOptions) => Promise<DiarizeResult>
 
 export interface DiarizeOptions {
+  /**
+   * 本场会议人数。2–6 时固定聚类数；省略或 0 时由模型自动估计。
+   *
+   * 已知人数比阈值可靠得多：长会议里同一个人音色会漂，自动聚类容易多分或少分。
+   */
+  readonly numClusters?: number
   /** 聚类阈值：越大分出的人越少。默认 0.5（实测两种系统音色能分开）。 */
   readonly threshold?: number
   /** 分析窗步长比例。默认 0.25：比上游默认 0.1 快约 2.5 倍，实测分段结果一致。 */
@@ -641,12 +647,14 @@ export interface DiarizeOptions {
   readonly forceInline?: boolean
 }
 
-function diarizationConfig(paths: DiarizationModelPaths, opts: DiarizeOptions): OfflineSpeakerDiarizationConfig {
+export function diarizationConfig(paths: DiarizationModelPaths, opts: DiarizeOptions): OfflineSpeakerDiarizationConfig {
   const threads = opts.numThreads ?? Math.max(1, Math.min(4, Math.floor(os.cpus().length / 2)))
+  const numClusters = opts.numClusters !== undefined && opts.numClusters >= 1 && opts.numClusters <= 8
+    ? Math.floor(opts.numClusters) : -1
   return {
     segmentation: { pyannote: { model: paths.segmentation, windowShiftRatio: opts.windowShiftRatio ?? 0.25 }, numThreads: threads },
     embedding: { model: paths.embedding, numThreads: threads },
-    clustering: { numClusters: -1, threshold: opts.threshold ?? 0.5 },
+    clustering: { numClusters, threshold: opts.threshold ?? 0.5 },
     minDurationOn: 0.3,
     minDurationOff: 0.5,
   }

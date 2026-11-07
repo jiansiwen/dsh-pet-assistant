@@ -104,7 +104,7 @@ contextBridge.exposeInMainWorld('petApi', {
       error?: string
     }>,
   /** 让角色闭嘴：掐掉当前这句并丢掉排队的那些。 */
-  stopSpeech: () => ipcRenderer.send('speech-stop'),
+  stopSpeech: (preserveAutoResume?: boolean) => ipcRenderer.send('speech-stop', preserveAutoResume === true),
   /** 只在本机念一句（不进会话、不调模型）。用于"又只喊了一句名字"的本地应答。 */
   speakLocal: (text: string) => ipcRenderer.send('speech-local', text),
   getTeam: () => ipcRenderer.invoke('team-get') as Promise<TeamSnapshot | null>,
@@ -147,13 +147,16 @@ contextBridge.exposeInMainWorld('petApi', {
   onTtsStop: (callback: (payload: { id: string }) => void) => listen('tts-stop', callback),
   /** 渲染层播放的实际开始 / 播完 / 停下回执。 */
   ttsPlaybackReceipt: (receipt: PlaybackReceiptPayload) => ipcRenderer.send('tts-playback-receipt', receipt),
-  /** 插话检出（已在本地止声）：主进程据此停掉整段播报并把设备留给听写。 */
+  /** 插话检出：先把设备留给听写；命中停止口令后才由 speech-stop 停掉整段播报。 */
   bargeInDetected: (payload: { onsetAtMs: number; detectedAtMs: number; playing: boolean }) => ipcRenderer.send('barge-in-detected', payload),
   /** 插话埋点（两段延迟），只记时间不记音频。 */
   bargeInMetrics: (metrics: BargeInMetrics) => ipcRenderer.send('barge-in-metrics', metrics),
   /** 常驻 / 唤醒 / 开机自启 / 外放插话 的状态与设置。 */
   residencyState: () => ipcRenderer.invoke('residency-state') as Promise<ResidencyState>,
   residencySet: (patch: ResidencyPatch) => ipcRenderer.invoke('residency-set', patch) as Promise<ResidencyResult>,
+  voiceprintStatus: () => ipcRenderer.invoke('voiceprint-status') as Promise<{ registered: boolean; count: number; createdAt: number | null; problem: string | null }>,
+  voiceprintEnroll: (wavs: string[]) => ipcRenderer.invoke('voiceprint-enroll', wavs) as Promise<{ ok: boolean; count?: number; error?: string }>,
+  voiceprintClear: () => ipcRenderer.invoke('voiceprint-clear') as Promise<{ ok: boolean; removed?: boolean; error?: string }>,
   openReportDir: () => ipcRenderer.invoke('open-report-dir') as Promise<{ ok: boolean }>,
   openReportWorkbench: () => ipcRenderer.invoke('report-workbench-open') as Promise<{ ok: boolean }>,
   startRuntime: (profile?: string) => ipcRenderer.invoke('runtime-start', profile) as Promise<{ ok: boolean }>,
@@ -267,6 +270,9 @@ contextBridge.exposeInMainWorld('petApi', {
   meetingFlushDone: (meetingId: string, report?: MeetingFlushReport) =>
     ipcRenderer.invoke('meeting-flush-done', meetingId, report) as Promise<SimpleOkResult>,
   meetingState: () => ipcRenderer.invoke('meeting-state') as Promise<MeetingRuntimeState>,
+  /** 删除整场会议（录音、转写与纪要）；主进程会先弹原生确认。 */
+  meetingDelete: (meetingId: string) =>
+    ipcRenderer.invoke('meeting-delete', meetingId) as Promise<SimpleOkResult>,
   meetingTranscribe: (meetingId: string) =>
     ipcRenderer.invoke('meeting-transcribe', meetingId) as Promise<SimpleOkResult>,
   /** 只重试转写失败的片段（缺口占位段），其余段与用户的修订不动。复用 meeting-transcribe 通道。 */

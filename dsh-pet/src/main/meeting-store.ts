@@ -1535,6 +1535,45 @@ export class MeetingStore {
     return { ok: true }
   }
 
+  /**
+   * 删除整场会议：录音文件、转写、纪要、产物登记、助理播报区间与讲解记录一并清掉。
+   *
+   * 录音中不删（采集端还在写块）；先删目录再删行 —— 目录删不掉就整场都不删，
+   * 不会留下"行没了、加密录音还躺在盘上"的半截状态。
+   */
+  deleteMeeting(meetingId: string): { ok: true } | { ok: false; error: string } {
+    const meeting = this.getMeeting(meetingId)
+    if (meeting === null) return { ok: false, error: '没有这场会议' }
+    if (meeting.state === 'recording') return { ok: false, error: '会议还在录制，停止后才能删除' }
+    const dir = this.meetingDir(meetingId)
+    try {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+    } catch (error) {
+      return { ok: false, error: `会议录音目录删不掉（可能被占用）：${error instanceof Error ? error.message : String(error)}` }
+    }
+    this.db.exec('BEGIN')
+    try {
+      this.db.prepare('DELETE FROM chunks WHERE meetingId = ?').run(meetingId)
+      this.db.prepare('DELETE FROM transcript_segments WHERE meetingId = ?').run(meetingId)
+      this.db.prepare('DELETE FROM transcript_meta WHERE meetingId = ?').run(meetingId)
+      this.db.prepare('DELETE FROM minutes WHERE meetingId = ?').run(meetingId)
+      this.db.prepare('DELETE FROM minutes_artifacts WHERE meetingId = ?').run(meetingId)
+      this.db.prepare('DELETE FROM assistant_speech WHERE meetingId = ?').run(meetingId)
+      // 讲解记录整份加密，meetingId 在密文里；逐条解密匹配，只删这场会议的。
+      const presentations = this.db.prepare('SELECT id FROM meeting_presentations').all() as Row[]
+      const dropPresentation = this.db.prepare('DELETE FROM meeting_presentations WHERE id = ?')
+      for (const row of presentations) {
+        if (this.getMeetingPresentation(String(row.id))?.meetingId === meetingId) dropPresentation.run(String(row.id))
+      }
+      this.db.prepare('DELETE FROM meetings WHERE id = ?').run(meetingId)
+      this.db.exec('COMMIT')
+      return { ok: true }
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* 事务可能已由 SQLite 回滚 */ }
+      return { ok: false, error: `会议记录删除失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
   // ===== 保留期 =====
 
   /**

@@ -20,9 +20,11 @@ $ProgressPreference = 'SilentlyContinue'
 $sherpaUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.7/sherpa-onnx-v1.13.7-win-x64-static-MD-Release-no-tts.tar.bz2'
 $modelUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2'
 $streamUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.tar.bz2'
-# Speaker diarization for meetings (pyannote segmentation + 3D-Speaker embedding); runs locally, audio never uploaded.
+# Meeting diarization and owner voiceprint (pyannote segmentation + 3D-Speaker ERes2NetV2 embedding); runs locally, audio never uploaded.
 $segUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2'
-$embUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx'
+$embUrl = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx'
+# 升级声纹模型时改这个标记：旧模型会被重新下载，会议分人与唤醒声纹共用同一份。
+$embTag = 'eres2netv2_zh-cn_16k-common'
 # Wake word ("xiao pan xiao pan") keyword spotter for local wake (M1-02): sherpa-onnx official kws-models release,
 # zipformer trained on WenetSpeech, ~3.3M params, pinyin initials/finals as tokens. License: Apache-2.0 (model README).
 # 15,292,881 bytes; sha256 from the release's checksum.txt (verified below before extracting).
@@ -46,6 +48,9 @@ $streamFiles = @('encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', '
 $diarDir = Join-Path $Dest 'diarization'
 $segOnnx = Join-Path $diarDir 'segmentation.onnx'
 $embOnnx = Join-Path $diarDir 'embedding.onnx'
+$embVersion = Join-Path $diarDir 'embedding.version.txt'
+$embCurrent = if (Test-Path $embVersion) { [string](Get-Content $embVersion -Raw) } else { '' }
+$embReady = (Test-Path $embOnnx) -and ($embCurrent.Trim() -eq $embTag)
 $kwsDir = Join-Path $Dest 'kws'
 $kwsFiles = @('encoder.int8.onnx', 'decoder.onnx', 'joiner.int8.onnx', 'tokens.txt')
 $kwsReady = @($kwsFiles | Where-Object { -not (Test-Path (Join-Path $kwsDir $_)) }).Count -eq 0
@@ -133,7 +138,7 @@ try {
         }
     }
 
-    if (-not (Test-Path $segOnnx) -or -not (Test-Path $embOnnx)) {
+    if (-not (Test-Path $segOnnx) -or -not $embReady) {
         New-Item -ItemType Directory -Force -Path $diarDir | Out-Null
         if (-not (Test-Path $segOnnx)) {
             $pack = Join-Path $tmp 'segmentation.tar.bz2'
@@ -146,11 +151,12 @@ try {
             if ($null -ne $license) { Copy-Item $license.FullName (Join-Path $diarDir 'LICENSE.segmentation.txt') -Force }
             Copy-Item $foundSeg.FullName $segOnnx -Force
         }
-        if (-not (Test-Path $embOnnx)) {
+        if (-not $embReady) {
             $file = Join-Path $tmp 'embedding.onnx'
             Fetch $embUrl $file
             if ((Get-Item $file).Length -lt 1MB) { throw 'speaker embedding model looks truncated' }
             Copy-Item $file $embOnnx -Force
+            Set-Content -Path $embVersion -Value $embTag -Encoding utf8
         }
     }
 

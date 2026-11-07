@@ -11,7 +11,7 @@ const ROOT = '/companion/v1/members'
 interface Options {
   getStageWindow(): BrowserWindow | null
   pagePath: string
-  request(method: string, pathname: string, body: unknown, subject: 'owner'): Promise<{ status: number; body: unknown }>
+  request(method: string, pathname: string, body: unknown, subject: 'owner', timeoutMs?: number): Promise<{ status: number; body: unknown }>
   /** 额外放行的窗口（成员编辑窗口）；必须自行核对 sender、主框架与固定本地地址。 */
   allowWindow?(event: IpcMainInvokeEvent): boolean
   /** 原生确认的父窗口；缺省用舞台。编辑窗口发起的保存要显示在编辑窗口上。 */
@@ -66,7 +66,7 @@ function draft(value: RecordValue, writing = false): MemberDraft {
     displayName: text(value.displayName, 80), description: text(value.description, 2000), personality: text(value.personality, 2000),
     permissionMode: choice(value.permissionMode, ['ask', 'auto', 'full']), persona: text(value.persona, 8000),
     skinId: text(value.skinId, 128), enabled: bool(value.enabled), provider: text(value.provider, 128), model: text(value.model, 256),
-    maxTokens: integer(value.maxTokens, 1, 32768), capabilities: list(value.capabilities, item => choice(item, MEMBER_CAPABILITIES)),
+    maxTokens: integer(value.maxTokens, 1, 131072), capabilities: list(value.capabilities, item => choice(item, MEMBER_CAPABILITIES)),
     allowedTools: list(value.allowedTools, item => text(item, 128)), dailyTokenLimit: integer(value.dailyTokenLimit),
     totalTokenLimit: integer(value.totalTokenLimit), thresholdPercent: integer(value.thresholdPercent, 1, 100), timezone: text(value.timezone, 128),
   }
@@ -281,6 +281,11 @@ function parseAssist(raw: unknown): { request: string; current?: MemberDraft } {
   return { request, ...(input.current === undefined ? {} : { current: draft(record(input.current)) }) }
 }
 function failure(code: string): MemberResult { return { ok: false, error: { code, message: messages[code] ?? messages.unavailable! } } }
+/**
+ * 成员配置助手最长允许模型想 90 秒；桌面端原来沿用 10 秒的审批超时，
+ * 模型稍慢就报"回执异常、结果未知"。这条请求单独放宽，其他成员请求仍是 10 秒。
+ */
+const ASSIST_TIMEOUT_MS = 120_000
 /** 删除被业务规则挡住时保留宿主的中文原因，不把内部错误或凭据带出来。 */
 class MemberConflict extends Error {}
 
@@ -302,7 +307,8 @@ export function registerMemberManagement(options: Options): () => void {
     flags: { keepConflictMessage?: boolean } = {}): Promise<unknown> {
     if (!allowed(event)) throw new Error('denied')
     let response: { status: number; body: unknown }
-    try { response = await options.request(method, path, body, 'owner') } catch { throw new Error('unavailable') }
+    const timeoutMs = path.endsWith('/assist') ? ASSIST_TIMEOUT_MS : undefined
+    try { response = await options.request(method, path, body, 'owner', timeoutMs) } catch { throw new Error('unavailable') }
     if (!allowed(event)) throw new Error('denied')
     if (response.status === 409) {
       if (flags.keepConflictMessage) {

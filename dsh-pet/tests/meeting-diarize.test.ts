@@ -18,6 +18,7 @@ import {
   ASSISTANT_SPEAKER,
   applyAssistantSpeech,
   compressSilence,
+  diarizationConfig,
   diarizationModelPaths,
   diarizationModelStatus,
   diarizeTimelineSamples,
@@ -222,6 +223,28 @@ describe('会后精修：同一会议内自动分人（分离替身）', () => {
     assert.ok(minutes?.content.includes('对方·发言人1（说话人未经确认）：对方丙说话'))
     assert.ok(minutes?.content.includes('转写说明：已自动分人'))
     h.store.close()
+  })
+
+  test('会议页设置每轨人数时，按轨把 numClusters 传给分人模型', async () => {
+    const h = setupRecorder({ speakerCounts: () => ({ mic: 2, loopback: 1 }) })
+    await recordAndRefine(h)
+    assert.deepEqual(h.diarizeOptions.map(options => options?.numClusters), [2, 1], '两条音轨各用自己的人数，不共用一个全场人数')
+    h.store.close()
+  })
+
+  test('人数保持自动时不传 numClusters', async () => {
+    const h = setupRecorder({ speakerCounts: () => ({ mic: 0, loopback: 0 }) })
+    await recordAndRefine(h)
+    assert.deepEqual(h.diarizeOptions, [undefined, undefined])
+    h.store.close()
+  })
+
+  test('聚类配置：2–6 人固定人数，其余回落到自动', () => {
+    const paths = { segmentation: 'seg.onnx', embedding: 'emb.onnx' }
+    assert.equal(diarizationConfig(paths, { numClusters: 4 }).clustering?.numClusters, 4)
+    assert.equal(diarizationConfig(paths, { numClusters: 1 }).clustering?.numClusters, 1, '单轨只有一个人时也允许固定')
+    assert.equal(diarizationConfig(paths, {}).clustering?.numClusters, -1)
+    assert.equal(diarizationConfig(paths, { numClusters: 9 }).clustering?.numClusters, -1)
   })
 
   test('改名/合并/拆分对自动分出的组照常有效', async () => {
@@ -554,17 +577,17 @@ describe('没人说话不是失败', () => {
   })
 })
 
-describe('IPC 面：分轨协议与局部重试不新增通道', () => {
+describe('IPC 面：分轨协议与局部重试不新增通道，删除会议单独一条', () => {
   test('meeting-chunk 把分轨 meta 交给 recorder 校验；局部重试走 meeting-transcribe 的 failed-only 模式', async () => {
     const failValues = new Set([6000])
     const h = setupRecorder({ transcribe: transcribeByValue(DEFAULT_WORDS, { failValues }) })
     const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
     registerMeetingIpc({ ipc: { handle: (channel, listener) => { handlers.set(channel, listener) } }, recorder: h.recorder })
     assert.deepEqual([...handlers.keys()].sort(), [
-      'meeting-chunk', 'meeting-flush-done', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-speaker-merge',
+      'meeting-chunk', 'meeting-delete', 'meeting-flush-done', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-speaker-merge',
       'meeting-speaker-rename', 'meeting-speaker-split', 'meeting-speakers', 'meeting-start', 'meeting-state',
       'meeting-stop', 'meeting-track-missing', 'meeting-transcribe',
-    ], '通道清单与之前完全一致：分轨/重试都走既有通道的新参数')
+    ], '通道清单只新增了删除会议一条：分轨/重试仍走既有通道的新参数')
     const call = (channel: string, ...args: unknown[]): unknown => (handlers.get(channel) as (event: unknown, ...rest: unknown[]) => unknown)({}, ...args)
 
     const started = call('meeting-start', CONSENT_MIC) as { ok: boolean; meetingId: string }

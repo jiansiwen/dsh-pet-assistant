@@ -234,6 +234,9 @@ export function wakeEngines(platform: SupportedPlatform): readonly WakeEngine[] 
 }
 
 export function defaultWakeEngine(platform: SupportedPlatform): WakeEngine | null {
+  // Windows 的 System.Speech 拿不到它正在听的音频，没法做声纹验证，也不支持自定义唤醒词。
+  // KWS 是唯一两条都能做到的引擎，缺省就选它；System.Speech 仍保留给不需要这两项的用户。
+  if (platform === 'win32') return 'kws'
   return wakeEngines(platform)[0] ?? null
 }
 

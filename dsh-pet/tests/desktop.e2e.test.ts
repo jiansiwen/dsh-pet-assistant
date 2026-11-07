@@ -34,6 +34,18 @@ mock.module('../src/main/wake.ts', {
     },
   },
 })
+// Windows 缺省引擎已切到 KWS；测试替身只记录会话起停，不加载真模型。
+const kwsStarts: number[] = []
+let kwsStops = 0
+mock.module('../src/main/kws.ts', {
+  namedExports: {
+    kwsModelProblem: () => null,
+    startKws: () => {
+      kwsStarts.push(Date.now())
+      return { feed: () => {}, stop: () => { kwsStops += 1 }, running: true }
+    },
+  },
+})
 
 /** Narrator 的替身。静态收集实例，测试经它控制 isSpeaking 与核对调用。 */
 class FakeNarrator {
@@ -323,7 +335,7 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
   assert.equal(trays.length, 1, '托盘建了一个')
   assert.deepEqual(registeredShortcuts, ['CommandOrControl+Alt+P'],
     '主选注册成功就停手；备选 Ctrl+Alt+Space 只在主选被占用时兜底')
-  assert.equal(wakeStarts.length, 1, 'boot 后唤醒监听被仲裁器拉起一次（mock 的，没起真 PowerShell）')
+  assert.equal(kwsStarts.length, 1, 'boot 后 KWS 唤醒被仲裁器拉起一次（替身，不加载真模型）')
   assert.equal(playHostCalls.starts, 1, '唤醒应答的常驻播放进程在装配时预热一次')
 })
 
@@ -411,9 +423,11 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     // 外部证据收件（M3-03 / M4-06 后续）：主进程弹原生确认框，用户同意后才上报。
     'evidence-intake-minutes', 'evidence-intake-window',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
-    'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
+    'meeting-state', 'meeting-delete', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-todo-import',
     'audio-sync', 'residency-state', 'residency-set',
+    // 声纹唤醒：注册只接收舞台窗口送来的 WAV，只落加密特征；状态查询不返回 embedding。
+    'voiceprint-status', 'voiceprint-enroll', 'voiceprint-clear',
     // 成员目录、成员编辑窗口与额度（团队管理）。
     'members-state', 'member-command', 'member-memories', 'member-assist',
     'member-editor-open', 'member-editor-context', 'member-editor-close',
@@ -457,7 +471,7 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'stage-set-visible', 'stage-set-focus',
     'doc-open', 'doc-explain', 'doc-ask', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
-    'meeting-state', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
+    'meeting-state', 'meeting-delete', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
     'exit-done',
     'audio-sync', 'kws-feed', 'audio-consumer-lost', 'tts-playback-receipt', 'barge-in-detected', 'barge-in-metrics',
@@ -479,14 +493,14 @@ test('会话和浮层通道拒绝非舞台窗口的调用', async () => {
 test('stage-set-focus：专注模式掐掉唤醒监听，退出专注再恢复 —— 麦克风只有一个主人', () => {
   const setFocus = ipcListeners.get('stage-set-focus')
   assert.ok(setFocus)
-  const startsBefore = wakeStarts.length
-  const stopsBefore = wakeStops
+  const startsBefore = kwsStarts.length
+  const stopsBefore = kwsStops
 
   setFocus({} as object, true)
-  assert.equal(wakeStops, stopsBefore + 1, '专注开始：唤醒监听停掉，参会者的话不该被当指令')
+  assert.equal(kwsStops, stopsBefore + 1, '专注开始：唤醒监听停掉，参会者的话不该被当指令')
 
   setFocus({} as object, false)
-  assert.equal(wakeStarts.length, startsBefore + 1, '专注结束：唤醒监听恢复')
+  assert.equal(kwsStarts.length, startsBefore + 1, '专注结束：唤醒监听恢复')
   assert.ok(lastSent('companion-state') !== undefined, '状态变化投影到了界面')
 })
 
@@ -499,8 +513,8 @@ test('会议回环声：装配时注册了桌面采集授权，否则永远只�
 test('presentation-mode：只藏历史与提醒，不动麦克风、不动专注模式', () => {
   const setPresentation = ipcListeners.get('presentation-mode')
   assert.ok(setPresentation)
-  const wakesBefore = wakeStarts.length
-  const stopsBefore = wakeStops
+  const wakesBefore = kwsStarts.length
+  const stopsBefore = kwsStops
   const focusBefore = (lastSent('companion-state') as { focusMode?: boolean } | undefined)?.focusMode
 
   setPresentation({} as object, true)
@@ -508,8 +522,8 @@ test('presentation-mode：只藏历史与提醒，不动麦克风、不动专注
   assert.equal(after?.presentationMode, true, '状态投影到界面：渲染层据此隐藏历史与预览')
   assert.equal(after?.focusMode, focusBefore ?? false, '演示不该顺带打开/关闭专注模式')
   assert.equal(after?.stageVisible, true, '角色不该被隐藏：演示时用户还要看它讲解')
-  assert.equal(wakeStarts.length, wakesBefore, '不重启唤醒监听')
-  assert.equal(wakeStops, stopsBefore, '麦克风不受影响：演示时还要插话')
+  assert.equal(kwsStarts.length, wakesBefore, '不重启唤醒监听')
+  assert.equal(kwsStops, stopsBefore, '麦克风不受影响：演示时还要插话')
 
   setPresentation({} as object, false)
   const off = lastSent('companion-state') as { presentationMode?: boolean } | undefined
@@ -554,7 +568,7 @@ test('before-quit：第一次挡下退出收尾，收尾完放行第二次；资
   beforeQuit({ preventDefault: () => { prevented = true } })
   assert.equal(prevented, true, '第一次退出要被挡下：子进程静止要等事件循环，阻塞主线程等不到')
   assert.equal(shortcutsCleared, 1, '全局快捷键先摘掉')
-  assert.equal(wakeStops > 0, true, '唤醒监听已停')
+  assert.equal(kwsStops > 0, true, '唤醒监听已停')
   assert.equal(narrator.disposed, 1, '合成器释放一次')
   assert.equal(playHostCalls.stops >= 1, true, '常驻播放进程随退出收尾，不留空闲 PowerShell')
   assert.ok(ipcRemoved.some(item => item.channel === 'approval-open'), '审批通道已摘：退出过程中不该留能签发批准的窗口')

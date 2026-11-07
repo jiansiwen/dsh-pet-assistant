@@ -208,11 +208,16 @@ export interface RecordOptions {
   grantTimeoutMs?: number
   /** 测试注入的墙钟（兜底超时用）。 */
   now?: () => number
+  /** 本次录音的硬上限；默认 60 秒。声纹注册这类固定短语用更短的值。 */
+  maxDurationMs?: number
+  /** 输出的 WAV 采样率；目前只支持 16000（声纹模型只吃 16k）。不传保持设备原始采样率。 */
+  outputSampleRate?: 16000
 }
 
 export async function recordDictation(options: RecordOptions = {}): Promise<DictationResult> {
   const capture = options.capture ?? sharedCapture()
   const now = options.now ?? (() => Date.now())
+  const maxDurationMs = options.maxDurationMs ?? MAX_DURATION_MS
   if (!await capture.waitForGrant('dictation', options.grantTimeoutMs ?? 1500)) {
     console.error('[dictation] capture grant missing')
     return { wav: null, error: '麦克风没有授权给听写，请再试一次' }
@@ -269,7 +274,7 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
         silenceMs = 0
       }
     }
-    if (elapsedMs >= MAX_DURATION_MS) finished = true
+    if (elapsedMs >= maxDurationMs) finished = true
   }
 
   let subscription: CaptureSubscription
@@ -324,7 +329,7 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
       const check = (): void => {
         // 音频回调可能整体不来（设备挂起等）。兜底判据不看回调，只看墙钟：
         // 超过硬上限强制收——交互上点两下总能完成一次听写，不存在永久卡住的路径。
-        if (!finished && now() - startedAt >= MAX_DURATION_MS + 3000) finished = true
+        if (!finished && now() - startedAt >= maxDurationMs + 3000) finished = true
         if (!finished) {
           setTimeout(check, 50)
           return
@@ -342,7 +347,9 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
           merged.set(chunk, offset)
           offset += chunk.length
         }
-        resolve({ wav: encodeWav(merged, sampleRate) })
+        const output = options.outputSampleRate === 16000 && sampleRate !== 16000
+          ? resampleTo16k(merged, sampleRate) : merged
+        resolve({ wav: encodeWav(output, options.outputSampleRate ?? sampleRate) })
       }
       setTimeout(check, 50)
     })

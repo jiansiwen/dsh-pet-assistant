@@ -127,7 +127,7 @@ test('非法分类、字段、版本和数值在请求前拒绝', async () => {
     ['agent', { expectedRevision: 7, ...snapshot().agent, maxTokens: 0 }],
     ['agent', { expectedRevision: 7, ...snapshot().agent, tokenBudget: -1 }],
     ['agent', { expectedRevision: 7, ...snapshot().agent, tokenBudget: Infinity }],
-    ['agent', { expectedRevision: 7, ...snapshot().agent, maxTokens: 32769 }],
+    ['agent', { expectedRevision: 7, ...snapshot().agent, maxTokens: 131073 }],
     ['agent', { expectedRevision: 7, ...snapshot().agent, tokenBudget: 10_000_001 }],
     ['agent', { expectedRevision: 7, ...snapshot().agent, provider: '仅填服务商' }],
     ['agent', { expectedRevision: 7, ...snapshot().agent, name: ' ' }],

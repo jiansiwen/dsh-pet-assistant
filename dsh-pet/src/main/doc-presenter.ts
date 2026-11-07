@@ -643,6 +643,17 @@ export function describeStatus(status: PresenterStatus): string {
   return `${status.playing ? '正在讲解' : '等待播放'}，页面随实际播放推进${scanned}`
 }
 
+// ── 视图选择 ──────────────────────────────────────────────────────────────
+
+/** 用户点名的视图优先；'auto' 只在出声的 PDF 且 WPS 可用时才选 WPS，其余回退内置阅读视图。 */
+export function chooseDocVia(
+  requested: 'reading' | 'wps' | 'auto',
+  options: { readonly speak: boolean; readonly pdf: boolean; readonly wpsReady: boolean },
+): 'reading' | 'wps' {
+  if (requested !== 'auto') return requested
+  return options.speak && options.pdf && options.wpsReady ? 'wps' : 'reading'
+}
+
 // ── 视图目标接口（阅读视图窗口与 WPS 适配器共用） ──────────────────────────
 
 /** 视图无法展示这份文档的原因。全部有明确措辞，不留"加载失败"这种让人猜的说法。 */

@@ -10,7 +10,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { INITIAL_AUDIO_STATE, nextAudio, type AudioEvent, type AudioState, type AudioTransition } from '../src/main/audio.ts'
-import type { DiarizeFn, DiarizeResult } from '../src/main/diarize.ts'
+import type { DiarizeFn, DiarizeOptions, DiarizeResult } from '../src/main/diarize.ts'
 import { MeetingRecorder, type MeetingAsrResult, type MeetingChunkMeta } from '../src/main/meeting-recorder.ts'
 import { MeetingStore, type MeetingConsentInput, type MeetingTrack } from '../src/main/meeting-store.ts'
 
@@ -53,11 +53,14 @@ export interface Harness {
   readonly transcribed: Int16Array[]
   /** 每次分离调用拿到的样本。 */
   readonly diarized: Int16Array[]
+  /** 每次分离调用拿到的选项（按调用顺序）。 */
+  readonly diarizeOptions: Array<DiarizeOptions | undefined>
 }
 
 export function setupRecorder(opts: {
   transcribe?: TranscribeFn
   diarize?: DiarizeFn
+  speakerCounts?: () => { mic: number; loopback: number }
   liveCaptions?: boolean
   flushTimeoutMs?: number
   dir?: string
@@ -74,6 +77,7 @@ export function setupRecorder(opts: {
   const events: Array<{ channel: string; payload: unknown }> = []
   const transcribed: Int16Array[] = []
   const diarized: Int16Array[] = []
+  const diarizeOptions: Array<DiarizeOptions | undefined> = []
   const transcribe = opts.transcribe ?? transcribeByValue(DEFAULT_WORDS)
   const diarize = opts.diarize ?? diarizeByValue(DEFAULT_SPEAKERS)
   const recorder = new MeetingRecorder({
@@ -89,15 +93,17 @@ export function setupRecorder(opts: {
       transcribed.push(wavSamples(wav))
       return transcribe(wav, userDataDir)
     },
-    diarize: async (samples, userDataDir) => {
+    diarize: async (samples, userDataDir, options) => {
       diarized.push(samples.slice())
-      return diarize(samples, userDataDir)
+      diarizeOptions.push(options)
+      return diarize(samples, userDataDir, options)
     },
+    ...(opts.speakerCounts !== undefined ? { speakerCounts: opts.speakerCounts } : {}),
     ...(opts.liveCaptions !== undefined ? { liveCaptions: opts.liveCaptions } : {}),
     now: clock.now,
     ...(opts.flushTimeoutMs !== undefined ? { flushTimeoutMs: opts.flushTimeoutMs } : {}),
   })
-  return { dir, recorder, store, clock, events, audioState: () => audioState, transcribed, diarized }
+  return { dir, recorder, store, clock, events, audioState: () => audioState, transcribed, diarized, diarizeOptions }
 }
 
 // ===== 合成 PCM =====
