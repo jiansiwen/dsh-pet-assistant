@@ -22,10 +22,16 @@ export interface CompanionTaskMeta {
   blocker: CompanionBlocker
 }
 
+/** 受管执行器任务的输入：kind 限契约内的非内置类型，字段由注册执行器自己的校验器逐项验证。 */
+export interface ManagedTaskInput {
+  kind: Exclude<CompanionTaskKind, 'agent' | 'reminder'>
+  [field: string]: unknown
+}
+
 export interface CompanionInputRecord {
   inputRef: string
   principalId: string
-  input: CompanionInput
+  input: CompanionInput | ManagedTaskInput
   digest: string
   createdAt: number
 }

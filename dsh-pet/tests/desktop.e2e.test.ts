@@ -441,6 +441,12 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'office-view-fullscreen', 'office-view-close',
     // 助理设置页（渠道与邮箱）。
     'assistant-settings-state', 'assistant-settings-save',
+    // 形象与音色工作室（底座 4.8/4.9）：工作室窗口专用通道，发送方校验只认该窗口。
+    'custom-skins-list', 'asset-studio-open',
+    'asset-studio-state', 'asset-studio-save-providers', 'asset-studio-test-provider',
+    'asset-studio-start-job', 'asset-studio-cancel-job', 'asset-studio-rerun-post',
+    'asset-studio-apply-skin', 'asset-studio-delete-skin', 'asset-studio-pick-audio',
+    'asset-studio-start-clone', 'asset-studio-apply-voice', 'asset-studio-revoke-voice',
   ]
   assert.deepEqual([...ipcListeners.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedOn].sort())
   assert.deepEqual([...ipcHandlers.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedHandle].sort())
@@ -476,6 +482,7 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'exit-done',
     'audio-sync', 'kws-feed', 'audio-consumer-lost', 'tts-playback-receipt', 'barge-in-detected', 'barge-in-metrics',
     'residency-state', 'residency-set',
+    'custom-skins-list', 'asset-studio-open',
   ]
   for (const channel of exposed) {
     assert.ok(ipcHandlers.has(channel) || ipcListeners.has(channel), `preload 暴露了 ${channel}，主进程没接`)

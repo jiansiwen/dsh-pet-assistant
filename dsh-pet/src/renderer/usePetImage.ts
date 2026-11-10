@@ -5,6 +5,10 @@
  * 素材按皮肤在模块级共享缓存，见 loadSkinImages / loadSkinFrames。
  */
 import { useEffect, useState } from 'react'
+import { isCustomSkinId } from './custom-skin-registry.ts'
+
+/** 自定义皮肤素材在 userData，相对路径探不到，走主进程 pet-asset 协议。 */
+const assetBase = (skin: string): string => (isCustomSkinId(skin) ? 'pet-asset://custom/pets/' : '../assets/pets/')
 
 function removeBackground(img: HTMLImageElement): string | null {
   const w = img.naturalWidth
@@ -68,7 +72,7 @@ function removeBackground(img: HTMLImageElement): string | null {
   return canvas.toDataURL()
 }
 
-function loadOne(file: string): Promise<string | null> {
+function loadOne(file: string, base: string): Promise<string | null> {
   return new Promise(resolve => {
     const img = new Image()
     img.onload = () => {
@@ -79,7 +83,7 @@ function loadOne(file: string): Promise<string | null> {
       }
     }
     img.onerror = () => resolve(null)
-    img.src = `../assets/pets/${file}`
+    img.src = `${base}${file}`
   })
 }
 
@@ -129,7 +133,7 @@ export const FRAME_ACTIONS = [
 export const FRAME_MAX = 96
 
 const frameUrl = (skin: string, action: string, n: number) =>
-  `../assets/pets/frames/${skin}/${action}/f${String(n).padStart(3, '0')}.png`
+  `${assetBase(skin)}frames/${skin}/${action}/f${String(n).padStart(3, '0')}.png`
 
 export type SkinFrames = Partial<Record<string, string[]>>
 export type SkinVideos = Partial<Record<string, string>>
@@ -151,7 +155,7 @@ export function loadSkinImages(skin: string): Promise<SkinImages> {
   const cached = imagesCache.get(skin)
   if (cached) return cached
   const task = Promise.all(
-    SKIN_IMAGE_KEYS.map((key) => loadOne(fileFor(skin, key)).then((src) => [key, src] as const)),
+    SKIN_IMAGE_KEYS.map((key) => loadOne(fileFor(skin, key), assetBase(skin)).then((src) => [key, src] as const)),
   ).then((entries) => {
     const map: SkinImages = {}
     for (const [key, src] of entries) if (src) map[key] = src
@@ -203,7 +207,7 @@ export function clearPetAssetCache(): void {
 }
 
 const videoUrl = (skin: string, action: string) =>
-  `../assets/pets/webm/${skin}/${action}.webm`
+  `${assetBase(skin)}webm/${skin}/${action}.webm`
 
 /** 目前只有熊猫有 24fps 视频；其他皮肤继续走静态图/序列帧。 */
 const VIDEO_SKINS = new Set(['panda'])
@@ -240,7 +244,7 @@ function probeVideo(url: string): Promise<string | null> {
 export function loadSkinVideos(skin: string): Promise<SkinVideos> {
   const cached = videosCache.get(skin)
   if (cached) return cached
-  if (!VIDEO_SKINS.has(skin)) {
+  if (!VIDEO_SKINS.has(skin) && !isCustomSkinId(skin)) {
     const empty = Promise.resolve({})
     videosCache.set(skin, empty)
     return empty

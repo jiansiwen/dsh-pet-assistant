@@ -6,6 +6,7 @@ import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { MAX_RECENT_DIRS } from './document.ts'
+import { isCustomSkin } from './custom-skins.ts'
 import { isSafeProfileName } from './runtime-launch.ts'
 
 export type PetId = 'panda' | 'girl-glasses' | 'boy-glasses'
@@ -53,7 +54,7 @@ export interface PetSettings {
    * 只有 `skin`：人设、语音、模型与工具权限都是职责，归插件侧的团队配置管，桌面壳不碰 ——
    * 换个皮肤不该顺带改掉谁能写文件（design.md §2.2「换形象不换身份和记忆」）。
    */
-  characters?: Record<string, { skin: PetId }>
+  characters?: Record<string, { skin: string }>
   /**
    * 允许查找并讲解文档的目录（design.md §2.10："先在授权目录和用户最近选择范围内查找"）。
    *
@@ -119,10 +120,12 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.positions = positions
 
   // 形象同理逐个校验：皮肤名不认识就丢掉那一条。丢掉之后角色回落到插件下发的 skinId
-  // 或编制默认，而不是变成一只探测不到素材的空白角色。
-  const characters: Record<string, { skin: PetId }> = {}
+  // 或编制默认，而不是变成一只探测不到素材的空白角色。自定义皮肤以登记簿为准。
+  const characters: Record<string, { skin: string }> = {}
   for (const [key, value] of Object.entries(merged.characters ?? {})) {
-    if (key && value && VALID_PETS.includes(value.skin)) characters[key] = { skin: value.skin }
+    if (key && value && (VALID_PETS.includes(value.skin as PetId) || isCustomSkin(app.getPath('userData'), value.skin))) {
+      characters[key] = { skin: value.skin }
+    }
   }
   merged.characters = characters
 

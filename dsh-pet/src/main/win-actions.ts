@@ -334,6 +334,13 @@ export interface WinDesktopActions extends DesktopActions {
    * 只有 Windows 有：macOS 侧还没实现（见 `supportsForegroundText`），调用方要按平台拦。
    */
   readForegroundText(grant: TextReadGrant): Promise<ActionResult<{ text: string; truncated: boolean; identity: WindowIdentity }>>
+  /**
+   * 只取前台窗口身份（含所在显示器 displayId），不读正文与控件文本。唤醒前目标锁用。
+   * 标题仅作为身份字段随既有 parseWinIdentity 返回，目标锁本身不保存它。
+   */
+  readForegroundIdentity(): Promise<ActionResult<WindowIdentity & { displayId: string }>>
+  /** 只查询进程是否仍是同一代（启动时间 + 路径），不读任何窗口内容。目标锁复核用。 */
+  readProcessIdentity(pid: number): Promise<ActionResult<{ alive: boolean; processStartedAt?: string; processPath?: string }>>
 }
 
 export function createWinActions(options: WinActionsOptions): WinDesktopActions {
@@ -477,6 +484,29 @@ export function createWinActions(options: WinActionsOptions): WinDesktopActions 
       })
       result.evidence.grantReason = grant.reason
       return result
+    },
+
+    async readForegroundIdentity() {
+      const r = await call('verify', { op: 'foreground-identity' })
+      if ('result' in r) return r.result
+      return finish('verify', r.resp, undefined, false, resp => {
+        const identity = parseWinIdentity(resp.identity)
+        const raw = resp.identity !== null && typeof resp.identity === 'object' ? resp.identity as Record<string, unknown> : {}
+        const displayId = asString(raw.displayId)
+        if (identity === undefined || displayId === undefined || displayId === '') return undefined
+        return { ...identity, displayId }
+      })
+    },
+
+    async readProcessIdentity(pid) {
+      const evidence: ActionEvidence = { action: 'verify', platform: 'win32' }
+      if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffffffff) return fail('invalid-argument', '进程编号无效', evidence)
+      const r = await call('verify', { op: 'process-identity', pid })
+      if ('result' in r) return r.result
+      return finish('verify', r.resp, undefined, false, resp => {
+        if (typeof resp.alive !== 'boolean') return undefined
+        return { alive: resp.alive, processStartedAt: asString(resp.processStartedAt), processPath: asString(resp.processPath) }
+      })
     },
 
     async readPage(identity, profile, opts) {      const r = await call('readPage', { op: 'read-page', identity, profile, ownerPids: ownerPids(opts) })

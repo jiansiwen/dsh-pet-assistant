@@ -1,0 +1,17 @@
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7fb; color: #1c2333; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 20px 24px 60px; }
+h1 { font-size: 20px; }
+h2 { font-size: 16px; margin: 18px 0 8px; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tabs button.on { background: #2f6fed; color: #fff; }
+button { border: 1px solid #c6cede; background: #fff; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+label { display: block; margin: 8px 0; }
+label.check { display: inline-flex; align-items: center; gap: 6px; margin-right: 12px; }
+input, select, textarea { display: block; width: 100%; margin-top: 4px; padding: 6px 8px; border: 1px solid #c6cede; border-radius: 6px; font: inherit; }
+label.check input { display: inline; width: auto; margin: 0; }
+.card { background: #fff; border: 1px solid #e2e6f0; border-radius: 10px; padding: 12px 14px; margin: 10px 0; }
+.muted { color: #6b7488; font-size: 12px; }
+.error { background: #fdecec; border: 1px solid #f3b7b7; color: #8c2626; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+.preview { width: 72px; height: 72px; object-fit: contain; background: #eef1f8; border-radius: 8px; }

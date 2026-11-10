@@ -119,6 +119,9 @@ function fakeWin(over: Partial2<WinDesktopActions> & { finds?: ActionResult<Wind
     readVisibleText: async () => fail('unsupported', 'x', { action: 'readVisibleText', platform: 'win32' }),
     // 读前台窗口只给"记录当前窗口"用，WPS 控制器不碰它。
     readForegroundText: async () => fail('unsupported', 'x', { action: 'readForegroundText', platform: 'win32' }),
+    // 目标锁专用身份接口，WPS 控制器同样不碰。
+    readForegroundIdentity: async () => fail('unsupported', 'x', { action: 'verify', platform: 'win32' }),
+    readProcessIdentity: async () => fail('unsupported', 'x', { action: 'verify', platform: 'win32' }),
     readPage: async () => { calls.push('readPage'); return ok<PagePosition>({ page: 1, total: 15 }, evidence('readPage')) },
     gotoPage: async (_id, page) => { calls.push(`goto ${page}`); return ok<PagePosition>({ page, total: 15 }, evidence('gotoPage')) },
     scroll: async () => fail('unsupported', 'x', { action: 'scroll', platform: 'win32' }),

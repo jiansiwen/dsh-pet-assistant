@@ -24,6 +24,7 @@ import type { HealthBody } from './runtime-launch.ts'
 import type { CancelReceipt, SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
 import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
 import type { DesktopMailNotice, DesktopMailNoticeAttention, DesktopReminderDelivery } from '../companion-types.ts'
+import type { DesktopExecutionCommand, DesktopExecutionReceipt } from './desktop-task-executor.ts'
 import { parseMeetingMailOutcome } from './approval-policy.ts'
 
 export interface BridgeInfo {
@@ -603,6 +604,82 @@ export class BridgeClient {
     } catch { return false }
   }
 
+  /**
+   * 受管执行器命令通道（4.6 切片1）：与提醒同一执行器凭据，领取 kinds 从 reminders
+   * 扩展到 /executor/v1/commands。这里只取 kind=desktop-action 的第一条；
+   * 命令形状只做最低限度核验，能力与授权由 desktop-task-executor 逐项校验。
+   */
+  async nextDesktopCommand(): Promise<DesktopExecutionCommand | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/commands`, {
+        headers: { 'x-dsh-companion-token': token },
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      const body = await response.json() as { commands?: unknown }
+      if (!Array.isArray(body.commands)) return null
+      const first = body.commands.find(item => item !== null && typeof item === 'object'
+        && (item as Record<string, unknown>).kind === 'desktop-action'
+        && typeof (item as Record<string, unknown>).commandId === 'string'
+        && typeof (item as Record<string, unknown>).executorEpoch === 'string')
+      return first ? first as DesktopExecutionCommand : null
+    } catch { return null }
+  }
+
+  async claimDesktopCommand(commandId: string): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/commands/${encodeURIComponent(commandId)}/claim`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ executorEpoch: info.epoch ?? '' }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
+  }
+
+  /** 回执只发一次；没送达也不重放动作，由插件侧对账。 */
+  async receiptDesktopCommand(commandId: string, receipt: DesktopExecutionReceipt): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/commands/${encodeURIComponent(commandId)}/receipt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify(receipt),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
+  }
+
+  /**
+   * 消费已批准的一次性电脑动作（4.6 切片2）：核验与消费在插件 computer 模块内完成。
+   * 网络失败返回 null，由执行器记 unknown 并对账，绝不重放动作。
+   */
+  async applyComputerAction(actionId: string): Promise<Record<string, unknown> | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/computer-apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ actionId }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      return await response.json() as Record<string, unknown>
+    } catch { return null }
+  }
+
   /** 邮件分析结果只由本机可信执行器领取；聊天令牌不能签发投递回执。 */
   async desktopMailNotices(): Promise<{ deliveries: DesktopMailNotice[]; attention: DesktopMailNoticeAttention[] } | null> {
     const info = this.info
@@ -676,7 +753,7 @@ export class BridgeClient {
   }
 
   /** 上报桌面状态（专注 / 可见），插件侧的提醒评估靠它实现"会议与免打扰不提醒"。 */
-  async reportPetState(state: { focus: boolean; visible: boolean; meeting: boolean }): Promise<void> {
+  async reportPetState(state: { focus: boolean; visible: boolean; meeting: boolean; locked?: boolean; screenSharing?: boolean }): Promise<void> {
     const info = this.info
     if (!info) return
     try {

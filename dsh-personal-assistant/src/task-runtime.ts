@@ -4,10 +4,12 @@ import { ApprovalError, ApprovalService, digestOf } from './approval.ts'
 import {
   CompanionError, companionCommandSchema, companionContextSchema, companionCreateSchema, companionInputSchema, companionTaskViewSchema,
   reminderResponseSchema, reminderScheduleSchema, type CompanionCommand, type CompanionCreateInput,
-  type CompanionHttpResult, type CompanionSubject, type CompanionTaskView,
+  type CompanionHttpResult, type CompanionInput, type CompanionSubject, type CompanionTaskView,
 } from './companion-contract.ts'
 import { CompanionReminders, reminderClaimSchema, reminderReceiptSchema } from './reminders.ts'
-import { TERMINAL_TASK_STATUSES, TeamStore, type CompanionCommandRecord, type Task } from './team-domain.ts'
+import { getManagedExecutor, managedKinds } from './managed-executor.ts'
+import { validateEvidence } from './semantic-validators.ts'
+import { TERMINAL_TASK_STATUSES, TeamStore, type CompanionCommandRecord, type ManagedTaskInput, type Task } from './team-domain.ts'
 
 const emptyPayload = z.object({}).strict()
 const reschedulePayload = z.object({
@@ -16,6 +18,33 @@ const reschedulePayload = z.object({
 }).strict().refine(value => value.schedule !== undefined || value.deadlineAt !== undefined, '需要明确改期内容')
 
 const intervalPayload = z.object({ repeatEverySeconds: z.number().int().min(60).max(604_800) }).strict()
+/** 受管执行器回执：四态 + 证据引用；succeeded 可携带结构化读回证据供语义复核。 */
+const managedReceiptSchema = z.object({
+  executorEpoch: z.string().min(1).max(200),
+  state: z.enum(['succeeded', 'failed-before-effect', 'partial', 'unknown']),
+  evidenceRefs: z.array(z.string().min(1).max(500)).max(30),
+  evidence: z.record(z.string(), z.unknown()).optional(),
+  validatorKind: z.string().min(1).max(100).optional(),
+  errorCode: z.string().max(200).nullable().optional(),
+}).strict()
+/**
+ * 受管执行命令（内存态，参照提醒投递的 pending→领取→回执 路径，不新建调度器）。
+ * 切片1 不落新表：运行时重启后内存命令丢失，遗留任务在对账时一律转 unknown，禁止自动重发。
+ */
+interface ManagedCommandRecord {
+  commandId: string
+  operationId: string
+  taskId: string
+  taskRevision: number
+  executorEpoch: string
+  kind: string
+  inputRef: string
+  inputDigest: string
+  grantRef: string
+  expiresAt: string
+  state: 'pending' | 'claimed' | 'settled'
+  receiptDigest: string | null
+}
 const mailNoticeReceiptSchema = reminderReceiptSchema.extend({ attemptId: z.string().uuid() })
 const meetingTodoSchema = z.object({
   meetingId: z.string().min(1).max(200), itemId: z.string().regex(/^action-\d{1,3}$/), meetingName: z.string().trim().min(1).max(80),
@@ -71,6 +100,8 @@ export class CompanionTaskRuntime {
   private readonly canRetryBusy: () => boolean
   private readonly activeMailAccount: () => { accountKey: string; memberId: string } | null
   private readonly reminders: CompanionReminders
+  private readonly managedCommands = new Map<string, ManagedCommandRecord>()
+  private computerExecutorApply: ((actionId: string) => Promise<Record<string, unknown>>) | null = null
   private readonly unregister: () => void
   private accepting = true
   private disposed = false
@@ -143,14 +174,33 @@ export class CompanionTaskRuntime {
     this.memberManagement = service
   }
 
-  parseInput(body: unknown) {
+  /** 电脑动作执行器消费函数（4.6 切片2）：由 computer 模块装配注入，只经 executor 凭据路由可达。 */
+  attachComputerExecutor(fn: (actionId: string) => Promise<Record<string, unknown>>): void {
+    this.computerExecutorApply = fn
+  }
+
+  parseInput(body: unknown): CompanionInput | ManagedTaskInput {
     if (body && typeof body === 'object' && !Array.isArray(body)) {
       const raw = body as Record<string, unknown>
+      if (typeof raw.kind === 'string' && getManagedExecutor(raw.kind)) {
+        this.assertManagedInput(raw.kind, raw)
+        return raw as unknown as ManagedTaskInput
+      }
       if (raw.kind === 'reminder' && raw.repeatEverySeconds === undefined) {
         return companionInputSchema.parse({ ...raw, repeatEverySeconds: this.settings?.getReminderInterval() ?? 300 })
       }
     }
     return companionInputSchema.parse(body)
+  }
+
+  /** 受管 kind 的输入交给注册执行器自己的校验器；失败统一转 422，不透传任意错误。 */
+  private assertManagedInput(kind: string, input: unknown): void {
+    const executor = getManagedExecutor(kind)
+    if (!executor) throw new CompanionError('KIND_UNSUPPORTED', '此类任务尚未实现', 422)
+    try { executor.validate(input) } catch (error) {
+      const detail = error instanceof Error && error.message ? error.message.slice(0, 300) : ''
+      throw new CompanionError('INVALID_INPUT', detail ? `受管任务输入无效：${detail}` : '受管任务输入未通过执行器校验', 422)
+    }
   }
 
   /**
@@ -245,6 +295,101 @@ export class CompanionTaskRuntime {
     this.changed()
   }
 
+  // ===== 受管执行器命令：参照提醒投递的 登记→领取→回执 路径，不新建第二调度器 =====
+
+  /** 命令视图：契约字段 + 已校验输入，只经可信执行器凭据发出。 */
+  private managedCommandView(command: ManagedCommandRecord): Record<string, unknown> {
+    const input = this.store.getCompanionInput(command.inputRef)
+    const executor = getManagedExecutor(command.kind)
+    return { commandId: command.commandId, operationId: command.operationId, taskId: command.taskId,
+      taskRevision: command.taskRevision, executorEpoch: command.executorEpoch, kind: command.kind,
+      inputRef: command.inputRef, inputDigest: command.inputDigest, grantRef: command.grantRef,
+      expiresAt: command.expiresAt, title: this.store.getTask(command.taskId)?.goal ?? '',
+      capabilities: executor?.capabilities ?? [], input: input?.input ?? null }
+  }
+
+  private managedCommandClaimable(command: ManagedCommandRecord): boolean {
+    if (command.state !== 'pending' || Date.parse(command.expiresAt) <= this.now()) return false
+    const meta = this.store.getCompanionMeta(command.taskId)
+    const task = this.store.getTask(command.taskId)
+    return !!meta && meta.runtimeScope === 'companion' && meta.principalId === this.principalId
+      && meta.deviceId === this.deviceId && meta.kind === command.kind && !meta.blocker
+      && !!task && task.status === 'queued' && task.revision === command.taskRevision
+      && !!getManagedExecutor(command.kind)
+  }
+
+  private listManagedCommands(): Array<Record<string, unknown>> {
+    return [...this.managedCommands.values()].filter(command => this.managedCommandClaimable(command))
+      .map(command => this.managedCommandView(command))
+  }
+
+  /** 创建获准后立即登记一条待领取命令（一次性，无日程）；操作账本与提醒投递同样预登记 planned。 */
+  private createManagedCommand(task: Task, grantOperationId: string): void {
+    const meta = this.store.getCompanionMeta(task.taskId)!
+    const input = this.store.getCompanionInput(meta.inputRef)!
+    const operationId = randomUUID(), commandId = randomUUID(), at = this.now()
+    this.store.insertOperation({ operationId, taskId: task.taskId, approvalId: null, kind: `managed.${meta.kind}`, state: 'planned',
+      resultDigest: null, startedAt: at, endedAt: null, assistantId: 'executor:managed', target: this.deviceId,
+      paramsDigest: input.digest, runId: commandId, executedAt: null, resultDetail: null })
+    this.store.setOperationEvidence(operationId, { grantRef: grantOperationId, inputRef: meta.inputRef })
+    this.managedCommands.set(commandId, { commandId, operationId, taskId: task.taskId, taskRevision: task.revision,
+      executorEpoch: this.epoch, kind: meta.kind, inputRef: meta.inputRef, inputDigest: input.digest,
+      grantRef: grantOperationId, expiresAt: new Date(at + 15 * 60_000).toISOString(), state: 'pending', receiptDigest: null })
+  }
+
+  private claimManagedCommand(commandId: string, body: unknown): { command: Record<string, unknown> } {
+    const request = reminderClaimSchema.parse(body)
+    return this.store.transaction(() => {
+      const command = this.managedCommands.get(commandId)
+      if (!command) throw new CompanionError('NOT_FOUND', '命令不存在', 404)
+      if (command.executorEpoch !== request.executorEpoch) throw new CompanionError('EPOCH_MISMATCH', '执行器代次已失效')
+      if (!this.managedCommandClaimable(command)) throw new CompanionError('ALREADY_CLAIMED', '命令已领取、已过期或任务已变化，禁止重复执行')
+      if (!this.approvals.markRunning(command.operationId)) throw new CompanionError('ALREADY_CLAIMED', '操作已失效，禁止执行')
+      this.store.insertRun({ runId: command.commandId, taskId: command.taskId, assistantId: 'executor:managed',
+        childSessionId: null, messageId: null, state: 'running', stopReason: null, outputDigest: null,
+        startedAt: this.now(), endedAt: null })
+      command.state = 'claimed'
+      this.changeTask(command.taskId, 'running')
+      return { command: this.managedCommandView(command) }
+    })
+  }
+
+  /**
+   * 四态回执：succeeded 且语义验证通过才 done；仅发出输入/读回未过最多 review；
+   * partial 保留证据进复核；unknown 禁止自动重试；执行前证实无效果记 failed。
+   * 同一回执摘要重复提交返回原结果，不覆盖、不重放。
+   */
+  private receiptManagedCommand(commandId: string, body: unknown): { commandId: string; state: string } {
+    const receipt = managedReceiptSchema.parse(body)
+    return this.store.transaction(() => {
+      const command = this.managedCommands.get(commandId)
+      // 先查命令再比代次：重启后内存命令已消失，旧回执应得 404 而不是代次冲突。
+      if (!command) throw new CompanionError('NOT_FOUND', '命令不存在', 404)
+      if (command.executorEpoch !== receipt.executorEpoch) throw new CompanionError('EPOCH_MISMATCH', '领取代次已失效')
+      const digest = digestOf(receipt)
+      if (command.receiptDigest === digest) return { commandId, state: command.state }
+      if (command.state !== 'claimed') throw new CompanionError('RECEIPT_CONFLICT', '未领取或已有回执，不能覆盖')
+      const task = this.ownedTask(command.taskId)
+      if (TERMINAL_TASK_STATUSES.includes(task.status)) throw new CompanionError('RECEIPT_CONFLICT', '任务已结束，不再接受执行回执')
+      if (receipt.state === 'succeeded' && receipt.evidenceRefs.length === 0) throw new CompanionError('INVALID_RECEIPT', '成功回执缺少读回证据引用', 422)
+      const check = receipt.state === 'succeeded' ? validateEvidence(receipt.validatorKind ?? command.kind, receipt.evidence ?? null) : null
+      const operationState = receipt.state === 'succeeded' ? 'succeeded' : receipt.state === 'failed-before-effect' ? 'failed' : 'unknown'
+      const taskStatus: Task['status'] = receipt.state === 'succeeded' ? (check?.passed ? 'done' : 'review')
+        : receipt.state === 'failed-before-effect' ? 'failed' : receipt.state === 'partial' ? 'review' : 'unknown'
+      command.state = 'settled'
+      command.receiptDigest = digest
+      this.approvals.settle(command.operationId, operationState, digest,
+        receipt.state === 'succeeded' ? (check?.passed ? '读回证据通过语义验证' : '输入已发出，读回未通过语义验证，等待复核') : '桌面执行器回执')
+      this.store.setOperationEvidence(command.operationId, { grantRef: command.grantRef, ...receipt,
+        ...(check ? { semanticCheck: check } : {}) })
+      this.store.finishRun(command.commandId, operationState === 'succeeded' ? 'succeeded' : operationState === 'failed' ? 'failed' : 'unknown', '桌面执行器回执', digest)
+      const artifact = this.store.insertCompanionArtifact(task.taskId, command.operationId, receipt, this.now())
+      this.changeTask(task.taskId, taskStatus, undefined, [...task.artifacts, artifact])
+      this.store.appendEvent('task.artifact', { taskId: task.taskId, artifactId: artifact }, { taskId: task.taskId })
+      return { commandId, state: taskStatus }
+    })
+  }
+
   private changed(): void {
     try { this.onChange() } catch { }
   }
@@ -268,6 +413,19 @@ export class CompanionTaskRuntime {
       }
       this.store.recoverMailNotices(this.epoch, this.now() - 60_000, this.now())
       this.reminders.recover()
+      // 受管命令是内存态：代次变化后一律失效。遗留的 queued/running 受管任务
+      // 无法证明是否已执行，统一对账为 unknown，禁止自动重发（与提醒 recover 同一安全口径）。
+      for (const task of this.store.listTasks({ runtimeScope: 'companion' })) {
+        const meta = this.store.getCompanionMeta(task.taskId)
+        if (!meta || meta.principalId !== this.principalId || meta.kind === 'agent' || meta.kind === 'reminder') continue
+        if (task.status !== 'queued' && task.status !== 'running') continue
+        for (const operation of this.store.listOperations(task.taskId)) {
+          if (operation.assistantId !== 'executor:managed' || !['planned', 'running'].includes(operation.state)) continue
+          this.approvals.settle(operation.operationId, 'unknown', null, '运行时代次变化，受管命令已失效，禁止重发')
+          if (operation.runId) this.store.finishRun(operation.runId, 'unknown', '受管命令回执缺失', null)
+        }
+        this.changeTask(task.taskId, 'unknown')
+      }
     })
     this.tick()
     this.timer = setInterval(() => {
@@ -493,8 +651,10 @@ export class CompanionTaskRuntime {
   private insertTask(title: string, inputRef: string, parentTaskId: string | null, dependsOn: string[], status: Task['status'], commandId: string): Task {
     const input = this.store.getCompanionInput(inputRef)!
     const at = this.now()
-    const task: Task = { taskId: randomUUID(), teamId: 'companion', ownerId: `executor:${input.input.kind === 'agent' ? 'manual' : 'reminder'}`,
-      goal: title, inputEvidence: [inputRef], acceptance: [input.input.kind === 'agent' ? '本人明确标记完成' : '本人回应本轮提醒'],
+    const task: Task = { taskId: randomUUID(), teamId: 'companion',
+      ownerId: `executor:${input.input.kind === 'agent' ? 'manual' : input.input.kind === 'reminder' ? 'reminder' : 'managed'}`,
+      goal: title, inputEvidence: [inputRef],
+      acceptance: [input.input.kind === 'agent' ? '本人明确标记完成' : input.input.kind === 'reminder' ? '本人回应本轮提醒' : '执行器读回证据通过语义复核'],
       toolScope: 'read-only', budgetTokens: 0, deadlineAt: null, dependsOn, status, revision: 1, artifacts: [],
       originRequestId: commandId, originChannel: 'companion', createdAt: at, updatedAt: at }
     this.store.insertTask(task)
@@ -574,6 +734,20 @@ export class CompanionTaskRuntime {
           const result = match[2] === 'claim' ? this.reminders.claim(match[1], body) : this.reminders.receipt(match[1], body)
           this.changed()
           return { status: 200, body: match[2] === 'claim' ? { delivery: result } : result }
+        }
+        // 受管执行器通道：与提醒同一 executor 凭据与代次核验，领取/回执模式一致。
+        if (method === 'GET' && pathname === '/executor/v1/commands') return { status: 200, body: { commands: this.listManagedCommands() } }
+        if (method === 'POST' && pathname === '/executor/v1/computer-apply') {
+          // 切片2：受管执行器消费已批准的一次性电脑动作；消费核验在 computer 模块内完成。
+          if (!this.computerExecutorApply) throw new CompanionError('COMPANION_UNAVAILABLE', '电脑执行通道未装配', 503)
+          const actionId = (body as Record<string, unknown> | null)?.actionId
+          return { status: 200, body: await this.computerExecutorApply(typeof actionId === 'string' ? actionId : '') }
+        }
+        const managed = /^\/executor\/v1\/commands\/([^/]+)\/(claim|receipt)$/.exec(pathname)
+        if (method === 'POST' && managed) {
+          const result = managed[2] === 'claim' ? this.claimManagedCommand(managed[1]!, body) : this.receiptManagedCommand(managed[1]!, body)
+          this.changed()
+          return { status: 200, body: result }
         }
         throw new CompanionError('NOT_FOUND', '接口不存在', 404)
       }
@@ -668,18 +842,24 @@ export class CompanionTaskRuntime {
 
   private validateCreate(payload: CompanionCreateInput): void {
     if (payload.budgetAccountId) throw new CompanionError('BUDGET_UNSUPPORTED', '首批不支持预算账户', 422)
-    if (!['agent', 'reminder'].includes(payload.kind)) throw new CompanionError('KIND_UNSUPPORTED', '此类任务尚未实现', 422)
+    if (!['agent', 'reminder', ...managedKinds()].includes(payload.kind)) throw new CompanionError('KIND_UNSUPPORTED', '此类任务尚未实现', 422)
     const input = this.store.getCompanionInput(payload.inputRef)
     if (!input || input.principalId !== this.principalId || input.digest !== digestOf(input.input)) throw new CompanionError('INPUT_CHANGED', '输入不存在、已变化或不属于本人')
-    const validated = companionInputSchema.parse(input.input)
-    if (validated.kind !== payload.kind) throw new CompanionError('INPUT_CHANGED', '输入类型与任务不符', 422)
+    let validated: CompanionInput | null = null
+    if (getManagedExecutor(payload.kind)) {
+      if (input.input.kind !== payload.kind) throw new CompanionError('INPUT_CHANGED', '输入类型与任务不符', 422)
+      this.assertManagedInput(payload.kind, input.input)
+    } else {
+      validated = companionInputSchema.parse(input.input)
+      if (validated.kind !== payload.kind) throw new CompanionError('INPUT_CHANGED', '输入类型与任务不符', 422)
+    }
     for (const id of payload.dependsOn) this.ownedTask(id)
     if (payload.parentTaskId && TERMINAL_TASK_STATUSES.includes(this.ownedTask(payload.parentTaskId).status)) throw new CompanionError('PARENT_CLOSED', '父任务已结束')
-    if (validated.kind === 'reminder' && validated.channel === 'wecom'
+    if (validated?.kind === 'reminder' && validated.channel === 'wecom'
       && (!validated.recipientId || !this.acceptsRecipient('wecom', validated.recipientId))) {
       throw new CompanionError('INVALID_RECIPIENT', '企业微信提醒只能发到已绑定提醒的会话', 422)
     }
-    if (validated.kind === 'reminder' && validated.relatedBusinessTaskId) {
+    if (validated?.kind === 'reminder' && validated.relatedBusinessTaskId) {
       const related = this.ownedTask(validated.relatedBusinessTaskId)
       if (this.store.getCompanionMeta(related.taskId)?.kind !== 'agent' || TERMINAL_TASK_STATUSES.includes(related.status)) {
         throw new CompanionError('INVALID_RELATED_TASK', '关联业务任务必须是本人尚未结束的人工待办', 422)
@@ -807,6 +987,7 @@ export class CompanionTaskRuntime {
       if (route.action === 'create') {
         const updated = this.changeTask(task.taskId, meta.kind === 'agent' && task.dependsOn.every(id => this.store.getTask(id)?.status === 'done') ? 'awaiting-user' : 'queued')
         if (meta.kind === 'reminder') this.reminders.create(updated, operation.operationId)
+        else if (getManagedExecutor(meta.kind)) this.createManagedCommand(updated, operation.operationId)
       } else if (route.action === 'respond') {
         this.reminders.respond(reminderResponseSchema.parse(current.command.payload))
       } else if (route.action === 'set-interval') {

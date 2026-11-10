@@ -35,6 +35,7 @@ public static class Native {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
@@ -64,6 +65,8 @@ public static class Native {
     return r;
   }
   public static uint Pid(IntPtr h) { uint pid; GetWindowThreadProcessId(h, out pid); return pid; }
+  /** 窗口所在显示器（MONITOR_DEFAULTTONEAREST）的句柄标识，供目标锁记录 displayId。 */
+  public static string DisplayId(IntPtr h) { return MonitorFromWindow(h, 2).ToInt64().ToString(); }
   public static string Title(IntPtr h) { var s = new StringBuilder(1024); GetWindowTextW(h, s, 1024); return s.ToString(); }
   public static string ClassName(IntPtr h) { var s = new StringBuilder(256); GetClassNameW(h, s, 256); return s.ToString(); }
 
@@ -682,6 +685,22 @@ function Op-ReadForegroundText($req) {
   return (Op-ReadText $relay)
 }
 
+# 只取前台窗口身份（含所在显示器），不遍历控件、不读正文。唤醒前目标锁用。
+function Op-ForegroundIdentity($req) {
+  $h = [DshUia.Native]::GetForegroundWindow()
+  if ($h -eq [IntPtr]::Zero) { return (New-Fail 'unsupported' '现在没有前台窗口' 'no-foreground') }
+  $id = Get-Identity $h $null
+  $id.displayId = [DshUia.Native]::DisplayId($h)
+  return @{ ok = $true; identity = $id }
+}
+
+# 只查询进程代次（是否存活 + 启动时间 + 路径），不读任何窗口内容。目标锁复核用。
+function Op-ProcessIdentity($req) {
+  $procId = [uint32]$req.pid
+  if (-not [DshUia.Native]::ProcAlive($procId)) { return @{ ok = $true; alive = $false } }
+  return @{ ok = $true; alive = $true; processStartedAt = [DshUia.Native]::ProcStart($procId); processPath = [DshUia.Native]::ProcPath($procId) }
+}
+
 function Invoke-Request($req) {
   $script:Deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(1000, [Math]::Min(60000, [int]$req.timeoutMs)))
   switch ([string]$req.op) {
@@ -695,6 +714,8 @@ function Invoke-Request($req) {
     'scroll' { return (Op-Scroll $req) }
     'read-text' { return (Op-ReadText $req) }
     'read-foreground-text' { return (Op-ReadForegroundText $req) }
+    'foreground-identity' { return (Op-ForegroundIdentity $req) }
+    'process-identity' { return (Op-ProcessIdentity $req) }
     default { return (New-Fail 'invalid-argument' '未知操作') }
   }
 }

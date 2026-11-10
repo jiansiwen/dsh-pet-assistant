@@ -61,6 +61,8 @@ import { intakeMinutes, intakeWindow, type EvidenceConfirmView, type EvidenceInt
 import { createMeetingTodoHandler } from './meeting-todo.ts'
 import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
 import { createWinActions, type WinDesktopActions } from './win-actions.ts'
+import { createDesktopTaskExecutor } from './desktop-task-executor.ts'
+import { createTargetLock, winActionsTargetLockIO } from './target-lock.ts'
 import { settingsUri, type MediaAccessStatus } from './first-run.ts'
 import { createMacActions } from './mac-actions.ts'
 import type { DownloadConfirmation } from './model-resources.ts'
@@ -79,6 +81,12 @@ import { Narrator, spawnTtsEdgeWorker, type TtsWorkerEvent } from './tts.ts'
 import { sniffAudioMime } from './tts-edge-worker.ts'
 import { DEFAULT_TTS_VOICE, synthesizeSpeech } from './edge-tts.ts'
 import { VoiceApiStore, synthesizeApi, transcribeApi } from './voice-api.ts'
+import { AssetPipeline } from './asset-pipeline.ts'
+import { MediaProviderStore } from './media-providers.ts'
+import { VoiceCloneService } from './voice-clone.ts'
+import { AssetStudio } from './asset-studio-window.ts'
+import { registerPetAssetProtocol } from './asset-protocol.ts'
+import { listCustomSkins } from './custom-skins.ts'
 import type { VoiceApiKind, VoiceApiResult, VoiceApiState, ResolvedVoiceApi } from '../voice-api-types.ts'
 import { createMeetingRecorder, markAssistantSpeech, registerMeetingIpc, type MeetingRecorder } from './meeting-recorder.ts'
 import type { MeetingConsentInput, MeetingPresentationRecord, MeetingPresentationState } from './meeting-store.ts'
@@ -303,6 +311,7 @@ let host: CompanionHost | null = null
  * 只在主进程里解开送给请求；页面拿到的列表里永远没有密钥本体。
  */
 let voiceApiStore: VoiceApiStore | null = null
+let assetStudio: AssetStudio | null = null
 
 /**
  * 会议要采"对方的声音"（系统回环声）时，必须由主进程批准一次桌面采集。
@@ -480,10 +489,13 @@ function sendToRenderer(channel: string, payload: unknown): void {
 /** 主动提醒评估要用的桌面状态：插件侧靠它实现"会议与免打扰不提醒"（design.md §2.7）。 */
 let petStageVisible = true
 let petFocusMode = false
+let petLocked = false
+let petPresentation = false
+let targetLockHandle: import('./target-lock.ts').TargetLockHandle | null = null
 
 function reportPetState(): void {
   // 会议进行中插件不评估主动提醒；状态以录制器为准，不靠界面猜。
-  void bridge.reportPetState({ focus: petFocusMode, visible: petStageVisible, meeting: meetingRecorder?.getState().recording === true })
+  void bridge.reportPetState({ focus: petFocusMode, visible: petStageVisible, meeting: meetingRecorder?.getState().recording === true, locked: petLocked, screenSharing: petPresentation })
 }
 
 function applyStageVisible(visible: boolean): void {
@@ -647,6 +659,8 @@ function stopWake(): void {
 }
 
 function onWakeWord(): void {
+  // 唤醒应答会抢焦点：先把唤醒前的前台身份锁住，供"刚才那个窗口"类任务引用。
+  void targetLockHandle?.captureTargetLock(Date.now())
   // 诊断：唤醒链路每一步都要能在日志里看见。用户喊了没反应时，第一句就能定位卡在哪：
   // 路径根本没进来（识别没命中）／被下面某个条件挡住／进来了但在合成/播放阶段失败。
   console.log('[dsh-pet] 唤醒命中：',
@@ -3054,6 +3068,7 @@ function buildContextMenu(target: MenuTarget | null): Menu {
     { label: '会议', click: () => openSettings('meeting') },
     { label: '任务与提醒', click: () => companionTasks?.open() },
     { label: '日报工作台', click: () => reportWorkbench?.open() },
+    { label: '形象与音色工作室', click: () => assetStudio?.open() },
     { label: '日报文件夹', click: () => { void shell.openPath(path.join(dshHome(), 'personal-assistant', 'reports')) } },
     { type: 'separator' },
     { label: '隐藏角色（截图 / 录屏）', click: () => host?.setStageVisible(false) },
@@ -3403,6 +3418,39 @@ function registerIpc(): void {
     }
   }
 
+  // ===== 受管执行器与目标锁（底座 4.6 切片1）=====
+  // 与窗口证据共用同一 UIA 辅助进程；只有真的领到命令才拉起，平时不常驻。
+  const execActions = (): WinDesktopActions => (evidenceActions ??= createWinActions({ scriptDir: layout.scriptDir }))
+  targetLockHandle = createTargetLock(winActionsTargetLockIO({
+    readForegroundIdentity: () => execActions().readForegroundIdentity(),
+    readProcessIdentity: pid => execActions().readProcessIdentity(pid),
+  }))
+  const desktopExecutor = createDesktopTaskExecutor({
+    channel: {
+      nextCommand: () => bridge.nextDesktopCommand(),
+      claimCommand: id => bridge.claimDesktopCommand(id),
+      receiptCommand: (id, receipt) => bridge.receiptDesktopCommand(id, receipt),
+    },
+    actions: {
+      readVisibleText: (...args: Parameters<WinDesktopActions['readVisibleText']>) => execActions().readVisibleText(...args),
+      readPage: (...args: Parameters<WinDesktopActions['readPage']>) => execActions().readPage(...args),
+    },
+    targetLock: targetLockHandle,
+    // 切片2：经 executor 凭据消费插件侧已批准的一次性动作；无回执记 unknown 由执行器对账。
+    applyApprovedAction: async (actionId) => {
+      const result = await bridge.applyComputerAction(actionId)
+      if (!result) throw new Error('电脑动作没有确定回执')
+      if (result.ok === true && result.state === 'issued') return { state: 'issued' }
+      if (result.state === 'failed-before-effect') return { state: 'failed-before-effect', error: String(result.error ?? '执行前被拒绝') }
+      return { state: 'unknown', error: String(result.error ?? '结果不明') }
+    },
+    log: message => console.log(`[desktop-executor] ${message}`),
+  })
+  const executorTimer = setInterval(() => {
+    if (platformOf() === 'win32') void desktopExecutor.runOnce().catch(() => {})
+  }, 2000)
+  executorTimer.unref()
+
   const evidenceDeps: EvidenceIntakeDeps = {
     confirm: async (view: EvidenceConfirmView): Promise<boolean> => {
       // 用主进程原生对话框：渲染层弹的框可以被页面自己的样式伪装，
@@ -3494,6 +3542,40 @@ function registerIpc(): void {
   ipcMain.handle('voice-api-save', (_event, input: unknown) => voiceApiCall(() => apis.save(input)))
   ipcMain.handle('voice-api-remove', (_event, id: unknown) => voiceApiCall(() => apis.remove(id)))
   ipcMain.handle('voice-api-select', (_event, kind: unknown, id: unknown) => voiceApiCall(() => apis.select(kind as VoiceApiKind, id)))
+
+  // ===== 形象与音色工作室（底座 4.8/4.9）=====
+  // provider 全部用户自配；密钥走系统密钥库；生成/克隆/删除前原生确认。
+  const studioUserData = app.getPath('userData')
+  const broadcastAll = (channel: string, payload?: unknown): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send(channel, payload)
+    }
+  }
+  const fanout = (event: string): void => {
+    if (event === 'custom-skins-changed') {
+      broadcastAll(event, listCustomSkins(studioUserData).map(skin => skin.id))
+    } else if (event === 'pet-settings-changed') {
+      sendToRenderer('characters-changed', loadSettings().characters ?? {})
+    } else {
+      broadcastAll(event)
+    }
+  }
+  const mediaProviders = new MediaProviderStore(studioUserData, { dpapi: { safeStorage } })
+  const assetPipeline = new AssetPipeline({ userDataDir: studioUserData, store: mediaProviders, emit: fanout })
+  const voiceClone = new VoiceCloneService({ userDataDir: studioUserData, store: mediaProviders, voices: apis, emit: fanout })
+  assetStudio = new AssetStudio({
+    userDataDir: studioUserData,
+    pipeline: assetPipeline,
+    voices: voiceClone,
+    providers: mediaProviders,
+    voiceStore: apis,
+    broadcast: fanout,
+  })
+  ipcMain.handle('custom-skins-list', () => listCustomSkins(studioUserData).map(skin => skin.id))
+  ipcMain.handle('asset-studio-open', () => {
+    assetStudio?.open()
+    return { ok: true }
+  })
 
   // ===== 首次使用检查（M5-06 界面部分）=====
   //
@@ -3949,7 +4031,9 @@ function registerIpc(): void {
   // 演示隐私模式（M5-05）：只改"渲染哪些历史与预览"，不动麦克风、不动窗口、不动专注模式。
   // 演示时用户往往还要讲解、还要插话，把它们一起掐掉就成了"关掉宠物"。
   ipcMain.on('presentation-mode', (_event, on: unknown) => {
+    petPresentation = on === true
     host?.setPresentationMode(on === true)
+    reportPetState()
   })
 
   // 听写拆成两拍：begin 只做麦克风仲裁（渲染层录音时唤醒监听已停），transcribe 收 wav
@@ -4423,6 +4507,18 @@ if (!gotLock) {
     })
     // 会议回环声的桌面采集授权：必须在任何 getDisplayMedia 之前注册（见函数注释）。
     configureDisplayMedia()
+    // 自定义皮肤素材在 userData，渲染层相对路径探不到，走 pet-asset 协议。
+    // 装配替身可能没有 getAppPath：拿不到就指一个空目录，协议注册本身会因替身缺 protocol 而跳过。
+    let bundledAssets = path.join(app.getPath('userData'), 'bundled-assets')
+    try {
+      bundledAssets = path.join(app.getAppPath(), 'dist', 'assets')
+    } catch { /* 装配测试替身 */ }
+    registerPetAssetProtocol(app.getPath('userData'), bundledAssets)
+    // 锁屏/解锁是陪伴静默的真实信号源；拿不到 powerMonitor 时只是少这一条闸门。
+    void import('electron').then(({ powerMonitor }) => {
+      powerMonitor?.on('lock-screen', () => { petLocked = true; reportPetState() })
+      powerMonitor?.on('unlock-screen', () => { petLocked = false; reportPetState() })
+    })
     registerIpc()
     createWindow()
 
@@ -4463,6 +4559,8 @@ if (!gotLock) {
     const fallback = platformOf() === 'darwin' ? 'Command+Alt+Space' : 'CommandOrControl+Alt+Space'
     for (const accelerator of [primary, fallback]) {
       if (globalShortcut.register(accelerator, () => {
+        // 快捷键唤出同样抢焦点：先锁唤醒前前台身份。
+        void targetLockHandle?.captureTargetLock(Date.now())
         // 经壳层叫出来，托盘上的"角色：显示中/已隐藏"才和桌面上看到的一致。
         host?.setStageVisible(true)
         sendToRenderer('pet-summon', null)

@@ -584,7 +584,7 @@ export class SessionBridge {
    * 宠物上报的桌面状态，主动提醒评估的输入（§2.7：会议/演示/免打扰不提醒）。
    * 桥接断开或重启后回到默认（可见、不专注）—— 宁可多看一眼，不可该提醒时漏掉。
    */
-  private petState: { focus: boolean; visible: boolean; meeting: boolean } = { focus: false, visible: true, meeting: false }
+  private petState: { focus: boolean; visible: boolean; meeting: boolean; locked?: boolean; screenSharing?: boolean } = { focus: false, visible: true, meeting: false }
   private teamCursor = 0
   private teamTimer: NodeJS.Timeout | null = null
   private events: BridgeEvent[] = []
@@ -2011,10 +2011,12 @@ export class SessionBridge {
     }
     if (request.method === 'POST' && url.pathname === '/pet-state') {
       try {
-        const body = JSON.parse(await this.readBody(request)) as { focus?: unknown; visible?: unknown; meeting?: unknown }
+        const body = JSON.parse(await this.readBody(request)) as { focus?: unknown; visible?: unknown; meeting?: unknown; locked?: unknown; screenSharing?: unknown }
         if (typeof body.focus === 'boolean') this.petState.focus = body.focus
         if (typeof body.visible === 'boolean') this.petState.visible = body.visible
         if (typeof body.meeting === 'boolean') this.petState.meeting = body.meeting
+        if (typeof body.locked === 'boolean') this.petState.locked = body.locked
+        if (typeof body.screenSharing === 'boolean') this.petState.screenSharing = body.screenSharing
         this.respond(response, 200, { ok: true })
       } catch (error) {
         const message = error instanceof Error ? error.message : 'malformed body'
@@ -2354,7 +2356,7 @@ export class SessionBridge {
   }
 
   /** 最新一次宠物上报的桌面状态（专注 / 可见 / 会议中）。 */
-  getPetState(): { focus: boolean; visible: boolean; meeting: boolean } {
+  getPetState(): { focus: boolean; visible: boolean; meeting: boolean; locked?: boolean; screenSharing?: boolean } {
     return { ...this.petState }
   }
 

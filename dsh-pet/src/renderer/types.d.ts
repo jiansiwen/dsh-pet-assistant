@@ -556,6 +556,11 @@ export interface PetApi extends MemberApi {
   setPresentationMode(on: boolean): void
   /** 某个角色的形象被改了（右键菜单）：主进程广播整张表，界面据此立刻换图。 */
   onCharactersChanged(callback: (characters: SkinOverrides) => void): void
+  /** 生成流水线登记的自定义皮肤 id 列表（启动时读一次）。 */
+  customSkins(): Promise<string[]>
+  /** 自定义皮肤登记变化：渲染层注册 id 并清素材缓存后重挂舞台。 */
+  onCustomSkins(callback: (ids: string[]) => void): void
+  openAssetStudio(): Promise<{ ok: boolean }>
   /** 主进程请求退场（会话销毁或用户右键退出）：渲染层播完退场动画后调用 exitDone。 */
   onExitRequested(callback: () => void): void
   /** 全局快捷键唤起输入模式。 */

@@ -163,6 +163,8 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
   log(message: string): void
   run?: ComputerRun
   platform?: string
+  /** 受管执行通道（4.6 切片2）：装配侧把执行器消费函数挂到任务运行时的 executor 路由。 */
+  attachComputerExecutor?: (fn: (actionId: string) => Promise<Record<string, unknown>>) => void
 }): () => void {
   const script = path.join(deps.scriptDir, 'computer.ps1')
   const run = deps.run ?? runComputerScript
@@ -194,6 +196,42 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
     for (const [actionId, action] of actions) if (action.targetId === id) dropAction(actionId)
     return true
   }
+  /**
+   * 受管执行器消费一次性动作许可（4.6 切片2）：与模型工具 apply 同口径——
+   * 只消费已批准、未过期、目标仍被观察的许可；桌面绑定变化即失效；消费发生在任何 await 前。
+   * 回执只证明输入发出（issued/verified:false），业务效果由执行器读回验证。
+   */
+  const executorApply = async (actionId: string): Promise<Record<string, unknown>> => {
+    const grant = actions.get(actionId)
+    const entry = grant && live(grant.targetId, grant.session)
+    const binding = deps.bridge.currentDesktopBinding()
+    let grantBinding: string | null = null
+    try {
+      const parsed = JSON.parse(grant?.session ?? 'null') as unknown
+      grantBinding = Array.isArray(parsed) && typeof parsed[1] === 'string' ? parsed[1] : null
+    } catch { grantBinding = null }
+    if (!grant || grant.state !== 'authorized' || grant.expiresAt <= Date.now()
+      || !entry || entry.state !== 'observed' || !binding || grantBinding !== binding) {
+      return { ok: false, state: 'failed-before-effect', error: '操作不存在、未获批准、已过期、已消费或桌面绑定已变化' }
+    }
+    actions.delete(actionId)
+    try {
+      const result = await run(script, grant.fixed)
+      const afterTarget = parseTarget(result.target), before = parseControl(result.before)
+      if (result.ok !== true || !afterTarget || !sameTarget(entry.target, afterTarget)
+        || !before || !sameControl(grant.fixed.control, before) || result.verified !== false) {
+        return { ok: false, state: 'unknown', error: '动作回执不完整或目标已变化；可能已有部分效果，不自动重试' }
+      }
+      return { ok: true, state: 'issued', issued: true, verified: false, before, after: parseControl(result.after) }
+    } catch (error) {
+      return {
+        ok: false,
+        state: error instanceof BeforeEffectError ? 'failed-before-effect' : 'unknown',
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+  deps.attachComputerExecutor?.(executorApply)
   const prune = () => {
     for (const [id, entry] of targets) if (entry.expiresAt <= Date.now()) dropTarget(id)
     for (const [id, entry] of actions) if (entry.expiresAt <= Date.now()) dropAction(id)

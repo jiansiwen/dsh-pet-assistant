@@ -24,7 +24,8 @@ import {
   type StageMember,
   type StageTaskStatus,
 } from './stage-layout.js'
-import { manifestFor, manifestForLegacySkin } from './character-manifest.js'
+import { manifestFor, manifestForLegacySkin, registerCustomSkins } from './character-manifest.js'
+import { clearPetAssetCache } from './usePetImage.js'
 import { PROACTIVE_ACCEPT_MESSAGE } from './proactive-ui.js'
 import { arrayBufferToBase64, pcm16Base64, recordDictation, stopDictation, type DictationHandover } from './dictation.js'
 import { installAudioBridge, isWakePhraseOnly } from './barge-in.ts'
@@ -115,6 +116,7 @@ export default function App() {
    * 之后听广播 —— 界面不自己推断"他大概想换成熊猫吧"。
    */
   const [characters, setCharacters] = useState<SkinOverrides>({})
+  const [assetEpoch, setAssetEpoch] = useState(0)
   const [panelOpen, setPanelOpen] = useState(false)
   /** 管理页与会话显隐独立，切页不影响输入草稿或后台任务。 */
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null)
@@ -346,6 +348,17 @@ export default function App() {
     })
     window.petApi.onCharactersChanged(setCharacters)
     return () => clearStageHitboxes()
+  }, [])
+
+  // 自定义皮肤登记变化：注册 id、清素材缓存并重挂舞台，否则 hook 依赖的 skin 字符串不变不会重新探测。
+  useEffect(() => {
+    const apply = (ids: string[]) => {
+      registerCustomSkins(ids)
+      clearPetAssetCache()
+      setAssetEpoch(epoch => epoch + 1)
+    }
+    void window.petApi.customSkins().then(apply)
+    window.petApi.onCustomSkins(apply)
   }, [])
 
   /**
@@ -1555,6 +1568,7 @@ export default function App() {
         assistantActive={false}
         statusByAssistant={stageStatuses}
         positions={positions}
+        key={assetEpoch}
         selectedId={selectedId}
         chatOpen={panelOpen}
         onSelect={handleSelect}

@@ -25,6 +25,7 @@ import { ReportApprovalService } from './report-approval.ts'
 import { platformCaptureBlockedReason, readLastSample, readSamples, sampleFileOf, samplerScriptName } from './sampler.ts'
 import { buildSpansFrom } from './spans.ts'
 import { ProactiveHelpFlow, type ProactiveConfig } from './proactive.ts'
+import { registerManagedExecutor, getManagedExecutor } from './managed-executor.ts'
 import { ASSISTANT_SCHEMA_VERSION, getUserFlag, openAssistantStore, setUserFlag } from './store.ts'
 import { TeamService, type TeamLogger } from './team.ts'
 import { TeamStore } from './team-domain.ts'
@@ -537,6 +538,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ctx.effect(() => registerComputerTools(ctx as never, {
       scriptDir: assets, shotDir: path.join(home, 'personal-assistant', 'screenshots'),
       approvalMode: () => config.approvalMode, bridge, log,
+      attachComputerExecutor: fn => companionRuntime.attachComputerExecutor(fn),
     }), 'personal-assistant:computer-tools')
   } catch (error) {
     log(`[warn] 电脑操作工具注册失败：${error instanceof Error ? error.message : String(error)}`)
@@ -710,6 +712,14 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
           authorized: helpContexts.list(),
         }
       },
+      // §4.7 事实型建议：只描述可观察的前台应用，不推断情绪/健康；拿不到事实就回退固定文案。
+      offerSource: () => {
+        const sample = readLastSample(sampleFileOf(sampleDir, localDateOf(Date.now())))
+        if (!sample || sample.idle || sample.excluded) return null
+        const proc = sample.proc ?? ''
+        if (!proc) return null
+        return { topicKey: `app:${proc}`, message: `要不要一起看看你刚才在 ${proc} 里处理的内容？` }
+      },
     })
     bridge.onProactiveFeedback(kind => {
       proactive.feedback(kind, Date.now())
@@ -724,6 +734,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
         focusMode: pet.focus,
         stageVisible: pet.visible,
         meetingActive: pet.meeting,
+        locked: pet.locked === true,
+        screenSharing: pet.screenSharing === true,
         captureActive: tracker.capturing,
         sampleAt: sample?.ts ?? null,
         sampleIntervalMs: Math.max(1000, config.sampleIntervalMs),
@@ -744,6 +756,22 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     }, PROACTIVE_EVALUATE_MS)
     ctx.effect(() => () => clearInterval(proactiveTimer), 'personal-assistant:proactive')
   }
+
+  // ===== 受管执行器登记（底座 4.6 切片1/2）=====
+  // readback 只读观察；action 只消费已获本机批准的一次性 actionId，执行后由执行器读回验证。
+  // 插件可能被同进程重复 apply（测试/热重载）：注册表拒绝重复登记，装配侧先查再登。
+  if (!getManagedExecutor('desktop-action')) registerManagedExecutor('desktop-action', {
+    capabilities: ['desktop.readback', 'desktop.action'],
+    validate: (input: unknown) => {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('输入必须是对象')
+      const raw = input as Record<string, unknown>
+      if (raw.kind !== 'desktop-action') throw new Error('kind 不符')
+      if (raw.capability !== 'desktop.readback' && raw.capability !== 'desktop.action') throw new Error('能力不在登记清单内')
+      if (raw.capability === 'desktop.action' && (typeof raw.actionId !== 'string' || !raw.actionId)) throw new Error('desktop.action 需要已批准的一次性 actionId')
+      if (typeof raw.targetLockId !== 'string' && typeof raw.targetGrantRef !== 'string') throw new Error('需要目标锁或审批授权引用')
+      if (raw.successCheck !== undefined && (typeof raw.successCheck !== 'object' || raw.successCheck === null)) throw new Error('successCheck 必须是对象')
+    },
+  })
 
   const assistantApprovals = new AssistantApprovalService({ epoch: bridge.epoch, ttlMs: Math.max(10_000, config.approvalTtlMs) })
   bridge.attachAssistantApprovals(assistantApprovals)

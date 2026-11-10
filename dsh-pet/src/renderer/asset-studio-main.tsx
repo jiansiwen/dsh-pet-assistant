@@ -1,0 +1,310 @@
+import React, { useEffect, useState } from 'react'
+import { createRoot } from 'react-dom/client'
+import { knownCharacters } from './character-manifest.js'
+
+type Result = { ok: true; value?: any } | { ok: false; error: string }
+
+interface ProviderBase {
+  id: string
+  name: string
+  type: string
+  baseUrl: string
+  model?: string
+  auth?: { headerName?: string; scheme?: string; apiKeyRef?: string }
+  submitPath?: string
+  bodyTemplate?: Record<string, unknown>
+  [key: string]: any
+}
+
+interface StudioState {
+  config: { image: ProviderBase[]; video: ProviderBase[]; clone: ProviderBase[]; ffmpegPath?: string; keyColor?: string }
+  secretFlags: Record<string, boolean>
+  jobs: any[]
+  skins: any[]
+  voices: any[]
+  ffmpeg: string | null
+  selectedTts: string | null
+}
+
+declare global {
+  interface Window { assetStudioApi: any }
+}
+
+const api = () => window.assetStudioApi
+
+function useStudio() {
+  const [state, setState] = useState<StudioState | null>(null)
+  const [error, setError] = useState('')
+  const refresh = async () => {
+    const result: Result = await api().state()
+    if (result.ok) setState(result.value as StudioState)
+    else setError(result.error)
+  }
+  useEffect(() => {
+    void refresh()
+    return api().onChanged(() => void refresh())
+  }, [])
+  return { state, error, refresh, setError }
+}
+
+const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+
+function ProviderEditor(props: {
+  kind: 'image' | 'video' | 'clone'
+  provider: ProviderBase
+  secretFlags: Record<string, boolean>
+  onChange: (p: ProviderBase) => void
+  onRemove: () => void
+  onTest: () => void
+  onSecret: (ref: string, value: string) => void
+}) {
+  const { provider, onChange } = props
+  const [key, setKey] = useState('')
+  const [ttsKey, setTtsKey] = useState('')
+  const [templateRaw, setTemplateRaw] = useState(JSON.stringify(provider.bodyTemplate ?? {}, null, 2))
+  const [templateBad, setTemplateBad] = useState(false)
+  const set = (patch: Record<string, any>) => onChange({ ...provider, ...patch })
+  const ref = provider.id
+  return (
+    <div className="card">
+      <div className="row">
+        <strong>{provider.name || provider.id}</strong>
+        <span className="muted">{provider.type}</span>
+        <button onClick={props.onTest}>连通检查</button>
+        <button onClick={props.onRemove}>删除</button>
+      </div>
+      <label>名称<input value={provider.name} onChange={e => set({ name: e.target.value })} /></label>
+      <label>协议类型
+        <select value={provider.type} onChange={e => set({ type: e.target.value })}>
+          {props.kind === 'image' && <><option value="openai-images">openai-images</option><option value="http-json">http-json（自定字段）</option></>}
+          {props.kind === 'video' && <><option value="async-task">async-task（提交+轮询）</option><option value="sync-url">sync-url（同步返回地址）</option></>}
+          {props.kind === 'clone' && <option value="http-json">http-json</option>}
+        </select>
+      </label>
+      <label>baseUrl<input value={provider.baseUrl} onChange={e => set({ baseUrl: e.target.value })} placeholder="https://你的模型服务/" /></label>
+      {props.kind !== 'clone' && <label>model<input value={provider.model ?? ''} onChange={e => set({ model: e.target.value })} /></label>}
+      <label>提交路径<input value={provider.submitPath ?? ''} onChange={e => set({ submitPath: e.target.value })} placeholder="/v1/xxx" /></label>
+      <label>请求体模板（JSON，占位符 {'{{prompt}} {{image_url}} {{model}} {{samples}}'}）
+        <textarea
+          rows={3}
+          value={templateRaw}
+          onChange={e => {
+            setTemplateRaw(e.target.value)
+            try {
+              onChange({ ...provider, bodyTemplate: JSON.parse(e.target.value) })
+              setTemplateBad(false)
+            } catch {
+              setTemplateBad(true)
+            }
+          }}
+        />
+      </label>
+      {templateBad && <div className="muted">模板 JSON 暂不合法，修正后才会保存</div>}
+      {props.kind === 'image' && <>
+        <label>结果 url 路径<input value={provider.resultUrlPath ?? ''} onChange={e => set({ resultUrlPath: e.target.value })} placeholder="data[0].url" /></label>
+        <label>结果 b64 路径<input value={provider.resultB64Path ?? ''} onChange={e => set({ resultB64Path: e.target.value })} placeholder="data[0].b64_json" /></label>
+      </>}
+      {props.kind === 'video' && <>
+        <label>任务 ID 路径<input value={provider.taskIdPath ?? ''} onChange={e => set({ taskIdPath: e.target.value })} placeholder="output.task_id" /></label>
+        <label>轮询路径<input value={provider.pollPath ?? ''} onChange={e => set({ pollPath: e.target.value })} placeholder="/v1/tasks/{{task_id}}" /></label>
+        <label>状态路径<input value={provider.statusPath ?? ''} onChange={e => set({ statusPath: e.target.value })} placeholder="output.task_status" /></label>
+        <label>视频地址路径<input value={provider.videoUrlPath ?? ''} onChange={e => set({ videoUrlPath: e.target.value })} placeholder="output.video_url" /></label>
+      </>}
+      {props.kind === 'clone' && <>
+        <label>voiceId 路径<input value={provider.voiceIdPath ?? ''} onChange={e => set({ voiceIdPath: e.target.value })} placeholder="voice_id" /></label>
+        <label>TTS 端点（openai 兼容）<input value={provider.ttsEndpoint ?? ''} onChange={e => set({ ttsEndpoint: e.target.value })} /></label>
+        <label>TTS model<input value={provider.ttsModel ?? ''} onChange={e => set({ ttsModel: e.target.value })} /></label>
+      </>}
+      <label>鉴权头名<input value={provider.auth?.headerName ?? ''} onChange={e => set({ auth: { ...provider.auth, headerName: e.target.value } })} placeholder="authorization" /></label>
+      <label>鉴权前缀<input value={provider.auth?.scheme ?? ''} onChange={e => set({ auth: { ...provider.auth, scheme: e.target.value } })} placeholder="Bearer " /></label>
+      <label>API 密钥（只写，加密落盘；{props.secretFlags[ref] ? '已保存' : '未保存'}）
+        <input type="password" value={key} onChange={e => {
+          setKey(e.target.value)
+          props.onSecret(ref, e.target.value)
+          set({ auth: { ...provider.auth, apiKeyRef: ref } })
+        }} />
+      </label>
+      {props.kind === 'clone' && (
+        <label>TTS 密钥（只写；{props.secretFlags[`${ref}-tts`] ? '已保存' : '未保存'}）
+          <input type="password" value={ttsKey} onChange={e => {
+            setTtsKey(e.target.value)
+            props.onSecret(`${ref}-tts`, e.target.value)
+            set({ ttsApiKeyRef: `${ref}-tts` })
+          }} />
+        </label>
+      )}
+    </div>
+  )
+}
+
+function App() {
+  const { state, error, refresh, setError } = useStudio()
+  const [tab, setTab] = useState<'pipeline' | 'voice' | 'providers'>('pipeline')
+  const [draft, setDraft] = useState<StudioState['config'] | null>(null)
+  const [secrets, setSecrets] = useState<Record<string, string>>({})
+  const [job, setJob] = useState({ name: '', prompt: '', imageProviderId: '', videoProviderId: '', approved: false, actions: ['idle', 'walk', 'think', 'wave', 'jump', 'sleep'] as string[] })
+  const [clone, setClone] = useState({ providerId: '', name: '', files: [] as string[], consent: false })
+  const [applyTarget, setApplyTarget] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState('')
+
+  const config = draft ?? state?.config
+  const run = async (label: string, fn: () => Promise<Result>) => {
+    setBusy(label)
+    const result = await fn()
+    setBusy('')
+    if (!result.ok) setError(result.error)
+    else await refresh()
+  }
+
+  if (!state || !config) return <div className="wrap">加载中… {error}</div>
+
+  const saveProviders = () => run('保存配置', async () => {
+    const result = await api().saveProviders(config, secrets)
+    if (result.ok) { setDraft(null); setSecrets({}) }
+    return result
+  })
+
+  return (
+    <div className="wrap">
+      <h1>形象与音色工作室</h1>
+      <div className="row tabs">
+        <button className={tab === 'pipeline' ? 'on' : ''} onClick={() => setTab('pipeline')}>形象流水线</button>
+        <button className={tab === 'voice' ? 'on' : ''} onClick={() => setTab('voice')}>自定义音色</button>
+        <button className={tab === 'providers' ? 'on' : ''} onClick={() => setTab('providers')}>模型接入配置</button>
+      </div>
+      {error && <div className="error">{error}<button onClick={() => setError('')}>关闭</button></div>}
+
+      {tab === 'providers' && <>
+        <p className="muted">接你自己的模型：填 baseUrl 与协议字段即可。密钥加密落盘，配置里只留引用。ffmpeg：{state.ffmpeg ?? '未找到（后处理会停住并提示）'}</p>
+        <label>ffmpeg 路径（可选）<input value={config.ffmpegPath ?? ''} onChange={e => setDraft({ ...config, ffmpegPath: e.target.value })} /></label>
+        <label>抠像底色（可选）<input value={config.keyColor ?? ''} onChange={e => setDraft({ ...config, keyColor: e.target.value })} placeholder="0x00FF00" /></label>
+        {(['image', 'video', 'clone'] as const).map(kind => (
+          <section key={kind}>
+            <div className="row">
+              <h2>{kind === 'image' ? '图像模型' : kind === 'video' ? '视频模型' : '音色克隆模型'}</h2>
+              <button onClick={() => setDraft({
+                ...config,
+                [kind]: [...config[kind], {
+                  id: newId(kind), name: '', type: kind === 'image' ? 'openai-images' : kind === 'video' ? 'async-task' : 'http-json', baseUrl: '', model: '',
+                }],
+              })}>添加</button>
+            </div>
+            {config[kind].map((p, i) => (
+              <ProviderEditor
+                key={p.id}
+                kind={kind}
+                provider={p}
+                secretFlags={state.secretFlags}
+                onChange={np => setDraft({ ...config, [kind]: config[kind].map((old, j) => j === i ? np : old) })}
+                onRemove={() => setDraft({ ...config, [kind]: config[kind].filter((_, j) => j !== i) })}
+                onTest={() => void run('连通检查', async () => {
+                  const r = await api().testProvider(kind, p.id)
+                  if (r.ok) setError(`连通检查：HTTP ${r.value.status}${r.value.ok ? '（可达）' : '（不可达或鉴权失败）'}`)
+                  return r
+                })}
+                onSecret={(ref, value) => setSecrets(s => ({ ...s, [ref]: value }))}
+              />
+            ))}
+          </section>
+        ))}
+        <div className="row">
+          <button disabled={busy !== ''} onClick={saveProviders}>保存配置</button>
+          {draft && <button onClick={() => { setDraft(null); setSecrets({}) }}>放弃修改</button>}
+        </div>
+      </>}
+
+      {tab === 'pipeline' && <>
+        <div className="card">
+          <label>形象名称<input value={job.name} onChange={e => setJob({ ...job, name: e.target.value })} /></label>
+          <label>形象描述（prompt）<textarea rows={3} value={job.prompt} onChange={e => setJob({ ...job, prompt: e.target.value })} /></label>
+          <label>图像模型
+            <select value={job.imageProviderId} onChange={e => setJob({ ...job, imageProviderId: e.target.value })}>
+              <option value="">选择…</option>
+              {state.config.image.map(p => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
+            </select>
+          </label>
+          <label>视频模型
+            <select value={job.videoProviderId} onChange={e => setJob({ ...job, videoProviderId: e.target.value })}>
+              <option value="">选择…</option>
+              {state.config.video.map(p => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
+            </select>
+          </label>
+          <div className="row">
+            {['idle', 'walk', 'think', 'wave', 'jump', 'sleep'].map(a => (
+              <label key={a} className="check">
+                <input type="checkbox" checked={job.actions.includes(a)} onChange={e => setJob({ ...job, actions: e.target.checked ? [...job.actions, a] : job.actions.filter(x => x !== a) })} />{a}
+              </label>
+            ))}
+          </div>
+          <label className="check">
+            <input type="checkbox" checked={job.approved} onChange={e => setJob({ ...job, approved: e.target.checked })} />
+            我知悉：1 次图像 + {job.actions.length} 次视频调用，费用计入我所配平台
+          </label>
+          <button disabled={busy !== '' || !job.approved || !job.imageProviderId || !job.videoProviderId} onClick={() => void run('生成', () => api().startJob(job))}>开始生成</button>
+        </div>
+        <h2>作业</h2>
+        {state.jobs.map(j => (
+          <div className="card" key={j.id}>
+            <div className="row"><strong>{j.name}</strong><span className="muted">{j.status}</span>
+              {(j.status === 'queued' || j.status === 'image' || j.status === 'clips' || j.status === 'post') && <button onClick={() => void run('取消', () => api().cancelJob(j.id))}>取消</button>}
+              {j.status === 'needs-postprocess' && <button onClick={() => void run('后处理', () => api().rerunPost(j.id))}>重试后处理</button>}
+            </div>
+            {j.error && <div className="error">{j.error}</div>}
+            {j.skinId && <div className="row">
+              <img className="preview" src={`pet-asset://custom/pets/${j.skinId}.png`} alt="皮肤预览" />
+              <select value={applyTarget[j.skinId] ?? ''} onChange={e => setApplyTarget({ ...applyTarget, [j.skinId]: e.target.value })}>
+                <option value="">应用到角色…</option>
+                {knownCharacters().map(c => <option key={c.assistantId} value={c.assistantId}>{c.displayName}</option>)}
+              </select>
+              <button disabled={!applyTarget[j.skinId]} onClick={() => void run('应用', () => api().applySkin(j.skinId, applyTarget[j.skinId]))}>应用</button>
+            </div>}
+          </div>
+        ))}
+        <h2>已登记皮肤</h2>
+        {state.skins.map(s => (
+          <div className="card row" key={s.id}>
+            <img className="preview" src={`pet-asset://custom/pets/${s.id}.png`} alt={s.name} />
+            <strong>{s.name}</strong><span className="muted">{s.actions.join('/')}</span>
+            <button onClick={() => void run('删除', () => api().deleteSkin(s.id))}>删除</button>
+          </div>
+        ))}
+      </>}
+
+      {tab === 'voice' && <>
+        <div className="card">
+          <label>克隆模型
+            <select value={clone.providerId} onChange={e => setClone({ ...clone, providerId: e.target.value })}>
+              <option value="">选择…</option>
+              {state.config.clone.map(p => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
+            </select>
+          </label>
+          <label>音色名称<input value={clone.name} onChange={e => setClone({ ...clone, name: e.target.value })} /></label>
+          <div className="row">
+            <button onClick={() => void run('选样本', async () => {
+              const r = await api().pickAudio()
+              if (r.ok) setClone({ ...clone, files: r.value as string[] })
+              return r
+            })}>选择样本（1–3 个音频）</button>
+            <span className="muted">{clone.files.map(f => f.split(/[\\/]/).pop()).join('、') || '未选择'}</span>
+          </div>
+          <label className="check">
+            <input type="checkbox" checked={clone.consent} onChange={e => setClone({ ...clone, consent: e.target.checked })} />
+            我确认样本为本人或已获授权的声音，并知悉样本将发送到我配置的克隆端点
+          </label>
+          <button disabled={busy !== '' || !clone.consent || !clone.providerId || clone.files.length === 0} onClick={() => void run('克隆', () => api().startClone(clone))}>开始克隆</button>
+        </div>
+        <h2>我的音色</h2>
+        {state.voices.map(v => (
+          <div className="card row" key={v.id}>
+            <strong>{v.name}</strong><span className="muted">voiceId {v.voiceId}</span>
+            <button onClick={() => void run('应用', () => api().applyVoice(v.id))}>设为当前音色</button>
+            <button onClick={() => void run('撤销', () => api().revokeVoice(v.id))}>撤销</button>
+          </div>
+        ))}
+        <p className="muted">当前 TTS profile：{state.selectedTts ?? '默认'}。撤销后回退默认音色；已发送到克隆端点的样本副本无法收回。</p>
+      </>}
+    </div>
+  )
+}
+
+createRoot(document.getElementById('root')!).render(<App />)

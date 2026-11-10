@@ -22,6 +22,9 @@
  */
 
 import type { PetSkin } from './PetSprite.js'
+import { isCustomSkinId } from './custom-skin-registry.ts'
+
+export { registerCustomSkins, isCustomSkinId } from './custom-skin-registry.ts'
 
 /** 桌面真实拥有的皮肤素材。三套静态图齐全，frames 目前只有 panda 有。 */
 export const KNOWN_SKINS: readonly PetSkin[] = ['panda', 'girl-glasses', 'boy-glasses']
@@ -150,7 +153,7 @@ export function knownCharacters(): readonly CharacterManifest[] {
  * 与 `resolveSkin` 的区别是它不兜底 —— 兜底是"没有别的信息了"才该做的事。
  */
 function knownSkin(skinId: string | null | undefined): PetSkin | null {
-  return skinId && (KNOWN_SKINS as readonly string[]).includes(skinId) ? (skinId as PetSkin) : null
+  return skinId && ((KNOWN_SKINS as readonly string[]).includes(skinId) || isCustomSkinId(skinId)) ? (skinId as PetSkin) : null
 }
 
 /**

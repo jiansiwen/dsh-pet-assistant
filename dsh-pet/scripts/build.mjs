@@ -172,6 +172,23 @@ const targets = [
     format: 'iife',
     define: { 'process.env.NODE_ENV': '"production"' },
   },
+  {
+    // 形象与音色工作室 preload：只暴露本窗口固定 IPC，provider 请求在主进程发出。
+    name: 'asset-studio-preload',
+    entryPoints: [path.join(root, 'src/preload/asset-studio.ts')],
+    outfile: path.join(root, 'dist/preload/asset-studio.cjs'),
+    platform: 'node',
+    format: 'cjs',
+    external: ['electron'],
+  },
+  {
+    name: 'asset-studio-renderer',
+    entryPoints: [path.join(root, 'src/renderer/asset-studio-main.tsx')],
+    outfile: path.join(root, 'dist/renderer/asset-studio.js'),
+    platform: 'browser',
+    format: 'iife',
+    define: { 'process.env.NODE_ENV': '"production"' },
+  },
 ]
 
 function copyStatic() {
@@ -181,6 +198,8 @@ function copyStatic() {
   cpSync(path.join(root, 'src/renderer/report-workbench.html'), path.join(root, 'dist/renderer/report-workbench.html'))
   cpSync(path.join(root, 'src/renderer/companion-tasks.html'), path.join(root, 'dist/renderer/companion-tasks.html'))
   cpSync(path.join(root, 'src/renderer/member-editor.html'), path.join(root, 'dist/renderer/member-editor.html'))
+  cpSync(path.join(root, 'src/renderer/asset-studio.html'), path.join(root, 'dist/renderer/asset-studio.html'))
+  cpSync(path.join(root, 'src/renderer/asset-studio.css'), path.join(root, 'dist/renderer/asset-studio.css'))
   cpSync(path.join(root, 'src/renderer/office-view.html'), path.join(root, 'dist/renderer/office-view.html'))
   cpSync(path.join(root, 'src/renderer/styles.css'), path.join(root, 'dist/renderer/styles.css'))
   // ⚠️ 这里只做「覆盖拷贝」，**不删除**目标里多余的文件。

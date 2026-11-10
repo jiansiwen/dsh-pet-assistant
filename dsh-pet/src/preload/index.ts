@@ -168,6 +168,11 @@ contextBridge.exposeInMainWorld('petApi', {
   onCharactersChanged: (callback: (characters: SkinOverrides) => void) => {
     subscribe('characters-changed', characters => callback((characters ?? {}) as SkinOverrides))
   },
+  customSkins: () => ipcRenderer.invoke('custom-skins-list') as Promise<string[]>,
+  onCustomSkins: (callback: (ids: string[]) => void) => {
+    subscribe('custom-skins-changed', ids => callback((ids ?? []) as string[]))
+  },
+  openAssetStudio: () => ipcRenderer.invoke('asset-studio-open') as Promise<{ ok: boolean }>,
   onExitRequested: (callback: () => void) => {
     subscribe('pet-exit-requested', () => callback())
   },
