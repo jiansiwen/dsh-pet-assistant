@@ -454,7 +454,7 @@ export class TeamService {
     })
   }
 
-  /** 仅补写缺失的旧版种子；已有成员的启用状态、权限和人设均以持久目录为准。 */
+  /** 仅首装补写种子；已有成员的启用状态、权限和人设均以持久目录为准。 */
   ensureRoster(): MemberConfig[] {
     const { enabled, unknown } = resolveSeats(ROSTER, this.options.seats)
     for (const name of unknown) this.options.logger.warn(`团队席位名单里认不出这个名字，已忽略：${name}`)
@@ -462,22 +462,22 @@ export class TeamService {
     if (chief && !enabled.has(chief.assistantId)) {
       this.options.logger.warn('团队席位名单里没有总助理：没人拆任务、转交审批与汇总专家结论')
     }
+    // 删除必须永久生效：启动时不再补回缺失的种子。总助理不可删除，
+    // 因此"表全空"等价于首次安装；任何删除之后表必非空，种子不会复活。
+    if (this.store.listMembers().length > 0) return this.roster()
     for (const seed of ROSTER) {
       const onStage = enabled.has(seed.assistantId)
-      const existing = this.store.getMember(seed.assistantId)
-      if (!existing) {
-        this.store.upsertMember({
-          assistantId: seed.assistantId,
-          roleId: seed.roleId,
-          displayName: seed.displayName,
-          skinId: seed.skinId,
-          persona: seed.persona,
-          voiceProfile: seed.voiceProfile,
-          toolPolicy: { mode: seed.mode, denyTools: [] },
-          enabled: onStage,
-          revision: 1,
-        })
-      }
+      this.store.upsertMember({
+        assistantId: seed.assistantId,
+        roleId: seed.roleId,
+        displayName: seed.displayName,
+        skinId: seed.skinId,
+        persona: seed.persona,
+        voiceProfile: seed.voiceProfile,
+        toolPolicy: { mode: seed.mode, denyTools: [] },
+        enabled: onStage,
+        revision: 1,
+      })
     }
     return this.roster()
   }
@@ -554,7 +554,9 @@ export class TeamService {
       this.store.insertTask(task)
       this.store.appendEvent('task/created', { taskId, goal: task.goal, ownerId, status: task.status }, { taskId, assistantId: ownerId })
     })
-    return task
+    // 回读而不是回内存里那份：`insertTask` 会补默认列（priority/source 等），
+    // 返回内存对象会让调用方拿到一个和库里不一致的 Task。
+    return this.store.getTask(taskId) ?? task
   }
 
   getTask(taskId: string): Task | null {

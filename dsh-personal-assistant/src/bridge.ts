@@ -1333,7 +1333,9 @@ export class SessionBridge {
       this.push({ type: 'reply', id: requestId, ok: false, error: `没有叫「${assistantId}」的成员，也不会替你换人` })
       return
     }
-    if (member && this.team && this.teamAgent) {
+    // 委派给成员就走成员独立会话；teamAgent 未注入时回退主会话作父身份，
+    // 不让委派落回总助理会话（否则子助理没有自己的会话记录）。
+    if (member && this.team && (this.teamAgent ?? this.agent)) {
       const running = this.runTeamTask(requestId, text, member)
       this.inflightTasks.set(requestId, running)
       return
@@ -1354,7 +1356,7 @@ export class SessionBridge {
   /** 点名成员：建任务 → 子代理执行 → 用 run.result 归属回复。 */
   private runTeamTask(requestId: string, text: string, member: MemberConfig): Promise<void> {
     const team = this.team
-    const parent = this.teamAgent
+    const parent = this.teamAgent ?? (this.agent as unknown as Agent | null)
     if (!team || !parent) return Promise.resolve()
     const task = team.submitTask({
       goal: text,

@@ -37,7 +37,10 @@ export class MemberManagement {
     acknowledgeMailSend?(intentId: string, expectedState: 'partial' | 'unknown'): boolean
     channelInboundAttention?(): NonNullable<MemberSnapshot['channelInboundAttention']>
     acknowledgeChannelInbound?(id: string, expectedRevision: number): boolean
-    assistant?: { draft(input: { request: string; current?: MemberDraft }): Promise<{ draft: MemberDraft; notes: string }> }
+    assistant?: {
+      draft(input: { request: string; current?: MemberDraft }): Promise<{ draft: MemberDraft; notes: string }>
+      studio?(input: { request: string }): Promise<{ name: string; prompt: string; actions: string[]; notes: string }>
+    }
   }
   constructor(options: MemberManagement['options']) { this.options = options }
   snapshot(): MemberSnapshot {
@@ -82,6 +85,15 @@ export class MemberManagement {
           return { status: 200, body: { draft: draft.parse(output.draft), notes: output.notes.slice(0, 2000) } }
         } catch (error) {
           return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '成员配置助手暂时不可用' } }
+        }
+      }
+      if (method === 'POST' && pathname === '/companion/v1/members/studio-assist') {
+        if (!this.options.assistant?.studio) return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: '形象配置助手尚未启用' } }
+        const input = assistSchema.parse(raw)
+        try {
+          return { status: 200, body: await this.options.assistant.studio({ request: input.request }) }
+        } catch (error) {
+          return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '形象配置助手暂时不可用' } }
         }
       }
       const notice = /^\/companion\/v1\/members\/mail-notices\/([a-f0-9-]{36})\/acknowledge$/iu.exec(pathname)

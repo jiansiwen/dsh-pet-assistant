@@ -9,7 +9,7 @@ import {
 import { CompanionReminders, reminderClaimSchema, reminderReceiptSchema } from './reminders.ts'
 import { getManagedExecutor, managedKinds } from './managed-executor.ts'
 import { validateEvidence } from './semantic-validators.ts'
-import { TERMINAL_TASK_STATUSES, TeamStore, type CompanionCommandRecord, type ManagedTaskInput, type Task } from './team-domain.ts'
+import { TASK_PRIORITIES, TERMINAL_TASK_STATUSES, TeamStore, type CompanionCommandRecord, type ManagedTaskInput, type Task } from './team-domain.ts'
 
 const emptyPayload = z.object({}).strict()
 const reschedulePayload = z.object({
@@ -18,6 +18,12 @@ const reschedulePayload = z.object({
 }).strict().refine(value => value.schedule !== undefined || value.deadlineAt !== undefined, '需要明确改期内容')
 
 const intervalPayload = z.object({ repeatEverySeconds: z.number().int().min(60).max(604_800) }).strict()
+/**
+ * 改优先级的 payload：**只认这三个小写值**。
+ * `urgent` / `HIGH` / 空串一律拒 —— 不做大小写宽容、不做同义词映射：
+ * 优先级会影响列表排序，猜错会让"要紧的事"沉到列表底部，而那没人能立刻发现。
+ */
+const priorityPayload = z.object({ priority: z.enum(TASK_PRIORITIES) }).strict()
 /** 受管执行器回执：四态 + 证据引用；succeeded 可携带结构化读回证据供语义复核。 */
 const managedReceiptSchema = z.object({
   executorEpoch: z.string().min(1).max(200),
@@ -60,6 +66,7 @@ const meetingTodoSchema = z.object({
   }
 })
 type Action = 'create' | 'pause' | 'resume' | 'cancel' | 'complete' | 'reschedule' | 'respond' | 'set-interval'
+  | 'set-priority'
 
 /** 仅标记尚未进入业务调度、且事务能够回滚的数据库争用。 */
 class RetryableTickBusy extends Error {
@@ -512,7 +519,7 @@ export class CompanionTaskRuntime {
       const inputRef = randomUUID()
       const at = this.now()
       this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input, digest: digestOf(input), createdAt: at })
-      const task = this.insertTask('查看会议纪要邮件', inputRef, null, [], 'queued', `meeting-mail-${intentId}`)
+      const task = this.insertTask('查看会议纪要邮件', inputRef, null, [], 'queued', `meeting-mail-${intentId}`, 'enterprise')
       const operationId = randomUUID()
       this.store.insertOperation({ operationId, taskId: task.taskId, approvalId: null, kind: 'meeting-mail.reminder', state: 'succeeded',
         resultDigest: digestOf({ intentId, taskId: task.taskId }), startedAt: at, endedAt: at, executedAt: at,
@@ -546,7 +553,7 @@ export class CompanionTaskRuntime {
       const taskInput = companionInputSchema.parse({ kind: 'agent', executionMode: 'manual', description })
       const inputRef = randomUUID(), at = this.now()
       this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input: taskInput, digest: digestOf(taskInput), createdAt: at })
-      const task = this.insertTask(input.text, inputRef, null, [], 'awaiting-user', `meeting-todo-${randomUUID()}`)
+      const task = this.insertTask(input.text, inputRef, null, [], 'awaiting-user', `meeting-todo-${randomUUID()}`, 'meeting')
       const source = { principalId: this.principalId, deviceId: this.deviceId, meetingId: input.meetingId, itemId: input.itemId,
         revision: input.revision, minuteDigest: input.digest, itemDigest, confirmedAt: input.confirmedAt, createdAt: at, taskId: task.taskId }
       this.store.saveMeetingTodoSource(source)
@@ -572,7 +579,9 @@ export class CompanionTaskRuntime {
     const meta = this.store.getCompanionMeta(task.taskId)!
     return companionTaskViewSchema.parse({ taskId: task.taskId, parentTaskId: meta.parentTaskId, kind: meta.kind,
       title: task.goal, status: task.status, blocker: meta.blocker, revision: task.revision, deviceId: meta.deviceId,
-      artifactIds: [...task.artifacts], updatedAt: new Date(task.updatedAt).toISOString() })
+      artifactIds: [...task.artifacts], updatedAt: new Date(task.updatedAt).toISOString(),
+      // 老记录已经由迁移补齐；这里再兜一层默认值，保证 `.strict()` 的 schema 永远拿到合法枚举。
+      priority: task.priority ?? 'normal', source: task.source ?? 'manual' })
   }
 
   snapshot(): { tasks: CompanionTaskView[]; cursor: number; meetingMailAttention: Array<{ intentId: string; acceptedAt: string }> } {
@@ -648,7 +657,27 @@ export class CompanionTaskRuntime {
     return updated
   }
 
-  private insertTask(title: string, inputRef: string, parentTaskId: string | null, dependsOn: string[], status: Task['status'], commandId: string): Task {
+  /**
+   * 创建方没声明来源时的推断：邮件/企微这类企业侧动作算 enterprise，会议算 meeting，
+   * 其余（本人发起的助手任务）算 manual。模型主动建的必须显式声明 `source: 'ai'`，
+   * 因为这条链路上没有可靠的"是谁发起的"信号 —— 猜出来的来源比没有来源更糟。
+   */
+  private sourceForKind(kind: string): Task['source'] {
+    if (kind === 'meeting' || kind === 'presentation') return 'meeting'
+    if (kind === 'mail-send' || kind === 'mail-analyze') return 'enterprise'
+    return 'manual'
+  }
+
+  private insertTask(
+    title: string,
+    inputRef: string,
+    parentTaskId: string | null,
+    dependsOn: string[],
+    status: Task['status'],
+    commandId: string,
+    /** 创建时就确定的来源：manual / meeting / enterprise / ai。缺省 manual。 */
+    source: Task['source'] = 'manual',
+  ): Task {
     const input = this.store.getCompanionInput(inputRef)!
     const at = this.now()
     const task: Task = { taskId: randomUUID(), teamId: 'companion',
@@ -656,7 +685,8 @@ export class CompanionTaskRuntime {
       goal: title, inputEvidence: [inputRef],
       acceptance: [input.input.kind === 'agent' ? '本人明确标记完成' : input.input.kind === 'reminder' ? '本人回应本轮提醒' : '执行器读回证据通过语义复核'],
       toolScope: 'read-only', budgetTokens: 0, deadlineAt: null, dependsOn, status, revision: 1, artifacts: [],
-      originRequestId: commandId, originChannel: 'companion', createdAt: at, updatedAt: at }
+      originRequestId: commandId, originChannel: 'companion', createdAt: at, updatedAt: at,
+      priority: 'normal', source }
     this.store.insertTask(task)
     this.store.saveCompanionMeta({ taskId: task.taskId, runtimeScope: 'companion', principalId: this.principalId,
       deviceId: this.deviceId, parentTaskId, kind: input.input.kind, inputRef, blocker: null })
@@ -833,7 +863,7 @@ export class CompanionTaskRuntime {
 
   private action(pathname: string): { action: Action; pathId?: string } {
     if (pathname === '/companion/v1/tasks') return { action: 'create' }
-    const task = /^\/companion\/v1\/tasks\/([^/]+)\/(pause|resume|cancel|complete|reschedule|set-interval)$/.exec(pathname)
+    const task = /^\/companion\/v1\/tasks\/([^/]+)\/(pause|resume|cancel|complete|reschedule|set-interval|set-priority)$/.exec(pathname)
     if (task) return { action: task[2] as Action, pathId: task[1] }
     const reminder = /^\/companion\/v1\/reminders\/([^/]+)\/respond$/.exec(pathname)
     if (reminder) return { action: 'respond', pathId: reminder[1] }
@@ -902,6 +932,8 @@ export class CompanionTaskRuntime {
       intervalPayload.parse(command.payload)
       if (meta.kind !== 'reminder') throw new CompanionError('INVALID_INPUT', '催办间隔只适用于提醒计划', 422)
       this.reminders.assertIntervalEditable(task.taskId)
+    } else if (route.action === 'set-priority') {
+      priorityPayload.parse(command.payload)
     } else if (route.action === 'reschedule') {
       const payload = reschedulePayload.parse(command.payload)
       if (meta.kind === 'reminder' && (!payload.schedule || payload.deadlineAt)) throw new CompanionError('INVALID_INPUT', '提醒改期需要明确的日程', 422)
@@ -914,8 +946,18 @@ export class CompanionTaskRuntime {
 
   private binding(command: CompanionCommandRecord): unknown {
     const input = this.store.getCompanionInput(this.store.getCompanionMeta(command.taskId)!.inputRef)!
-    return { principalId: this.principalId, deviceId: this.deviceId, pathname: command.pathname,
+    const base = { principalId: this.principalId, deviceId: this.deviceId, pathname: command.pathname,
       command: command.command, inputDigest: input.digest }
+    // 改优先级额外把目标值单独放进绑定：这条写会改变列表顺序（用户最直观可见的一处），
+    // 把它摊在提案参数里，审批窗口/日志里能直接看到"批准的是改成哪一个值"，
+    // 而不是让人去 payload 里翻。
+    // **只对这一个 action 生效**：给所有 action 都加字段会改变它们的绑定摘要，
+    // 升级瞬间在途的待批提案会全部作废 —— 那是没必要的连带伤害。
+    if (/\/set-priority$/.test(command.pathname)) {
+      const priority = (command.command.payload as { priority?: unknown } | null)?.priority
+      return { ...base, action: 'set-priority', priority }
+    }
+    return base
   }
 
   private submit(pathname: string, body: unknown, subject: CompanionSubject): CompanionHttpResult {
@@ -941,7 +983,8 @@ export class CompanionTaskRuntime {
       let task: Task
       if (route.action === 'create') {
         const payload = companionCreateSchema.parse(command.payload)
-        task = this.insertTask(payload.title, payload.inputRef, payload.parentTaskId ?? null, payload.dependsOn, 'awaiting-approval', command.commandId)
+        task = this.insertTask(payload.title, payload.inputRef, payload.parentTaskId ?? null, payload.dependsOn, 'awaiting-approval',
+          command.commandId, payload.source ?? this.sourceForKind(payload.kind))
         for (const dep of payload.dependsOn) if (this.store.wouldCreateCycle(task.taskId, dep)) throw new CompanionError('DEPENDENCY_CYCLE', '任务依赖不能成环', 422)
       } else task = this.ownedTask(command.taskId!)
       const record: CompanionCommandRecord = { commandId: command.commandId, principalId: this.principalId, digest,
@@ -992,6 +1035,14 @@ export class CompanionTaskRuntime {
         this.reminders.respond(reminderResponseSchema.parse(current.command.payload))
       } else if (route.action === 'set-interval') {
         this.reminders.setInterval(task.taskId, intervalPayload.parse(current.command.payload).repeatEverySeconds, operation.operationId)
+      } else if (route.action === 'set-priority') {
+        // 只改优先级：不动状态、不动依赖、不碰提醒周期。状态不变是刻意保证的 ——
+        // "把这件事标成高优先级"不该让一个进行中的任务跳回队列。
+        const priority = priorityPayload.parse(current.command.payload).priority
+        const updated = this.store.setTaskPriority(task.taskId, priority, this.now())
+        if (updated === null) throw new CompanionError('NOT_FOUND', '任务不存在', 404)
+        this.approvals.invalidateTasks([task.taskId], '任务优先级已变化')
+        this.emit(updated)
       } else if (meta.kind === 'reminder') {
         if (route.action === 'complete') throw new CompanionError('USE_REMINDER_RESPONSE', '提醒需要本人回应，不能代替业务完成', 422)
         const spec = route.action === 'reschedule' ? reschedulePayload.parse(current.command.payload).schedule : undefined

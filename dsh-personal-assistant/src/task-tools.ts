@@ -98,9 +98,12 @@ export function registerCompanionTools(host: { tools: { register(definition: unk
     })))
     disposers.push(host.tools.register(defineTool({
       name: 'companion_create_task',
-      description: '提交人工待办或桌面提醒创建提案，必须由本人在可信桌面确认后才生效。不会调用模型执行人工待办。不得声称待批准提案已开始提醒。',
+      description: '提交人工待办或桌面提醒创建提案，必须由本人在可信桌面确认后才生效。不会调用模型执行人工待办。不得声称待批准提案已开始提醒。'
+        + ' **来源必须如实声明**：由你（模型）主动创建的任务，payload 里传 source:"ai"；用户直接要求创建时留空（服务端会记 manual）。'
+        + ' 不要为了"看起来重要"而改优先级或来源——两者都会进统计，写错没人能发现。',
       parameters: { commandJson: { type: 'string', required: true,
-        description: '命令 JSON：protocolVersion=1、唯一 commandId、expiresAt、payload={kind,title,inputRef,dependsOn}；重试复用完全相同的命令' } },
+        description: '命令 JSON：protocolVersion=1、唯一 commandId、expiresAt、payload={kind,title,inputRef,dependsOn,source?}；'
+          + 'source 可选，取值 manual|meeting|enterprise|ai，模型主动创建时传 "ai"，用户要求创建时留空；重试复用完全相同的命令' } },
       output,
       execute: (args: { commandJson: string }) => post('/companion/v1/tasks', args.commandJson),
     })))

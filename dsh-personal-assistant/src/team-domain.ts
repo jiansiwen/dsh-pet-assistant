@@ -295,6 +295,32 @@ export const TASK_STATUSES = [
 ] as const
 export type TaskStatus = (typeof TASK_STATUSES)[number]
 
+/** 待办优先级。列表按它排序（high 在前），同优先级再按 updatedAt 倒序。 */
+export const TASK_PRIORITIES = ['high', 'normal', 'low'] as const
+export type TaskPriority = (typeof TASK_PRIORITIES)[number]
+export const DEFAULT_TASK_PRIORITY: TaskPriority = 'normal'
+
+/**
+ * 待办来源。**创建时就定**，之后不改：它回答的是"这条是怎么来的"，
+ * 不是"现在归谁管"——所以不做可编辑字段。
+ * - manual：用户手输 / 手点
+ * - meeting：会议里产生的
+ * - enterprise：邮件、企业微信等企业侧产生的
+ * - ai：模型主动建的
+ */
+export const TASK_SOURCES = ['manual', 'meeting', 'enterprise', 'ai'] as const
+export type TaskSource = (typeof TASK_SOURCES)[number]
+export const DEFAULT_TASK_SOURCE: TaskSource = 'manual'
+
+/** 库里的值可能是老的/手改的：认不出的按默认处理，绝不让它变成 undefined 冒到界面上。 */
+export function normalizePriority(raw: unknown): TaskPriority {
+  return (TASK_PRIORITIES as readonly string[]).includes(String(raw)) ? String(raw) as TaskPriority : DEFAULT_TASK_PRIORITY
+}
+
+export function normalizeSource(raw: unknown): TaskSource {
+  return (TASK_SOURCES as readonly string[]).includes(String(raw)) ? String(raw) as TaskSource : DEFAULT_TASK_SOURCE
+}
+
 /** 终态：不再接受新的执行步骤，只接受复核或重新开任务。 */
 export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ['done', 'failed', 'cancelled']
 
@@ -317,6 +343,10 @@ export interface Task {
   readonly originChannel: string | null
   readonly createdAt: number
   readonly updatedAt: number
+  /** 缺省按 {@link DEFAULT_TASK_PRIORITY}；老记录在库里迁移时已补齐。 */
+  readonly priority?: TaskPriority
+  /** 缺省按 {@link DEFAULT_TASK_SOURCE}；老记录在库里迁移时已补齐。 */
+  readonly source?: TaskSource
 }
 
 export const RUN_STATES = ['running', 'succeeded', 'failed', 'cancelled', 'unknown'] as const
@@ -1019,6 +1049,10 @@ export class TeamStore {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications (task_id, created_at)`)
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_operation ON operation_reviews (operation_id, created_at)`)
 
+    // 待办的优先级与来源：老库的 tasks 表已经存在，CREATE TABLE IF NOT EXISTS 不会补列，
+    // 所以在建完核心表之后按列名补齐（幂等，见 migrateTaskColumns）。
+    this.migrateTaskColumns()
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS companion_identity (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1315,13 +1349,39 @@ export class TeamStore {
     }
   }
 
+  /**
+   * 幂等迁移：给 tasks 补 `priority` / `source` 两列。
+   *
+   * 为什么用 PRAGMA + ALTER 而不是改 CREATE TABLE：老库的 `tasks` 已经存在，
+   * `CREATE TABLE IF NOT EXISTS` 不会补列。ALTER 带 `DEFAULT` 时 SQLite 会把**已有行**
+   * 一并填成默认值，所以老任务不会变成 NULL / undefined；重复执行因为先查了列名，不会报错。
+   */
+  private migrateTaskColumns(): void {
+    const columns = new Set((this.db.prepare('PRAGMA table_info(tasks)').all() as Row[]).map(row => String(row.name)))
+    if (!columns.has('priority')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT '${DEFAULT_TASK_PRIORITY}'`)
+    }
+    if (!columns.has('source')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN source TEXT NOT NULL DEFAULT '${DEFAULT_TASK_SOURCE}'`)
+    }
+  }
+
+  /** 改优先级。只动 priority 与 updatedAt/revision —— 不碰状态、不碰审批。 */
+  setTaskPriority(taskId: string, priority: TaskPriority, now: number): Task | null {
+    const current = this.getTask(taskId)
+    if (current === null) return null
+    this.db.prepare('UPDATE tasks SET priority = ?, updated_at = ?, revision = revision + 1 WHERE task_id = ?')
+      .run(priority, now, taskId)
+    return this.getTask(taskId)
+  }
+
   insertTask(task: Task): void {
     this.db
       .prepare(
         `INSERT INTO tasks (task_id, team_id, owner_id, goal, input_evidence, acceptance, tool_scope, budget_tokens,
                             deadline_at, status, revision, artifacts, origin_request_id, origin_channel,
-                            created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            created_at, updated_at, priority, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.taskId,
@@ -1340,6 +1400,8 @@ export class TeamStore {
         text(task.originChannel),
         task.createdAt,
         task.updatedAt,
+        task.priority ?? DEFAULT_TASK_PRIORITY,
+        task.source ?? DEFAULT_TASK_SOURCE,
       )
     for (const dep of task.dependsOn) {
       this.db.prepare('INSERT OR IGNORE INTO task_dependencies (task_id, depends_on) VALUES (?, ?)').run(task.taskId, dep)
@@ -1397,6 +1459,8 @@ export class TeamStore {
       artifacts: parseList(text(row.artifacts as string | null)),
       originRequestId: text(row.origin_request_id as string | null),
       originChannel: text(row.origin_channel as string | null),
+      priority: normalizePriority(row.priority),
+      source: normalizeSource(row.source),
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
     }

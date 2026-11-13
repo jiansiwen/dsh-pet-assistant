@@ -51,6 +51,12 @@ import {
 import { localDateOf, startOfLocalDate } from './time.ts'
 import type { ActivityTracker } from './tracker.ts'
 import { planWorkItem, type EvidenceType, type PlannedWorkItem, type SourceResolver, type WorkItemInput, type WorkItemStore } from './work-items.ts'
+// 近期工作上下文：纯函数在 work-context.ts，这里只做"取数据 + 拼段落"。
+// 只 import 渲染所需的最小形状（WorkContextItem），不 import WorkItemStore。
+import { buildWorkContext, WORK_CONTEXT_WINDOW_MS, type WorkContextItem } from './work-context.ts'
+// 只取类型与"召回依赖"的形状：真正的检索实现在 recall-index.ts，由 index.ts 装配进来。
+// 这里刻意只 `import type`，工具层不持有库连接，也不参与索引的建表/对账。
+import type { RecallBundle } from './recall-index.ts'
 
 interface AssistantHost {
   tools: { register(definition: unknown): () => void }
@@ -58,6 +64,12 @@ interface AssistantHost {
     section(section: { name: string; order: number; text: string }): () => void
     variable(name: string, provider: () => string | undefined): () => void
   }
+  /**
+   * 宿主事件总线。**可选**：index.ts 用 `ctx as never` 把上下文传进来，假宿主（测试、
+   * 无 UI 宿主）可能连这个方法都没有。拿不到就退化成"永远静态注入"，不是错误。
+   * 只用到 `session/event`，载荷形状见 {@link userMessageText}。
+   */
+  on?(event: string, listener: (session: unknown, event: unknown) => void): unknown
 }
 
 export interface ToolOptions {
@@ -69,6 +81,14 @@ export interface ToolOptions {
   reports: ReportStore
   /** 注入系统提示词的记忆条数上限。 */
   maxInjectedMemories: number
+  /**
+   * 记忆召回：给定确定性查询词返回召回结果。
+   *
+   * 缺失或抛错时一律回退静态注入（见 {@link renderPreferences}）。做成注入依赖而不是
+   * 在 tools.ts 里直接 import recallMemories + db：工具层不应该知道库在哪，
+   * 也不该在提示词装配链上多一条同步 DB 调用的硬依赖。
+   */
+  recall?: RecallDependency
   /** 采集闸门：旧数据迁移没跑完时返回原因，开启助理模式的工具据此拒绝启动采集。 */
   captureBlockedReason(): string | null
   /** 采集范围首次确认；未装配时沿用旧行为并在回执里明示范围。 */
@@ -111,6 +131,260 @@ const TRUSTED_ACTOR: MemoryActor = { id: 'desktop-shell', isUser: true }
  * 而且必须在该项目帮助授权仍有效（实际路径未改指）时才读。
  */
 const MEMORY_CONTEXT: MemoryContext = {}
+
+// ---------------------------------------------------------------------------
+// 记忆召回 → 提示词注入
+//
+// 这一段是"静态注入"与"按话语召回"之间的唯一接缝，刻意做成**纯函数**：变量回调依赖
+// 宿主 ctx，装配期根本进不了单测；把判定与渲染抽出来，回退路径才有确定性的用例。
+// ---------------------------------------------------------------------------
+
+/** 召回依赖的形状：给确定性查询词，还召回结果。实现见 index.ts（失败时返回降级 bundle）。 */
+export type RecallDependency = (terms: readonly string[], now: number) => RecallBundle
+
+/** 静态兜底的空态文案。与改造前逐字一致：召回接不上时用户看到的东西不该变。 */
+const EMPTY_PREFERENCES = '（暂无已确认的记忆。用户表达长期偏好后会自动出现在这里。）'
+
+/**
+ * 静态回退分支的抬头。只包在静态注入外面，不改 {@link renderMemorySection} 本身
+ * ——那个函数还有别的调用方（项目证据、列表），改它会波及无关路径。
+ *
+ * 两个措辞纪律：
+ * - **陈述句、不出现"未找到"**：模型看到"没找到"很容易对用户复述"我没找到相关记忆"，
+ *   而事实只是"本轮没有更相关的检索结果"，不是"没有记忆"，更不是"没记住"。
+ * - 明说"全局长期规则"：召回命中时注入串自带"以下是与本轮请求相关的长期记忆"抬头，
+ *   回退路径没有抬头的话，模型容易把常驻规则误当成"用户刚才提到了这个"。
+ */
+const STATIC_PREFERENCES_HEADER = '以下是全局长期规则（本轮未检索到更相关的记忆）：'
+
+/**
+ * 查询词上限。词太多等于把整句话当查询：OR 出来的 bigram 会把几乎所有记忆都命中，
+ * 排序再好也退化成"全都注入"，白挤上下文预算。
+ */
+export const RECALL_TERM_LIMIT = 8
+/** 单个查询词最长字符数。只要够表达"用户这句话在说什么"，剩下的交给 bigram。 */
+export const RECALL_TERM_MAX_CHARS = 20
+
+const CJK_CHAR = /[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7AF]/
+const WORD_CHAR = /[\p{L}\p{N}]/u
+
+/**
+ * 从本轮用户话语里抽召回查询词（**确定性抽取，不用模型**）。
+ *
+ * 为什么不用模型生成查询词：召回发生在提示词装配期，一次模型调用就足够把首字延迟拖到
+ * 秒级，而且模型生成的词不可复现——同一句话两次装配可能召回不同记忆，排障时无从对齐。
+ * 这里只做切分与过滤，bigram 由 recall-index.ts 统一处理，绝不在两层各做一套。
+ *
+ * 规则：NFKC 归一 → 按空白/中英文标点切段 → 中文连续段 ≥2 字保留（长句整段保留，
+ * 单字丢弃）、英文/数字词 ≥2 字保留 → 去重保序 → 最多 8 个 → 单个截 20 字。
+ */
+export function extractRecallTerms(text: string): string[] {
+  if (typeof text !== 'string') return []
+  const trimmed = text.trim()
+  if (trimmed === '') return []
+
+  const terms: string[] = []
+  const seen = new Set<string>()
+  let cjk = ''
+  let word = ''
+  let stop = false
+
+  // 返回 true 表示已到上限。
+  const push = (value: string): boolean => {
+    const term = value.slice(0, RECALL_TERM_MAX_CHARS)
+    const key = term.toLowerCase()
+    if (key === '' || seen.has(key)) return false
+    seen.add(key)
+    terms.push(term)
+    return terms.length >= RECALL_TERM_LIMIT
+  }
+  // 单字的连续段一律丢掉：中文单字几乎没有区分度（"我""的""了"），
+  // 英文/数字单字母同理。少一个词的代价远小于拿噪音把候选集撑满。
+  const flushCjk = (): void => {
+    if (cjk === '') return
+    const value = cjk
+    cjk = ''
+    if (value.length >= 2 && push(value)) stop = true
+  }
+  const flushWord = (): void => {
+    if (word === '') return
+    const value = word
+    word = ''
+    if (value.length >= 2 && push(value)) stop = true
+  }
+
+  for (const char of trimmed.normalize('NFKC').toLowerCase()) {
+    if (CJK_CHAR.test(char)) {
+      flushWord()
+      if (stop) break
+      cjk += char
+      continue
+    }
+    if (WORD_CHAR.test(char)) {
+      flushCjk()
+      if (stop) break
+      word += char
+      continue
+    }
+    // 标点、空白、emoji 一律当切分点：绝不让查询词跨标点拼出一个假词。
+    flushCjk()
+    if (stop) break
+    flushWord()
+    if (stop) break
+  }
+  if (!stop) {
+    flushCjk()
+    if (!stop) flushWord()
+  }
+  return terms
+}
+
+/**
+ * 从 `session/event` 的 `user/message` 载荷里取"真人说了什么"。
+ *
+ * **真实载荷结构**（依据：`@deepseek-ai/dsh-session` 的 `lib/types/types.d.ts` 里
+ * `'user/message': UserMessage`，`UserMessage = { id, role:'user', content: ContentBlock[],
+ * source: MessageSource }`；本仓库 `src/session-mirror.ts` 也是这么消费的）：
+ *
+ *   { type: 'user/message', seq, surfaceOp, data: { id, role: 'user', content, source } }
+ *
+ * 也就是说 `event.data` **就是** UserMessage 本身，没有 `data.message` 这一层；
+ * `content` 也不是字符串，而是块数组，可见文本只在 `{ type: 'text', text }` 块里。
+ *
+ * `source.kind` 是 producer 自报的来源：`'user'` 才是真人输入；运行时上下文、时间块、
+ * skill 正文、子目录 AGENTS.md、子代理回报等注入件是别的 kind，它们不是"用户说的话"，
+ * 拿去当查询词只会召回一堆与用户意图无关的记忆。缺失/空串按旧宿主当真人输入处理
+ * ——与 session-mirror.ts 的判定保持一致，不在同一个仓库里养两套口径。
+ */
+export function userMessageText(event: { type?: unknown; data?: unknown } | null | undefined): string {
+  if (!event || event.type !== 'user/message') return ''
+  const data = event.data as { content?: unknown; source?: { kind?: unknown } } | null | undefined
+  const kind = data?.source?.kind
+  if (typeof kind === 'string' && kind !== '' && kind !== 'user') return ''
+  const content = data?.content
+  if (typeof content === 'string') return content.trim()
+  if (!Array.isArray(content)) return ''
+  let out = ''
+  for (const block of content) {
+    const item = block as { type?: unknown; text?: unknown } | null
+    if (item && item.type === 'text' && typeof item.text === 'string') out += item.text
+  }
+  return out.trim()
+}
+
+/**
+ * 召回调用包一层 try/catch，异常一律当成"没有召回"。
+ *
+ * 真机教训：变量回调抛出会把整轮提示词装配炸掉，用户看到的是助理彻底不回话；
+ * 而召回只是增强项，最差也应该是"退回静态注入"。所以这里**绝不**让异常穿出去。
+ */
+function safeRecall(recall: RecallDependency, terms: readonly string[], now: number): RecallBundle | null {
+  try {
+    return recall(terms, now) ?? null
+  } catch {
+    return null
+  }
+}
+
+/** {@link renderPreferences} 只需要这三样，不依赖整个 ToolOptions。 */
+export interface PreferencesSource {
+  memories: Pick<MemoryStore, 'injectable'>
+  maxInjectedMemories: number
+  recall?: RecallDependency
+  /**
+   * 近期工作事项（M2）。刻意只声明 `listInRange` 一个方法：
+   * 工具层渲染提示词只需要读，不需要 `add`/`confirm`/`remove` 这些写接口。
+   * 未装配时整段工作上下文不注入（见 {@link renderWorkContext}）。
+   */
+  workItems?: { listInRange(from: number, to: number): WorkContextItem[] }
+}
+
+/**
+ * 渲染 `personal_assistant_preferences` 变量的取值。**返回值永远是字符串。**
+ *
+ * 宿主把"变量没有值"当装配错误直接炸（真机实测：新库无记忆时报
+ * `prompt variable … has no value`），所以这里三层保证：
+ * 正常召回给字符串 → 静态渲染给字符串 → 静态也读不出来就用常量文案，外层再兜一个 catch。
+ *
+ * 判定只有一条：**召回真的命中过（非降级、非空、且确实注入了条目）才用召回结果，其余一律静态注入。**
+ * 回退顺序与理由：
+ * - 没有用户话语（宿主不支持 session/event、或本轮还没进真人输入）→ 静态注入：
+ *   没有查询词的"召回"只能按时间倒序取前 N 条，与静态注入等价，却多一次 FTS 开销。
+ * - 召回抛错 / 返回 undefined / 注入串是空串 → 静态注入：召回是增强项，不能因为它坏了
+ *   就让用户以为助理把教过的东西忘了。
+ * - 召回 degraded（FTS 异常、索引没建起来）→ 静态注入。recall-index 降级时给的是
+ *   "未找到相关记忆"的空态串，直接返回等于把今天的静态兜底也一起关掉。
+ * - 召回 empty（没命中 / 全被状态过滤 / 预算截空）→ **也回退静态注入**。全局偏好是
+ *   "长期规则"，与"这一轮说了什么词"无关：不带关键词的一轮（"今天天气不错"）改造前照样
+ *   注入、照样生效。只按命中与否决定要不要给，等于用户随口聊一句就感觉助理把偏好忘了，
+ *   比完全不召回更糟。宁可多给几条不相关的规则，也不能少给长期生效的规则。
+ * - 正常命中 → 原样返回注入串，不二次加工：改写渲染会与 recall-index 的口径分裂。
+ * - 静态注入有内容时统一加 {@link STATIC_PREFERENCES_HEADER} 抬头，让模型分得清
+ *   "这批是本轮检索出来的"（召回串自带抬头）与"这批是常驻全局规则"；0 条时不加，
+ *   仍返回与改造前逐字一致的 EMPTY_PREFERENCES。
+ */
+export function renderPreferences(
+  source: PreferencesSource,
+  lastUserText: string,
+  now = Date.now(),
+): string {
+  try {
+    const terms = extractRecallTerms(lastUserText)
+    const bundle = terms.length > 0 && source.recall ? safeRecall(source.recall, terms, now) : null
+    const injection = bundle?.injection
+    // injected 非空是**防御性**判定：empty=false 却没有条目本不该发生，
+    // 真发生了说明上游状态自相矛盾，这时回退静态注入永远比返回一个可疑串安全。
+    if (bundle && !bundle.degraded && !bundle.empty
+      && Array.isArray(bundle.injected) && bundle.injected.length > 0
+      && typeof injection === 'string' && injection.trim() !== '') {
+      return injection
+    }
+    const records = source.memories
+      .injectable(MEMORY_CONTEXT, now)
+      .slice(0, Math.max(0, source.maxInjectedMemories))
+    const section = renderMemorySection(records, MEMORY_CONTEXT)
+    // 抬头只加在"确实有内容"的静态注入上：0 条时加抬头会变成一句没有指代对象的话，
+    // 而且 0 条必须与改造前逐字一致（EMPTY_PREFERENCES 原样返回）。
+    return section === undefined ? EMPTY_PREFERENCES : `${STATIC_PREFERENCES_HEADER}\n${section}`
+  } catch {
+    // 连静态注入都读不出来（库异常）：仍然必须是字符串，否则装配期直接抛。
+    return EMPTY_PREFERENCES
+  }
+}
+
+/**
+ * 把若干段落按顺序拼接，空/空白段落直接丢掉。
+ *
+ * 为什么要这个函数：宿主把"变量没有值"当装配错误，`''` 与 `undefined` 都会炸，
+ * 但两段内容天然可能其中一段为空（今天没记任何工作事项太正常了）。直接模板拼接会
+ * 在中间留下连续空行，模型看到的是一堆空行夹着内容，抬头的归属也会变糊。
+ * 丢掉空段后：有内容就只剩内容，全空则返回 `''`（由调用方决定兜底文案）。
+ */
+export function joinSections(...parts: Array<string | undefined | null>): string {
+  return parts
+    .filter((part): part is string => typeof part === 'string' && part.trim() !== '')
+    .join('\n')
+}
+
+/**
+ * 渲染近期工作上下文段落（M2）。
+ *
+ * 只做三件事：没装配 `workItems` 就返回空串；按 24 小时窗口取事项；交给纯函数渲染。
+ * 任何异常都吞成空串——工作上下文是**增强项**，不能因为它在装配期把整轮提示词炸掉
+ * （真机踩过的坑：变量回调抛错 = 助理彻底不回话）。
+ *
+ * 取数范围写成 `[now - 24h, now + 1)`：`listInRange` 的上界是开区间（`start_at < to`），
+ * 不加 1 会把"正好此刻开始"的事项漏掉，而这条恰恰是最可能被"继续刚才那个"指向的。
+ */
+export function renderWorkContext(source: PreferencesSource, now = Date.now()): string {
+  try {
+    if (!source.workItems) return ''
+    const items = source.workItems.listInRange(now - WORK_CONTEXT_WINDOW_MS, now + 1)
+    return buildWorkContext(items, { now })
+  } catch {
+    return ''
+  }
+}
 
 function systemTimezone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'local'
@@ -1495,6 +1769,24 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       : 'manual（日报与偏好需用户在桌面专用审批窗口批准）'
   })
 
+  // 本轮用户话语：召回要拿"用户这句话"当确定性查询词，而变量回调本身拿不到对话内容，
+  // 所以在装配之前先把它快照下来。时机与 channel-agent-settings.ts 同一套：
+  // `user/message` 在 turn/start 之后、首步组装之前落库，装配时读到的必是本轮的话。
+  //
+  // ctx.on 可能不存在（index.ts 用 `ctx as never` 传 ctx，假宿主也可能什么都没有），
+  // 这时 lastUserText 永远为空 → renderPreferences 直接走静态注入，行为与改动前一致。
+  // 订阅本身也包 try/catch：宿主不认识这个事件名时不该让插件起不来。
+  let lastUserText = ''
+  try {
+    ctx.on?.('session/event', (_session, event) => {
+      const text = userMessageText(event as { type?: unknown; data?: unknown })
+      if (text !== '') lastUserText = text
+      return undefined
+    })
+  } catch {
+    // 订阅不可用 = 宿主不支持：静默退回静态注入，不阻断工具注册。
+  }
+
   // 记忆直接渲染进系统提示词：任何新会话一启动就自带偏好，不依赖模型记不记得调
   // personal_assistant_list_preferences。记忆存在助理库（全局范围），跨会话、跨天始终生效
   // ——这是"下次开新会话不用重新交代"的保证。
@@ -1502,18 +1794,16 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
   // 条数要有上限：记忆是只增不减的，全塞进提示词迟早把上下文挤爆，
   // 挤爆之后连当前任务的材料都放不下，那就本末倒置了。按优先级取前 N 条，
   // 剩下的仍然在库里，用户问起时 list_preferences 能看到全部。
-  ctx.systemPrompt.variable('personal_assistant_preferences', () => {
-    const records = options.memories
-      .injectable(MEMORY_CONTEXT, Date.now())
-      .slice(0, Math.max(0, options.maxInjectedMemories))
-    // 空态必须给字符串而不是 undefined：宿主把"变量没有值"当成装配错误直接炸
-    // （真机实测：新库无记忆时报 "prompt variable … has no value"）。空态的话告诉
-    // 模型记忆机制存在，别让"已确认的记忆"标题下面空着让模型猜。
-    return (
-      renderMemorySection(records, MEMORY_CONTEXT)
-      ?? '（暂无已确认的记忆。用户表达长期偏好后会自动出现在这里。）'
-    )
-  })
+  //
+  // 取值逻辑在纯函数 renderPreferences 里：先按本轮话语召回，再退回静态注入。
+  // 这里只留一行调用，是因为变量回调依赖宿主 ctx、进不了单测，逻辑留在闭包里就永远测不到。
+  //
+  // 两段拼接：长期规则（偏好）+ 近期工作上下文（M2）。段落顺序是先规则后背景——
+  // 规则是"怎么做事"，背景是"最近在做什么"，模型优先守规则再谈上下文不会把顺序搞反。
+  // joinSections 丢空段：今天没记事项时输出与 M1 逐字一致，不出现空行；
+  // renderPreferences 保证非空，所以拼接结果永远非空（宿主不接受空变量值）。
+  ctx.systemPrompt.variable('personal_assistant_preferences',
+    () => joinSections(renderPreferences(options, lastUserText), renderWorkContext(options)))
 
   // 矛盾的记忆一律不注入（isInjectable 只放 confirmed）。但"不注入"不等于"没这回事"：
   // 用户需要知道有两条互相打架的说法停在那里，否则助理看起来像是把他教过的东西忘了。

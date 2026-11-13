@@ -28,11 +28,55 @@ import { ProactiveHelpFlow, type ProactiveConfig } from './proactive.ts'
 import { registerManagedExecutor, getManagedExecutor } from './managed-executor.ts'
 import { ASSISTANT_SCHEMA_VERSION, getUserFlag, openAssistantStore, setUserFlag } from './store.ts'
 import { TeamService, type TeamLogger } from './team.ts'
-import { TeamStore } from './team-domain.ts'
+import { TeamStore, TERMINAL_TASK_STATUSES } from './team-domain.ts'
+import {
+  WORKBENCH_OFFLINE_TEXT,
+  WORKBENCH_PAGE_HINT,
+  WORKBENCH_PAGE_LABELS,
+  formatMeetingToday,
+  parseSetOption,
+  parseSetPriority,
+  SET_PRIORITY_USAGE,
+  SET_PRIORITY_BAD_VALUE,
+  SET_PRIORITY_SUBMITTED,
+  describeSetOption,
+  SET_OPTION_HINT,
+  parseWorkbenchPage,
+  summarizeWorkbench,
+  type WorkbenchSummarySnapshot,
+} from './workbench-summary.ts'
+import {
+  EMPTY_FIELD,
+  formatMeetingHistory,
+  formatMeetingList,
+  formatReportList,
+  formatSettingsSummary,
+  formatTeamList,
+  formatTodoList,
+  type MeetingListRow,
+  type ReportListRow,
+  type TeamListRow,
+  type TodoListRow,
+} from './workbench-lists.ts'
 import { registerTeamTools } from './team-tools.ts'
 import { CompanionTaskRuntime } from './task-runtime.ts'
 import { registerCompanionTools } from './task-tools.ts'
 import { decryptDpapiFile, decryptSecret, mailSendAccountKey, readMailConfig, registerMailTools } from './mail.ts'
+import { parseConfigArguments } from './config-args.ts'
+import {
+  MAIL_CONFIG_HINT,
+  checkMailConfig,
+  formatMailConfigView,
+  readMailConfigView,
+  saveMailConfig,
+} from './mail-config.ts'
+import {
+  WECOM_CONFIG_HINT,
+  checkWeComAppConfig,
+  formatWeComAppView,
+  readWeComAppView,
+  saveWeComAppConfig,
+} from './wecom-config.ts'
 import { ChannelManager, channelAccountKey, type ChannelSettings } from './channels.ts'
 import { registerMeetingMailTools } from './meeting-mail.ts'
 import { registerMeetingPresentationTools } from './meeting-presentation-tools.ts'
@@ -48,6 +92,7 @@ import { registerComputerTools } from './computer.ts'
 import { localDateOf } from './time.ts'
 import { applyRetention, startRetention } from './retention.ts'
 import { registerAssistantTools } from './tools.ts'
+import { ensureRecallSchema, RECALL_EMPTY_INJECTION, recallMemories, reconcileRecallIndex } from './recall-index.ts'
 import { ActivityTracker } from './tracker.ts'
 import { WorkItemStore } from './work-items.ts'
 import { MaterialStore } from './materials.ts'
@@ -186,6 +231,36 @@ export interface UserCommandDeps {
   captureBlockedReason: () => string | null
   captureScopeAuthorized: () => boolean
   log?: (message: string) => void
+  /**
+   * 工作台概览的三个数字（只读）。宿主没接数据源时整条命令回「暂时读不到」，
+   * 而不是不注册 —— 前端的卡片是固定位置的，命令消失比显示"读不到"更难解释。
+   */
+  summary?: () => WorkbenchSummarySnapshot
+  /**
+   * 工作台三张**本地**列表（待办 / 日报 / 成员）。会议列表不在这里 ——
+   * 它的数据在桌宠侧，命令内部直接走 `meeting.list` 桌面命令。
+   * 每个 getter 返回 `null` 表示"这个源此刻读不到"，与"空列表"严格分开。
+   */
+  /**
+   * 任务运行时：改优先级要「先读快照拿 revision → 再提交提案」，
+   * 必须走 runtime 的 client 通道（**不能**用 owner 直接改，那会让模型绕过可信审批）。
+   */
+  tasks?: { request(method: string, pathname: string, body: unknown, subject: 'client' | 'owner' | 'executor'): Promise<{ status: number; body: unknown }> }
+  lists?: {
+    readonly todos: () => TodoListRow[] | null
+    readonly reports: () => ReportListRow[] | null
+    readonly members: () => TeamListRow[] | null
+  }
+  /**
+   * 配置文件所在的 DSH_HOME。生产环境由 `apply()` 传入；测试注入临时目录，
+   * 免得跑一条配置命令就去动真实 `~/.dsh`。
+   */
+  home?: string
+  /**
+   * 凭据加密器。默认走当前 Windows 用户的 DPAPI（与 setup-mail.mjs 同一机制）；
+   * 只有可信宿主/测试才注入替身 —— 生产路径不接受"明文落盘"这种降级。
+   */
+  encryptSecret?: (secret: string) => Promise<string>
 }
 
 /**
@@ -210,6 +285,8 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
   const commands = hostCommands(ctx)
   if (!commands) return false
   const { bridge, tracker } = deps
+  // 配置命令要落盘，所以这里统一解析一次 home：生产走 dshHome()，测试注入临时目录。
+  const home = deps.home ?? dshHome()
   ctx.effect(() => {
     const disposers: Array<() => void> = []
     const register = (definition: Parameters<HostCommands['register']>[0]): void => {
@@ -298,11 +375,318 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
       },
     })
 
+    // ── 工作台概览（只读，无副作用）──────────────────────────────
+    // 客户端只能通过 `remote.commands.execute(sessionId, '/命令')` 拿数据，
+    // 所以每个数字都做成一条命令；文本已经格式化好（≤40 字），前端直接显示。
+    const readLine = (pick: (value: ReturnType<typeof summarizeWorkbench>) => { text: string; available: boolean }) => {
+      if (deps.summary === undefined) return { kind: 'success' as const, text: '暂时读不到（宿主没有接概览数据源）' }
+      return { kind: 'success' as const, text: pick(summarizeWorkbench(deps.summary)).text }
+    }
+    register({
+      name: 'assistant-todo-count',
+      description: '当前未完成的待办数（只读）',
+      recordInput: false,
+      handler() { return readLine(value => value.todo) },
+    })
+    register({
+      name: 'assistant-meeting-today',
+      description: '今天的会议场数（只读）',
+      recordInput: false,
+      async handler() {
+        // 会议数据在桌宠侧（meetings.sqlite），这里走既有的只读桌面命令 `meeting.count`。
+        // 超时压到 2 秒：这是一张概览卡片，不值得让用户干等 5 秒 —— 超时就降级成"读不到"。
+        // **失败绝不当成 0**：0 和"没读到"是两件事，把后者显示成前者会让人以为今天真没开会。
+        try {
+          const now = Date.now()
+          const dayStart = new Date(now)
+          dayStart.setHours(0, 0, 0, 0)
+          const reply = await bridge.requestDesktopCommand('meeting.count',
+            { from: dayStart.getTime(), to: now + 1 }, { timeoutMs: 2_000 }) as { count?: unknown } | null | undefined
+          const count = typeof reply?.count === 'number' && Number.isFinite(reply.count) ? reply.count : null
+          return { kind: 'success' as const, text: formatMeetingToday({ meetingsToday: count }).text }
+        } catch {
+          return { kind: 'success' as const, text: formatMeetingToday({ meetingsToday: null }).text }
+        }
+      },
+    })
+    register({
+      name: 'assistant-today-summary',
+      description: '今日活动摘要：总时长与主要去向（只读）',
+      recordInput: false,
+      handler() { return readLine(value => value.today) },
+    })
+
+    // ── 从 DSH 打开工作台（无副作用，只切页面）──────────────────────
+    // 桌宠侧由 `workbench.open` 桌面命令承接（主进程 openSettings(page)），
+    // 这里只负责解析页面、把命令转发过去；桌宠没跑就如实说，不静默拉起。
+    register({
+      name: 'open-workbench',
+      description: '让桌面宠物打开工作台并切到指定页（todo / meeting / report / team / doc / general）',
+      recordInput: false,
+      async handler(invocation) {
+        const page = parseWorkbenchPage(invocation.rawInput)
+        // 参数问题算 success：这是用户输入没给全，不是系统错误。
+        if (page === null) return { kind: 'success', text: WORKBENCH_PAGE_HINT }
+        try {
+          await bridge.requestDesktopCommand('workbench.open', { page }, { timeoutMs: 8_000 })
+          return { kind: 'success', text: `已打开工作台的「${WORKBENCH_PAGE_LABELS[page]}」` }
+        } catch {
+          // 超时/通道断开都归到"桌宠没在运行"：不猜其它原因，也不自动拉起。
+          return { kind: 'success', text: WORKBENCH_OFFLINE_TEXT }
+        }
+      },
+    })
+
+    // ── 工作台四张列表（只读，无副作用）──────────────────────────────
+    // 格式：一行一条、字段用 ` | ` 分隔、空字段 `—`，前端按行 split 直接渲染表格。
+    // 读不到与空列表严格分开（见 workbench-lists.ts 的注释）。
+    const readList = (pick: () => string | null) => {
+      const text = pick()
+      return { kind: 'success' as const, text: text ?? '暂时读不到' }
+    }
+    register({
+      name: 'assistant-todo-list',
+      description: '未完成的待办列表（只读，一行一条）',
+      recordInput: false,
+      handler() {
+        return readList(() => (deps.lists === undefined ? null : formatTodoList(deps.lists.todos())))
+      },
+    })
+    register({
+      name: 'assistant-meeting-list',
+      description: '今天的会议列表（只读，一行一条）',
+      recordInput: false,
+      async handler() {
+        // 与 /assistant-meeting-today 同源（桌宠的 meetings.sqlite），超时同样 2 秒。
+        try {
+          const now = Date.now()
+          const dayStart = new Date(now)
+          dayStart.setHours(0, 0, 0, 0)
+          const reply = await bridge.requestDesktopCommand('meeting.list',
+            { from: dayStart.getTime(), to: now + 1, limit: 10 }, { timeoutMs: 2_000 }) as
+            | { meetings?: unknown }
+            | null
+            | undefined
+          const raw = Array.isArray(reply?.meetings) ? reply.meetings : null
+          const rows: MeetingListRow[] | null = raw === null ? null : raw.flatMap(item => {
+            if (item === null || typeof item !== 'object') return []
+            const record = item as { startedAt?: unknown; name?: unknown; state?: unknown }
+            return [{
+              startedAt: typeof record.startedAt === 'number' ? record.startedAt : 0,
+              name: typeof record.name === 'string' ? record.name : EMPTY_FIELD,
+              state: typeof record.state === 'string' ? record.state : '',
+            }]
+          })
+          return { kind: 'success' as const, text: formatMeetingList(rows) }
+        } catch {
+          return { kind: 'success' as const, text: formatMeetingList(null) }
+        }
+      },
+    })
+    register({
+      name: 'assistant-report-list',
+      description: '日报草稿与已发布列表（只读，一行一条）',
+      recordInput: false,
+      handler() {
+        return readList(() => (deps.lists === undefined ? null : formatReportList(deps.lists.reports())))
+      },
+    })
+    register({
+      name: 'assistant-team-list',
+      description: '助理团成员列表（只读，一行一条）',
+      recordInput: false,
+      handler() {
+        return readList(() => (deps.lists === undefined ? null : formatTeamList(deps.lists.members())))
+      },
+    })
+
+    // ── 历史会议列表（只读）────────────────────────────────────────
+    // 与「今天的会议列表」是两条命令：今天用 HH:mm、历史必须带日期，用途不同，不合并。
+    register({
+      name: 'assistant-meeting-history',
+      description: '历史会议列表（只读，一行一条：时间 / 名称 / 来源 / 保留期 / 状态）',
+      recordInput: false,
+      async handler() {
+        try {
+          const reply = await bridge.requestDesktopCommand('meeting.history', { limit: 20 }, { timeoutMs: 2_000 }) as
+            | { meetings?: unknown }
+            | null
+            | undefined
+          const raw = Array.isArray(reply?.meetings) ? reply.meetings : null
+          const rows = raw === null ? null : raw.flatMap(item => {
+            if (item === null || typeof item !== 'object') return []
+            return [item as Record<string, unknown>]
+          })
+          return { kind: 'success' as const, text: formatMeetingHistory(rows) }
+        } catch {
+          return { kind: 'success' as const, text: formatMeetingHistory(null) }
+        }
+      },
+    })
+
+    // ── 改某条待办的优先级（写，走可信审批）────────────────────────
+    // 用户点一下就提交一个**提案**：桌面宠物确认后才生效。所以成功文案只能是"已提交"，
+    // 不能是"已改成"——后者是替服务端撒谎（用户回去看列表会发现没变）。
+    register({
+      name: 'assistant-set-task-priority',
+      description: '把一条待办的优先级改成 high / normal / low（提交后在桌面宠物确认生效）',
+      recordInput: false,
+      async handler(invocation) {
+        const parsed = parseSetPriority(invocation.rawInput)
+        if (!parsed.ok) {
+          // 两档失败**语义不同**，不能都算 success：
+          // - 参数个数不对：用户没给全，补上就能成 —— 这是**输入提示**；
+          // - 值非法：用户给了、系统不接受，**这件事没办成** —— 必须让调用方判得出来，
+          //   否则它会显示成"已提交"，用户去桌宠发现什么都没有。
+          // 判据：执行完之后"用户想要的那件事"有没有可能发生。值非法是不可能，且用户以为自己提交了。
+          if (parsed.problem === 'usage') return { kind: 'success' as const, text: SET_PRIORITY_USAGE }
+          return { kind: 'error' as const, text: SET_PRIORITY_BAD_VALUE }
+        }
+        const tasks = deps.tasks
+        if (tasks === undefined) return { kind: 'error' as const, text: '优先级没改成：任务运行时不可用' }
+        const path = `/companion/v1/tasks/${encodeURIComponent(parsed.taskId)}`
+        try {
+          // ① 先读快照拿 revision：命令契约要求 expectedRevision，猜一个必然 409。
+          const detail = await tasks.request('GET', path, null, 'client')
+          const view = (detail.body as { task?: { revision?: unknown; title?: unknown } } | null)?.task
+          const revision = view?.revision
+          if (detail.status !== 200 || typeof revision !== 'number') {
+            return { kind: 'error' as const, text: '优先级没改成：没找到这条待办' }
+          }
+          // ② 再提交提案（client 身份 = 只提案，不落库）。
+          const result = await tasks.request('POST', `${path}/set-priority`, {
+            protocolVersion: 1,
+            commandId: randomUUID(),
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            payload: { priority: parsed.priority },
+            taskId: parsed.taskId,
+            expectedRevision: revision,
+          }, 'client')
+          if (result.status === 202) {
+            // 带上标题：用户要知道"改的是哪一条"。标题拿不到就退回不带标题的说法，
+            // 但**绝不**换成"已改成"——那是在宣称系统还没做到的事。
+            const title = typeof view?.title === 'string' ? view.title : ''
+            const label = parsed.priority === 'high' ? '高' : parsed.priority === 'low' ? '低' : '中'
+            return {
+              kind: 'success' as const,
+              text: title === '' ? SET_PRIORITY_SUBMITTED : `已提交「${title}」改成${label}优先级，请在桌面宠物里确认`,
+            }
+          }
+          const message = (result.body as { message?: unknown } | null)?.message
+          return { kind: 'error' as const, text: `优先级没改成：${typeof message === 'string' && message !== '' ? message : '桌面还没有确认'}` }
+        } catch {
+          return { kind: 'error' as const, text: '优先级没改成：任务运行时暂时不可用' }
+        }
+      },
+    })
+
+    // ── 改设置（唯一的写命令，白名单三项）──────────────────────────
+    // 桌宠侧 `settings.set` 走的是**和设置页同一条写入路径**，并在改完立刻回读；
+    // 这里只负责解析 `键=值` 与把结果说人话。参数不对算 success（用户输入问题）。
+    register({
+      name: 'assistant-set-option',
+      description: '改一项设置：/assistant-set-option wake=on|off、broadcast=all|voice、docSpeech=source|ai',
+      recordInput: false,
+      async handler(invocation) {
+        const option = parseSetOption(invocation.rawInput)
+        if (option === null) return { kind: 'success' as const, text: SET_OPTION_HINT }
+        try {
+          const reply = await bridge.requestDesktopCommand('settings.set',
+            { key: option.key, value: option.value }, { timeoutMs: 5_000 }) as
+            | { applied?: unknown; error?: unknown }
+            | null
+            | undefined
+          if (reply !== null && reply !== undefined && reply.applied === true) {
+            return { kind: 'success' as const, text: describeSetOption(option.key, option.value) }
+          }
+          const reason = typeof reply?.error === 'string' && reply.error !== '' ? reply.error : '桌面宠物没有确认这次修改'
+          // **写失败回 kind:'error'**：客户端不该靠文案前缀判断成败。
+          // 参数问题是用户输入问题（上面那条仍回 success + 用法），而"没写进去"是系统失败。
+          return { kind: 'error' as const, text: `设置没改成：${reason}` }
+        } catch {
+          return { kind: 'error' as const, text: '设置没改成：桌面宠物没在运行，先召唤它' }
+        }
+      },
+    })
+
+    // ── 邮件配置（读写）────────────────────────────────────────────
+    // 参数形状固定为 `key=value key=value`（前端 config-forms.ts:buildCommandLine 就拼这个）；
+    // 不带参数 = 读。写成功必须回读确认后才算成功。
+    // **授权码只写不读**：回包、日志、错误文案里都不出现，包括截断片段。
+    register({
+      name: 'assistant-mail-config',
+      description: '查看或保存发信邮箱配置（不带参数查看；保存用 mail= smtpHost= smtpPort= imapHost= imapPort= password=）',
+      recordInput: false,
+      async handler(invocation) {
+        const values = parseConfigArguments(invocation.rawInput)
+        // 参数形状不可用（缺等号、孤立词、引号没闭合）：给用法，绝不猜着写。
+        if (values === null) return { kind: 'error' as const, text: MAIL_CONFIG_HINT }
+        if (Object.keys(values).length === 0) {
+          return { kind: 'success' as const, text: formatMailConfigView(readMailConfigView(home)) }
+        }
+        const check = checkMailConfig(values)
+        // 校验失败回具体原因，且 kind=error：前端据此显示红字，不会误报"已保存"。
+        if (!check.ok) return { kind: 'error' as const, text: check.reason }
+        const saved = await saveMailConfig({ home, ...(deps.encryptSecret === undefined ? {} : { encrypt: deps.encryptSecret }) }, check.value)
+        if (!saved.ok) return { kind: 'error' as const, text: saved.reason }
+        deps.log?.('邮箱配置已保存')
+        return { kind: 'success' as const, text: '邮箱配置已保存' }
+      },
+    })
+
+    // ── 企业微信应用配置（读写）────────────────────────────────────
+    // 与企业微信智能机器人那套 `wecom.json` 分开存（见 wecom-config.ts 顶部注释），
+    // 但共用同一目录、同一套 DPAPI 凭据机制与原子写。Secret 同样只写不读。
+    register({
+      name: 'assistant-wecom-config',
+      description: '查看或保存企业微信应用配置（不带参数查看；保存用 corpId= agentId= secret= toUser=）',
+      recordInput: false,
+      async handler(invocation) {
+        const values = parseConfigArguments(invocation.rawInput)
+        if (values === null) return { kind: 'error' as const, text: WECOM_CONFIG_HINT }
+        if (Object.keys(values).length === 0) {
+          return { kind: 'success' as const, text: formatWeComAppView(readWeComAppView(home)) }
+        }
+        const check = checkWeComAppConfig(values)
+        if (!check.ok) return { kind: 'error' as const, text: check.reason }
+        const saved = await saveWeComAppConfig({ home, ...(deps.encryptSecret === undefined ? {} : { encrypt: deps.encryptSecret }) }, check.value)
+        if (!saved.ok) return { kind: 'error' as const, text: saved.reason }
+        deps.log?.('企业微信配置已保存')
+        return { kind: 'success' as const, text: '企业微信配置已保存' }
+      },
+    })
+
+    // ── 设置摘要（只读，三行真值）──────────────────────────────────
+    // 数据在桌宠侧（audio-prefs.json / settings.json），走只读桌面命令 `settings.summary`。
+    // 那条命令在桌宠侧是**纯读**：不调 applyAudio、不写文件。
+    // 「悬停工具栏」在主进程没有持久化设置（渲染层 localStorage），这里不编值，故只回三行。
+    register({
+      name: 'assistant-settings-summary',
+      description: '唤醒 / 播报 / 讲解模式的当前设置（只读，一行一条）',
+      recordInput: false,
+      async handler() {
+        try {
+          const reply = await bridge.requestDesktopCommand('settings.summary', {}, { timeoutMs: 2_000 }) as
+            | Record<string, unknown>
+            | null
+            | undefined
+          return { kind: 'success' as const, text: formatSettingsSummary(reply ?? null) }
+        } catch {
+          return { kind: 'success' as const, text: formatSettingsSummary(null) }
+        }
+      },
+    })
+
     return () => {
       for (const dispose of disposers.splice(0)) dispose()
     }
   }, 'personal-assistant:commands')
-  deps.log?.('一键命令已注册：summon-pet / assistant-on / assistant-off')
+  deps.log?.('一键命令已注册：summon-pet / bind-pet / assistant-on / assistant-off'
+    + '；工作台概览：assistant-todo-count / assistant-meeting-today / assistant-today-summary / open-workbench'
+    + '；列表：assistant-todo-list / assistant-meeting-list / assistant-report-list / assistant-team-list'
+    + '；改设置：assistant-set-option'
+    + '；配置：assistant-mail-config / assistant-wecom-config'
+    + '；设置摘要：assistant-settings-summary')
   return true
 }
 
@@ -883,6 +1267,81 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   // 外部证据收件（会议纪要 / 窗口文本）：桌面壳经 POST /evidence/intake 送进来。
   // 校验与入库都在 `intakeEvidence` 里，这里只把资料库与时钟接上。
   evidenceIntakeHandler = request => intakeEvidence(request, { materials, now: () => Date.now() })
+  // 记忆召回索引：recall-index 的派生投影只服务检索，随时可整表重建，对真源零触发器。
+  // 位置放在迁移之后、注册工具之前：迁移写进来的历史记忆能在同一次启动里就对账进去，
+  // 否则用户升级完第一次开机看到的还是空的。
+  //
+  // 失败只警告不阻断启动——召回是增强项，索引起不来最差就是提示词退回静态注入
+  // （也就是改造前的行为），不该让整个插件因为一个派生索引起不来。
+  try {
+    ensureRecallSchema(db)
+    reconcileRecallIndex(db, Date.now())
+  } catch (error) {
+    const message = `记忆召回索引初始化失败，将回退静态注入：${error instanceof Error ? error.message : String(error)}`
+    if (logger?.warn) logger.warn(message)
+    else log(`[warn] ${message}`)
+  }
+
+  /**
+   * 给 tools.ts 的召回依赖。**这个函数永远不抛异常**：它跑在提示词装配链上，
+   * 抛出去就是整轮对话炸掉；失败一律返回降级的空态 bundle，由 renderPreferences
+   * 判定 degraded 后回退静态注入。
+   *
+   * 顺带做一次限流对账：`memories` 上没有触发器（recall-index 的纪律），运行期新记住的
+   * 偏好不会自己进索引，只靠启动对账的话，用户"下次记得"要在重启后才生效。
+   * 30 秒一次全表差分的代价是毫秒级，换来的是"记住就能马上被召回"。
+   *
+   * 为什么在**提示词装配期**写派生表是安全的（逐条对应顾虑）：
+   * 1. `DatabaseSync` 同进程单连接、全同步调用，写入天然串行——装配期不会有第二个
+   *    写事务插进来，也不可能和别处的 `inTransaction` 交错（store.ts 的嵌套计数还允许
+   *    被外层事务包含，跟着外层提交/回滚）。
+   * 2. 写的是 `recall_proj` / `recall_fts` 这两张**派生表**：随时可整表 DROP 重建、
+   *    不具权威性，真源 `memories` 一行不动（零触发器、零写入）。写坏了最多召回不准，
+   *    不会让任何一条记忆"变成"别的东西，也不会影响删除一致性（查询期强制回连真源）。
+   * 3. 全程包在 try/catch 里：对账失败只让索引旧 30 秒，召回本身照跑；召回失败再降级，
+   *    由 renderPreferences 回退静态注入。整条链路没有任何一步能让提示词装配失败。
+   * 4. 只有抽到查询词才走到这里（`renderPreferences` 在 `lastUserText` 为空时根本不调
+   *    召回依赖），因此非用户轮次、注入型上下文轮次都不会触发写库。
+   */
+  let lastRecallReconcile = 0
+  const RECALL_RECONCILE_INTERVAL_MS = 30_000
+  const recallForPrompt = (terms: readonly string[], now: number) => {
+    try {
+      if (now - lastRecallReconcile >= RECALL_RECONCILE_INTERVAL_MS) {
+        lastRecallReconcile = now
+        try {
+          reconcileRecallIndex(db, now)
+        } catch {
+          // 对账失败只是索引旧一点，查询期还会强制回连真源，不影响删掉的记忆不被召回。
+        }
+      }
+      return recallMemories(db, {
+        now,
+        queryTerms: [...terms],
+        // MEMORY_CONTEXT 为空（只有 global），这里必须与它同构：项目/团队/角色范围的记忆
+        // 一律不进系统提示词，否则项目 A 的规则会漂到项目 B 的会话里。
+        scopes: [{ kind: 'global', id: '' }],
+        maxItems: Math.max(0, Math.floor(config.maxInjectedMemories)),
+      })
+    } catch {
+      return {
+        matched: [], injected: [], injection: RECALL_EMPTY_INJECTION,
+        matchLimit: 0, totalMatched: 0, truncated: false, aliveChecks: 0, deadHitsFiltered: 0,
+        empty: true, emptyReason: 'degraded' as const,
+        trace: {
+          matchExpr: '',
+          rawMatchCount: 0,
+          perChannel: { 'fts-index': 0, rule: 0, 'time-window': 0, project: 0, 'artifact-pointer': 0 },
+          budget: { maxItems: 0, maxChars: 0, applied: false },
+          reconcileDelta: 0,
+          degraded: true,
+        },
+        filtered: { candidate: 0, conflicting: 0, expired: 0, outOfScope: 0, tombstoned: 0 },
+        degraded: true, degradeReason: 'recall-threw', generatedAt: now,
+      }
+    }
+  }
+
   registerAssistantTools(ctx as never, tracker, {
     reportDir,
     bridge,
@@ -902,6 +1361,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       describe: titles => describeCaptureScope(titles ?? tracker.captureTitles),
     },
     maxInjectedMemories: Math.max(0, Math.floor(config.maxInjectedMemories)),
+    recall: recallForPrompt,
     captureBlockedReason,
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
     enableTeamMode,
@@ -909,12 +1369,93 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     approvalMode: () => config.approvalMode,
   })
   // 一键入口：输入框「+ → 指令」里的召唤与开关，不经过模型、不产生消息。
+  // 工作台概览的数据源：全部只读，且都复用既有存储（team.sqlite 的任务表 / work_items 表）。
+  // 会议数没有本地数据源 —— 会议记录在桌宠侧（dsh-pet 的 meetings.sqlite），插件这边读不到，
+  // 所以如实给 null，让命令回「暂时读不到今天的会议」，而不是显示 0。
+  const workbenchSummary = (): WorkbenchSummarySnapshot => {
+    let openTodos: number | null = null
+    let awaitingUser: number | null = null
+    try {
+      const tasks = teamStore.listTasks({ runtimeScope: 'companion' })
+      const open = tasks.filter(task => !TERMINAL_TASK_STATUSES.includes(task.status))
+      openTodos = open.length
+      awaitingUser = open.filter(task => task.status === 'awaiting-user' || task.status === 'awaiting-approval').length
+    } catch { /* 团队库还没起来：保持 null = 读不到 */ }
+    let activeMs: number | null = null
+    let topSubject: string | null = null
+    try {
+      const now = Date.now()
+      const dayStart = new Date(now)
+      dayStart.setHours(0, 0, 0, 0)
+      const items = workItems.listInRange(dayStart.getTime(), now + 1)
+      if (items.length > 0) {
+        activeMs = items.reduce((sum, item) => sum + Math.max(0, item.end - item.start), 0)
+        const byProject = new Map<string, number>()
+        for (const item of items) {
+          const name = (item.project ?? '').split(/[\\/]/u).filter(Boolean).pop() ?? ''
+          if (name === '') continue
+          byProject.set(name, (byProject.get(name) ?? 0) + Math.max(0, item.end - item.start))
+        }
+        topSubject = [...byProject.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null
+      } else {
+        activeMs = 0
+      }
+    } catch { /* 表还没建好：保持 null */ }
+    return { openTodos, awaitingUser, meetingsToday: null, activeMs, topSubject }
+  }
   registerUserCommands(ctx, {
     bridge,
     tracker,
     captureBlockedReason,
     captureScopeAuthorized: () => captureScopeAuthorized(tracker.captureTitles),
     log,
+    home,
+    summary: workbenchSummary,
+    ...(companionRuntime === undefined ? {} : { tasks: companionRuntime }),
+    // 四张列表的本地三张（会议走桌宠，见命令自身）。全部只读、复用既有存储：
+    // - 待办：team.sqlite 的 companion 任务（与概览的待办数是同一个过滤口径）；
+    // - 日报：插件域的 reports 表（key = YYYY-MM-DD）；
+    // - 成员：team.sqlite 的成员表 + 额度视图。
+    // 每个 getter 失败即 `null`（= 读不到），绝不吞成空列表。
+    lists: {
+      todos: () => {
+        try {
+          return teamStore.listTasks({ runtimeScope: 'companion' })
+            .filter(task => !TERMINAL_TASK_STATUSES.includes(task.status))
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+            .map(task => ({
+              goal: task.goal, status: task.status, deadlineAt: task.deadlineAt,
+              priority: task.priority ?? 'normal', source: task.source ?? 'manual', updatedAt: task.updatedAt,
+              taskId: task.taskId,
+            }))
+        } catch { return null }
+      },
+      reports: () => {
+        try {
+          return [...domain.table('reports').entries()]
+            .map(([date, meta]) => ({
+              date,
+              state: meta.confirmedAt !== undefined ? '已确认' : meta.draft !== undefined ? '草稿'
+                : meta.filePath !== undefined ? '已发布' : '空',
+              // 摘要只取草稿第一行前 40 字：表格里放不下整份日报，用户点进去看全文。
+              summary: (meta.draft ?? '').split(/\r?\n/u)[0] ?? '',
+            }))
+            .sort((a, b) => b.date.localeCompare(a.date))
+        } catch { return null }
+      },
+      members: () => {
+        try {
+          return teamStore.listMembers().map(member => {
+            let quota = '—'
+            try {
+              const view = teamStore.directory.quota(member.assistantId)
+              quota = view.unknown ? '—' : `${view.dailyUsed}/${view.dailyTokenLimit}`
+            } catch { quota = '—' }
+            return { name: member.displayName, role: member.roleId, enabled: member.enabled, quota }
+          })
+        } catch { return null }
+      },
+    },
   })
   // 日报工作台：桌面逐条修订、按看到的那一版请求发布、分类删除。发布与删除只经桌面可信审批生效。
   mountReportWorkbench(bridge, {
