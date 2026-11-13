@@ -19,3 +19,5 @@ docs/
 
 # 本地工具产物
 spark-output/
+.idea/
+.workbuddy/
