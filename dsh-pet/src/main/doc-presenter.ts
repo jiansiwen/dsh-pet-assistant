@@ -650,8 +650,17 @@ export function chooseDocVia(
   requested: 'reading' | 'wps' | 'auto',
   options: { readonly speak: boolean; readonly pdf: boolean; readonly wpsReady: boolean },
 ): 'reading' | 'wps' {
+  // 用户明确点名（"用 WPS 打开/讲讲"）才用 WPS；`reading` 也原样返回。
   if (requested !== 'auto') return requested
-  return options.speak && options.pdf && options.wpsReady ? 'wps' : 'reading'
+  // 没点名时**恒走内置阅读视图**。
+  //
+  // 曾经是"装了 WPS 就用 WPS 跟着翻页"，但真机（WPS 12.1 / Qt5）证明那条路做不到
+  // 「讲哪段、屏幕在哪段」：窗口读不到页码控件，跳页只能靠 Ctrl+G 盲发，事后又没有
+  // 可读回的页码可以验证（Ctrl+A 复制的是整份文档）。讲解内容与屏幕页码对不上，
+  // 比"用不了 WPS 的原版式"糟糕得多。
+  // 内置阅读视图的页码由我们自己的代码决定，才有真正的对应关系。
+  // `options` 保留在签名里：显式 wps 路径与将来的判断仍然需要这些前提，且既有调用方不必改。
+  return 'reading'
 }
 
 // ── 视图目标接口（阅读视图窗口与 WPS 适配器共用） ──────────────────────────

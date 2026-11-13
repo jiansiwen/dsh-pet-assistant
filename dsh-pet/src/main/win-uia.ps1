@@ -148,6 +148,41 @@ public static class Native {
     a[1].type = 1; a[1].u.ki.wVk = vk; a[1].u.ki.wScan = scan; a[1].u.ki.dwFlags = 1u | 2u;
     return SendInput(2, a, Marshal.SizeOf(typeof(INPUT)));
   }
+  // Ctrl+<字母>。白名单只有 A / C / G —— 全是"全选 / 复制 / 页码定位"要用的那几个，
+  // 不开放任意组合键，免得这个脚本变成通用的键盘注入器。
+  static readonly ushort[] ComboLetters = { 0x41, 0x43, 0x47 };
+  public static uint TapCtrl(ushort letter) {
+    if (Array.IndexOf(ComboLetters, letter) < 0) throw new ArgumentException("only A/C/G may be combined with Ctrl");
+    var a = new INPUT[4];
+    ushort ctrlScan = (ushort)MapVirtualKeyW(0x11, 0);
+    ushort scan = (ushort)MapVirtualKeyW(letter, 0);
+    a[0].type = 1; a[0].u.ki.wVk = 0x11; a[0].u.ki.wScan = ctrlScan; a[0].u.ki.dwFlags = 0;
+    a[1].type = 1; a[1].u.ki.wVk = letter; a[1].u.ki.wScan = scan; a[1].u.ki.dwFlags = 0;
+    a[2].type = 1; a[2].u.ki.wVk = letter; a[2].u.ki.wScan = scan; a[2].u.ki.dwFlags = 2u;
+    a[3].type = 1; a[3].u.ki.wVk = 0x11; a[3].u.ki.wScan = ctrlScan; a[3].u.ki.dwFlags = 2u;
+    return SendInput(4, a, Marshal.SizeOf(typeof(INPUT)));
+  }
+  /** Enter / Esc：页码定位框里确认与放弃。 */
+  public static uint TapKey(ushort vk) {
+    if (vk != 0x0D && vk != 0x1B) throw new ArgumentException("only Enter and Esc are allowed");
+    var a = new INPUT[2];
+    ushort scan = (ushort)MapVirtualKeyW(vk, 0);
+    a[0].type = 1; a[0].u.ki.wVk = vk; a[0].u.ki.wScan = scan; a[0].u.ki.dwFlags = 1u;
+    a[1].type = 1; a[1].u.ki.wVk = vk; a[1].u.ki.wScan = scan; a[1].u.ki.dwFlags = 1u | 2u;
+    return SendInput(2, a, Marshal.SizeOf(typeof(INPUT)));
+  }
+  /**
+   * 输入一个 ASCII 数字。用 KEYEVENTF_UNICODE 直接投递字符，不受输入法/键盘布局影响
+   * （否则在中文输入法下"3"可能变成候选框里的一笔）。
+   * 只允许 0-9：这个脚本永远不能输入任意文本。
+   */
+  public static uint TypeDigit(char c) {
+    if (c < '0' || c > '9') throw new ArgumentException("only digits may be typed");
+    var a = new INPUT[2];
+    a[0].type = 1; a[0].u.ki.wVk = 0; a[0].u.ki.wScan = c; a[0].u.ki.dwFlags = 4u;
+    a[1].type = 1; a[1].u.ki.wVk = 0; a[1].u.ki.wScan = c; a[1].u.ki.dwFlags = 4u | 2u;
+    return SendInput(2, a, Marshal.SizeOf(typeof(INPUT)));
+  }
 }
 }
 '@
@@ -267,6 +302,8 @@ function Get-WpsPdfDoc($mainEl, [string]$documentName, [string]$installDir) {
 }
 
 function Read-WpsPdfPage($doc) {
+  # 没有视图（WPS 12.x 的 Qt5 窗口）就没有页码可读：返回 $null 让调用方走键盘退路。
+  if ($null -eq $doc) { return $null }
   # 同一请求内缓存页码标签元素：轮询读回时不必每次重新遍历子树。
   if ($doc.labelEl) {
     try {
@@ -300,6 +337,7 @@ function Read-WpsPdfPage($doc) {
 }
 
 function Read-WpsPdfScroll($doc) {
+  if ($null -eq $doc) { return $null }
   if (-not $doc.scrollEl) {
     foreach ($s in (Find-ByClass $doc.el 'KPdfScrollBarWheelFixed' 24 2000)) { $doc.scrollEl = $s; break }
   }
@@ -312,7 +350,7 @@ function Read-WpsPdfScroll($doc) {
 }
 
 # 页码标签刷新略有延迟：轮询到变化后再稳定一拍。
-function Wait-PageChange($doc, $prev, [int]$maxMs = 1500) {
+function Wait-PageChange($doc, $prev, [int]$maxMs = 2500) {
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $last = $prev
   while ($sw.ElapsedMilliseconds -lt $maxMs) {
@@ -358,8 +396,13 @@ function Test-Target($req) {
     $doc = Get-WpsPdfDoc $el $exp.documentName ([IO.Path]::GetDirectoryName($exp.processPath))
     if ($doc.error -eq 'ambiguous') { return @{ fail = (New-Fail 'ambiguous-window' '同一窗口里有多个同名文档' 'ambiguous'); identity = $id } }
     if ($doc.error -eq 'foreign-component') { return @{ fail = (New-Fail 'identity-changed' '文档组件进程不属于这份 WPS 安装' 'component-path'); identity = $id } }
-    if ($doc.error) { return @{ fail = (New-Fail 'window-not-found' '窗口里找不到这份文档的 PDF 视图' 'document-not-loaded'); identity = $id } }
-    $id.component = @{ pid = $doc.pid; windowId = [string]$doc.hwnd.ToInt64(); processPath = $doc.path }
+    # 找不到 PDF 视图**不再**整体失败。
+    # 12.x 的 WPS 是 Qt5 渲染，UIA 树里根本没有 KxPdfView / 页码控件：按版本适配是条死路
+    # （每个小版本都可能换内核），而窗口本身是可用的 —— 能激活、能收键盘。
+    # 所以这里只记下"没有视图"，后续读页码/跳页走键盘退路（见 Op-GotoPage）。
+    if ($doc.error) { $doc = $null }
+    if ($doc) { $id.component = @{ pid = $doc.pid; windowId = [string]$doc.hwnd.ToInt64(); processPath = $doc.path } }
+    else { $id.pdfView = $false }
   }
   $dialog = Get-DialogState $h $doc
   if ($dialog -ne '') { return @{ fail = (New-Fail 'dialog-blocking' '目标应用有弹窗挡着' $dialog); identity = $id } }
@@ -384,6 +427,7 @@ function Assert-Foreground($t, $ownerPids) {
 }
 
 function Test-ViewFocused($doc) {
+  if ($null -eq $doc) { return $false }
   try { $f = $AE::FocusedElement } catch { return $false }
   if (-not $f) { return $false }
   $c = $f.Current
@@ -413,7 +457,9 @@ function Assert-ViewFocus($doc) {
 # 发一个导航键：发之前核对前台与焦点，发之后立即复核。
 function Send-NavKey($t, [string]$name) {
   if ([DshUia.Native]::GetForegroundWindow() -ne $t.hwnd) { return (New-Fail 'focus-stolen' '发送按键前前台已变化' 'foreground-changed') }
-  if (-not (Test-ViewFocused $t.doc)) { return (New-Fail 'focus-stolen' '发送按键前键盘焦点已离开文档' 'focus-changed') }
+  # 有视图时要求焦点真的在文档视图里（用户可能在输入框里打字）；没有视图的 WPS 只能要求
+  # "前台是目标窗口"这一层 —— 这也正是不会把 PageDown 发到别的应用去的保证。
+  if ($t.doc -ne $null -and -not (Test-ViewFocused $t.doc)) { return (New-Fail 'focus-stolen' '发送按键前键盘焦点已离开文档' 'focus-changed') }
   if ([DshUia.Native]::ModifierHeld()) { return (New-Fail 'focus-stolen' '用户正按着修饰键，未发送按键' 'modifier-held') }
   $sent = [DshUia.Native]::TapNav([uint16]$VK[$name])
   if ($sent -ne 2) { return (New-Fail 'failed' '系统未接受按键输入' 'sendinput') }
@@ -459,6 +505,20 @@ function Op-Locate($req) {
   return @{ ok = $true; candidates = $items.ToArray() }
 }
 
+# 枚举正在运行的 WPS 进程的可执行路径。注册表可能指向另一个已安装版本，
+# 而单实例 WPS 会把新启动的进程交接给正在运行的旧版本；按运行中的版本认窗口才认得对。
+function Op-RunningWps($req) {
+  $paths = New-Object System.Collections.Generic.List[string]
+  foreach ($name in @('wps', 'wpp', 'et', 'wpspdf')) {
+    try {
+      foreach ($p in (Get-Process -Name $name -ErrorAction Stop)) {
+        try { if ($p.Path) { $paths.Add([string]$p.Path) } } catch { }
+      }
+    } catch { }
+  }
+  return @{ ok = $true; paths = $paths.ToArray() }
+}
+
 # 查找：先按进程路径过滤，只有路径对得上的窗口才读标题；对不上的标题不读、不输出。
 function Op-Find($req) {
   $q = $req.query
@@ -492,14 +552,16 @@ function Op-Find($req) {
   $req2 = @{ identity = (Get-Identity $found[0] $req.documentName); profile = $req.profile }
   $t = Test-Target $req2
   if ($t.fail) { $t.fail.before = $req2.identity; return $t.fail }
-  return @{ ok = $true; identity = $t.identity; sameNameTabs = $proxies }
+  # pdfView=false 表示"窗口找到了，但读不到 PDF 视图/页码"：调用方据此走键盘翻页，不要因此放弃 WPS。
+  return @{ ok = $true; identity = $t.identity; sameNameTabs = $proxies; pdfView = ($t.doc -ne $null) }
 }
 
 function Op-Verify($req) {
   $t = Test-Target $req
   if ($t.fail) { if ($t.identity) { $t.fail.after = $t.identity }; return $t.fail }
   $r = @{ ok = $true; before = $t.identity; after = $t.identity; foregroundBefore = (Get-Foreground $t.hwnd $req.ownerPids) }
-  if ($req.profile -eq 'wps-pdf') { $p = Read-WpsPdfPage $t.doc; if ($p) { $r.page = $p.page; $r.total = $p.total; $r.raw = $p.raw } }
+  if ($req.profile -eq 'wps-pdf' -and $t.doc -ne $null) { $p = Read-WpsPdfPage $t.doc; if ($p) { $r.page = $p.page; $r.total = $p.total; $r.raw = $p.raw } }
+  if ($req.profile -eq 'wps-pdf') { $r.pdfView = ($t.doc -ne $null) }
   return $r
 }
 
@@ -535,9 +597,129 @@ function Enter-KeyMode($req) {
   $a = Assert-Foreground $t $req.ownerPids
   if ($a.fail) { $f = $a.fail; $f.before = $t.identity; $f.foregroundBefore = $a.snap; return @{ fail = $f } }
   if ($a.reclaimed) { $t = Test-Target $req; if ($t.fail) { return @{ fail = $t.fail } } }
-  $vf = Assert-ViewFocus $t.doc
-  if ($vf) { $vf.before = $t.identity; $vf.foregroundBefore = $a.snap; return @{ fail = $vf } }
+  # 没有 PDF 视图（WPS 12.x 的 Qt5 窗口）就没有"文档视图"可聚焦：这时只要求前台是目标窗口，
+  # 按键落到前台窗口上 —— 这也正是键盘翻页退路要的粒度。
+  if ($t.doc -ne $null) {
+    $vf = Assert-ViewFocus $t.doc
+    if ($vf) { $vf.before = $t.identity; $vf.foregroundBefore = $a.snap; return @{ fail = $vf } }
+  }
   return @{ t = $t; snap = $a.snap }
+}
+
+# 退化路径：窗口可用但读不到页码（WPS 12.x 的 Qt5 窗口没有 KxPdfView / 页码控件）。
+# 这时不放弃 WPS，改成**相对键盘翻页**：激活窗口后发一屏 PageDown。
+# 为什么是一屏而不是"跳到第 N 页"：没有页码就没有"当前页"，算不出要按几次。
+# 讲解推进本来就是一段接一段往前走，一次请求发一屏正好对齐；往回翻只能靠用户自己动屏幕
+# （不猜，也不连发一串按键把别人的页面翻乱）。
+function Goto-PageByKeyboard($t, $req, $snap) {
+  $e = Send-NavKey $t 'PageDown'
+  if ($e) { $e.before = $t.identity; return (Complete-After $t $e $req.ownerPids) }
+  Start-Sleep -Milliseconds 260
+  $r = @{ ok = $true; before = $t.identity; foregroundBefore = $snap; method = 'keyboard-relative'; keys = 1
+    pdfView = $false }
+  # 报了页码会被上层当成"读回到了第 N 页"。这里如实说明：页码是目标值，不是读回的。
+  $r.page = [int]$req.page
+  $r.total = [int]$req.page
+  $r.assumed = $true
+  # **必须走 Complete-After 补齐 foregroundAfter/after**：上层 crossCheck 要求"动作后的前台状态"，
+  # 缺了它整条翻页会被判 failed（真机表现就是「WPS 操作失败」）。键盘路径和 UIA 路径要用同一套收尾。
+  return (Complete-After $t $r $req.ownerPids)
+}
+
+# ---------- 绝对跳页（窗口能开但读不到页码时的唯一正解） ----------
+
+# 读剪贴板里的文本（只要文本，不碰图片）。失败返回 $null。
+function Read-ClipboardText {
+  try {
+    $v = Get-Clipboard -Raw -Format Text -ErrorAction Stop
+    if ($null -eq $v) { return '' }
+    return [string]$v
+  } catch { return $null }
+}
+
+# 把剪贴板写回去。'null' 字符串是哨兵：表示原来根本没有可读文本，那就清空，别留我们自己的副本。
+function Restore-Clipboard([string]$saved) {
+  try {
+    if ($null -eq $saved -or $saved -eq 'null') { Set-Clipboard -Value $null -ErrorAction Stop }
+    else { Set-Clipboard -Value $saved -ErrorAction Stop }
+  } catch { }
+}
+
+# 发键前统一复检：前台还是目标窗口、用户没按着修饰键。返回 $null 表示可以发。
+# 这是"绝不把按键发给别人窗口"的最后一道闸，新加的按键路径一律先过它。
+function Assert-KeySendable($t) {
+  if ([DshUia.Native]::GetForegroundWindow() -ne $t.hwnd) { return (New-Fail 'focus-stolen' '发送按键前前台已变化' 'foreground-changed') }
+  if ([DshUia.Native]::ModifierHeld()) { return (New-Fail 'focus-stolen' '用户正按着修饰键，未发送按键' 'modifier-held') }
+  return $null
+}
+
+function Send-CtrlLetter($t, [string]$letter) {
+  $e = Assert-KeySendable $t
+  if ($e) { return $e }
+  $sent = 0
+  try { $sent = [DshUia.Native]::TapCtrl([uint16][char]$letter) } catch { return (New-Fail 'failed' '组合键被本脚本拒绝' 'key-not-allowed') }
+  if ($sent -ne 4) { return (New-Fail 'failed' '系统未接受组合键' 'sendinput') }
+  return $null
+}
+
+# 绝对跳页：Ctrl+G 输页码 → Enter → Ctrl+A/Ctrl+C 读回这一页的文本。
+#
+# 为什么必须绝对跳：讲解的每一段都带 PDF 物理页码（OutlineSection.pageNumber），目标是确定的。
+# 上一版按"一段一屏 PageDown"相对翻，真机反馈"讲一句翻一下、页和内容对不上" —— 一段不等于一页。
+#
+# 为什么必须读回：跳没跳到只有屏幕知道。回包里带 pageText，让上层拿它和这一段的原文比对；
+# 对不上就暂停讲解并说明原因，绝不返回"同步成功"。
+function Goto-PageExact($t, $req, $snap) {
+  $target = [int]$req.page
+  if ($target -lt 1 -or $target -gt 100000) { return (New-Fail 'invalid-argument' '页码不合法') }
+  $steps = New-Object System.Collections.Generic.List[string]
+  # 剪贴板先备份：读回要占用它，用完必须写回去，不能污染用户的剪贴板。
+  $saved = Read-ClipboardText
+  try {
+    # ① 打开"页码定位"框。
+    $e = Send-CtrlLetter $t 'G'
+    if ($e) { $e.before = $t.identity; return (Complete-After $t $e $req.ownerPids) }
+    Start-Sleep -Milliseconds 220
+    $steps.Add('ctrl+g')
+    # ② 输入目标页码并确认。数字用 KEYEVENTF_UNICODE 直接投递，不受输入法影响。
+    foreach ($ch in ([string]$target).ToCharArray()) {
+      $e2 = Assert-KeySendable $t
+      if ($e2) { $e2.before = $t.identity; $e2.steps = $steps.ToArray(); return (Complete-After $t $e2 $req.ownerPids) }
+      [void][DshUia.Native]::TypeDigit($ch)
+      Start-Sleep -Milliseconds 40
+    }
+    [void][DshUia.Native]::TapKey([uint16]0x0D)
+    Start-Sleep -Milliseconds 320
+    $steps.Add("type:$target+enter")
+    # ③ 读回当前页文本：全选 + 复制，然后读剪贴板（只读文本）。
+    $readback = 'failed'
+    $pageText = $null
+    $e3 = Send-CtrlLetter $t 'A'
+    if ($null -eq $e3) {
+      Start-Sleep -Milliseconds 120
+      $e4 = Send-CtrlLetter $t 'C'
+      if ($null -eq $e4) {
+        Start-Sleep -Milliseconds 350
+        $got = Read-ClipboardText
+        if ($null -ne $got) {
+          $readback = 'ok'
+          # 截断到 2000 字：只要够比对这一段开头，不必把整页都塞进回包。
+          if ($got.Length -gt 2000) { $pageText = $got.Substring(0, 2000) } else { $pageText = $got }
+        }
+      }
+    }
+    $steps.Add("readback:$readback")
+    $r = @{ ok = $true; before = $t.identity; foregroundBefore = $snap; method = 'keyboard-absolute'
+      keys = 3; pdfView = $false; readback = $readback; steps = $steps.ToArray() }
+    # 页码是**目标值**，不是读回的：读回的内容在 pageText 里，由上层比对。
+    $r.page = $target
+    $r.total = $target
+    $r.assumed = $true
+    if ($null -ne $pageText) { $r.pageText = $pageText }
+    return (Complete-After $t $r $req.ownerPids)
+  } finally {
+    Restore-Clipboard $saved
+  }
 }
 
 function Op-GotoPage($req) {
@@ -545,8 +727,12 @@ function Op-GotoPage($req) {
   $k = Enter-KeyMode $req
   if ($k.fail) { return $k.fail }
   $t = $k.t
+  # 没有 PDF 视图 → 绝对跳页 + 读回（见 Goto-PageExact 的注释）。
+  if ($t.doc -eq $null) { return (Goto-PageExact $t $req $k.snap) }
+  $t.doc.labelEl = $null
   $cur = Read-WpsPdfPage $t.doc
-  if (-not $cur) { return (New-Fail 'unsupported' '读不到页码，无法确认跳页结果' 'page-label-missing') }
+  # 有视图但读不到页码：同样走绝对跳页，而不是让整条讲解链断在这里。
+  if (-not $cur) { return (Goto-PageExact $t $req $k.snap) }
   if ($target -lt 1 -or $target -gt $cur.total) { return (New-Fail 'invalid-argument' "页码超出范围 1..$($cur.total)") }
   $r = @{ before = $t.identity; foregroundBefore = $k.snap; pageBefore = @{ page = $cur.page; total = $cur.total } }
   $steps = New-Object System.Collections.Generic.List[string]
@@ -559,10 +745,14 @@ function Op-GotoPage($req) {
     $plan = @()
     if ($target -eq 1) { $plan = @('Home') }
     elseif ($target -eq $cur.total) { $plan = @('End') }
-    elseif ([Math]::Abs($delta) -gt ($target - 1) + 1 -and $round -eq 1) { $plan = @('Home') }
-    elseif ([Math]::Abs($delta) -gt ($cur.total - $target) + 1 -and $round -eq 1) { $plan = @('End') }
     else {
-      $name = 'Right'; if ($delta -lt 0) { $name = 'Left' }
+      # 不同 WPS 视图模式翻页键不同：连续滚动模式 Right/Left 只平移不翻页。
+      # 先试 PageDown/PageUp，停滞再退到 Down/Up、Right/Left，覆盖单页/连续两种模式。
+      $fwd = 'PageDown'; $bwd = 'PageUp'
+      if ($round -eq 2) { $fwd = 'Down'; $bwd = 'Up' }
+      elseif ($round -ge 3) { $fwd = 'Right'; $bwd = 'Left' }
+      $name = $fwd; if ($delta -lt 0) { $name = $bwd }
+      # 大步长快进，冲过由下一轮反向读回纠正；每轮读回页码做反馈。
       $n = [Math]::Min([Math]::Abs($delta), 10)
       $plan = @(1..$n | ForEach-Object { $name })
     }
@@ -573,16 +763,21 @@ function Op-GotoPage($req) {
       Start-Sleep -Milliseconds 40
     }
     $prev = $cur
+    $t.doc.labelEl = $null
     $cur = Wait-PageChange $t.doc $prev
     if (-not $cur) { $e = New-Fail 'failed' '按键后读不到页码' 'page-label-lost'; $e.steps = $steps.ToArray(); return (Complete-After $t $e $req.ownerPids) }
     $steps.Add("$($plan[0])x$($plan.Count)->$($cur.page)/$($cur.total)")
-    # 连续两轮按键都没让页码变化：按键对这个视图无效，停下来如实报告，不继续盲按。
+    # 连续三轮按键都没让页码变化：按键对这个视图无效，停下来如实报告，不继续盲按。
     if ($cur.page -eq $prev.page) { $stalled++ } else { $stalled = 0 }
-    if ($stalled -ge 2) { break }
+    if ($stalled -ge 3) { break }
     Test-Deadline
   }
   $t2 = Test-Target $req
   if ($t2.fail) { $t2.fail.steps = $steps.ToArray(); $t2.fail.before = $t.identity; return $t2.fail }
+  # 收尾再新鲜读一次页码，避免用滚动过程中的滞后值误判跳页结果。
+  $t.doc.labelEl = $null
+  $final = Read-WpsPdfPage $t.doc
+  if ($final) { $cur = $final }
   $r.steps = $steps.ToArray()
   $r.page = $cur.page; $r.total = $cur.total; $r.raw = $cur.raw
   $r.method = "key-nav x$keys"
@@ -706,6 +901,7 @@ function Invoke-Request($req) {
   switch ([string]$req.op) {
     'ping' { return @{ ok = $true } }
     'locate-wps' { return (Op-Locate $req) }
+    'running-wps' { return (Op-RunningWps $req) }
     'find' { return (Op-Find $req) }
     'verify' { return (Op-Verify $req) }
     'focus' { return (Op-Focus $req) }

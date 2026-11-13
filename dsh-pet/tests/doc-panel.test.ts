@@ -8,7 +8,11 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { formatDate, formatSize, progressLabel, sectionLabel, shortenDir } from '../src/renderer/doc-panel.ts'
+import {
+  DEFAULT_DOC_SPEECH_MODE, DOC_SPEECH_CODE_HINT, DOC_SPEECH_SWITCH_HINT,
+  docSpeechModeOf, docSpeechOptions, formatDate, formatSize, presenterLabel, progressLabel, sectionLabel, shortenDir,
+  type DocSpeechMode,
+} from '../src/renderer/doc-panel.ts'
 
 describe('formatSize', () => {
   it('按 1024 进制标 B/KB/MB', () => {
@@ -124,6 +128,70 @@ describe('shortenDir', () => {
     for (const max of [4, 5, 6, 10, 34]) {
       const dir = 'D:\\some\\deeply\\nested\\directory'
       assert.ok(shortenDir(dir, max).length <= dir.length, `max=${max} 时反而变长了`)
+    }
+  })
+})
+
+describe('presenterLabel', () => {
+  it('委派成员要点名', () => {
+    assert.equal(presenterLabel('小会'), '讲解：小会')
+  })
+
+  it('总助理自己讲或名字缺失时不重复点名', () => {
+    assert.equal(presenterLabel(null), '')
+    assert.equal(presenterLabel(undefined), '')
+    assert.equal(presenterLabel('  '), '')
+  })
+})
+
+/**
+ * 讲解模式的文案与默认值。
+ *
+ * 这一块的决定全部落在文字上：用户点哪个选项、点完会不会打断正在讲的那一段、遇到代码会怎样，
+ * 全靠这几句话交代。说错了界面就是在撒谎（而且是让用户不敢点的那种撒谎），所以逐字钉住。
+ */
+describe('讲解模式（docSpeechMode）', () => {
+  it('默认原文朗读；只有明确是 ai 才切过去', () => {
+    assert.equal(DEFAULT_DOC_SPEECH_MODE, 'source')
+    assert.equal(docSpeechModeOf(undefined), 'source')
+    assert.equal(docSpeechModeOf(null), 'source')
+    assert.equal(docSpeechModeOf('source'), 'source')
+    assert.equal(docSpeechModeOf('ai'), 'ai')
+    // 设置文件是用户可以手改的：写错一个词不该把界面推进半个状态。
+    assert.equal(docSpeechModeOf('AI' as DocSpeechMode), 'source')
+  })
+
+  it('正好两个选项，顺序固定为「原文朗读」在前', () => {
+    const options = docSpeechOptions()
+    assert.deepEqual(options.map(option => option.value), ['source', 'ai'])
+    assert.deepEqual(options.map(option => option.label), ['原文朗读（推荐）', 'AI 讲解'])
+  })
+
+  it('两个选项的副文案逐字一致：说清"慢/贵/有没有解读"，不承诺做不到的事', () => {
+    const [source, ai] = docSpeechOptions()
+    assert.equal(source.detail, '按文档原文逐段朗读，屏幕同步翻页。解释和补充只在你提问时产生，接近真人开会。')
+    assert.equal(ai.detail, '每段由模型生成解释与补充再朗读。更慢、更费，但每段都有解读。')
+  })
+
+  it('切换提示明确"不打断正在播的那一段"：否则用户不敢点', () => {
+    assert.equal(DOC_SPEECH_SWITCH_HINT, '切换后从下一段生效，正在播的这一段不会被打断。')
+    assert.ok(DOC_SPEECH_SWITCH_HINT.includes('下一段'))
+    assert.ok(DOC_SPEECH_SWITCH_HINT.includes('不会被打断'))
+  })
+
+  it('代码/表格/公式的说明写明会停 10 秒，用户不会以为漏讲了一段', () => {
+    assert.equal(DOC_SPEECH_CODE_HINT, '原文朗读遇到代码、表格、公式时不会逐行念，会提示一句并停 10 秒，方便大家看屏幕。')
+    assert.ok(DOC_SPEECH_CODE_HINT.includes('10 秒'))
+  })
+
+  it('文案里不出现实现词', () => {
+    const all = [
+      ...docSpeechOptions().flatMap(option => [option.label, option.detail]),
+      DOC_SPEECH_SWITCH_HINT,
+      DOC_SPEECH_CODE_HINT,
+    ].join(' ')
+    for (const word of ['FTS', 'ASR', 'token', 'Token', 'prompt', 'embedding', '索引']) {
+      assert.ok(!all.includes(word), `文案里出现了实现词「${word}」：${all}`)
     }
   })
 })

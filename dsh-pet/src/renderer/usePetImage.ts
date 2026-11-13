@@ -5,7 +5,7 @@
  * 素材按皮肤在模块级共享缓存，见 loadSkinImages / loadSkinFrames。
  */
 import { useEffect, useState } from 'react'
-import { isCustomSkinId } from './custom-skin-registry.ts'
+import { isCustomSkinId, customActionsFor } from './custom-skin-registry.ts'
 
 /** 自定义皮肤素材在 userData，相对路径探不到，走主进程 pet-asset 协议。 */
 const assetBase = (skin: string): string => (isCustomSkinId(skin) ? 'pet-asset://custom/pets/' : '../assets/pets/')
@@ -185,7 +185,7 @@ export function loadSkinFrames(skin: string): Promise<SkinFrames> {
     return [action, list]
   }
 
-  const task = Promise.all(FRAME_ACTIONS.map(probe)).then((entries) => {
+  const task = Promise.all([...FRAME_ACTIONS, ...customActionsFor(skin)].map(probe)).then((entries) => {
     const map: SkinFrames = {}
     for (const entry of entries) if (entry) map[entry[0]] = entry[1]
     return map
@@ -250,7 +250,7 @@ export function loadSkinVideos(skin: string): Promise<SkinVideos> {
     return empty
   }
   const task = Promise.all(
-    FRAME_ACTIONS.map(async (action) => {
+    [...FRAME_ACTIONS, ...customActionsFor(skin)].map(async (action) => {
       const src = await probeVideo(videoUrl(skin, action))
       return src ? ([action, src] as const) : null
     }),

@@ -322,6 +322,8 @@ export interface WinDesktopActions extends DesktopActions {
   readonly platform: 'win32'
   /** 读 WPS 的安装登记（App Paths / Kingsoft InstallRoot / 卸载项）。 */
   readWpsRegistry(): Promise<ActionResult<RegistryCandidate[]>>
+  /** 正在运行的 WPS 进程的可执行路径（可能不止一个版本）。locate 优先用它认窗口。 */
+  runningWpsPaths(): Promise<ActionResult<string[]>>
   /** 只核对身份与弹窗，不动作。讲解同步用它判断"现在还能不能继续"。 */
   verify(identity: WindowIdentity, profile?: SemanticProfile, options?: FocusOptions): Promise<ActionResult<WindowIdentity & { position?: PagePosition }>>
   /**
@@ -406,6 +408,15 @@ export function createWinActions(options: WinActionsOptions): WinDesktopActions 
             version: asString(v.version) || undefined, installLocation: asString(v.installLocation) || undefined,
           }]
         })
+      })
+    },
+
+    async runningWpsPaths() {
+      const r = await call('locate', { op: 'running-wps' })
+      if ('result' in r) return r.result
+      return finish('locate', r.resp, undefined, false, resp => {
+        if (!Array.isArray(resp.paths)) return undefined
+        return resp.paths.filter((p): p is string => typeof p === 'string' && p.length > 0)
       })
     },
 
@@ -519,7 +530,12 @@ export function createWinActions(options: WinActionsOptions): WinDesktopActions 
       // 每页最多约 10 次按键 × 若干轮，按页数放宽时间上限，但不超过 45 秒。
       const r = await call('gotoPage', { op: 'goto-page', identity, profile, page, ownerPids: ownerPids(opts) }, Math.min(45_000, timeoutMs + 4_000))
       if ('result' in r) return r.result
-      const result = finish('gotoPage', r.resp, identity, true, resp => parsePosition(resp))
+      const result = finish('gotoPage', r.resp, identity, true, resp => {
+        const pos = parsePosition(resp)
+        if (pos === undefined) return undefined
+        const pageText = asString(resp.pageText)
+        return pageText === undefined ? pos : { ...pos, pageText }
+      })
       // 第三道：读回页码必须等于目标页。
       if (result.ok && result.value.page !== page) {
         return fail('failed', `读回第 ${result.value.page} 页，不是目标第 ${page} 页`, result.evidence, { detail: 'readback-mismatch' })

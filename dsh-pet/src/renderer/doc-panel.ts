@@ -42,6 +42,12 @@ export function progressLabel(next: number, total: number, estMinutes: number): 
   return `已讲 ${next}/${total} 段，接下来第 ${next + 1} 段，剩下约 ${left} 分钟`
 }
 
+/** 讲解者点名：委派给子助理时要让用户看见是谁在讲；总助理自己讲不重复点名。 */
+export function presenterLabel(name: string | null | undefined): string {
+  const clean = (name ?? '').trim()
+  return clean === '' ? '' : `讲解：${clean}`
+}
+
 /**
  * 一条目录该显示成什么。
  *
@@ -56,4 +62,55 @@ export function shortenDir(dir: string, max = 34): string {
   // 而 `slice(-0)` 就是 `slice(0)`，整条路径会被接到省略号后面，越缩越长。
   const tail = Math.max(1, max - head.length - 1)
   return `${head}…${clean.slice(-tail)}`
+}
+
+/** 讲解形态：`source` 照原文念稿，`ai` 每段让模型生成解释。 */
+export type DocSpeechMode = 'source' | 'ai'
+
+export interface DocSpeechOption {
+  readonly value: DocSpeechMode
+  readonly label: string
+  readonly detail: string
+}
+
+/**
+ * 默认按原文朗读。
+ *
+ * 选它当默认有产品理由：屏幕和耳朵听的是同一句话时，用户能对上号；模型生成解释的那条路
+ * 慢、贵，而且每段都多一层"这是它自己想的"要判断。想听解读的人再切过去，属于主动选择。
+ */
+export const DEFAULT_DOC_SPEECH_MODE: DocSpeechMode = 'source'
+
+/** 切换时机提示：写设置不会碰正在播的那一段，用户需要被告知这一点，否则不敢点。 */
+export const DOC_SPEECH_SWITCH_HINT = '切换后从下一段生效，正在播的这一段不会被打断。'
+
+/** 原文朗读遇到非正文块时的行为说明：不解释清楚，用户会以为它跳过了一段。 */
+export const DOC_SPEECH_CODE_HINT = '原文朗读遇到代码、表格、公式时不会逐行念，会提示一句并停 10 秒，方便大家看屏幕。'
+
+/**
+ * 两个选项的文案。
+ *
+ * 字符串放在纯逻辑里（而不是 `.tsx` 里），是这一层的既有规矩：措辞错了就是界面在撒谎，
+ * 而撒谎这件事得能被 `node --test` 钉住。文案刻意只说用户能感知的事 —— 慢、贵、有没有解读、
+ * 会不会停 10 秒 —— 不出现实现词（索引、识别、字数配额之类）：那些要么与他此刻的选择无关，
+ * 要么说了也改变不了他的决定。
+ */
+export function docSpeechOptions(): readonly DocSpeechOption[] {
+  return [
+    {
+      value: 'source',
+      label: '原文朗读（推荐）',
+      detail: '按文档原文逐段朗读，屏幕同步翻页。解释和补充只在你提问时产生，接近真人开会。',
+    },
+    {
+      value: 'ai',
+      label: 'AI 讲解',
+      detail: '每段由模型生成解释与补充再朗读。更慢、更费，但每段都有解读。',
+    },
+  ]
+}
+
+/** 存量设置与脏数据一律落到默认值：界面上永远只有一个确定的选择。 */
+export function docSpeechModeOf(value: DocSpeechMode | undefined | null): DocSpeechMode {
+  return value === 'ai' ? 'ai' : DEFAULT_DOC_SPEECH_MODE
 }

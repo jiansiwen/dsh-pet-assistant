@@ -150,12 +150,12 @@ describe('startMeeting：consent 必填与仲裁', () => {
     h.store.close()
   })
 
-  test('唤醒在听时开会议：stop-wake 生效，参会者的话不进命令识别器', () => {
+  test('唤醒在听时开会议：录音不剥夺唤醒，唤醒保持监听', () => {
     const awake = nextAudio(INITIAL_AUDIO_STATE, { type: 'boot' }).state
     const h = setup({ initialAudio: awake })
     const result = h.recorder.startMeeting(CONSENT)
     assert.equal(result.ok, true)
-    assert.deepEqual(h.audioEffects, ['stop-wake'])
+    assert.deepEqual(h.audioEffects, [], '唤醒原本在听，会议不再停它')
     assert.equal(h.audioState().holder, 'meeting')
     h.store.close()
   })
@@ -303,11 +303,11 @@ describe('音频仲裁：会议与听写互斥（纯函数）', () => {
   const AWAKE = nextAudio(INITIAL_AUDIO_STATE, { type: 'boot' }).state
   const MEETING = nextAudio(AWAKE, { type: 'meeting-requested' }).state
 
-  test('会议占着设备时听写被拒，状态一点不动', () => {
+  test('会议中本人按键听写放开：交给听写，唤醒让路', () => {
     const turn = nextAudio(MEETING, { type: 'dictation-requested' })
-    assert.ok(turn.denied !== null)
-    assert.equal(turn.state.holder, 'meeting')
-    assert.deepEqual(turn.effects, [])
+    assert.equal(turn.denied, null)
+    assert.equal(turn.state.holder, 'dictation')
+    assert.deepEqual(turn.effects, ['stop-wake'])
   })
 
   test('听写占着设备时会议被拒', () => {
@@ -321,10 +321,10 @@ describe('音频仲裁：会议与听写互斥（纯函数）', () => {
     assert.ok(nextAudio(MEETING, { type: 'meeting-requested' }).denied !== null)
   })
 
-  test('会议结束把设备还给唤醒；专注下不还给唤醒', () => {
+  test('会议结束唤醒记回 wake（一直在听，不重复拉起）；专注下不还给唤醒', () => {
     const finished = nextAudio(MEETING, { type: 'meeting-finished' })
     assert.equal(finished.state.holder, 'wake')
-    assert.deepEqual(finished.effects, ['start-wake'])
+    assert.deepEqual(finished.effects, [], '会议期间唤醒没停过，收尾不重复 start-wake')
 
     const focus = nextAudio(AWAKE, { type: 'focus', on: true }).state
     const meetingInFocus = nextAudio(focus, { type: 'meeting-requested' }).state
@@ -340,18 +340,18 @@ describe('音频仲裁：会议与听写互斥（纯函数）', () => {
     assert.deepEqual(second.state, first.state)
   })
 
-  test('开专注不打断进行中的会议', () => {
+  test('开专注不打断进行中的会议，但停掉唤醒', () => {
     const turn = nextAudio(MEETING, { type: 'focus', on: true })
     assert.equal(turn.state.holder, 'meeting')
     assert.equal(turn.state.focus, true)
-    assert.deepEqual(turn.effects, [])
+    assert.deepEqual(turn.effects, ['stop-wake'])
   })
 
   test('唤醒进程挂了不带走会议', () => {
     const turn = nextAudio(MEETING, { type: 'wake-lost' })
     assert.equal(turn.state.holder, 'meeting')
     assert.equal(turn.state.wakeUnavailable, true)
-    assert.deepEqual(turn.effects, [])
+    assert.deepEqual(turn.effects, ['stop-wake'], '清掉 wake 自动重启定时器')
   })
 })
 

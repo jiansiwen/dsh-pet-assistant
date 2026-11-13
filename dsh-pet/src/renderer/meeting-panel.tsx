@@ -2,38 +2,22 @@
  * 会议页：开始表单（名称/来源/知情勾选/保留天数）、录音中的红色常显标识与立即停止、
  * 各音轨收音状态与临时字幕、转写状态、说话人修订列表、纪要预览与确认按钮。
  *
- * 采音在这一层做（getUserMedia）：主进程拿不到 Web 音频设备。麦克风与系统回环声（loopback）
- * **各自一条音轨**：每路单独缓冲、单独切块（TrackChunker，约 4 秒一块），块带音源、轨内序号、
- * 起点（相对会议开始的毫秒）、原始采样率与 16k 帧数，经 petApi.meetingChunk 推上去，主进程
- * 收到立即 AES-256-GCM 加密落盘——明文不过夜，两路也绝不交错拼成一条。两路共用一个
- * AudioContext 的时钟，相对对齐不受墙钟误差影响。
- *
- * loopback 用 chromeMediaSource desktop 尝试；拿不到就如实上报 track 缺失（meetingTrackMissing），
- * **不伪造静音块**：纪要里会写"这条音轨没录到"。某条音轨中途结束（设备拔出）就把它的残块
- * 冲刷掉并停止处理，之后那段时间在时间轴上是缺口，不会被静音填成"录到了"。
- *
- * 停止是两段式：主进程发 meeting-stopping → 这里停轨、把两路缓冲里最后一块都推完 →
- * meetingFlushDone 触发结算。直接停会丢会议最后几秒。采集句柄放在模块级：会议页在录音中被
- * 切走再切回来（组件卸载重建）也找得到它，停得下麦克风。
+ * 采音与桌面命令接收不在这一层：它们在 meeting-capture-session.ts 由 App 常驻安装，
+ * 设置页不打开也能开始录音。采集细节（双轨切块、加密推块、缺口不伪造静音、两段式停止）
+ * 见该模块注释。本页只投影状态与提供人工操作。
  *
  * 说话人：停录后主进程用本地模型自动分人（同一音轨内分组，标签如「本机麦克风·发言人1」
  * 「对方·发言人2」），全部标"未确认"；模型缺失或失败时整条音轨归一组并写明"未自动分人"。
  * 最终分组只来自用户在这个页面上的改名/合并/拆分。纪要确认按钮是唯一能把纪要置成 confirmed 的入口。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { pcm16Base64, resampleTo16k } from './dictation.js'
-import { TrackChunker, type TrackChunk } from './meeting-capture.js'
-import { frameWallMs, sharedCapture, type CaptureSubscription } from './audio-capture.ts'
 import MeetingMinutesReview from './meeting-minutes-review.js'
 import type {
   LiveCaption,
-  MeetingConsentInput,
-  MeetingFlushReport,
   MeetingIntegrity,
   MeetingMinutesResult,
   MeetingRuntimeState,
   MeetingSpeakersResult,
-  MeetingStartedPayload,
   MeetingTrack,
   TranscriptSegment,
 } from './types.js'
@@ -42,359 +26,8 @@ import type {
 export const MEETING_CONSENT_TEXT =
   '我知晓本场会议将被录音：音频加密保存在本机、按保留期自动删除，转写与纪要保留；我会告知其他参会者本次录音。'
 
-/** 每块的目标时长（毫秒）。主进程按块做临时字幕，块太长字幕就滞后。 */
-const CHUNK_MS = 4000
-/** ScriptProcessor 缓冲帧数。两路一样大，回调延迟一致，相对对齐不受影响。 */
-const PROCESSOR_FRAMES = 4096
-/** 停录时距最后一帧超过此时长，尾部可能丢音，不能按完整录音结算。 */
-const TRACK_STALL_MS = 1500
-
 const TRACK_NAME: Record<MeetingTrack, string> = { mic: '本机麦克风', loopback: '对方（系统回环声）' }
 const TRACK_SHORT: Record<MeetingTrack, string> = { mic: '本机麦克风', loopback: '对方' }
-
-interface CaptureHandle {
-  readonly meetingId: string
-  stopAndFlush(): Promise<{ ok: boolean; error?: string }>
-}
-
-/** 进行中的采集。模块级而不是组件 ref：会议页卸载重建后仍要能停下它。 */
-let activeCapture: CaptureHandle | null = null
-/** 采集正在打开设备的会议（getUserMedia 要几百毫秒）。 */
-let startingFor: string | null = null
-/** 开轨过程中停止时立即撤销已取得的设备，不等待另一条音轨打开。 */
-let startingController: AbortController | null = null
-/** 设备还没打开完就收到了停止：打开后立刻停。 */
-let stopRequestedFor: string | null = null
-
-/**
- * 拿系统回环声（会议里"对方的声音"）。
- *
- * 两条路，按顺序试：
- *
- * 1. **`getDisplayMedia`（Electron 17+ 的正路）**。主进程的 `setDisplayMediaRequestHandler`
- *    决定给什么：这里只批准音频回环，画面拿到后立刻停掉 —— 会议不录屏。
- * 2. **旧的 `chromeMediaSource: 'desktop'` 约束**。老版本 Electron 才认；留作兜底。
- *
- * 两条都失败返回 null，由调用方如实上报缺失。
- *
- * ⚠️ macOS 13 以下不支持 `audio: 'loopback'`：那时第 1 条会成功但要不到音轨
- * （`getAudioTracks()` 为空），所以这里检查的是"有没有音轨"而不是"有没有抛错"。
- */
-async function openLoopback(): Promise<{ stream: MediaStream | null; reason: string | null }> {
-  const takeAudioOnly = (stream: MediaStream): MediaStream | null => {
-    // 不管哪条路，视频轨一律停掉：只录声音是承诺，不是实现细节。
-    for (const video of stream.getVideoTracks()) {
-      video.stop()
-      stream.removeTrack(video)
-    }
-    if (stream.getAudioTracks().length > 0) return stream
-    stream.getTracks().forEach(track => track.stop())
-    return null
-  }
-
-  // 1) Electron 的正路。需要主进程注册 setDisplayMediaRequestHandler，否则直接 reject。
-  const media = navigator.mediaDevices as MediaDevices & {
-    getDisplayMedia?: (constraints?: MediaStreamConstraints) => Promise<MediaStream>
-  }
-  if (typeof media.getDisplayMedia === 'function') {
-    try {
-      const stream = await media.getDisplayMedia({ audio: true, video: true })
-      const audioOnly = takeAudioOnly(stream)
-      if (audioOnly !== null) return { stream: audioOnly, reason: null }
-      return { stream: null, reason: '这个系统没有提供系统音频轨（macOS 13 以下不支持回环声），只录了本机麦克风' }
-    } catch (error) {
-      console.error('[meeting] getDisplayMedia failed:', error)
-    }
-  }
-
-  // 2) 旧约束兜底。
-  const attempts = [
-    { audio: { mandatory: { chromeMediaSource: 'desktop' } }, video: false },
-    { audio: { mandatory: { chromeMediaSource: 'desktop' } }, video: { mandatory: { chromeMediaSource: 'desktop' } } },
-  ] as unknown as MediaStreamConstraints[]
-  for (const constraints of attempts) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      const audioOnly = takeAudioOnly(stream)
-      if (audioOnly !== null) return { stream: audioOnly, reason: null }
-    } catch (error) {
-      console.error('[meeting] loopback capture attempt failed:', error)
-    }
-  }
-  return { stream: null, reason: null }
-}
-
-/**
- * 开始采音。mic 必采；sources 含 loopback 时再试系统回环声，失败只标缺失不中断会议。
- * mic 本身拿不到时也如实上报——会议照常"录"，但状态里能看到缺了什么，纪要不会假装录到了内容。
- */
-async function startMeetingCapture(
-  payload: MeetingStartedPayload, api: Window['petApi'], signal: AbortSignal, onError: (reason: string) => void,
-): Promise<CaptureHandle | null> {
-  const { meetingId, sources } = payload
-  const wanted: MeetingTrack[] = sources === 'mic+loopback' ? ['mic', 'loopback'] : ['mic']
-  let chain: Promise<void> = Promise.resolve()
-  const errors: string[] = []
-  const progress: Record<MeetingTrack, { sent: number | null; acknowledged: number | null }> = {
-    mic: { sent: null, acknowledged: null }, loopback: { sent: null, acknowledged: null },
-  }
-  const noteError = (reason: string): void => {
-    if (errors.length < 32) {
-      errors.push(reason.slice(0, 240))
-      onError(reason)
-    }
-    console.error('[meeting]', reason)
-  }
-  const reportMissing = (track: MeetingTrack, reason?: string): void => {
-    noteError(`${track} 音轨缺失或中断：${reason ?? '未能采集'}`)
-    // 排在该轨残块之后，避免主进程先将音轨标为缺失而拒收残块。
-    chain = chain.then(async () => {
-      try {
-        const result = await api.meetingTrackMissing(meetingId, track, reason)
-        if (!result.ok) noteError(`${track} 音轨缺失报告失败：${result.error ?? '主进程拒绝'}`)
-      } catch (error) {
-        noteError(`${track} 音轨缺失报告异常：${error instanceof Error ? error.message : String(error)}`)
-      }
-    })
-  }
-  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-    // 不能写 wanted.forEach(reportMissing)：forEach 会把数组下标当第二个参数传进去，
-    // 于是"原因"变成 0/1 这种数字。必须显式包一层。
-    for (const track of wanted) reportMissing(track)
-    await chain
-    return null
-  }
-
-  let context: AudioContext
-  try {
-    context = new AudioContext()
-    if (context.state === 'suspended') await context.resume().catch(() => undefined)
-  } catch {
-    for (const track of wanted) reportMissing(track)
-    await chain
-    return null
-  }
-
-  // 时间轴零点是主进程的会议开始时刻；之后全按这一个 AudioContext 的时钟推进。
-  const meetingStartedAt = typeof payload.startedAt === 'number' && Number.isFinite(payload.startedAt) ? payload.startedAt : Date.now()
-  const anchorWallMs = Date.now()
-  const anchorCtx = context.currentTime
-  const toMeetingMs = (ctxTime: number): number => anchorWallMs - meetingStartedAt + (ctxTime - anchorCtx) * 1000
-  const bufferMs = (PROCESSOR_FRAMES / context.sampleRate) * 1000
-
-  /** 推块串行化：meetingChunk 是异步的，乱序会让主进程的轨内序号校验拒块。 */
-  let stopped = false
-  let stoppedAt: number | null = null
-  let stopping: Promise<{ ok: boolean; error?: string }> | null = null
-  let micSubscription: CaptureSubscription | null = null
-  const mediaTracks: MediaStreamTrack[] = []
-  const chunkers: TrackChunker[] = []
-  const lastFrameAt: Record<MeetingTrack, number | null> = { mic: null, loopback: null }
-  let contextClosing: Promise<void> | null = null
-  const closeContext = (): Promise<void> => {
-    if (contextClosing === null) {
-      contextClosing = (async () => {
-        try { await context.close() } catch (error) { noteError(`采集上下文关闭失败：${error instanceof Error ? error.message : String(error)}`) }
-      })()
-    }
-    return contextClosing
-  }
-  const stopOpening = (): void => {
-    stopped = true
-    stoppedAt ??= performance.now()
-    try { micSubscription?.close() } catch (error) { noteError(`麦克风释放失败：${error instanceof Error ? error.message : String(error)}`) }
-    for (const track of mediaTracks) {
-      try { track.stop() } catch (error) { noteError(`音轨释放失败：${error instanceof Error ? error.message : String(error)}`) }
-    }
-    void closeContext()
-  }
-  signal.addEventListener('abort', stopOpening, { once: true })
-  if (signal.aborted) stopOpening()
-  const send = (chunk: TrackChunk): void => {
-    const b64 = pcm16Base64(chunk.pcm16k)
-    const { track, seq } = chunk.meta
-    progress[track].sent = seq
-    chain = chain.then(async () => {
-      try {
-        const result = await api.meetingChunk(meetingId, b64, chunk.meta)
-        if (!result.ok || !Number.isSafeInteger(result.seq)) {
-          noteError(`${track} 音轨第 ${seq} 块未确认：${result.error ?? '主进程没有给出落盘序号'}`)
-          return
-        }
-        progress[track].acknowledged = seq
-      } catch (error) {
-        noteError(`${track} 音轨第 ${seq} 块发送异常：${error instanceof Error ? error.message : String(error)}`)
-      }
-    })
-  }
-
-  // ScriptProcessor 要接到 destination 才跑；直连会外放会议声音，挂一个静音节点。
-  let mute: ScriptProcessorNode
-  try {
-    mute = context.createScriptProcessor(256, 1, 1)
-    mute.onaudioprocess = () => undefined
-    mute.connect(context.destination)
-  } catch (error) {
-    for (const track of wanted) reportMissing(track, error instanceof Error ? error.message : '音频处理节点创建失败')
-    void closeContext()
-    await chain
-    await closeContext()
-    return null
-  }
-
-  const attach = (track: MeetingTrack, stream: MediaStream): void => {
-    const chunker = new TrackChunker({ track, sampleRate: context.sampleRate, chunkMs: CHUNK_MS, resample: resampleTo16k })
-    chunkers.push(chunker)
-    const source = context.createMediaStreamSource(stream)
-    const processor = context.createScriptProcessor(PROCESSOR_FRAMES, 1, 1)
-    let ended = false
-    processor.onaudioprocess = (event) => {
-      if (stopped || ended) return
-      lastFrameAt[track] = performance.now()
-      const data = event.inputBuffer.getChannelData(0)
-      // playbackTime 是这批样本在音频时钟上的位置；输入大约早一个缓冲。两路同一个 context，偏移一致。
-      const ctxTime = Number.isFinite(event.playbackTime) && event.playbackTime > 0 ? event.playbackTime : context.currentTime
-      const before = chunker.discontinuities
-      const chunks = chunker.push(data, toMeetingMs(ctxTime) - bufferMs)
-      if (chunker.discontinuities > before) noteError(`${track} 音轨采集出现时间缺口`)
-      for (const chunk of chunks) send(chunk)
-    }
-    for (const media of stream.getTracks()) {
-      mediaTracks.push(media)
-      // 设备中途没了：残块冲刷掉、这一路停止处理。之后的时间是缺口，绝不让静音冒充录音。
-      media.addEventListener('ended', () => {
-        if (ended || stopped) return
-        ended = true
-        const rest = chunker.flush()
-        if (rest !== null) send(rest)
-        try { processor.disconnect() } catch { /* 已断开 */ }
-        console.error(`[meeting] ${track} 音轨中途结束`)
-        reportMissing(track, '音轨中途结束，后续音频未录到')
-      })
-    }
-    source.connect(processor)
-    processor.connect(mute)
-  }
-
-  // 麦克风轨来自共享采集（M1-03）：会议只是它的一个消费者，凭主进程下发的会议授权订阅
-  //（令牌 = 正在录的会议 id），不再自己开设备。帧的时间戳是单调时钟，换算到会议时间轴；
-  // 设备重开后采样率变了就换一个切块器，轨内序号接着编。
-  let micChunker: TrackChunker | null = null
-  let micRate = 0
-  let micEnded = false
-  try {
-    const capture = sharedCapture()
-    if (!await capture.waitForGrant('meeting', 2000, meetingId)) throw new Error('没有收到这场会议的麦克风授权')
-    if (signal.aborted) {
-      reportMissing('mic', '麦克风开轨期间收到停止，未开始采集')
-    } else micSubscription = await capture.subscribe({
-      kind: 'meeting',
-      token: meetingId,
-      onFrame: (frame) => {
-        if (stopped || micEnded) return
-        lastFrameAt.mic = performance.now()
-        if (frame.gapBefore) noteError('mic 音轨设备重开或采集出现时间缺口')
-        if (micChunker === null || frame.sampleRate !== micRate) {
-          const rest = micChunker?.flush() ?? null
-          if (rest !== null) send(rest)
-          micRate = frame.sampleRate
-          micChunker = new TrackChunker({ track: 'mic', sampleRate: micRate, chunkMs: CHUNK_MS, resample: resampleTo16k, firstSeq: micChunker?.seq ?? 0 })
-        }
-        for (const chunk of micChunker.push(frame.samples, frameWallMs(frame) - meetingStartedAt)) send(chunk)
-      },
-      onEnd: (receipt) => {
-        if (receipt.reason === 'unsubscribed' || micEnded) return
-        // 设备中途没了 / 授权被收回：残块冲刷掉、这一路停止处理。之后是缺口，不用静音冒充。
-        micEnded = true
-        const rest = micChunker?.flush() ?? null
-        if (rest !== null) send(rest)
-        console.error(`[meeting] mic 音轨中途结束：${receipt.reason}`)
-        reportMissing('mic', `麦克风中途结束：${receipt.reason}`)
-      },
-    })
-    if (signal.aborted) micSubscription?.close()
-  } catch (error) {
-    console.error('[meeting] mic capture failed:', error)
-    reportMissing('mic', error instanceof Error ? error.message : '麦克风采集失败')
-  }
-
-  if (sources === 'mic+loopback') {
-    // 先问主进程"现在能不能采系统音频"。拿不到就直接记缺失并跳过，不去反复试 ——
-    // 无权限时每一次尝试都会被拒，而用户只会看到"对方的声音一直没录到"。
-    try {
-      if (signal.aborted) {
-        reportMissing('loopback', '停止时系统音轨尚未开启')
-      } else {
-        const capability = await api.meetingLoopbackCapability()
-        if (signal.aborted) {
-          reportMissing('loopback', '停止时系统音轨尚未开启')
-        } else if (!capability.available) {
-          reportMissing('loopback', capability.reason ?? '这个系统上采不到系统音频')
-        } else {
-          const loop = await openLoopback()
-          if (loop.stream === null) reportMissing('loopback', loop.reason ?? undefined)
-          else if (signal.aborted) {
-            for (const track of loop.stream.getTracks()) { try { track.stop() } catch { /* 已停 */ } }
-            reportMissing('loopback', '停止后系统音轨才返回，已立即关闭')
-          } else {
-            try { attach('loopback', loop.stream) } catch (error) {
-              for (const track of loop.stream.getTracks()) { try { track.stop() } catch { /* 已停 */ } }
-              reportMissing('loopback', error instanceof Error ? error.message : '系统音轨连接失败')
-            }
-          }
-        }
-      }
-    } catch (error) {
-      reportMissing('loopback', error instanceof Error ? error.message : '系统音频能力查询失败')
-    }
-  }
-
-  return {
-    meetingId,
-    stopAndFlush(): Promise<{ ok: boolean; error?: string }> {
-      if (stopping !== null) return stopping
-      stopping = (async () => {
-        stopped = true
-        stoppedAt ??= performance.now()
-        signal.removeEventListener('abort', stopOpening)
-        for (const track of wanted) {
-          const last = lastFrameAt[track]
-          if (last !== null && stoppedAt - last > TRACK_STALL_MS) noteError(`${track} 音轨停录前采集长时间中断，尾部可能存在缺口`)
-        }
-        // 两路各自把缓冲里的最后一块推完，再报 flushDone——顺序反了会丢会议最后几秒。
-        for (const chunker of [...chunkers, ...(micChunker === null ? [] : [micChunker])]) {
-          try {
-            const last = chunker.flush()
-            if (last !== null) send(last)
-          } catch (error) {
-            noteError(`${chunker.track} 音轨冲刷失败：${error instanceof Error ? error.message : String(error)}`)
-          }
-        }
-        try { micSubscription?.close() } catch (error) { noteError(`麦克风释放失败：${error instanceof Error ? error.message : String(error)}`) }
-        for (const track of mediaTracks) {
-          try { track.stop() } catch (error) { noteError(`音轨释放失败：${error instanceof Error ? error.message : String(error)}`) }
-        }
-        await closeContext()
-        await chain
-        const report: MeetingFlushReport = {
-          tracks: Object.fromEntries(wanted.map(track => [track, { ...progress[track] }])),
-          errors: [...errors],
-        }
-        const unconfirmed = wanted.find(track => progress[track].sent === null || progress[track].acknowledged !== progress[track].sent)
-        const localFailure = errors[0] ?? (unconfirmed ? `${unconfirmed} 音轨末块未确认` : null)
-        try {
-          const result = await api.meetingFlushDone(meetingId, report)
-          if (!result.ok) return { ok: false, error: result.error ?? '录音冲刷未能确认' }
-          if (localFailure !== null) return { ok: false, error: `录音不完整：${localFailure}` }
-          return { ok: true }
-        } catch (error) {
-          return { ok: false, error: `录音冲刷回执异常：${error instanceof Error ? error.message : String(error)}` }
-        }
-      })()
-      return stopping
-    },
-  }
-}
 
 function mmss(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return '--:--'
@@ -447,7 +80,6 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
   const [elapsed, setElapsed] = useState('')
   /** 正在请求删除的会议 id：防止重复点击，也用来禁用按钮。 */
   const [deleting, setDeleting] = useState<string | null>(null)
-  const handledCommands = useRef(new Set<string>())
 
   const selectedId = selected ?? runtime?.lastMeetingId ?? null
   const recording = runtime?.recording === true
@@ -475,20 +107,10 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
     setMinutes(minutesResult !== null && minutesResult.ok ? minutesResult : null)
   }, [api])
 
-  // 状态投影与采音生命周期。preload 的 subscribe 会先清旧监听，重复挂载不会堆积。
+  // 状态投影。采音生命周期与桌面命令接收在 App 层常驻安装（meeting-capture-session），
+  // 设置页不打开也能开录；这里只负责把状态画出来。
   useEffect(() => {
     if (api === undefined) return
-    const showFlush = (result: { ok: boolean; error?: string }): void => {
-      if (!result.ok) setNotice(result.error ?? '录音停止结果未能确认')
-    }
-    const finish = (handle: CaptureHandle): void => {
-      void handle.stopAndFlush().then(showFlush).catch(() => setNotice('录音冲刷异常，停止结果未知'))
-    }
-    const noCapture = (meetingId: string): void => {
-      setNotice('录音停止结果未知：渲染层没有可停止和核验的采集句柄')
-      void api.meetingFlushDone(meetingId, { tracks: {}, errors: ['渲染层没有可停止和核验的采集句柄'] })
-        .then(showFlush).catch(() => setNotice('录音冲刷回执异常，停止结果未知'))
-    }
     void api.meetingState().then(setRuntime).catch(() => undefined)
     // 人数是按音轨存的全局设置：会议页重新打开时把上次的选择带回来。
     // 面板在部分隔离测试里用最小 api 替身，没有 getState 时跳过即可。
@@ -499,50 +121,6 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
       }).catch(() => undefined)
     }
     api.onMeetingState((state) => setRuntime(state))
-    api.onMeetingStarted((payload) => {
-      startingFor = payload.meetingId
-      stopRequestedFor = null
-      const controller = new AbortController()
-      startingController = controller
-      void startMeetingCapture(payload, api, controller.signal, reason => setNotice(`录音不完整：${reason}`)).then((handle) => {
-        startingFor = null
-        if (startingController === controller) startingController = null
-        const stopNow = stopRequestedFor === payload.meetingId
-        stopRequestedFor = null
-        if (handle === null) {
-          if (stopNow) noCapture(payload.meetingId)
-          return
-        }
-        if (stopNow) {
-          finish(handle)
-          return
-        }
-        activeCapture = handle
-      }).catch(() => {
-        startingFor = null
-        if (startingController === controller) startingController = null
-        setNotice('会议采集启动失败，录音完整性未知')
-        if (stopRequestedFor === payload.meetingId) {
-          stopRequestedFor = null
-          noCapture(payload.meetingId)
-        }
-      })
-    })
-    api.onMeetingStopping((payload) => {
-      const handle = activeCapture
-      if (handle !== null && handle.meetingId === payload.meetingId) {
-        activeCapture = null
-        finish(handle)
-        return
-      }
-      if (startingFor === payload.meetingId) {
-        stopRequestedFor = payload.meetingId
-        startingController?.abort()
-        return
-      }
-      // 没有在采（设备一路都没拿到）：没有块要冲刷，直接告诉主进程可以结算，不用干等超时。
-      noCapture(payload.meetingId)
-    })
   }, [api])
 
   // 换了一场要看的会议、或转写阶段变了（精修写完库）就重新拉段与纪要。
@@ -596,30 +174,6 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
     const result = await api.meetingStop().catch(() => ({ ok: false, error: '主进程没有响应' }))
     if (!result.ok) setNotice(result.error ?? null)
   }, [api])
-
-  /** 子助理通过桌面命令发起：用户已在桌面明确要求，直接用这次指令作为知情记录开录。 */
-  const startFromCommand = useCallback(async (command: { requestId: string; consent: MeetingConsentInput }) => {
-    if (api === undefined || handledCommands.current.has(command.requestId)) return
-    handledCommands.current.add(command.requestId)
-    setFormError(null)
-    setName(command.consent.name)
-    setSources(command.consent.sources)
-    setRetentionDays(command.consent.retentionDays)
-    setConsented(true)
-    const result = await api.meetingStart(command.consent, command.requestId).catch(() => ({ ok: false, error: '主进程没有响应' }))
-    if (!result.ok) setFormError(result.error ?? '无法开始会议')
-  }, [api])
-
-  // 菜单页挂载时取一次待执行命令；已挂载时由 meeting-command 推送，两条路都按 requestId 去重。
-  useEffect(() => {
-    if (api === undefined) return
-    let cancelled = false
-    void api.meetingTakeCommand().then(command => {
-      if (!cancelled && command) void startFromCommand(command)
-    }).catch(() => undefined)
-    const off = api.onMeetingCommand(command => { if (!cancelled) void startFromCommand(command) })
-    return () => { cancelled = true; off() }
-  }, [api, startFromCommand])
 
   const runEdit = useCallback(async (edit: () => Promise<{ ok: boolean; error?: string; revision?: number }>, okMessage: string) => {
     if (api === undefined) return

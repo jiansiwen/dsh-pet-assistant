@@ -292,10 +292,19 @@ test('接线保留任务审批底座，移除独立标签，主动提示有可�
   const app = readFileSync(new URL('../src/renderer/App.tsx', import.meta.url), 'utf8')
   const panel = readFileSync(new URL('../src/renderer/PetSettingsPanel.tsx', import.meta.url), 'utf8')
   const settings = readFileSync(new URL('../src/renderer/AssistantSettings.tsx', import.meta.url), 'utf8')
+  const nav = readFileSync(new URL('../src/renderer/settings-nav.ts', import.meta.url), 'utf8')
   assert.ok(app.indexOf('<MemberManagement') < app.indexOf('<TeamPanel'))
   assert.match(app, /onOpenApproval=\{openApproval\}/)
   assert.match(app, /registerCharacterHitbox\('__member_quota__'/)
   assert.match(app, /打开团队/)
-  assert.doesNotMatch(panel, /\['agent',/)
-  assert.doesNotMatch(settings, /setAgent|tokenBudget|企业微信独立智能体/)
+  // 2026-11-11 用户要求性格入口可见：总助理页暴露名字与性格；模型/额度仍不在该页编辑。
+  // 2026-11-12 导航收成九项之后，「总助理」不再是导航项，入口改到「通用」页的按钮上；
+  // 这条断言跟着挪位，但要钉的意图不变：这个入口必须仍然存在、且指向 agent 页。
+  assert.match(panel, /settingsPageMeta/)
+  assert.match(nav, /page === 'agent'\) return \{ title: '总助理'/)
+  assert.match(app, /总助理设置（名字与性格）/)
+  assert.match(app, /setSettingsPage\('agent'\)/)
+  assert.match(settings, /setAgentPersona/)
+  assert.doesNotMatch(settings, /企业微信独立智能体/)
+  assert.doesNotMatch(settings, /setAgentMaxTokens|setAgentTokenBudget|value=\{state\.agent\.(maxTokens|tokenBudget)/)
 })

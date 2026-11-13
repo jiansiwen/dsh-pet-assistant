@@ -146,6 +146,9 @@ function App() {
   const [clone, setClone] = useState({ providerId: '', name: '', files: [] as string[], consent: false })
   const [applyTarget, setApplyTarget] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState('')
+  const [aiRequest, setAiRequest] = useState('')
+  const [aiBusy, setAiBusy] = useState(false)
+  const [customAction, setCustomAction] = useState('')
 
   const config = draft ?? state?.config
   const run = async (label: string, fn: () => Promise<Result>) => {
@@ -163,6 +166,24 @@ function App() {
     if (result.ok) { setDraft(null); setSecrets({}) }
     return result
   })
+
+  const runAi = async () => {
+    if (!aiRequest.trim() || aiBusy) return
+    setAiBusy(true)
+    const result: Result = await api().assist(aiRequest.trim())
+    setAiBusy(false)
+    if (!result.ok) { setError(result.error); return }
+    const v = result.value as { name: string; prompt: string; actions: string[]; notes: string }
+    setJob(j => ({ ...j, name: v.name || j.name, prompt: v.prompt || j.prompt, actions: v.actions?.length ? v.actions : j.actions }))
+    setError('')
+  }
+
+  const addAction = (name: string) => {
+    const a = name.trim().toLowerCase()
+    if (!a || !/^[a-z][a-z0-9-]{0,23}$/.test(a)) { setError('动作名用小写英文/数字/短横线，如 dance、tai-chi'); return }
+    setJob(j => j.actions.includes(a) ? j : { ...j, actions: [...j.actions, a].slice(0, 8) })
+    setCustomAction('')
+  }
 
   return (
     <div className="wrap">
@@ -215,6 +236,15 @@ function App() {
 
       {tab === 'pipeline' && <>
         <div className="card">
+          <label>用一句话描述形象（AI 帮我配）
+            <textarea rows={2} value={aiRequest} onChange={e => setAiRequest(e.target.value)} placeholder="例：一只戴眼镜的橘猫，温和爱看书，动作有走路、挥手、看书、打盹" />
+          </label>
+          <div className="row">
+            <button disabled={aiBusy || !aiRequest.trim()} onClick={() => void runAi()}>{aiBusy ? '小潘正在想…' : '让 AI 帮我配'}</button>
+          </div>
+          <p className="muted">AI 只填名称、形象描述和建议动作；是否生成、费用确认仍由你决定。</p>
+        </div>
+        <div className="card">
           <label>形象名称<input value={job.name} onChange={e => setJob({ ...job, name: e.target.value })} /></label>
           <label>形象描述（prompt）<textarea rows={3} value={job.prompt} onChange={e => setJob({ ...job, prompt: e.target.value })} /></label>
           <label>图像模型
@@ -230,12 +260,17 @@ function App() {
             </select>
           </label>
           <div className="row">
-            {['idle', 'walk', 'think', 'wave', 'jump', 'sleep'].map(a => (
+            {[...new Set(['idle', 'walk', 'think', 'wave', 'jump', 'sleep', ...job.actions])].map(a => (
               <label key={a} className="check">
                 <input type="checkbox" checked={job.actions.includes(a)} onChange={e => setJob({ ...job, actions: e.target.checked ? [...job.actions, a] : job.actions.filter(x => x !== a) })} />{a}
               </label>
             ))}
           </div>
+          <div className="row">
+            <input value={customAction} onChange={e => setCustomAction(e.target.value)} placeholder="自定义动作名，如 dance" />
+            <button onClick={() => addAction(customAction)}>添加动作</button>
+          </div>
+          <p className="muted">可添加任意自定义动作（不受预设限制）；生成时会为每个勾选动作出片，最多 8 个。</p>
           <label className="check">
             <input type="checkbox" checked={job.approved} onChange={e => setJob({ ...job, approved: e.target.checked })} />
             我知悉：1 次图像 + {job.actions.length} 次视频调用，费用计入我所配平台

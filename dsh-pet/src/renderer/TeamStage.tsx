@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import PetSprite from './PetSprite.js'
 import PortalExit, { type PortalPhase } from './PortalExit.js'
 import { manifestFor, markForeground, type CharacterManifest, type SkinOverrides } from './character-manifest.js'
+import { PET_TRANSFORM_ORIGIN, characterTransform, normalizePetOpacity, normalizePetScale, surfaceOpacity } from './pet-appearance.js'
 import type { CharacterMenuTarget } from './types.js'
 import type { ConversationEvent } from './pet-interaction.js'
 import { depthToZIndex, type SceneRole } from './group-scene.js'
@@ -42,6 +43,10 @@ interface CharacterSlotProps {
   quiet: boolean
   idleSleepMinutes: number
   sleepMinutes: number
+  /** 角色大小档位（0.8 / 1 / 1.2），按底部中心缩放。 */
+  petScale?: number
+  /** 角色透明度档位（0.6 / 0.8 / 1）：只作用于角色图，不作用于气泡与工具栏。 */
+  petOpacity?: number
   proactive: { message: string; suggestDisable: boolean } | null
   onProactiveRespond(kind: 'accept' | 'decline' | 'disable'): void
   onBehavior(behavior: PetBehavior | null): void
@@ -52,10 +57,10 @@ interface CharacterSlotProps {
 }
 
 function CharacterSlot({ manifest, home, scene, assistantActive, status, selected, hideBubble, exitStage, portalPhase,
-  showPortal, quiet, idleSleepMinutes, sleepMinutes, proactive, onProactiveRespond, onBehavior,
+  showPortal, quiet, idleSleepMinutes, sleepMinutes, petScale = 1, petOpacity = 1, proactive, onProactiveRespond, onBehavior,
   onSelect, onPersist, onContextMenu, onDragStart }: CharacterSlotProps) {
   const behavior = usePetBehavior({ assistantActive, lines: manifest.lines, home, working: isWorking(status),
-    sceneBound: scene.bound, quiet, idleSleepMinutes, sleepMinutes, onPersist })
+    sceneBound: scene.bound, quiet, idleSleepMinutes, sleepMinutes, randomActions: manifest.randomActions, onPersist })
   const images = usePetSkinImages(manifest.skin)
   const frames = usePetFrames(manifest.skin)
   const videos = usePetVideos(manifest.skin)
@@ -118,6 +123,9 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
   }, [projected, force, behavior.protected])
 
   const markForegroundColor = useMemo(() => markForeground(manifest.markColor), [manifest.markColor])
+  // 归一化一次：设置文件可以被手改，传进来的值不一定是三档之一。
+  const scale = normalizePetScale(petScale)
+  const opacity = normalizePetOpacity(petOpacity)
   const attention = needsAttention(status)
   const facing = behavior.protected ? behavior.facing : scene.facing ?? behavior.facing
   return (
@@ -125,6 +133,13 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
       className={['pet-stage', 'character-slot', `action-${behavior.action}`, facing === -1 ? 'facing-left' : '',
         exitStage === 'turn' ? 'exit-turn' : '', exitStage === 'jump' ? 'exit-jump' : '', selected ? 'selected' : ''].filter(Boolean).join(' ')}
       style={{ left: behavior.x, top: behavior.y, width: PET_WIDTH, zIndex: depthToZIndex(scene.depth),
+        // 缩放锚在底部中心：放大时脚不离地，看起来是"站起来"而不是"掉下去"。
+        // 只在这一层做 transform —— 位置仍由座位坐标（left/top）负责，两者混在一起会互相打架。
+        transform: characterTransform(scale),
+        transformOrigin: PET_TRANSFORM_ORIGIN,
+        // 透明度以 CSS 变量下发，只作用于 .pet-svg/.pet-img/.pet-video（见 pet-anim.css）；
+        // 气泡、徽标、悬停工具栏都是交互元素，不跟着变淡。
+        ['--pet-opacity' as string]: String(surfaceOpacity('character', opacity)),
         ['--mark' as string]: manifest.markColor, ['--mark-fg' as string]: markForegroundColor }}
       data-assistant-id={manifest.assistantId}
       data-interactive
@@ -169,6 +184,16 @@ export interface TeamStageProps {
   characterSkins?: SkinOverrides
   idleSleepMinutes?: number
   sleepMinutes?: number
+  /** 角色大小档位（0.8 / 1 / 1.2），透传给每个角色容器。 */
+  petScale?: number
+  /** 角色透明度档位（0.6 / 0.8 / 1），只作用于角色图。 */
+  petOpacity?: number
+  /**
+   * 已收起成停靠态的角色：这一位不再渲染（改由 `DockedPet` 那个小圆代表它）。
+   *
+   * 只跳过渲染、不动 `positions`：取消停靠时按原坐标重新挂载，位置和动画状态天然回到原处。
+   */
+  dockedId?: string | null
   onPersist(assistantId: string, x: number, y: number): void
   onContextMenu(target: CharacterMenuTarget): void
   onDragStart(event: React.MouseEvent, behavior: PetBehavior): void
@@ -179,6 +204,7 @@ export interface TeamStageProps {
 
 export default function TeamStage({ members, assistantActive, statusByAssistant, positions, selectedId, chatOpen = false, onSelect,
   exitStage, portalPhase, showPortal = false, focusMode = false, characterSkins, idleSleepMinutes = 2, sleepMinutes = 20,
+  petScale = 1, petOpacity = 1, dockedId = null,
   onPersist, onContextMenu, onDragStart, proactive, onProactiveRespond, handleRef }: TeamStageProps) {
   const cast = useMemo(() => members.filter(member => member.enabled !== false && member.assistantId)
     .map(member => manifestFor(member, characterSkins)), [members, characterSkins])
@@ -272,12 +298,15 @@ export default function TeamStage({ members, assistantActive, statusByAssistant,
         style={{ left: scene.prop.x, top: scene.prop.y, width: scene.prop.width, height: scene.prop.height, zIndex: depthToZIndex(scene.prop.depth) }} />}
       {cast.map((manifest, index) => {
         const home = homes[index] ?? { x: 8, y: 8 }
+        // 收起的角色不渲染：它的替身是屏幕边上那个 48×48 的小圆。
+        if (manifest.assistantId === dockedId) return null
         return <CharacterSlot key={manifest.assistantId} manifest={manifest} home={home}
           scene={scene.roleOf(manifest.assistantId, home)} assistantActive={assistantActive}
           status={statusByAssistant?.[manifest.assistantId]} selected={manifest.assistantId === selected}
           hideBubble={chatOpen && manifest.assistantId === selected}
           exitStage={exitStage} portalPhase={portalPhase} showPortal={showPortal} quiet={focusMode}
           idleSleepMinutes={idleSleepMinutes} sleepMinutes={sleepMinutes}
+          petScale={petScale} petOpacity={petOpacity}
           proactive={manifest.assistantId === selected ? proactive : null} onProactiveRespond={onProactiveRespond}
           onBehavior={callbackFor(manifest.assistantId)} onSelect={position => onSelect(manifest.assistantId, position)}
           onPersist={(x, y) => onPersist(manifest.assistantId, x, y)}

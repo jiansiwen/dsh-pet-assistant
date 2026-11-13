@@ -7,11 +7,16 @@ import { fail, ok, type ActionResult, type PagePosition, type WindowIdentity } f
 import { openWithSpecifiedApp } from '../src/main/doc-fs.ts'
 import type { RegistryCandidate, WinDesktopActions } from '../src/main/win-actions.ts'
 import {
+  cachedWpsProbe,
+  matchesPageText,
   createWpsController,
+  nextWpsProbe,
   resolveWpsInstallMac,
   resolveWpsInstallWin,
   semanticProfileFor,
   WPS_MAC_BUNDLE_IDS,
+  WPS_PROBE_FAIL_TTL_MS,
+  WPS_PROBE_TTL_MS,
   wpsLaunchArgs,
   type WpsSession,
 } from '../src/main/wps-control.ts'
@@ -112,6 +117,7 @@ function fakeWin(over: Partial2<WinDesktopActions> & { finds?: ActionResult<Wind
   const win: WinDesktopActions = {
     platform: 'win32',
     readWpsRegistry: async () => { calls.push('registry'); return ok(REAL, { action: 'locate', platform: 'win32' }) },
+    runningWpsPaths: async () => ok([], { action: 'locate', platform: 'win32' }),
     openWith: async (app, file) => { calls.push(`open ${app.executable} ${[...(app.args ?? []), file].join('|')}`); return ok({ launched: true, pid: 1, verified: false } as const, { action: 'openWith', platform: 'win32', command: { command: app.executable, args: [...(app.args ?? []), file] } }) },
     findWindow: async () => { calls.push('find'); return finds.length > 1 ? finds.shift()! : finds[0] },
     verify: async () => fail('unsupported', 'x', { action: 'verify', platform: 'win32' }),
@@ -146,6 +152,19 @@ describe('wps-control：打开流程', () => {
     assert.deepEqual(r.value.position, { page: 1, total: 15 })
     assert.deepEqual(r.evidence.readBack, { page: 1, total: 15 })
     assert.deepEqual(r.evidence.command?.args, ['/prometheus', '/pdf', FILE])
+  })
+
+  test('注册表与运行版本不一致时，优先按运行中的进程认安装目录', async () => {
+    const RUN = 'D:\\WPS Office\\12.1.0.29690\\office6\\wps.exe'
+    const { win, calls } = fakeWin({ runningWpsPaths: async () => ok([RUN], { action: 'locate', platform: 'win32' }) })
+    const c = createWpsController({ platform: 'win32', scriptDir: 'C:\\x', win, exists: f => f === RUN, sleep: async () => {} })
+    const r = await c.open(FILE)
+    assert.equal(r.ok, true)
+    if (!r.ok) return
+    assert.equal(r.value.install.executable, RUN)
+    assert.equal(r.value.install.source, 'running-process')
+    assert.ok(!calls.includes('registry'), '运行中版本命中后不应再查注册表')
+    assert.ok(calls.some(x => x.startsWith(`open ${RUN} `)), '应启动运行中的版本，避免跨版本交接')
   })
 
   test('WPS 还在加载时继续等，窗口出现后成功', async () => {
@@ -306,5 +325,72 @@ describe('doc-fs：用指定应用打开', () => {
     assert.equal(!r1.ok && r1.error.code, 'invalid-argument')
     const r2 = await openWithSpecifiedApp('/tmp/a.pdf', { executable: '/usr/bin/wps' }, { platform: 'linux', statFile, launcher: async () => ({}) })
     assert.equal(!r2.ok && r2.error.code, 'unsupported')
+  })
+})
+
+describe('WPS 可用性探测：成功与失败分开计时', () => {
+  test('成功缓存 10 分钟', () => {
+    const cache = nextWpsProbe({ ok: true }, 1_000)
+    assert.deepEqual(cache, { at: 1_000, available: true, failed: false })
+    assert.equal(cachedWpsProbe(cache, 1_000 + WPS_PROBE_TTL_MS - 1), true, '期内复用成功结论')
+    assert.equal(cachedWpsProbe(cache, 1_000 + WPS_PROBE_TTL_MS), null, '过期必须重探')
+  })
+
+  test('失败只缓存 3 秒：用户先开桌宠、后开 WPS 时不会被十分钟的旧结论挡住', () => {
+    const cache = nextWpsProbe({ ok: false }, 1_000)
+    assert.deepEqual(cache, { at: 1_000, available: false, failed: true })
+    // 防抖窗口内复用，不重复拉起辅助进程。
+    assert.equal(cachedWpsProbe(cache, 1_000), false)
+    assert.equal(cachedWpsProbe(cache, 1_000 + WPS_PROBE_FAIL_TTL_MS - 1), false)
+    // 3 秒后必须重探 —— 真机上 WPS 是后来才打开的。
+    assert.equal(cachedWpsProbe(cache, 1_000 + WPS_PROBE_FAIL_TTL_MS), null)
+    assert.ok(WPS_PROBE_FAIL_TTL_MS < WPS_PROBE_TTL_MS, '失败窗口必须显著短于成功')
+  })
+
+  test('探测抛异常也按失败记，同样只挡 3 秒', () => {
+    const cache = nextWpsProbe(null, 5_000)
+    assert.deepEqual(cache, { at: 5_000, available: false, failed: true })
+    assert.equal(cachedWpsProbe(cache, 5_100), false)
+    assert.equal(cachedWpsProbe(cache, 5_000 + WPS_PROBE_FAIL_TTL_MS), null)
+  })
+
+  test('失败不保留旧的可用结论', () => {
+    const old = nextWpsProbe({ ok: true }, 0)
+    assert.equal(cachedWpsProbe(old, WPS_PROBE_TTL_MS - 1), true)
+    // 到了重探的时候，这次探测失败：结论必须变成不可用（WPS 可能已被卸载/辅助进程挂了）。
+    const fresh = nextWpsProbe({ ok: false }, WPS_PROBE_TTL_MS)
+    assert.equal(cachedWpsProbe(fresh, WPS_PROBE_TTL_MS), false)
+  })
+
+  test('没有缓存时必须去探', () => {
+    assert.equal(cachedWpsProbe(null, 123), null)
+  })
+})
+
+describe('WPS 跳页读回比对（matchesPageText）', () => {
+  // 读回文本的口径：WPS 12.x 的 Ctrl+A 复制的是**整份文档**，换行/断行位置完全不可信，
+  // 所以比对只看非空白字符；"未命中"才是硬证据（这份文档里根本没这段）。
+  const docText = '潘 小潘同学\r\n桌面 AI 工作伙伴 · 功能讲解（精简版）\r\n提醒、邮件、会议、文档讲解、语音唤醒'
+
+  test('命中：整段在文档里（空格与换行不同也认）', () => {
+    assert.equal(matchesPageText(docText, '桌面AI工作伙伴 · 功能讲解（精简版）'), true)
+    assert.equal(matchesPageText(docText, '提醒、邮件、会议、文档讲解、语音唤醒——把日常工作中散落的环节'), true, '前 20 字够就命中')
+  })
+
+  test('放宽到 12 字：前 20 字对不上但前 12 字对得上，仍然算命中', () => {
+    const page = '会议录音与说话人分离会议录音同时采两条音轨'
+    const needle = '会议录音与说话人分离会议XX后面完全不同'   // 前 12 字对得上，第 13 字起不同
+    assert.equal(matchesPageText('无关内容', needle), false)
+    assert.equal(matchesPageText(page, needle), true)
+  })
+
+  test('未命中：拿错文档 / 换过文件', () => {
+    assert.equal(matchesPageText(docText, '这是另一份文档的内容，完全不一样的开头文字'), false)
+    assert.equal(matchesPageText('', '任何内容都不该在空文本里命中'), false)
+  })
+
+  test('太短的段不做比对（三个字能命中任何一页）', () => {
+    // 8 个非空白字符以下：即便子串存在也不该被当成证据 —— 调用方（syncTo）会跳过验证。
+    assert.equal(matchesPageText('一二三四五六七八九十', '一二三'), false)
   })
 })

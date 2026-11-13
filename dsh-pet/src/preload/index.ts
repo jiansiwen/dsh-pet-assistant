@@ -63,6 +63,9 @@ contextBridge.exposeInMainWorld('petApi', {
   onSessionUpdate: (callback: (update: SessionUpdate) => void) => listen('session-update', callback),
   onSessionConnection: (callback: (status: string) => void) => listen('bridge-status', callback),
   onSettingsOpen: (callback: (page: SettingsPage) => void) => listen('settings-open', callback),
+  onSettingsClose: (callback: () => void) => listen('settings-close', callback),
+  onMemberStepDown: (callback: (assistantId: string) => void) => listen('member-step-down', callback),
+  onMemberStepUp: (callback: (assistantId: string) => void) => listen('member-step-up', callback),
   onOverlayDismiss: (callback: () => void) => listen('overlay-dismiss', callback),
   onOverlayError: (callback: (message: string) => void) => listen('overlay-error', callback),
   overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
@@ -84,6 +87,12 @@ contextBridge.exposeInMainWorld('petApi', {
   voiceApiRemove: (id: string) => ipcRenderer.invoke('voice-api-remove', id) as Promise<VoiceApiResult>,
   voiceApiSelect: (kind: VoiceApiKind, id: string | null) =>
     ipcRenderer.invoke('voice-api-select', kind, id) as Promise<VoiceApiResult>,
+  /** 快速应答（快嘴旁路）：配置、测试连接；短应答事件只用于宠物气泡显示。 */
+  fastReplyState: () => ipcRenderer.invoke('fast-reply-state') as Promise<import('../main/fast-reply.js').FastReplySnapshot | null>,
+  fastReplySave: (input: import('../main/fast-reply.js').FastReplyInput) =>
+    ipcRenderer.invoke('fast-reply-save', input) as Promise<{ ok: boolean; state?: import('../main/fast-reply.js').FastReplySnapshot; error?: string }>,
+  fastReplyTest: () => ipcRenderer.invoke('fast-reply-test') as Promise<{ ok: boolean; sample?: string; error?: string }>,
+  onFastAck: (callback: (payload: { text: string }) => void) => listen('fast-ack', callback),
   /**
    * 首次使用检查（M5-06）：环境清单、模型下载计划、按确认执行下载、打开系统权限设置页。
    *
@@ -215,9 +224,15 @@ contextBridge.exposeInMainWorld('petApi', {
   onSpeechState: (callback: (status: SpeechStatus) => void) => {
     subscribe('speech-state', status => callback(status as SpeechStatus))
   },
-  /** 会话流水（正文/思考/工具/输入）：按发生顺序显示，归属与出错以 chat 的返回值为准。 */
+  /**
+   * 会话流水（正文/思考/工具/输入）：按发生顺序显示，归属与出错以 chat 的返回值为准。
+   *
+   * 这里用 `listen` 而不是 `subscribe`：`subscribe` 会先 `removeAllListeners` 再挂，
+   * 只要有两个订阅方（逐字尾，以及紧接着要接上来的九态状态机），后挂的就会把先挂的静掉；
+   * 而且 React effect 重挂一次也会连带摘掉别人。返回退订函数，各自摘自己那一条。
+   */
   onChatDelta: (callback: (delta: BridgeEventPayload) => void) => {
-    subscribe('chat-delta', payload => callback(payload as BridgeEventPayload))
+    return listen('chat-delta', payload => callback(payload as BridgeEventPayload))
   },
   /** 语音识别的流式增量：mimo 等服务边识别边出字，最终文本以 asrTranscribe 返回值为准。 */
   onAsrDelta: (callback: (delta: { text: string }) => void) => {

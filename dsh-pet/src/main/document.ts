@@ -190,6 +190,22 @@ export interface OutlineSection {
    * 讲解时据此补一句"这一段有代码，我没念"。
    */
   readonly hasCode: boolean
+  /**
+   * 这一段里有表格，且表格的格子已经进了正文（`plainSpeech` 把竖线换成了逗号）。
+   *
+   * 原文朗读模式下逐格念「姓名，年龄，部门，入职时间…」既难听懂又很慢，所以这一段不逐行念，
+   * 改成念一句"这段是表格，我跳过"，然后把屏幕停在这里给人看。
+   *
+   * 可选：只有会解析 Markdown/纯文本结构的生产者（`buildOutline`）才填得出来；Office 页面
+   * 这类不解析表格结构的生产者保持缺省。消费侧一律按 `=== true` 判定，缺省等价于"没有" ——
+   * 保守方向是"照原文念"，不会因为缺字段就把一整段吞掉。
+   */
+  readonly hasTable?: boolean
+  /**
+   * 这一段里有数学公式。`$` 和 `\` 会被合成器念成"美元/反斜杠"之类的噪音，
+   * 所以和表格同样处理：不逐行念，念一句跳过提示。可选字段的理由同 {@link hasTable}。
+   */
+  readonly hasFormula?: boolean
 }
 
 export interface Outline {
@@ -243,6 +259,63 @@ export function plainSpeech(markdown: string): string {
 
 const HEADING_LINE = /^(#{1,6})\s+(.+?)\s*#*\s*$/
 const CODE_FENCE = /^\s*(```|~~~)/
+
+/** 表格分隔行：`|---|---|`、`| :--- | ---: |`、`--- | ---` 这些写法都算。 */
+const TABLE_SEPARATOR = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/
+
+/**
+ * 一行是不是表格行：分隔行，或者「以 `|` 开头或结尾、且内部至少还有一个 `|`」的行。
+ *
+ * 只认 `a | b` 这种正文里的孤立竖线是不行的 —— 那多半是"甲 | 乙"这种随手写法，
+ * 把它判成表格会让整段原文不被朗读。
+ */
+function isTableLine(line: string): boolean {
+  const trimmed = line.trim()
+  if (trimmed === '') return false
+  if (TABLE_SEPARATOR.test(trimmed)) return true
+  if (!(trimmed.startsWith('|') || trimmed.endsWith('|'))) return false
+  return trimmed.split('|').length >= 3
+}
+
+/**
+ * 一行里有没有行内数学公式 `$…$`。
+ *
+ * 难点是金额：`成本 $50，收入 $80` 里正好有两个 `$`，朴素地两两配对会把
+ * `$50，收入 $` 判成一个公式，于是整段被跳过、用户一个字都听不到。
+ * 判据因此落在「`$` **紧跟**的字符是不是数字」上：是数字就是金额（`$50`），不是就当定界符
+ * （`$x$`、`$E=mc^2$`）。两处都是金额时一个定界符都不产生，自然判不出公式。
+ */
+function hasInlineDollarMath(line: string): boolean {
+  const marks: number[] = []
+  for (let index = 0; index < line.length; index += 1) {
+    if (line[index] !== '$') continue
+    const next = line[index + 1] ?? ''
+    if (next !== '' && next >= '0' && next <= '9') continue
+    marks.push(index)
+  }
+  // 两个定界符之间必须真有内容：`$x$` 有，`$$` 空对没有（那是块级公式，另有判据）。
+  return marks.some((mark, order) => order + 1 < marks.length && marks[order + 1] - mark > 1)
+}
+
+/**
+ * 判定一段原始行里有没有表格/公式。
+ *
+ * **必须拿 plainSpeech 之前的原始行判**：`plainSpeech` 会把表格竖线换成逗号、把 `|---|`
+ * 整行删掉、把 `$` 原样留下 —— 处理过之后再判，表格和公式就都判不出来了。
+ *
+ * 表格要求至少 2 行：单行的 `| 只有一列 |` 更可能是排版装饰，不是真表格。
+ */
+export function detectSectionMarkers(lines: readonly string[]): { hasTable: boolean; hasFormula: boolean } {
+  let tableLines = 0
+  for (const line of lines) if (isTableLine(line)) tableLines += 1
+  const joined = lines.join('\n')
+  // 块级公式：`$$…$$`（可跨行）或 LaTeX 的 `\[…\]`。
+  const blockMath = /\$\$[\s\S]*?\$\$/.test(joined) || /\\\[[\s\S]*?\\\]/.test(joined)
+  return {
+    hasTable: tableLines >= 2,
+    hasFormula: blockMath || lines.some(hasInlineDollarMath),
+  }
+}
 
 interface RawSection {
   heading: string | null
@@ -317,6 +390,9 @@ export function buildOutline(fileName: string, content: string): ParseResult {
 
   const sections: OutlineSection[] = []
   for (const item of raw) {
+    // 表格/公式必须在 plainSpeech **之前**、拿原始行判：plainSpeech 会把表格竖线换成逗号、
+    // 把 `|---|` 分隔行整行删掉，之后再判就永远判不出来。这里 item.lines 就是原始行。
+    const markers = detectSectionMarkers(item.lines)
     const text = plainSpeech(item.lines.join('\n'))
     // 只有标题、没有正文的段要留着：标题本身就是结构，一份全是标题的文档不该被判成空文档。
     if (text === '' && item.heading === null && !item.hasCode) continue
@@ -326,6 +402,8 @@ export function buildOutline(fileName: string, content: string): ParseResult {
       level: item.level,
       text,
       hasCode: item.hasCode,
+      hasTable: markers.hasTable,
+      hasFormula: markers.hasFormula,
     })
   }
   if (sections.length === 0) return { kind: 'empty' }
@@ -353,6 +431,11 @@ function pdfOutline(fileName: string, pages: readonly PdfPage[]): Outline {
     level: 1,
     text: page.text,
     hasCode: false,
+    // PDF 走的是"提取出来的纯文本"，竖线与 `$` 的排版关系在提取时已经丢了：一页文字里
+    // 出现两个 `$` 完全可能是报价单上的金额。宁可漏判（照原文念）也不要误判（整页被跳过），
+    // 所以这里保守置 false，表格/公式不支持逐行念的收益只能等结构化提取落地再补。
+    hasTable: false,
+    hasFormula: false,
   }))
   const charCount = sections.reduce((total, section) => total + section.text.length, 0)
   return { title: stemOf(fileName), sections, charCount, estMinutes: Math.max(1, Math.ceil(charCount / CHARS_PER_MINUTE)), truncated: false }
@@ -376,12 +459,83 @@ export function describeOutline(outline: Outline): string {
     const label = section.heading ?? `第 ${section.index + 1} 段`
     const lead = section.heading === null ? ` — ${section.text.slice(0, 24).replace(/\n/g, ' ')}…` : ''
     const page = section.pageNumber === undefined ? '' : `第 ${section.pageNumber} 页 · `
-    lines.push(`${section.index + 1}. ${page}${label}${section.hasCode ? '（含代码，不朗读）' : ''}${lead}`)
+    // 提纲要如实说这一段的哪部分不会被念出来，否则用户听到跳过提示会以为是漏讲了。
+    const skipped = [
+      section.hasCode ? '代码' : '',
+      section.hasTable ? '表格' : '',
+      section.hasFormula ? '公式' : '',
+    ].filter((mark) => mark !== '')
+    const mark = skipped.length > 0 ? `（含${skipped.join('、')}，不朗读）` : ''
+    lines.push(`${section.index + 1}. ${page}${label}${mark}${lead}`)
   }
   const rest = outline.sections.length - MAX_OUTLINE_LINES
   if (rest > 0) lines.push(`（还有 ${rest} 段没列出来，说"讲第 N 段"就能直接跳过去。）`)
   if (outline.truncated) lines.push(`文档超过 ${MAX_DOC_CHARS} 字，只解析了前面这部分。`)
   return lines.join('\n')
+}
+
+/**
+ * 讲解形态。
+ *
+ * - `source`：按原文念稿，逐段念 `section.text`，解释和补充只在用户提问时产生。
+ *   用户要的是"像真人开会"：念得最快、最不容易跑题，也不花模型调用。
+ * - `ai`：每段先让模型生成【原文+解释+补充】再念（旧行为）。
+ *
+ * 词表定义在 document.ts 而不是 settings.ts：判定逻辑在这里，设置只是它的持久化；
+ * 反过来让 document.ts 去 import settings.ts 会把 electron 拖进纯解析模块的依赖里。
+ */
+export type PresentationMode = 'source' | 'ai'
+
+/**
+ * 跳过类段落（代码/表格/公式）念完跳过提示后的停留时长。
+ *
+ * 用户要求固定 10 秒：这段时间屏幕停在这一段让人自己看，讲的人也不抢话。
+ * 后续可以按内容长度调整（表格行数、代码行数），但先按用户明确要求的固定值来。
+ */
+export const DOC_SKIP_HOLD_MS = 10_000
+
+export interface DocSpeechPlan {
+  readonly mode: PresentationMode
+  /** 要念、也要投屏显示的文本。`mode === 'ai'` 时是空串——那段文本由模型产。 */
+  readonly text: string
+  /** 这段话念完之后要额外停多久（毫秒）。0 表示念完就接着往下讲。 */
+  readonly holdMs: number
+}
+
+/**
+ * 一段话在某种讲解形态下"念什么、念完停多久"。
+ *
+ * 抽成纯函数是为了能被单测钉住：`advanceDocTalk` 长在 electron 主进程里，测不到它的分支，
+ * 而"跳过哪类段落、要不要留停留"恰恰是这次最容易改错的地方。
+ *
+ * 跳过类的优先级 代码 > 表格 > 公式：三者同时出现时统一念一句"这段是代码"，不用连说三遍。
+ * 跳过时**整段都不念**：表格的格子、公式的符号本来就是要跳过的东西，而代码段的散文也跟着跳过，
+ * 是为了让屏幕停在同一处 —— 用户看代码比听描述快，这段时间正是留给他看的。
+ *
+ * 四种情形的结论（`text` 就是这一段的正文，纯代码/纯表格段往往是空串）：
+ *
+ * | 形态 | 段落 | text | holdMs |
+ * |---|---|---|---|
+ * | source | 有正文、无标记 | 正文 | 0 |
+ * | source | 有正文、有标记 | 跳过提示 | DOC_SKIP_HOLD_MS |
+ * | source | **无正文、有标记**（纯代码/纯表格） | 跳过提示 | DOC_SKIP_HOLD_MS |
+ * | source | 无正文、无标记（真空段） | `''` | 0 |
+ * | ai | 任意 | `''`（由模型产） | 0 |
+ *
+ * 真空段返回空串、零停留，调用方据此静默跳段：一段既没正文也没什么可提示的，念一句反而奇怪。
+ * 纯代码段必须返回提示 —— 不说的话听众会以为文档里没这段内容。
+ */
+export function docSpeechPlan(section: OutlineSection, mode: PresentationMode): DocSpeechPlan {
+  if (mode === 'ai') return { mode, text: '', holdMs: 0 }
+  const skipKind = section.hasCode ? '代码' : section.hasTable ? '表格' : section.hasFormula ? '公式' : null
+  if (skipKind !== null) {
+    return {
+      mode,
+      text: `这段是${skipKind}，我跳过，请大家看屏幕自行看一下，需要的话你问我。`,
+      holdMs: DOC_SKIP_HOLD_MS,
+    }
+  }
+  return { mode, text: section.text, holdMs: 0 }
 }
 
 /**

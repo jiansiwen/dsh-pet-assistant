@@ -5,7 +5,7 @@
 import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { MAX_RECENT_DIRS } from './document.ts'
+import { MAX_RECENT_DIRS, type PresentationMode } from './document.ts'
 import { isCustomSkin } from './custom-skins.ts'
 import { isSafeProfileName } from './runtime-launch.ts'
 
@@ -54,7 +54,9 @@ export interface PetSettings {
    * 只有 `skin`：人设、语音、模型与工具权限都是职责，归插件侧的团队配置管，桌面壳不碰 ——
    * 换个皮肤不该顺带改掉谁能写文件（design.md §2.2「换形象不换身份和记忆」）。
    */
-  characters?: Record<string, { skin: string }>
+  characters?: Record<string, { skin: string; randomActions?: string[] }>
+  /** 用户手动"让TA退下"的成员 assistantId 列表；持久化，召唤/重启不自动复活，直到手动请回。 */
+  stepDownMembers?: string[]
   /**
    * 允许查找并讲解文档的目录（design.md §2.10："先在授权目录和用户最近选择范围内查找"）。
    *
@@ -77,9 +79,54 @@ export interface PetSettings {
   chatDock?: 'top' | 'auto'
   /** 会话框尺寸（CSS 像素），由右下角拖拽调整后保存。 */
   chatSize?: { width: number; height: number }
+  /**
+   * 文档讲解形态。
+   *
+   * - `source`（默认）：按原文念稿 —— 逐段念正文，解释与补充只在用户提问时产生。
+   * - `ai`：每段先让模型写【原文+解释+补充】再念。
+   *
+   * 默认 source 的理由：用户要的讲解形态就是"跟真人开会一样照着稿子讲" —— 念原文最快、
+   * 不跑题、不烧模型调用；AI 讲解每段都要等模型回话，更慢也更费，留作主动选择的增强模式。
+   *
+   * **不要与演示隐私模式的 `presentationMode` 混淆**：那个是布尔、挂在 companion 状态快照上
+   * （`companion-host.ts`，渲染层据此隐藏历史与预览）；这里是讲解形态、挂在 settings 上，
+   * 两个同样叫"presentation"的东西完全不同义，所以这一侧刻意叫 `docSpeechMode`。
+   */
+  docSpeechMode?: PresentationMode
+  /**
+   * 角色大小：0.8 / 1 / 1.2 三档，默认 1。
+   *
+   * 只存档位不存任意数值：缩放和命中盒、悬停工具栏的定位是同一件事，允许连续值等于允许
+   * 出现一个"点不中自己"的尺寸。归一化在 `normalize()` 里做，脏数据一律退回默认。
+   */
+  petScale?: number
+  /** 角色透明度：0.6 / 0.8 / 1 三档，默认 1。下限 0.6 —— 再低用户会找不到宠物。 */
+  petOpacity?: number
+  /** 拖到屏幕边缘时是否吸附并收起成停靠态。默认开。 */
+  petDock?: boolean
+  /**
+   * 上次停靠在哪个边；null = 没停靠。
+   *
+   * 只存"边"不存坐标：停靠位置由那条边 + 原位置算出来（`dockPosition`），存坐标等于把
+   * 同一份事实记两处，屏幕一变就打架。原位置仍在 `positions` 里，取消停靠据此回到原处。
+   */
+  dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null
 }
 
-const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false, chatDock: 'top' }
+const DEFAULTS: PetSettings = {
+  pet: 'panda',
+  layoutVersion: LAYOUT_VERSION,
+  runtimeProfile: 'web',
+  trayResident: false,
+  chatDock: 'top',
+  // 讲解默认按原文念稿：真人会议优先，AI 逐段讲解要等模型、更慢也更费。
+  docSpeechMode: 'source',
+  // 默认原大、不透明：任何"一装上就变了样子"的默认值都会让用户以为是 bug。
+  petScale: 1,
+  petOpacity: 1,
+  petDock: true,
+  dockedAt: null,
+}
 
 let cache: PetSettings | null = null
 
@@ -121,13 +168,20 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
 
   // 形象同理逐个校验：皮肤名不认识就丢掉那一条。丢掉之后角色回落到插件下发的 skinId
   // 或编制默认，而不是变成一只探测不到素材的空白角色。自定义皮肤以登记簿为准。
-  const characters: Record<string, { skin: string }> = {}
+  const characters: Record<string, { skin: string; randomActions?: string[] }> = {}
   for (const [key, value] of Object.entries(merged.characters ?? {})) {
     if (key && value && (VALID_PETS.includes(value.skin as PetId) || isCustomSkin(app.getPath('userData'), value.skin))) {
-      characters[key] = { skin: value.skin }
+      const randomActions = Array.isArray((value as { randomActions?: unknown }).randomActions)
+        ? [...new Set(((value as { randomActions?: unknown[] }).randomActions ?? []).filter((a): a is string => typeof a === 'string' && a !== ''))].slice(0, 16)
+        : undefined
+      characters[key] = { skin: value.skin, ...(randomActions ? { randomActions } : {}) }
     }
   }
   merged.characters = characters
+
+  // 手动退下名单：只留非空字符串、去重、限量，防止手改设置塞进任意内容。
+  merged.stepDownMembers = [...new Set((Array.isArray(merged.stepDownMembers) ? merged.stepDownMembers : [])
+    .filter((id): id is string => typeof id === 'string' && id.trim() !== ''))].slice(0, 32)
 
   // 目录逐个校验：设置文件是用户可以直接改的，相对路径会随进程的工作目录漂移 ——
   // 那意味着同一份设置在双击启动和命令行启动下授权了不同的目录，这种事不能靠猜。
@@ -138,6 +192,17 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.layoutVersion = LAYOUT_VERSION
   // 会话框停靠与尺寸：设置文件可手改，越界的值退回安全范围，别让面板一开就整块跑到屏幕外。
   if (merged.chatDock !== 'auto') merged.chatDock = 'top'
+  // 讲解形态同理：设置文件是用户可以手改的，认不出的值一律退回 source（照稿念，最保守），
+  // 而不是留一个 undefined 让调用方各自猜默认值。
+  if (merged.docSpeechMode !== 'ai' && merged.docSpeechMode !== 'source') merged.docSpeechMode = 'source'
+  // 档位制：不在枚举里的一律退回默认（用户手改过、旧版本、或将来缩减档位）。
+  if (merged.petScale !== 0.8 && merged.petScale !== 1 && merged.petScale !== 1.2) merged.petScale = 1
+  if (merged.petOpacity !== 0.6 && merged.petOpacity !== 0.8 && merged.petOpacity !== 1) merged.petOpacity = 1
+  merged.petDock = merged.petDock !== false
+  // 非法边名一律当没停靠：宁可恢复到原位，也别把角色放到算不出来的地方。
+  if (merged.dockedAt !== 'left' && merged.dockedAt !== 'right' && merged.dockedAt !== 'top' && merged.dockedAt !== 'bottom') {
+    merged.dockedAt = null
+  }
   const chatSize = merged.chatSize
   if (!chatSize || !Number.isFinite(chatSize.width) || !Number.isFinite(chatSize.height)) {
     merged.chatSize = undefined

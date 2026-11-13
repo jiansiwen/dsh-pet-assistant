@@ -342,3 +342,11 @@
   background-repeat: repeat-x;
   filter: drop-shadow(0 0 7px rgba(150, 200, 255, 0.5));
 }
+
+/*
+ * 角色透明度：只作用于**角色图**。
+ *
+ * 气泡、提醒徽标、悬停工具栏不在此列 —— 它们是交互元素，变淡就看不清按钮，等于把
+ * "可配置"变成"不能用"。变量由角色容器（.character-slot）下发，默认 1。
+ */
+.pet-svg, .pet-img, .pet-video, .pet-walk-strip { opacity: var(--pet-opacity, 1); }

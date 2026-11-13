@@ -40,12 +40,19 @@ function target(fake: ReturnType<typeof fakeWps>, pollMs = 60_000) {
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 20))
 
-test('打开失败或读不到页码时如实抛错，不假装可以同步', async () => {
+test('打开失败如实抛错；读不到页码不再算失败（走键盘翻页，且不轮询）', async () => {
   const failed = target(fakeWps({ ok: false, error: { code: 'not-installed', message: '没装 WPS', guidance: '请先安装 WPS' }, evidence } as ActionResult<WpsSession>))
   await assert.rejects(Promise.resolve(failed.view.show(shown)), /WPS 没能打开：请先安装 WPS/)
-  const noPage = target(fakeWps({ ok: true, value: { ...session, position: undefined }, evidence }))
-  await assert.rejects(Promise.resolve(noPage.view.show(shown)), /读不到页码/)
-  assert.equal(noPage.view.currentPage(), null)
+  // WPS 12.x 是 Qt5 窗口，UIA 树里没有页码控件：窗口能开就不该放弃 WPS，
+  // 翻页交给 win-uia.ps1 的键盘退路（Goto-PageByKeyboard）。
+  const fake = fakeWps({ ok: true, value: { ...session, position: undefined }, evidence })
+  const noPage = target(fake)
+  await Promise.resolve(noPage.view.show(shown))
+  assert.equal(noPage.view.currentPage(), null, '没有页码就是 null，不编一个出来')
+  // 关键：没有页码可读就**不轮询** —— 轮询只会每 60 秒把讲解误判成"暂停"。
+  await settle()
+  assert.deepEqual(fake.calls, ['open:D:/授权/讲解样本.pdf'], '开完之后不该去读状态')
+  noPage.view.dispose()
 })
 
 test('按状态机的锚点跳页，读回页码作为当前页；连续跳页串行执行', async () => {

@@ -43,7 +43,19 @@ import type { MemberAction, MemberApi, MemberCommandInputs, MemberDraft, MemberE
 
 export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?: string }
 
-export type SettingsPage = 'general' | 'team' | 'doc' | 'meeting' | Exclude<AssistantSettingsPage, 'agent'>
+/**
+ * 设置面板的页面。
+ *
+ * 前九个是导航上的九项，按「工作 / 设置」两组排布（顺序见 `settings-nav.ts`，那里是单一真源）。
+ * 末两个 `agent`（总助理）与 `reminders`（提醒）**不在导航里**：总助理从「通用」页的入口进去，
+ * 提醒的内容并入了「待办提醒」。保留它们在联合类型里，是因为 `AssistantSettings` 仍按 section
+ * 渲染这两块内容 —— 删掉就等于把功能藏起来。
+ */
+export type SettingsPage =
+  | 'chat' | 'todo' | 'mail' | 'wecom' | 'report' | 'meeting'
+  | 'team' | 'doc' | 'general'
+  | 'agent' | 'reminders'
+  | AssistantSettingsPage
 
 export type { CompanionState, MeetingConsentInput, MeetingRuntimeState, MinutesRecord, SkinOverrides, TranscriptSegment }
 
@@ -93,7 +105,25 @@ export interface PetState {
   positions?: Record<string, PetPosition>
   /** 用户在本机为每个角色挑的形象，键是 assistantId。 */
   characters?: SkinOverrides
+  /** 手动退下的成员名单；持久化，召唤/重启不自动复活。 */
+  stepDownMembers?: string[]
   layoutVersion?: number
+  /**
+   * 讲解形态：`source` 按文档原文逐段念稿（默认），`ai` 每段让模型生成解释与补充。
+   *
+   * **不要与演示隐私模式的 `presentationMode` 混淆**：那个是布尔、挂在 companion 快照上，
+   * 管的是"藏起历史与预览"；这个是讲解形态、挂在 settings 上。同叫 presentation 的两件事
+   * 完全不同义，所以这一侧刻意叫 `docSpeechMode`。
+   */
+  docSpeechMode?: 'source' | 'ai'
+  /** 角色大小档位：0.8 / 1 / 1.2，默认 1。 */
+  petScale?: 0.8 | 1 | 1.2
+  /** 角色透明度档位：0.6 / 0.8 / 1，默认 1；只作用于角色图。 */
+  petOpacity?: 0.6 | 0.8 | 1
+  /** 拖到屏幕边缘时是否吸附并收起成停靠态，默认 true。 */
+  petDock?: boolean
+  /** 上次停靠在哪个边；null = 没停靠。 */
+  dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null
 }
 
 export interface PetSettingsPatch {
@@ -108,6 +138,13 @@ export interface PetSettingsPatch {
   positions?: Record<string, PetPosition>
   chatDock?: 'top' | 'auto'
   chatSize?: { width: number; height: number }
+  stepDownMembers?: string[]
+  /** 讲解形态；写进 patch 是为了让设置页能改（主进程 `save-settings` 是白名单式的）。 */
+  docSpeechMode?: 'source' | 'ai'
+  petScale?: 0.8 | 1 | 1.2
+  petOpacity?: 0.6 | 0.8 | 1
+  petDock?: boolean
+  dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null
 }
 
 /**
@@ -281,6 +318,11 @@ export type DocState =
       readonly estMinutes: number
       readonly total: number
       readonly next: number
+      /** 讲解委派给的成员；null 表示总助理自己讲。 */
+      readonly assistantId?: string | null
+      readonly assistantName?: string
+      /** 正在出声讲解且未讲完才为 true；讲完/暂停/停止为 false（委派成员据此下台）。 */
+      readonly active?: boolean
       readonly sections: readonly DocSectionBrief[]
     }
 
@@ -368,6 +410,8 @@ export interface ResidencyState {
       readonly createdAt: number | null
       readonly problem: string | null
     }
+    /** 播报中是否也响应唤醒；默认 false（播报中安静）。讲解中始终可打断。 */
+    readonly wakeDuringSpeech: boolean
     readonly engines: ReadonlyArray<'system' | 'kws'>
     /** 仲裁器当前是否把麦克风交给了唤醒。 */
     readonly listening: boolean
@@ -392,6 +436,8 @@ export interface ResidencyPatch {
   readonly wakeVoiceprint?: boolean
   /** 声纹相似度阈值（0.5–0.9）。 */
   readonly wakeVoiceprintThreshold?: number
+  /** 播报中是否也响应唤醒（默认关）。与声纹是两个开关：声纹管"只认谁"，这个管"什么时候应"。 */
+  readonly wakeDuringSpeech?: boolean
   readonly launchAtLogin?: boolean
   readonly bargeIn?: boolean
   /** 唤醒失败后用户手动重试。 */
@@ -469,6 +515,12 @@ export interface PetApi extends MemberApi {
   onSessionUpdate(callback: (update: SessionUpdate) => void): () => void
   onSessionConnection(callback: (status: string) => void): () => void
   onSettingsOpen(callback: (page: SettingsPage) => void): () => void
+  /** 主进程在讲解开讲等时机收起管理面板，避免挡屏。 */
+  onSettingsClose(callback: () => void): () => void
+  /** 右键"让TA退下"：单独请某个非总助理成员下台，不退出应用。 */
+  onMemberStepDown(callback: (assistantId: string) => void): () => void
+  /** 右键"请TA上台"：把之前手动退下的成员请回舞台。 */
+  onMemberStepUp(callback: (assistantId: string) => void): () => void
   onOverlayDismiss(callback: () => void): () => void
   onOverlayError(callback: (message: string) => void): () => void
   overlayState(open: boolean, boxes: Box[], settingsOpen: boolean): void
@@ -481,6 +533,12 @@ export interface PetApi extends MemberApi {
   voiceApiSave(input: VoiceApiInput): Promise<VoiceApiResult>
   voiceApiRemove(id: string): Promise<VoiceApiResult>
   voiceApiSelect(kind: VoiceApiKind, id: string | null): Promise<VoiceApiResult>
+  /** 快速应答（快嘴旁路）：读配置（不含密钥）。 */
+  fastReplyState(): Promise<import('../main/fast-reply.js').FastReplySnapshot | null>
+  fastReplySave(input: import('../main/fast-reply.js').FastReplyInput): Promise<{ ok: boolean; state?: import('../main/fast-reply.js').FastReplySnapshot; error?: string }>
+  fastReplyTest(): Promise<{ ok: boolean; sample?: string; error?: string }>
+  /** 快嘴短应答：主进程已用 TTS 念出，界面只显示在宠物气泡，不进会话流水。 */
+  onFastAck(callback: (payload: { text: string }) => void): () => void
   /** 首次使用检查：环境清单 + 模型下载计划（只读，不发请求）。 */
   firstRunReport(): Promise<FirstRunReportResult>
   /** 按用户确认的那一项下载模型。确认三要素由计划视图原样带回，不能自己拼。 */
@@ -556,10 +614,10 @@ export interface PetApi extends MemberApi {
   setPresentationMode(on: boolean): void
   /** 某个角色的形象被改了（右键菜单）：主进程广播整张表，界面据此立刻换图。 */
   onCharactersChanged(callback: (characters: SkinOverrides) => void): void
-  /** 生成流水线登记的自定义皮肤 id 列表（启动时读一次）。 */
-  customSkins(): Promise<string[]>
-  /** 自定义皮肤登记变化：渲染层注册 id 并清素材缓存后重挂舞台。 */
-  onCustomSkins(callback: (ids: string[]) => void): void
+  /** 生成流水线登记的自定义皮肤（id+动作清单，启动时读一次）。 */
+  customSkins(): Promise<{ id: string; actions?: string[] }[]>
+  /** 自定义皮肤登记变化：渲染层注册 id/动作并清素材缓存后重挂舞台。 */
+  onCustomSkins(callback: (skins: { id: string; actions?: string[] }[]) => void): void
   openAssetStudio(): Promise<{ ok: boolean }>
   /** 主进程请求退场（会话销毁或用户右键退出）：渲染层播完退场动画后调用 exitDone。 */
   onExitRequested(callback: () => void): void
@@ -592,8 +650,10 @@ export interface PetApi extends MemberApi {
    * 与 `chat` 的返回值分工：流水负责「发生了什么」（含网页侧发起的轮次），
    * 返回值负责「这条回复归属谁、有没有出错」。宿主不吐增量时一次都不会触发，
    * 界面必须能接受整段回复一次到达。
+   *
+   * 返回退订函数；卸载时必须调用，否则 effect 重挂会堆监听（同一进程里可能不止一个订阅方）。
    */
-  onChatDelta(callback: (delta: BridgeEventPayload) => void): void
+  onChatDelta(callback: (delta: BridgeEventPayload) => void): () => void
   /**
    * 语音识别的流式增量。
    *

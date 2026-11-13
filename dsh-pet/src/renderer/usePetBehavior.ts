@@ -60,11 +60,13 @@ export interface PetBehaviorOptions {
   quiet?: boolean
   idleSleepMinutes?: number
   sleepMinutes?: number
+  /** 用户勾选的随机动作；缺省用默认集合。只从勾选的动作里随机。 */
+  randomActions?: readonly string[]
   onPersist?: (x: number, y: number) => void
 }
 
 export function usePetBehavior({ assistantActive = false, lines, home, working = false, sceneBound = false,
-  quiet = false, idleSleepMinutes = 2, sleepMinutes = 20, onPersist }: PetBehaviorOptions): PetBehavior {
+  quiet = false, idleSleepMinutes = 2, sleepMinutes = 20, randomActions, onPersist }: PetBehaviorOptions): PetBehavior {
   const [action, setAction] = useState<PetAction>('idle')
   const [facing, setFacing] = useState<1 | -1>(1)
   const [x, setX] = useState(() => home?.x ?? Math.round(window.innerWidth * 0.7))
@@ -80,8 +82,8 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   // 编制外成员的台词对象可能每次重渲染都重建；只更新内容，不重置生活计时器。
   const linesRef = useRef(lines)
   linesRef.current = lines
-  const optionsRef = useRef({ working, sceneBound, quiet, idleSleepMinutes, sleepMinutes })
-  optionsRef.current = { working, sceneBound, quiet, idleSleepMinutes, sleepMinutes }
+  const optionsRef = useRef({ working, sceneBound, quiet, idleSleepMinutes, sleepMinutes, randomActions })
+  optionsRef.current = { working, sceneBound, quiet, idleSleepMinutes, sleepMinutes, randomActions }
   const xRef = useRef(x)
   xRef.current = x
   const yRef = useRef(y)
@@ -222,6 +224,30 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
               startActivity('write', writeMs, writeMs)
             }
             if (Math.random() < 0.3) chatter(pick(currentLines.work))
+          } else if (optionsRef.current.randomActions) {
+            // 用户勾选了随机动作：只从勾选集合里挑；没勾选任何动作就安静站着。
+            const list = optionsRef.current.randomActions.filter(a => a !== 'idle')
+            const act = list.length > 0 ? pick(list) : 'idle'
+            if (act === 'idle' || Math.random() < 0.25) setAction('idle')
+            else if (act === 'walk') {
+              const max = window.innerWidth - PET_WIDTH - STAGE_MARGIN
+              const lo = Math.max(STAGE_MARGIN, homeRef.current.x - WANDER_RADIUS)
+              const hi = Math.min(max, homeRef.current.x + WANDER_RADIUS)
+              targetRef.current = { x: Math.round(lo + Math.random() * (hi - lo)), y: yRef.current }
+              setAction('walk')
+            } else if (act === 'jump') startActivity('jump', 5000, 5000)
+            else if (act === 'wave') {
+              startActivity('wave', 5700, 5700)
+              if (Math.random() < 0.5) chatter(pick(currentLines.greet))
+            } else if (act === 'read') {
+              startActivity('read', 6400, 6400)
+              if (Math.random() < 0.3) chatter(pick(currentLines.activity))
+            } else if (act === 'play') {
+              startActivity('play', 6600, 6600)
+              if (Math.random() < 0.3) chatter(pick(currentLines.activity))
+            } else if (act === 'write') startActivity('write', 3000, 4500)
+            else setAction('idle')
+            if (Math.random() < 0.22) chatter(pick(assistantActive ? currentLines.work : currentLines.idle))
           } else {
             const r = Math.random()
             if (r < 0.30) setAction('idle')

@@ -18,6 +18,8 @@ export interface AssetStudioDeps {
   providers: MediaProviderStore
   voiceStore: VoiceStoreLike
   broadcast: (event: string) => void
+  /** "AI 帮我配"：经插件 LLM 把一句话描述转成形象配置草稿；不触发生成。 */
+  studioAssist?: (request: string) => Promise<{ name: string; prompt: string; actions: string[]; notes: string }>
 }
 
 type Result = { ok: true; value?: unknown } | { ok: false; error: string }
@@ -111,6 +113,13 @@ export class AssetStudio {
         ffmpeg: this.ffmpegCache.value,
         selectedTts: this.deps.voiceStore.snapshot().selected.tts,
       })
+    })
+
+    this.handle('asset-studio-assist', async (input) => {
+      if (!this.deps.studioAssist) return fail('形象配置助手尚未启用（需先配置主助理模型）')
+      const request = typeof (input as { request?: unknown })?.request === 'string' ? (input as { request: string }).request : ''
+      if (!request.trim()) return fail('请先用一句话描述你想要的形象')
+      return ok(await this.deps.studioAssist(request.trim()))
     })
 
     this.handle('asset-studio-save-providers', (input) => {

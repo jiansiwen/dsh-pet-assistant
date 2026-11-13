@@ -24,7 +24,7 @@
 import type { PetSkin } from './PetSprite.js'
 import { isCustomSkinId } from './custom-skin-registry.ts'
 
-export { registerCustomSkins, isCustomSkinId } from './custom-skin-registry.ts'
+export { registerCustomSkins, isCustomSkinId, customActionsFor } from './custom-skin-registry.ts'
 
 /** 桌面真实拥有的皮肤素材。三套静态图齐全，frames 目前只有 panda 有。 */
 export const KNOWN_SKINS: readonly PetSkin[] = ['panda', 'girl-glasses', 'boy-glasses']
@@ -54,7 +54,14 @@ export interface CharacterManifest {
   /** 身份色标。名牌底色。 */
   readonly markColor: string
   readonly lines: CharacterLines
+  /** 用户勾选的随机动作；缺省用 DEFAULT_RANDOM_ACTIONS。只从勾选且有素材的动作里随机。 */
+  readonly randomActions?: readonly string[]
 }
+
+/** 右键"随机动作"可勾选的候选（都是自洽的循环/一次性生活动作）。 */
+export const RANDOM_CANDIDATES = ['walk', 'jump', 'wave', 'read', 'play', 'write'] as const
+/** 未勾选时的默认随机集合，保持既有观感。 */
+export const DEFAULT_RANDOM_ACTIONS = ['walk', 'jump', 'wave', 'read', 'play'] as const
 
 /**
  * 五个角色的编制与色标。assistantId 与插件 `ensureRoster()` 写库的值一一对应。
@@ -197,7 +204,7 @@ function hashOf(text: string): number {
  * 只放 `skin`：人设、语音、模型与工具权限都是**职责**，归插件侧的团队配置管（design.md §2.2），
  * 桌面壳不碰它们 —— 换个皮肤不该顺带改掉谁能写文件。
  */
-export type SkinOverrides = Readonly<Record<string, { readonly skin?: string } | undefined>>
+export type SkinOverrides = Readonly<Record<string, { readonly skin?: string; readonly randomActions?: readonly string[] } | undefined>>
 
 /**
  * 编制外的成员也要能上台：给一个降级皮肤、一个不撞色的备用色标、一套中性台词。
@@ -250,13 +257,16 @@ export function manifestFor(
   const assistantId = member.assistantId ?? ''
   // 本机的值只认认识的皮肤：设置文件用户可以直接改，写错了不该连插件那份合法值一起冲掉。
   const local = knownSkin(overrides?.[assistantId]?.skin)
+  const randomActions = overrides?.[assistantId]?.randomActions
   const known = BY_ASSISTANT_ID.get(assistantId)
   if (known) {
     const skin = local ?? resolveSkin(member.skinId ?? known.skin)
-    return skin === known.skin ? known : { ...known, skin }
+    const base = skin === known.skin ? known : { ...known, skin }
+    return randomActions ? { ...base, randomActions } : base
   }
   const stranger = synthesize(assistantId, member.displayName ?? '', member.roleId ?? '', member.skinId ?? undefined)
-  return local && local !== stranger.skin ? { ...stranger, skin: local } : stranger
+  const withSkin = local && local !== stranger.skin ? { ...stranger, skin: local } : stranger
+  return randomActions ? { ...withSkin, randomActions } : withSkin
 }
 
 /**

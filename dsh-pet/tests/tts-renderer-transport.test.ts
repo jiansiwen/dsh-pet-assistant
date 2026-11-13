@@ -174,6 +174,27 @@ describe('切换外壳', () => {
     assert.deepEqual(log, ['open process', 'process x#0', 'open renderer', 'close process', 'renderer x#1'])
     assert.equal(events.filter(e => 'ready' in e).length, 1)
   })
+
+  test('渲染层起播失败：回退进程传输重念同一句，不把错误报给 Narrator', async () => {
+    const log: string[] = []
+    const events: TtsWorkerEvent[] = []
+    let rendererDeliver: ((e: TtsWorkerEvent) => void) | null = null
+    const make = (name: string) => (d: (e: TtsWorkerEvent) => void): TtsTransport => {
+      log.push(`open ${name}`)
+      if (name === 'renderer') rendererDeliver = d
+      queueMicrotask(() => d({ ready: true }))
+      return { write: l => log.push(`${name} ${JSON.parse(l).speak?.id ?? 'stop'}`), close: () => log.push(`close ${name}`) }
+    }
+    const transport = createSwitchingTransport<'process' | 'renderer'>(() => 'renderer', { process: make('process'), renderer: make('renderer') })(e => events.push(e))
+    await tick()
+    transport.write('{"speak":{"id":"r#0","b64":""}}')
+    await tick()
+    rendererDeliver!({ ok: false, error: '渲染层解码音频失败' })
+    await tick(); await tick()
+    assert.ok(log.includes('process r#0'), '应回退进程传输重念同一句')
+    assert.ok(log.includes('close renderer'), '回退时应关掉渲染层传输')
+    assert.ok(!events.some(e => 'ok' in e && e.ok === false), '播放错误不应报给 Narrator 导致整轮取消')
+  })
 })
 
 describe('合成进程的只合成模式', () => {

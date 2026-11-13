@@ -1,127 +1,206 @@
 /* 设置面板的统一外观；审批窗口仍使用独立样式，避免把设置页误认为批准入口。 */
+/*
+ * 设置面板的视觉 token（与 DSH 个人助理页对齐，保留品牌绿）。
+ *
+ * 旧版是"墨绿 + 米白 + 18px 大圆角"，用户原话是"老气"：色块重、圆角大、区块之间没有卡片
+ * 分隔、留白不足。这里把底色换成中性灰、圆角压到 12 / 10、区块改成白卡 + 1px 描边，
+ * 主色只留在主按钮、选中态与强调线上 —— 颜色越少，界面越显新。
+ *
+ * 旧的 `--settings-*` 变量名保留：子面板（团队、文档、会议、语音接口）都在用，改名等于
+ * 让它们一夜之间失去颜色。这里只换值，不换名。
+ */
 .pet-management {
-  --settings-ink: #20333b;
-  --settings-muted: #526a72;
-  --settings-line: #d7e3e1;
-  --settings-brand: #176a67;
+  --surface-page: #f7f8fa;
+  --surface-card: #ffffff;
+  --surface-line: #eceef2;
+  --surface-soft: #f2f3f5;
+  --ink: #1f2329;
+  --ink-muted: rgba(31, 35, 41, .6);
+  --ink-faint: rgba(31, 35, 41, .42);
+  --brand: #176a67;
+  --brand-soft: rgba(23, 106, 103, .08);
+  --radius-card: 12px;
+  --radius-control: 10px;
+  --radius-pill: 999px;
+
+  /* 旧名 → 新值（子面板还在用这些名字） */
+  --settings-ink: var(--ink);
+  --settings-muted: var(--ink-muted);
+  --settings-line: var(--surface-line);
+  --settings-brand: var(--brand);
   --settings-brand-dark: #105651;
-  --settings-paper: #ffffff;
-  --approval-zone-bg: #f5f8f6;
-  --approval-card-bg: #ffffff;
-  --approval-border: #d7e3e1;
+  --settings-paper: var(--surface-card);
+  --approval-zone-bg: var(--surface-soft);
+  --approval-card-bg: var(--surface-card);
+  --approval-border: var(--surface-line);
   --approval-heading: #314a52;
-  --approval-summary: #20333b;
-  --approval-meta: #526a72;
-  --runtime-detail: #526a72;
-  --approve-bg: #176a67;
+  --approval-summary: var(--ink);
+  --approval-meta: var(--ink-muted);
+  --runtime-detail: var(--ink-muted);
+  --approve-bg: var(--brand);
+
   width: 540px;
   height: min(760px, calc(100vh - 32px));
-  border: 1px solid #c8dcd7;
-  border-radius: 18px;
-  background: #f5f8f6;
-  box-shadow: 0 18px 55px rgba(20, 49, 47, .24), 0 3px 12px rgba(20, 49, 47, .08);
-  color: var(--settings-ink);
+  border: 1px solid var(--surface-line);
+  border-radius: 14px;
+  background: var(--surface-page);
+  /* 面板浮在桌面上，没有阴影会和桌面糊在一起；只留极轻的一层，不再是旧的深投影。 */
+  box-shadow: 0 10px 30px rgba(20, 30, 40, .12);
+  color: var(--ink);
   font: 13px/1.6 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  overflow: hidden;
 }
 
 .pet-management .management-header {
   gap: 12px;
-  padding: 18px 20px 16px;
-  border-bottom: 0;
-  background: #fff;
+  padding: 16px 20px 14px;
+  border-bottom: 1px solid var(--surface-line);
+  background: var(--surface-card);
 }
 
 .pet-management .management-brand {
   display: grid;
   flex: none;
   place-items: center;
-  width: 42px;
-  height: 42px;
-  border-radius: 13px;
-  background: #176a67;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: var(--brand);
   color: #fff;
-  font-size: 19px;
+  font-size: 17px;
   font-weight: 700;
-  box-shadow: 0 4px 10px rgba(23, 106, 103, .18);
 }
 
 .pet-management .management-brand-copy { flex: 1; min-width: 0; }
-.pet-management .management-brand-copy span { display: block; color: var(--settings-muted); font-size: 11px; letter-spacing: .04em; }
-.pet-management .management-header h2 { margin: 0; color: var(--settings-ink); font-size: 18px; font-weight: 700; line-height: 1.35; }
+.pet-management .management-brand-copy span { display: block; color: var(--ink-muted); font-size: 11px; letter-spacing: .04em; }
+.pet-management .management-header h2 { margin: 0; color: var(--ink); font-size: 16px; font-weight: 600; line-height: 1.35; }
+/* 当前页的一句话：放在标题下面，用来说明"这一页是干什么的"。 */
+.pet-management .management-header-sub { margin: 2px 0 0; color: var(--ink-muted); font-size: 12px; line-height: 1.5; }
 .pet-management .management-header button {
   flex: none;
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--settings-line);
-  border-radius: 10px;
-  background: #fff;
-  color: #405c62;
-  font-size: 21px;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: 20px;
   line-height: 1;
+  cursor: pointer;
+  transition: background-color .16s ease, color .16s ease;
 }
+.pet-management .management-header button:hover { background: var(--surface-soft); color: var(--ink); }
 
 .pet-management nav.management-tabs {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 4px;
-  padding: 0 16px 12px;
-  border-bottom: 1px solid var(--settings-line);
-  background: #fff;
+  gap: 2px 4px;
+  padding: 8px 12px 10px;
+  border-bottom: 1px solid var(--surface-line);
+  background: var(--surface-card);
 }
 
+/*
+ * 每一项是"圆角行"，不是"色块按钮"：
+ * 选中态只用极浅的品牌绿底 + 品牌色文字 + 左侧 2px 竖条 —— 竖条是这一版的强调语言，
+ * 它比整块深色背景安静得多，也不会把九项里的某一个抢成按钮。
+ */
 .pet-management nav.management-tabs button {
+  position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
-  min-height: 48px;
-  padding: 6px 8px;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  color: #496168;
-  font-size: 12px;
+  min-height: 34px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: 12.5px;
   line-height: 1.3;
   text-align: left;
   white-space: normal;
+  cursor: pointer;
+  transition: background-color .16s ease, color .16s ease;
 }
-.pet-management .management-tab-index { color: #657f80; font-size: 10px; font-weight: 700; letter-spacing: .05em; }
-.pet-management nav.management-tabs button[aria-current='page'] { border-color: #b7d9d2; background: #e8f4f0; color: #105651; }
-.pet-management nav.management-tabs button[aria-current='page'] .management-tab-index { color: #176a67; }
-.pet-management nav.management-tabs .panel-tab-badge { margin: 0; position: absolute; transform: translate(31px, 12px); }
+.pet-management nav.management-tabs button:hover { background: var(--surface-soft); color: var(--ink); }
+.pet-management .management-tab-index { color: var(--ink-faint); font-size: 10px; font-weight: 600; letter-spacing: .04em; }
+.pet-management nav.management-tabs button[aria-current='page'] {
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-weight: 600;
+}
+.pet-management nav.management-tabs button[aria-current='page']::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--brand);
+}
+.pet-management nav.management-tabs button[aria-current='page'] .management-tab-index { color: var(--brand); }
+.pet-management nav.management-tabs .panel-tab-badge {
+  margin-left: auto;
+  position: static;
+  transform: none;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--brand);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
 
 .pet-management .management-content {
   padding: 18px 20px 22px;
-  scrollbar-color: #a7bfba transparent;
+  scrollbar-color: #c9ccd3 transparent;
   scroll-padding: 12px;
+  background: var(--surface-page);
 }
-.pet-management .management-intro { margin: 0 0 16px; }
-.pet-management .management-eyebrow { color: #176a67; font-size: 10px; font-weight: 700; letter-spacing: .07em; }
-.pet-management .management-intro h3 { margin: 2px 0 1px; color: var(--settings-ink); font-size: 21px; line-height: 1.4; }
-.pet-management .management-intro p { margin: 0; color: var(--settings-muted); font-size: 12px; }
-.pet-management .management-general { display: flex; flex-direction: column; gap: 12px; padding: 0; }
+/* 页内标题：只留一行小字眉标 + 标题，不再有 21px 的大标题压着卡片。 */
+.pet-management .management-intro { margin: 0 0 14px; }
+.pet-management .management-eyebrow { color: var(--brand); font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+.pet-management .management-intro h3 { margin: 2px 0 0; color: var(--ink); font-size: 15px; font-weight: 600; line-height: 1.4; }
+.pet-management .management-intro p { margin: 2px 0 0; color: var(--ink-muted); font-size: 12px; }
+.pet-management .management-general { display: flex; flex-direction: column; gap: 18px; padding: 0; }
 
+/*
+ * 卡片化：所有子面板的顶层区块（通用设置、语音接口、文档结果、文档页、会议页）都变成同一种卡。
+ * 用 `:is()` 一次覆盖，是为了**不改子组件内部结构**也能让它们落进新卡片 —— 它们的类名各自
+ * 不同，但在这里归一即可。卡片之间 18px，靠父容器的 gap / margin 控制。
+ */
 .pet-management :is(.management-section, .voice-api-settings, .management-doc-results, .doc-section, .meeting-section) {
   min-width: 0;
   margin: 0;
-  padding: 16px;
-  border: 1px solid var(--settings-line);
-  border-radius: 13px;
-  background: var(--settings-paper);
-  box-shadow: 0 2px 8px rgba(31, 65, 60, .035);
+  padding: 17px;
+  border: 1px solid var(--surface-line);
+  border-radius: var(--radius-card);
+  background: var(--surface-card);
 }
 .pet-management .management-section { gap: 10px; }
 .pet-management :is(.management-section h3, .voice-api-settings h3, .doc-section-title, .meeting-title, .team-section-title) {
   margin: 0;
-  color: var(--settings-ink);
+  color: var(--ink);
   font-size: 14px;
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: 0;
 }
+/* 提示文字：12px、浅灰、行高 1.6，与控件之间 6px —— 它是解释，不该和正文抢注意力。 */
 .pet-management :is(.management-hint, .management-diagnostic, .doc-hint, .meeting-hint, .team-none) {
-  color: var(--settings-muted);
+  margin: 6px 0 0;
+  color: var(--ink-faint);
   font-size: 12px;
-  line-height: 1.65;
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
 .pet-management :is(p, dl) { margin-top: 0; margin-bottom: 0; }
@@ -132,27 +211,29 @@
 .pet-management .runtime-row { padding: 10px 12px; border-color: var(--settings-line); border-radius: 10px; }
 .pet-management .management-diagnostic code { color: var(--settings-ink); }
 
+/* 次按钮：白底 + 1px 描边。主按钮下面单独覆盖。 */
 .pet-management :is(.management-button, .doc-btn, .meeting-btn, .voice-api-settings button, .runtime-btn, .team-go) {
-  min-height: 34px;
+  min-height: 32px;
   height: auto;
-  padding: 6px 12px;
-  border: 1px solid #bdd1cc;
-  border-radius: 9px;
-  background: #fff;
-  color: #245853;
+  padding: 8px 14px;
+  border: 1px solid var(--surface-line);
+  border-radius: var(--radius-control);
+  background: var(--surface-card);
+  color: var(--ink);
   font: inherit;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
+  transition: background-color .16s ease, color .16s ease;
 }
 .pet-management :is(.management-button, .doc-btn, .meeting-btn, .voice-api-settings button, .runtime-btn, .team-go):hover:not(:disabled) {
-  border-color: #7eaaa0;
-  background: #eef7f3;
+  border-color: #dfe3ea;
+  background: var(--surface-soft);
   filter: none;
 }
 .pet-management :is(.doc-btn.primary, .meeting-btn.primary, .runtime-btn:not(.ghost), .team-go) {
-  border-color: var(--settings-brand);
-  background: var(--settings-brand);
+  border-color: var(--brand);
+  background: var(--brand);
   color: #fff;
 }
 .pet-management :is(.doc-btn.primary, .meeting-btn.primary, .runtime-btn:not(.ghost), .team-go):hover:not(:disabled) {
@@ -160,23 +241,52 @@
   background: var(--settings-brand-dark);
   color: #fff;
 }
-.pet-management .meeting-btn.danger { border-color: #b3261e; background: #b3261e; color: #fff; }
-.pet-management .meeting-btn.danger:hover:not(:disabled) { background: #8d1d17; color: #fff; }
-.pet-management .management-button.danger { border-color: #d9a6a1; color: #a02b26; }
+/* 危险操作：不做红底大按钮，只把文字换成砖红 —— 红底会把整页的注意力吸走。 */
+.pet-management .meeting-btn.danger { border-color: var(--surface-line); background: var(--surface-card); color: #c2410c; }
+.pet-management .meeting-btn.danger:hover:not(:disabled) { border-color: #f0c3ae; background: #fff7f4; color: #c2410c; }
+.pet-management .management-button.danger { border-color: var(--surface-line); background: var(--surface-card); color: #c2410c; }
 .pet-management button:disabled { opacity: .55; cursor: not-allowed; }
 
+/* 表单行：label 与控件之间 8px（原来靠默认间距，读起来挤）。 */
+.pet-management label { display: inline-flex; flex-direction: column; gap: 8px; }
+.pet-management label.inline, .pet-management :is(.management-voice, .meeting-radio, .meeting-consent) { flex-direction: row; align-items: flex-start; }
 .pet-management :is(input:not([type='checkbox']):not([type='radio']), select, textarea) {
   box-sizing: border-box;
   min-width: 0;
   max-width: 100%;
   min-height: 36px;
   padding: 7px 10px;
-  border: 1px solid #c4d6d1;
-  border-radius: 9px;
-  background: #fbfdfc;
-  color: var(--settings-ink);
+  border: 1px solid var(--surface-line);
+  border-radius: var(--radius-control);
+  background: var(--surface-card);
+  color: var(--ink);
   font: inherit;
 }
+/*
+ * 开关：36×20 的胶囊。
+ *
+ * `<input>` 是替换元素，`::before/::after` 不生效，所以滑块用**背景渐变**画（白圆 + 1px 灰边），
+ * 既不需要包一层 DOM，也不改任何组件结构。关 = 灰底、圆在左；开 = 品牌绿底、圆在右。
+ */
+.pet-management input[type='checkbox'] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background-color: #d9dde3;
+  background-image: radial-gradient(circle at 10px 50%, #ffffff 0 7.5px, #cfd4da 7.5px 8.5px, transparent 8.5px);
+  cursor: pointer;
+  transition: background-color .16s ease;
+}
+.pet-management input[type='checkbox']:checked {
+  background-color: var(--brand);
+  background-image: radial-gradient(circle at 26px 50%, #ffffff 0 7.5px, rgba(0, 0, 0, .06) 7.5px 8.5px, transparent 8.5px);
+}
+.pet-management input[type='checkbox']:disabled { opacity: .55; cursor: not-allowed; }
 .pet-management textarea { resize: vertical; }
 .pet-management :is(input[type='checkbox'], input[type='radio']) { flex: none; accent-color: var(--settings-brand); }
 .pet-management :is(.management-voice, .meeting-radio, .meeting-consent) { align-items: flex-start; line-height: 1.6; }
@@ -186,21 +296,21 @@
 .pet-management select :is(option, optgroup) { background: #fff; color: #20333b; }
 
 .pet-management .management-group { gap: 8px; }
-.pet-management .management-checklist > li { border-radius: 8px; background: #f6f9f8; padding: 9px 10px; }
+.pet-management .management-checklist > li { border-radius: var(--radius-control); background: var(--surface-soft); padding: 9px 10px; }
 .pet-management .management-status { font-weight: 600; }
-.pet-management .management-doc-results { margin-bottom: 12px; }
-.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) { gap: 12px; padding: 0; background: transparent; }
-.pet-management .management-content > .team-page > .team-section { padding: 16px; border: 1px solid var(--settings-line); border-radius: 13px; background: #fff; }
-.pet-management .member-management { margin-bottom: 12px; }
-.pet-management .team-page + .management-section { margin-top: 12px; }
-.pet-management :is(.team-task, .team-proposal, .team-member, .doc-card, .doc-dir) { background: #fbfdfc; }
+.pet-management .management-doc-results { margin-bottom: 18px; }
+.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) { gap: 18px; padding: 0; background: transparent; }
+.pet-management .management-content > .team-page > .team-section { padding: 17px; border: 1px solid var(--surface-line); border-radius: var(--radius-card); background: var(--surface-card); }
+.pet-management .member-management { margin-bottom: 18px; }
+.pet-management .team-page + .management-section { margin-top: 18px; }
+.pet-management :is(.team-task, .team-proposal, .team-member, .doc-card, .doc-dir) { background: var(--surface-soft); }
 .pet-management :is(.doc-page, .meeting-page, .team-page) { color: var(--settings-ink); }
 .pet-management .doc-section, .pet-management .meeting-section { gap: 10px; }
 .pet-management .doc-actions, .pet-management .management-quick { gap: 8px; }
-.pet-management .doc-ask { background: #f6f9f8; }
-.pet-management .meeting-minutes { background: #f3f7f5; }
+.pet-management .doc-ask { background: var(--surface-soft); }
+.pet-management .meeting-minutes { background: var(--surface-soft); }
 .pet-management .meeting-rec-banner { top: -1px; }
-.pet-management .meeting-source-btn { color: #175c58; border-color: #a9cec5; }
+.pet-management .meeting-source-btn { color: var(--brand); border-color: var(--surface-line); }
 
 .pet-management .voice-api-settings { line-height: 1.6; }
 .pet-management .voice-api-settings > p { color: var(--settings-muted); }
@@ -211,15 +321,31 @@
 .pet-management .assistant-settings-error { color: #a3271b; }
 
 @media (max-width: 520px) {
-  .pet-management { right: 8px; top: 8px; max-width: calc(100vw - 16px); height: min(760px, calc(100vh - 16px)); border-radius: 14px; }
+  .pet-management { right: 8px; top: 8px; max-width: calc(100vw - 16px); height: min(760px, calc(100vh - 16px)); border-radius: 12px; }
   .pet-management .management-header { padding: 12px 14px; }
-  .pet-management nav.management-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 0 10px 10px; }
-  .pet-management nav.management-tabs button { flex-direction: row; align-items: center; min-height: 36px; gap: 6px; }
-  .pet-management nav.management-tabs .panel-tab-badge { position: static; transform: none; }
-  .pet-management .management-content { padding: 14px; }
-  .pet-management :is(.management-section, .voice-api-settings, .management-doc-results, .doc-section, .meeting-section) { padding: 12px; }
+  .pet-management nav.management-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 8px 10px; }
+  .pet-management nav.management-tabs button { min-height: 34px; gap: 6px; }
+  .pet-management .management-content { padding: 14px 14px 18px; }
+  .pet-management :is(.management-section, .voice-api-settings, .management-doc-results, .doc-section, .meeting-section) { padding: 14px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .pet-management :is(button, input, select, textarea) { transition: none; }
 }
+
+/*
+ * 导航分组标题（「工作」/「设置」）。
+ *
+ * 九项挤在一行会读不过来，所以分组；标题本身不可点 —— 它不是页面，点它没有去处。
+ * 用 `grid-column: 1 / -1` 占满整行，不改变既有按钮的六列栅格。
+ */
+.pet-management nav.management-tabs .management-nav-group {
+  grid-column: 1 / -1;
+  padding: 0 9px;
+  margin: 8px 0 2px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .1em;
+}
+.pet-management nav.management-tabs .management-nav-group:first-child { margin-top: 2px; }

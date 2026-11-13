@@ -4,12 +4,20 @@ import TeamPanel from './TeamPanel.js'
 import MemberManagement, { useMemberFeed } from './MemberManagement.js'
 import DocPanel from './DocPanel.js'
 import MeetingPanel from './meeting-panel.js'
+import { installMeetingSession } from './meeting-capture-session.ts'
 import VoiceApiSettings from './VoiceApiSettings.js'
 import AssistantSettings from './AssistantSettings.js'
 import ChatOverlay from './ChatOverlay.js'
-import PetSettingsPanel, { PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
+import PetSettingsPanel, { FastReplySettings, PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
 import { EnvironmentCheck } from './FirstRunSettings.js'
 import { useSession } from './useSession.js'
+import { useChatDelta } from './useChatDelta.js'
+import { usePresence } from './usePresence.js'
+import { PET_OPACITIES, PET_SCALES, normalizePetOpacity, normalizePetScale, type PetOpacity, type PetScale } from './pet-appearance.js'
+import { dockEdge, dockPosition, dockStatusTone, type DockEdge } from './pet-dock.js'
+import DockedPet from './DockedPet.js'
+import { PET_WIDTH } from './pet-metrics.js'
+import { HOVER_CLOSE_MS, HOVER_OPEN_MS, hoverActions, initialHover, reduceHover, type HoverEventKind } from './hover-toolbar.js'
 import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, planInterruptInput } from '../voice-conversation.ts'
 import type { VoiceTurn } from '../session-types.js'
 import {
@@ -29,6 +37,7 @@ import { clearPetAssetCache } from './usePetImage.js'
 import { PROACTIVE_ACCEPT_MESSAGE } from './proactive-ui.js'
 import { arrayBufferToBase64, pcm16Base64, recordDictation, stopDictation, type DictationHandover } from './dictation.js'
 import { installAudioBridge, isWakePhraseOnly } from './barge-in.ts'
+import { DEFAULT_QUEUE_LIMITS, drainForStop, enqueue, takeNext, type QueuedInput } from './input-queue.ts'
 import { isSelfSpeech, rememberSelfSpeech } from './self-speech.ts'
 import { LOCAL_ACKS } from '../main/greetings.ts'
 import { approvalBanner } from './team-panel.js'
@@ -87,6 +96,31 @@ function pickLocalGreeting(): string {
   return LOCAL_ACKS[Math.floor(Math.random() * LOCAL_ACKS.length)]
 }
 
+/**
+ * 「这一页还没建完」的入口卡片（第三块工作台的第一期形态）。
+ *
+ * 它存在的唯一理由是**不假装已经做完**：标题、这页以后长什么样、以及现在能用的那个入口。
+ * 下方一行灰字明说是独立窗口 —— 用户点开一个单独的窗口，不会以为是同一张页面没渲染全。
+ */
+function SettingsEntryCard({ title, description, action, onAction, secondary, disabled = false, pending }: {
+  title: string
+  description: string
+  action: string
+  onAction(): void
+  /** 次级入口：不抢主按钮的位置，给"另一个常见去处"。 */
+  secondary?: { label: string; onAction(): void }
+  disabled?: boolean
+  pending?: string
+}) {
+  return <section className="management-section" aria-label={title}>
+    <h3>{title}</h3>
+    <p className="management-hint">{description}</p>
+    <button className="management-button" disabled={disabled} onClick={onAction}>{pending ?? action}</button>
+    {secondary && <button className="management-button ghost" onClick={secondary.onAction}>{secondary.label}</button>}
+    <p className="management-hint">完整页面正在建设中，当前通过独立窗口使用。</p>
+  </section>
+}
+
 /** 合成进程报的故障码。协议在 `main/tts-edge-worker.ts` 头部。 */
 const SPEECH_ERROR_TEXT: Record<string, string> = {
   'no-voice': '这台机器上没有可用的语音合成音色',
@@ -108,6 +142,59 @@ function speechErrorText(code: string): string {
 export default function App() {
   const mirror = useSession()
   const { session } = mirror
+  /**
+   * 逐字呈现（A2）。影子的唯一入口在这里：它只读 `session.entries` 判断"哪些临时尾该让位"，
+   * 不往会话里写任何东西 —— 权威条目才是数据。
+   */
+  const chatDelta = useChatDelta(session?.entries)
+
+  /**
+   * 悬停快捷工具栏（3.7.1）。
+   *
+   * 时序全在 `hover-toolbar.ts` 的纯函数里，这里只负责"把 DOM 事件变成它的输入"和"按时钟
+   * 喂 tick"。真源是 ref：鼠标事件比 React 重渲染快得多，走 state 会读到上一次的值。
+   */
+  const [hoverEnabled, setHoverEnabled] = useState(() => {
+    // 主进程的设置表这轮不动，所以这个开关存在渲染层本地；键名带版本，将来搬进 settings 好清理。
+    try { return localStorage.getItem('dsh-pet.hoverToolbar') !== '0' } catch { return true }
+  })
+  const hoverState = useRef(initialHover(hoverEnabled))
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /**
+   * 指针当前停在哪个角色上（含它的实际矩形）。
+   *
+   * 用 `getBoundingClientRect()` 而不是 `positions[id]`：后者是角色**左上角**的坐标，
+   * 拿它算头顶中心会整体右偏半个角色宽（真机反馈"工具栏往右偏"就是这个）。
+   */
+  const hoverPet = useRef<{ id: string; left: number; top: number; bottom: number; width: number } | null>(null)
+  /** 工具栏挂在哪个角色上；`open` 期间一直保留，不随指针离开宠物而清空。 */
+  const [hoverBar, setHoverBar] = useState<{ id: string; left: number; top: number; bottom: number; width: number } | null>(null)
+
+  /**
+   * 喂一个悬停事件，并按"还差多久到下一个判定点"排一个 tick。
+   *
+   * 只用一个定时器：每次事件都重排，所以反复进出不会堆出两个互相打架的计时器 ——
+   * 那正是这类交互最容易出的 bug（展开计时和收起计时同时活着）。
+   */
+  const feedHover = useCallback((kind: HoverEventKind) => {
+    const now = Date.now()
+    const previous = hoverState.current
+    const next = reduceHover(previous, { kind, at: now })
+    hoverState.current = next
+    // **不能**用 `hoverPet.current !== null` 判断：指针一离开宠物它就被清空，
+    // 那句话会让工具栏在 mouseout 的同一帧消失，600ms 的通行缓冲等于没写（真机反馈"移不过去"）。
+    // 展开期间沿用上一份角色信息，只有 `open` 变 false（600ms 到点）才真正清空。
+    setHoverBar(prev => (next.open ? (hoverPet.current ?? prev) : null))
+    if (hoverTimer.current !== undefined) clearTimeout(hoverTimer.current)
+    hoverTimer.current = undefined
+    const leftAt = next.leftBarAt ?? next.leftPetAt
+    const wait = next.open
+      ? (leftAt === null ? null : HOVER_CLOSE_MS - (now - leftAt))
+      : (next.petSince === null ? null : HOVER_OPEN_MS - (now - next.petSince))
+    if (wait === null) return
+    hoverTimer.current = setTimeout(() => feedHover('tick'), Math.max(16, wait))
+  }, [])
+
   const [pet, setPet] = useState('panda')
   /**
    * 用户在本机为每个角色挑的形象，键是 assistantId。
@@ -135,6 +222,17 @@ export default function App() {
   /** 会话框停靠方式与尺寸；默认固定在头顶，尺寸 440×560。 */
   const [chatDock, setChatDock] = useState<'top' | 'auto'>('top')
   const [chatSize, setChatSize] = useState<{ width: number; height: number }>({ width: 440, height: 560 })
+  /** 讲解形态：默认照原文念稿（真人会议优先），AI 讲解要用户主动选。 */
+  const [docSpeechMode, setDocSpeechMode] = useState<'source' | 'ai'>('source')
+  /** 角色大小与透明度：档位制，来源是主进程设置（get-state 回读，不用 localStorage）。 */
+  const [petScale, setPetScale] = useState<PetScale>(1)
+  const [petOpacity, setPetOpacity] = useState<PetOpacity>(1)
+  /** 拖到边缘是否吸附收起，默认开。 */
+  const [petDock, setPetDock] = useState(true)
+  /** 当前停靠：哪个角色收在哪个边；null = 没有停靠。 */
+  const [docked, setDocked] = useState<{ id: string; edge: DockEdge } | null>(null)
+  /** 重启后要恢复的停靠边（等角色名单到位再解析成具体角色）。 */
+  const pendingDock = useRef<DockEdge | null>(null)
   const conversation = useRef(new VoiceConversation()).current
   const [continuousActive, setContinuousActive] = useState(false)
   const dictationGeneration = useRef(0)
@@ -149,6 +247,15 @@ export default function App() {
   const wakeListenTimer = useRef<ReturnType<typeof setTimeout>>()
   const listeningRef = useRef(false)
   const busyRef = useRef(false)
+  /**
+   * 忙时排队的话（A1：把"静默丢弃"改成"诚实入队"）。
+   *
+   * 真源是 ref 而不是 state：`send` 与出队 effect 都要在**同一个 tick 里**读到最新的队，
+   * 走 state 会读到上一次渲染的旧数组，于是刚排上的那条在下一次出队时凭空消失。
+   * `queueCount` 只是它的投影，用来触发 effect 重算并让界面上"排了几条"有个可读的值。
+   */
+  const queueRef = useRef<QueuedInput[]>([])
+  const [queueCount, setQueueCount] = useState(0)
   /** 角色是不是正在念回答。念的时候面板上要给一个能让它闭嘴的按钮。 */
   const [speech, setSpeech] = useState<SpeechStatus>({ speaking: false })
   /**
@@ -238,19 +345,29 @@ export default function App() {
    */
   const [stageTick, setStageTick] = useState(() => Date.now())
   const lingerUntil = useRef<Record<string, number>>({})
+  // 用户手动"让TA退下"的成员：不再自动上台，直到下一次真实任务/讲解活动。
+  const hiddenMembers = useRef<Set<string>>(new Set())
+  const chiefIdRef = useRef<string | null>(null)
+  chiefIdRef.current = members?.find(member => member.roleId === 'tangseng')?.assistantId ?? null
   useEffect(() => {
     const timer = window.setInterval(() => setStageTick(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [])
   useEffect(() => {
     const now = Date.now()
+    const presenter = docState.kind === 'outline' && docState.active ? docState.assistantId ?? null : null
     for (const member of members ?? []) {
       if (member.roleId === 'tangseng') continue
-      const working = isWorking(statusByAssistant[member.assistantId])
+      // 手动退下的成员保持隐藏，不因任务/讲解活动自动复活；只有"请TA上台"能解除。
+      if (hiddenMembers.current.has(member.assistantId)) {
+        lingerUntil.current[member.assistantId] = 0
+        continue
+      }
+      const working = isWorking(statusByAssistant[member.assistantId]) || member.assistantId === presenter
       if (working) lingerUntil.current[member.assistantId] = Number.POSITIVE_INFINITY
       else if (lingerUntil.current[member.assistantId] === Number.POSITIVE_INFINITY) lingerUntil.current[member.assistantId] = now + 10_000
     }
-  }, [members, statusByAssistant])
+  }, [members, statusByAssistant, docState])
 
   const cast = useMemo<StageMember[]>(() => {
     if (members?.length) {
@@ -282,13 +399,40 @@ export default function App() {
     }
   }, [selectedMember])
 
-  /** 会话只临时补充选中角色的工作状态；已有团队任务优先，结束后恢复原投影。 */
+  /** 会话只临时补充选中角色的工作状态；已有团队任务优先，结束后恢复原投影。讲解中的委派成员同样投影为工作中。 */
   const stageStatuses = useMemo(() => {
-    if (!selectedMember || (session?.status !== 'running' && session?.status !== 'waiting')) return statusByAssistant
+    const presenter = docState.kind === 'outline' && docState.active ? docState.assistantId ?? null : null
+    let projected = statusByAssistant
+    if (presenter && !isWorking(projected[presenter])) projected = { ...projected, [presenter]: 'running' as const }
+    if (!selectedMember || (session?.status !== 'running' && session?.status !== 'waiting')) return projected
     const who = selectedMember.assistantId
-    if (isWorking(statusByAssistant[who])) return statusByAssistant
-    return { ...statusByAssistant, [who]: session.status === 'waiting' ? 'awaiting-user' as const : 'running' as const }
-  }, [selectedMember, session?.status, statusByAssistant])
+    if (isWorking(projected[who])) return projected
+    return { ...projected, [who]: session.status === 'waiting' ? 'awaiting-user' as const : 'running' as const }
+  }, [selectedMember, session?.status, statusByAssistant, docState])
+
+  /**
+   * 九态聚合（A3）：把渲染层**现在就有**的事实翻成事件，喂给纯函数状态机。
+   *
+   * 这里只做"取事实"这一件事，判据全在 `presence-facts.ts`（哪些变化该说话、哪些不该）与
+   * `presence-view.ts`（优先级与驻留）。`assistantActive` 用它的会话级闩锁，不再另算一份。
+   *
+   * `muted` 传 false：设置里没有"静音"这个字段（只有 opt-in 的"朗读回复" `readReplies`，
+   * 默认关）。把 `!readReplies` 当静音会让宠物在默认配置下永久显示"静音"，那是在撒谎 ——
+   * 真静音要先在设置里加一个字段（主进程改动），不在本轮范围。
+   */
+  const presence = usePresence({
+    busy,
+    sessionStatus: session?.status ?? '',
+    speaking: speech.speaking,
+    listening,
+    hasStreamingText: (session?.entries ?? []).some(entry => entry.streaming === true && entry.kind === 'text' && entry.text.length > 0),
+    hasStreamingThink: (session?.entries ?? []).some(entry => entry.streaming === true && entry.kind === 'think' && entry.text.length > 0),
+    hasStreamingTool: (session?.entries ?? []).some(entry => entry.streaming === true && entry.kind === 'tool'),
+    taskRunning: Object.values(stageStatuses).some(status => status === 'running'),
+    continuous: conversation.active,
+    muted: false,
+    errorText: mirror.error || speech.error || '',
+  })
 
   // ---- 退场编排（时间线见 portal.css 顶部注释，总长 4.3s）----
   // none → wave（挥手拜拜）→ turn（转身）→ jump（跳入通道）→ gone（消失，通道消散）
@@ -330,6 +474,12 @@ export default function App() {
       setReadReplies(state.readReplies === true)
       setMeetingDocumentAutoApprove(state.meetingDocumentAutoApprove === true)
       setChatDock(state.chatDock === 'auto' ? 'auto' : 'top')
+      setDocSpeechMode(state.docSpeechMode === 'ai' ? 'ai' : 'source')
+      setPetScale(normalizePetScale(state.petScale))
+      setPetOpacity(normalizePetOpacity(state.petOpacity))
+      setPetDock(state.petDock !== false)
+      // 停靠边先记下来：此刻还不知道该由哪个角色代表，等名单到位再解析。
+      pendingDock.current = state.dockedAt ?? null
       if (state.chatSize && Number.isFinite(state.chatSize.width) && Number.isFinite(state.chatSize.height)) {
         setChatSize({ width: state.chatSize.width, height: state.chatSize.height })
       }
@@ -352,8 +502,8 @@ export default function App() {
 
   // 自定义皮肤登记变化：注册 id、清素材缓存并重挂舞台，否则 hook 依赖的 skin 字符串不变不会重新探测。
   useEffect(() => {
-    const apply = (ids: string[]) => {
-      registerCustomSkins(ids)
+    const apply = (skins: { id: string; actions?: string[] }[]) => {
+      registerCustomSkins(skins)
       clearPetAssetCache()
       setAssetEpoch(epoch => epoch + 1)
     }
@@ -433,11 +583,105 @@ export default function App() {
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__member_quota__') }
   }, [stageVisible, settingsPage, quotaPending])
 
+  /**
+   * 停靠时：悬停工具栏一律不弹。
+   *
+   * 48px 的圆旁边弹一排按钮会直接盖住它和状态点，而状态点正是"出事了要看得见"的那部分。
+   * 收起态要操作就用右键菜单 —— 那条路径一直在。
+   */
+  useEffect(() => {
+    if (docked === null) return
+    hoverPet.current = null
+    setHoverBar(null)
+    hoverState.current = initialHover(hoverEnabled)
+  }, [docked, hoverEnabled])
+
+  /**
+   * 收起时给一句话。
+   *
+   * 用户报障的原话是"我的宠物形象去哪了"——他不知道自己刚刚把它收起来了。这句话的作用
+   * 就是告诉他"东西还在、单击能展开"。
+   *
+   * **只在第一次弹**：每次收起都弹就成了骚扰。两层去重：
+   * - `dockHintShown.current`：本次运行只弹一次（localStorage 读写失败时的兜底）；
+   * - `localStorage['dsh-pet.dockHintShown']`：跨重启只弹一次。
+   * 用 try/catch 包住读写：隐私模式或存储被禁用时不能让提示逻辑抛错，那会连带停靠功能一起坏。
+   */
+  const dockHintShown = useRef(false)
+  useEffect(() => {
+    if (docked === null || dockHintShown.current) return
+    dockHintShown.current = true
+    let seen = false
+    try { seen = localStorage.getItem('dsh-pet.dockHintShown') === '1' } catch { seen = false }
+    if (seen) return
+    try { localStorage.setItem('dsh-pet.dockHintShown', '1') } catch { /* 存不下就只在本次运行提示一次 */ }
+    showToast('已收起到屏幕边缘，单击展开')
+  }, [docked, showToast])
+
+  /**
+   * 缩放变了：把悬停矩形作废。
+   *
+   * 工具栏位置来自 `getBoundingClientRect()`（含 transform），所以**重新量一次**就对了；
+   * 但"正在悬停时改大小"这一帧用的还是旧矩形，会让工具栏偏出一个角色的高度。
+   * 改完立刻清空，下次悬停按新尺寸重测 —— 比在渲染里猜偏移量可靠。
+   */
+  useEffect(() => {
+    hoverPet.current = null
+    setHoverBar(null)
+    hoverState.current = initialHover(hoverEnabled)
+  }, [hoverEnabled, petScale])
+
+  /**
+   * 悬停栏的五个动作，全部走**已有能力**：不新增 IPC，也不在这里造第二条业务路径。
+   * 会议按钮只把人带到会议页 —— 开始录音需要本人同意，不能让一个悬停按钮替他点掉。
+   */
+  const runHoverAction = useCallback((id: 'chat' | 'meeting' | 'todo' | 'report' | 'settings') => {
+    hoverState.current = initialHover(hoverEnabled)
+    setHoverBar(null)
+    if (id === 'chat') { setSettingsPage(null); setPanelOpen(true); return }
+    if (id === 'settings') { setSettingsPage('general'); return }
+    if (id === 'meeting') { setSettingsPage('meeting'); return }
+    if (id === 'todo') {
+      void window.petApi.openCompanionTasks().then(result => { if (!result.ok) showToast('待办窗口未能打开') })
+        .catch(() => showToast('待办窗口未能打开'))
+      return
+    }
+    void window.petApi.openReportWorkbench().then(result => { if (!result.ok) showToast('日报工作台未能打开') })
+      .catch(() => showToast('日报工作台未能打开'))
+  }, [hoverEnabled, showToast])
+
   useEffect(() => {
     const stopSettings = window.petApi.onSettingsOpen(setSettingsPage)
+    const stopSettingsClose = window.petApi.onSettingsClose(() => setSettingsPage(null))
     const stopDismiss = window.petApi.onOverlayDismiss(() => setPanelOpen(false))
     const stopError = window.petApi.onOverlayError(showToast)
-    return () => { stopSettings(); stopDismiss(); stopError(); window.clearTimeout(toastTimer.current) }
+    const stopStepDown = window.petApi.onMemberStepDown(assistantId => {
+      if (assistantId === chiefIdRef.current) return
+      hiddenMembers.current.add(assistantId)
+      lingerUntil.current[assistantId] = 0
+      void window.petApi.saveSettings({ stepDownMembers: [...hiddenMembers.current] })
+      setStageTick(Date.now())
+    })
+    const stopStepUp = window.petApi.onMemberStepUp(assistantId => {
+      hiddenMembers.current.delete(assistantId)
+      lingerUntil.current[assistantId] = Date.now() + 10_000
+      void window.petApi.saveSettings({ stepDownMembers: [...hiddenMembers.current] })
+      setStageTick(Date.now())
+    })
+    return () => { stopSettings(); stopSettingsClose(); stopDismiss(); stopError(); stopStepDown(); stopStepUp(); window.clearTimeout(toastTimer.current) }
+  }, [showToast])
+
+  // 退下名单持久化：召唤/重启后读取，手动退下的成员不自动复活。
+  useEffect(() => {
+    void window.petApi.getState().then(state => {
+      hiddenMembers.current = new Set(state.stepDownMembers ?? [])
+      setStageTick(Date.now())
+    }).catch(() => undefined)
+  }, [])
+
+  // 录音命令接收与双轨采集常驻安装：设置页不打开也能开录，异常用 toast 如实报。
+  useEffect(() => {
+    installMeetingSession(window.petApi, showToast)
   }, [showToast])
 
   useEffect(() => {
@@ -449,12 +693,39 @@ export default function App() {
     setSelectedId(assistantId)
   }, [])
 
+  /**
+   * 拖拽结束落位置。**这里是"是否吸附"的唯一判定点** —— 不改拖拽逻辑本身，只在收尾时看一眼。
+   *
+   * 命中边缘时**不写 positions**：那一格要保住"用户拖出来之前的位置"，取消停靠据此回到原处。
+   * 停靠本身只记一条边（`dockedAt`），坐标由边 + 原位算出来，两处不各记一份。
+   */
+  /**
+   * 重启恢复停靠：`dockedAt` 只记了边，具体由谁代表等名单到位再定。
+   *
+   * 选 `selectedId`（用户最后点的那个）优先，否则第一个成员 —— 与用户心里"我上次在跟谁说话"
+   * 一致；都没有（团队还没拉起）就保持不渲染小圆，等名单到了再说。
+   */
+  useEffect(() => {
+    const edge = pendingDock.current
+    if (edge === null || docked !== null || cast.length === 0) return
+    pendingDock.current = null
+    const id = selectedId && cast.some(member => member.assistantId === selectedId) ? selectedId : cast[0].assistantId
+    setDocked({ id, edge })
+  }, [cast, docked, selectedId])
+
   const handlePersist = useCallback((assistantId: string, x: number, y: number) => {
+    const workArea = { left: 0, top: 0, width: innerWidth, height: innerHeight }
+    const edge = petDock ? dockEdge({ left: x, top: y, width: PET_WIDTH, height: PET_WIDTH }, workArea) : null
+    if (edge !== null) {
+      setDocked({ id: assistantId, edge })
+      void window.petApi.saveSettings({ dockedAt: edge })
+      return
+    }
     const next = { ...positionsRef.current, [assistantId]: { x, y } }
     positionsRef.current = next
     setPositions(next)
     void window.petApi.saveSettings({ positions: next })
-  }, [])
+  }, [petDock])
 
   /**
    * 这一轮的输入是不是从麦克风来的。
@@ -546,8 +817,38 @@ export default function App() {
       const text = raw.trim()
       if (voiceTurn && !conversation.valid(voiceTurn.generation, voiceTurn.bindingId)) return
       if (!voiceTurn && conversation.active) stopContinuous()
-      if (!text || busyRef.current) {
+      if (!text) {
         if (voiceTurn) stopContinuous(false)
+        return
+      }
+      if (busyRef.current) {
+        if (voiceTurn) {
+          // 语音轮次不入队：它带 generation/binding 代次，排队到下一轮再发时那两个号早已失效，
+          // 发出去只会是一条"迟到的、不确定属不属于当前会话"的话。这条链的兜底是继续对话的状态机。
+          stopContinuous(false)
+          return
+        }
+        // 打字轮次入队。这是本轮改动的全部意义：忙不是拒绝的理由，只是延后的理由。
+        const outcome = enqueue(queueRef.current, {
+          id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          // 原文进队，trim 由 input-queue 负责（它的契约就是"存 trim 后的正本"），
+          // 这里再 trim 一次会让"排版用的换行"在两层之间来回变形。
+          text: raw,
+          enqueuedAt: Date.now(),
+          source: 'typed',
+          bindingId: session?.bindingId,
+        }, DEFAULT_QUEUE_LIMITS)
+        if (!outcome.ok) {
+          // 排不上也要诚实：原文回填输入框，并说清为什么没排上。绝不静默丢。
+          setInput(draft => (!draft || draft.trim() === text ? raw : `${raw}\n${draft}`))
+          showToast(outcome.reason === 'full'
+            ? `队列已满（最多 ${DEFAULT_QUEUE_LIMITS.maxItems} 条），这条没有排上`
+            : outcome.reason === 'too-long' ? '这条太长了，先精简一下再发' : '这条没有排上')
+          return
+        }
+        queueRef.current = outcome.queue
+        setQueueCount(outcome.queue.length)
+        showToast(`助理还在处理上一条，这条已排队（第 ${outcome.queue.length} 条）`)
         return
       }
       setPanelOpen(true)
@@ -613,6 +914,50 @@ export default function App() {
     // send 只读 session 的 bindingId 与 capabilities.prompt：按这两项更新即可，避免每条增量都重建回调。
     [session?.bindingId, session?.capabilities.prompt, mirror.command, mirror.adopt, showToast, conversation, stopContinuous, syncContinuous],
   )
+
+  /**
+   * 串行出队：一次只放一条出去，放完等它跑完再看下一条。
+   *
+   * 三条纪律：
+   * - **先摘队，再 send**。`send` 会同步把 `busyRef` 置真，但它中间还有一步 `startSession`
+   *   的 await；若反过来（先 send 再摘队），effect 在这段窗口里重入就会把同一条再发一遍。
+   * - **`busy` 与 `busyRef` 都要看**。前者是渲染值、会晚一拍，后者是即刻值；只看一个都会
+   *   在"刚提交完、还没重渲染"的那一拍漏过去。
+   * - **绑定失效的条目带进 dropped 并说一句**。会话换了还照着旧 `bindingId` 发，等于把用户
+   *   的话发进另一个会话里。失效不等于可以静默丢。
+   *
+   * `queueCount` 进依赖是有意的：入队发生在 busy 为真时（effect 会早退），只有它的变化能把
+   * 这条 effect 在"排上了但还没轮到"的这段时间里重新叫醒一次。
+   */
+  useEffect(() => {
+    if (busy || busyRef.current) return
+    if (queueRef.current.length === 0) return
+    const { next, queue, dropped } = takeNext(
+      queueRef.current,
+      Date.now(),
+      DEFAULT_QUEUE_LIMITS,
+      item => !item.bindingId || item.bindingId === session?.bindingId,
+    )
+    queueRef.current = queue
+    setQueueCount(queue.length)
+    if (dropped.length > 0) showToast(`${dropped.length} 条排队消息因会话切换已失效，未自动发送`)
+    if (!next) return
+    void send(next.text)
+  }, [busy, send, session?.bindingId, showToast, queueCount])
+
+  /**
+   * 把队列里还没说的话按原顺序拼回输入框。
+   *
+   * 「停止生成」时用它：那一刻用户要的是"从头来一次"，而不是让几条早已过时的请求在他停手
+   * 之后继续发出去。拼回而不是逐条弹确认 —— 停止本来就该是一次动作。
+   */
+  const drainQueueToInput = useCallback(() => {
+    if (queueRef.current.length === 0) return
+    const { queue, restoredText } = drainForStop(queueRef.current)
+    queueRef.current = queue
+    setQueueCount(0)
+    if (restoredText) setInput(draft => (!draft ? restoredText : `${restoredText}\n${draft}`))
+  }, [])
 
   const openSession = useCallback(async () => {
     if (busyRef.current) return
@@ -1144,6 +1489,17 @@ export default function App() {
   }, [showToast])
 
   /**
+   * 快嘴短应答：主进程已用 TTS 念出，这里只显示在角色头顶气泡，并记进自回声过滤表
+   * （连续对话开着麦，不记就可能把自己的应答识别成用户输入）。它不进会话流水。
+   */
+  useEffect(() => window.petApi.onFastAck(({ text }) => {
+    if (exitingRef.current || text === '') return
+    rememberSelfSpeech(text)
+    const who = selectedId ?? cast[0]?.assistantId
+    if (who) stageRef.current?.sayTo(who, text, 4000)
+  }), [selectedId, cast])
+
+  /**
    * 语音识别的流式增量（mimo 等服务）：边识别边出字，最终文本以 asrTranscribe 返回值为准。
    * 本地流式识别走 asrStreamFeed，不经过这里。
    */
@@ -1307,7 +1663,25 @@ export default function App() {
   }
 
   return (
-    <div className="stage" onMouseDownCapture={wakeConversation} onKeyDownCapture={wakeConversation}>
+    <div className="stage" onMouseDownCapture={wakeConversation} onKeyDownCapture={wakeConversation}
+      // 悬停在哪个角色上就用哪个角色：工具栏只跟着指针下那一个，不整个舞台弹。
+      onMouseOver={event => {
+        const slot = (event.target as Element | null)?.closest?.('.character-slot') ?? null
+        const id = slot?.getAttribute('data-assistant-id') ?? null
+        if (slot === null || id === null || id === hoverPet.current?.id) return
+        const rect = slot.getBoundingClientRect()
+        hoverPet.current = { id, left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width }
+        feedHover('enter-pet')
+      }}
+      onMouseOut={event => {
+        const from = (event.target as Element | null)?.closest?.('.character-slot') ?? null
+        if (from === null) return
+        const to = (event.relatedTarget as Element | null)?.closest?.('.character-slot') ?? null
+        if (to === from) return
+        if (to !== null) return // 直接挪到另一个角色：由 mouseover 接管
+        hoverPet.current = null
+        feedHover('leave-pet')
+      }}>
       {toast && <div className="toast" role="status">{toast}</div>}
       {quotaPending > 0 && settingsPage !== 'team' && <div className="member-quota-banner approval-banner" data-interactive role="status">
         <span className="approval-banner-text">{quotaPending} 条成员额度申请待处理</span>
@@ -1331,7 +1705,12 @@ export default function App() {
             void window.petApi.saveSettings({ chatSize: size })
           }}
           onCommand={command => {
-            if (command.kind === 'cancel') stopContinuous(false)
+            if (command.kind === 'cancel') {
+              // 「停止生成」（scope 缺省或 run）顺手把排队的话拿回手里。mute/pause/resume 不动队列：
+              // 那三个不中止在跑的运行，排队的内容照常该发。
+              if (command.scope === undefined || command.scope === 'run') drainQueueToInput()
+              stopContinuous(false)
+            }
             return mirror.command(command)
           }}
           onListen={() => void startListen()}
@@ -1345,11 +1724,22 @@ export default function App() {
           loadingOlder={mirror.loadingOlder}
           loadOlder={mirror.loadOlder}
           hiddenThroughSeq={presentationCutoff}
+          liveTurn={chatDelta.live}
+          queuedCount={queueCount}
         />
       )}
 
       {settingsPage !== null && (
-        <PetSettingsPanel page={settingsPage} onPage={setSettingsPage} onClose={() => setSettingsPage(null)} quotaPending={quotaPending}>
+        <PetSettingsPanel
+          page={settingsPage}
+          onPage={next => {
+            // 「对话」不是一个设置页：收起面板、回到聊天框。用户点它是想接着说话。
+            if (next === 'chat') { setSettingsPage(null); setPanelOpen(true); return }
+            setSettingsPage(next)
+          }}
+          onClose={() => setSettingsPage(null)}
+          quotaPending={quotaPending}
+        >
           {settingsPage === 'general' ? (
             <div className="management-general">
               <section className="management-section" aria-label="运行时与诊断">
@@ -1373,7 +1763,81 @@ export default function App() {
                 <p className="management-diagnostic">界面构建 <code>{UI_BUILD}</code></p>
                 {companion && <p className="management-diagnostic">运行配置 <code>{companion.profile}</code></p>}
                 <button className="management-button" onClick={() => void mirror.refresh().catch(error => showToast(String(error)))}>重新同步会话</button>
+                {/* 总助理设置不在九项导航里（导航要精确到九项），但从这里必须进得去：
+                    否则改名字与性格的功能就等于被藏起来了。 */}
+                <button className="management-button" onClick={() => setSettingsPage('agent')}>总助理设置（名字与性格）</button>
+                <label className="management-hint" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input type="checkbox" checked={hoverEnabled} onChange={event => {
+                    const next = event.target.checked
+                    setHoverEnabled(next)
+                    hoverState.current = initialHover(next)
+                    setHoverBar(null)
+                    if (hoverTimer.current !== undefined) clearTimeout(hoverTimer.current)
+                    hoverTimer.current = undefined
+                    try { localStorage.setItem('dsh-pet.hoverToolbar', next ? '1' : '0') } catch { /* 存不了就只在本次会话生效 */ }
+                  }} />
+                  悬停宠物时显示快捷工具栏
+                </label>
               </section>
+              <section className="management-section" aria-label="外观">
+                <h3>外观</h3>
+                {/* 两档都是三选一：不做滑杆 —— 连续值会造出"点不中自己"的尺寸和"看不见自己"的透明度。 */}
+                {([
+                  { key: 'scale' as const, label: '大小', values: PET_SCALES, current: petScale, text: (value: number) => `${Math.round(value * 100)}%` },
+                  { key: 'opacity' as const, label: '透明度', values: PET_OPACITIES, current: petOpacity, text: (value: number) => `${Math.round(value * 100)}%` },
+                ]).map(group => (
+                  <div key={group.key} className="management-voice" role="radiogroup" aria-label={group.label}>
+                    <span>{group.label}</span>
+                    {group.values.map(value => (
+                      <label key={value} style={{ display: 'inline-flex', flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <input
+                          type="radio"
+                          name={`pet-${group.key}`}
+                          checked={group.current === value}
+                          onChange={() => {
+                            // 先回显再落盘：点一下要立刻看到效果；失败回滚并说明。
+                            if (group.key === 'scale') {
+                              const previous = petScale
+                              const next = normalizePetScale(value)
+                              setPetScale(next)
+                              void window.petApi.saveSettings({ petScale: next })
+                                .then(result => { if (!result.ok) { setPetScale(previous); showToast('大小未保存') } })
+                                .catch(() => { setPetScale(previous); showToast('大小未保存') })
+                              return
+                            }
+                            const previous = petOpacity
+                            const next = normalizePetOpacity(value)
+                            setPetOpacity(next)
+                            void window.petApi.saveSettings({ petOpacity: next })
+                              .then(result => { if (!result.ok) { setPetOpacity(previous); showToast('透明度未保存') } })
+                              .catch(() => { setPetOpacity(previous); showToast('透明度未保存') })
+                          }}
+                        />
+                        <span>{group.key === 'opacity' && value === 1 ? '不透明' : group.text(value)}</span>
+                      </label>
+                    ))}
+                  </div>
+                ))}
+                <label className="management-voice">
+                  <input type="checkbox" checked={petDock} onChange={event => {
+                    // 关掉时如果正收在边上，顺手展开 —— 否则"关掉了却还是一个小圆"会让人以为没生效。
+                    const next = event.target.checked
+                    const previous = petDock
+                    setPetDock(next)
+                    if (!next && docked !== null) {
+                      setDocked(null)
+                      void window.petApi.saveSettings({ dockedAt: null })
+                    }
+                    void window.petApi.saveSettings({ petDock: next })
+                      .then(result => { if (!result.ok) { setPetDock(previous); showToast('停靠设置未保存') } })
+                      .catch(() => { setPetDock(previous); showToast('停靠设置未保存') })
+                  }} />
+                  <span>拖到屏幕边缘时收起</span>
+                </label>
+                <p className="management-hint">透明度只作用于角色本身，气泡与快捷工具栏保持清晰。</p>
+                <p className="management-hint">收起后仍会用一个小圆点显示录音、待处理与出错状态；单击展开。</p>
+              </section>
+
               <section className="management-section" aria-label="睡眠与唤醒">
                 <h3>睡眠与唤醒</h3>
                 {(['idleSleepMinutes', 'sleepMinutes'] as const).map(key => (
@@ -1450,6 +1914,7 @@ export default function App() {
                 }}
                 showToast={showToast}
               />
+              <FastReplySettings showToast={showToast} />
               <section className="management-section" aria-label="会议与文档审批">
                 <h3>会议与文档审批</h3>
                 <label className="management-voice">
@@ -1527,7 +1992,43 @@ export default function App() {
             </>
           ) : settingsPage === 'meeting' ? (
             <MeetingPanel />
-          ) : settingsPage === 'wecom' || settingsPage === 'reminders' ? (
+          ) : settingsPage === 'todo' ? (
+            <>
+              <SettingsEntryCard
+                title="待办提醒"
+                description="任务清单、催办间隔和到点提醒都在待办窗口里；这里先放打开它的入口。"
+                action="打开待办窗口"
+                onAction={() => void window.petApi.openCompanionTasks()
+                  .then(result => { if (!result.ok) showToast('待办窗口未能打开') })
+                  .catch(() => showToast('待办窗口未能打开'))}
+              />
+              {/* 催办间隔仍然留在这一页：它是"要看的东西"的一部分，挪走就等于藏起来。 */}
+              <AssistantSettings key="reminders" section="reminders" />
+            </>
+          ) : settingsPage === 'mail' ? (
+            <SettingsEntryCard
+              title="邮件"
+              description="审批时的发信与邮箱配置；完整收发页还在建设中。"
+              action="打开企业微信设置"
+              onAction={() => setSettingsPage('wecom')}
+            />
+          ) : settingsPage === 'report' ? (
+            <SettingsEntryCard
+              title="日报周报"
+              description="把今天做过的事整理成日报、导出成文件；工作台在独立窗口里。"
+              action="打开日报工作台"
+              onAction={() => void window.petApi.openReportWorkbench()
+                .then(result => { if (!result.ok) showToast('日报工作台未能打开') })
+                .catch(() => showToast('日报工作台未能打开'))}
+              secondary={{
+                label: '打开日报文件夹',
+                // 右键菜单里那项将来要撤掉，这里必须能顶上，否则用户找不到导出的文件。
+                onAction: () => void window.petApi.openReportDir()
+                  .then(result => { if (!result.ok) showToast('日报文件夹未能打开') })
+                  .catch(() => showToast('日报文件夹未能打开')),
+              }}
+            />
+          ) : settingsPage === 'wecom' || settingsPage === 'reminders' || settingsPage === 'agent' ? (
             <AssistantSettings key={settingsPage} section={settingsPage} />
           ) : (
             <>
@@ -1554,18 +2055,100 @@ export default function App() {
                 onAddRoot={() => void docAddRoot()}
                 onRemoveRoot={dir => void docRemoveRoot(dir)}
                 onForgetDir={dir => void docForgetDir(dir)}
+                docSpeechMode={docSpeechMode}
+                onDocSpeechModeChange={async mode => {
+                  // 先回显再落盘：设置页点一下要立刻看到选中，失败再回滚并说明。
+                  const previous = docSpeechMode
+                  setDocSpeechMode(mode)
+                  try {
+                    const result = await window.petApi.saveSettings({ docSpeechMode: mode })
+                    if (!result.ok) { setDocSpeechMode(previous); showToast('讲解模式未保存') }
+                  } catch { setDocSpeechMode(previous); showToast('讲解模式未保存') }
+                }}
               />
             </>
           )}
         </PetSettingsPanel>
       )}
 
+      {hoverEnabled && hoverBar !== null && (() => {
+        const bar = hoverBar
+        // 头顶居中：横向取角色矩形的**中心**（不是左上角），纵向底边贴头顶 8px。
+        // 8px 是刻意留的缝：太大鼠标跨不过去，太小会盖住角色。
+        const below = bar.top < 64
+        const left = Math.max(8, Math.round(bar.left + bar.width / 2))
+        const top = below ? Math.round(bar.bottom + 8) : Math.round(bar.top - 8)
+        return (
+          <div
+            className={`hover-bar${below ? ' hover-bar-below' : ''}`}
+            role="toolbar"
+            aria-label="快捷操作"
+            data-interactive
+            style={{ left, top }}
+            onMouseEnter={() => feedHover('enter-bar')}
+            onMouseLeave={() => feedHover('leave-bar')}
+            // 工具栏区域不吃拖动：否则点按钮会被判成拖宠物。
+            onPointerDown={event => event.stopPropagation()}
+          >
+            {hoverActions(false).map(action => (
+              <button key={action.id} type="button" className="hover-bar-btn" aria-label={action.ariaLabel}
+                onClick={() => runHoverAction(action.id)}>{action.label}</button>
+            ))}
+          </div>
+        )
+      })()}
+
+      {/* 收起后的替身：屏幕边上一个 48×48 的小圆。位置由"边 + 原位"算出来，不另存坐标。 */}
+      {docked !== null && (() => {
+        const home = positions[docked.id] ?? { x: 0, y: 0 }
+        const at = dockPosition(
+          docked.edge,
+          { left: home.x, top: home.y, width: PET_WIDTH, height: PET_WIDTH },
+          { left: 0, top: 0, width: innerWidth, height: innerHeight },
+        )
+        const member = cast.find(item => item.assistantId === docked.id)
+        const tone = dockStatusTone({
+          error: Boolean(mirror.error || speech.error),
+          recording: operations?.meeting === 'recording',
+          pendingApproval: quotaPending > 0,
+        })
+        return (
+          <DockedPet
+            left={at.left}
+            top={at.top}
+            tone={tone}
+            // 与舞台同一个形象来源（characters 里那套皮肤）；成员还没到就按默认形象，
+            // 反正停靠态要的是"还是那只宠物"，不是精确到某个自定义皮肤。
+            skin={characters[docked.id]?.skin ?? 'panda'}
+            onRestore={() => {
+              // 恢复：只清停靠标记，位置照旧来自 positions —— 于是回到用户拖出来之前那一格。
+              setDocked(null)
+              void window.petApi.saveSettings({ dockedAt: null })
+            }}
+            onContextMenu={event => {
+              event.preventDefault()
+              if (member !== undefined) {
+                // 皮肤用本机挑过的那个；没挑过就按默认形象给菜单（菜单只靠它定选中态）。
+                window.petApi.contextMenu({
+                  assistantId: member.assistantId,
+                  displayName: member.displayName || member.assistantId,
+                  skin: characters[member.assistantId]?.skin ?? 'panda',
+                })
+              }
+            }}
+          />
+        )
+      })()}
+
       <TeamStage
         members={cast}
         idleSleepMinutes={sleepSettings.idleSleepMinutes}
         sleepMinutes={sleepSettings.sleepMinutes}
-        // 共享协议没有个人助理模式字段，不从回答措辞猜测模式开关。
-        assistantActive={false}
+        petScale={petScale}
+        petOpacity={petOpacity}
+        dockedId={docked?.id ?? null}
+        // 共享协议没有个人助理模式字段，不从回答措辞猜测模式开关；这里的"活跃"只是会话级闩锁。
+        assistantActive={presence.active}
         statusByAssistant={stageStatuses}
         positions={positions}
         key={assetEpoch}

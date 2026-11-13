@@ -79,6 +79,12 @@ function App() {
   const [loading, setLoading] = useState(true)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
+  /** 过渡期间承接"上一页"的位图，滚动结束后移除；任何异常路径都会被立刻收起。 */
+  const outgoingRef = useRef<HTMLDivElement | null>(null)
+  const outgoingCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const sheetRef = useRef<HTMLDivElement | null>(null)
+  /** 进行中的翻页过渡；`finish` 可以被打断（连续推进时先收掉上一次）。 */
+  const transition = useRef<{ height: number; end: () => void } | null>(null)
   const pdfRef = useRef<PDFDocumentProxy | null>(null)
   const descriptorRef = useRef<DocViewDescriptor | null>(null)
   /** 每次渲染请求的序号：后来的请求作废先前未完成的，避免页面闪回旧页。 */
@@ -96,7 +102,86 @@ function App() {
     setFailure(problem)
   }, [])
 
+  /**
+   * 收掉翻页过渡：把接住旧画面的那一层藏起来，并把滚动位置补回去。
+   *
+   * 补偿是必须的：旧页在 DOM 里占着高度，移除后它下面那一页会整体上移；把 `scrollTop`
+   * 减去同样的高度，视觉上新页停在原处，用户看不到跳动。
+   * 幂等：没有进行中的过渡时什么都不做，所以连续推进可以先无条件调它。
+   */
+  const finishTransition = useCallback((): void => {
+    const current = transition.current
+    if (current === null) return
+    // 收尾（摘听、隐藏旧页、补偿滚动）都在 `end` 里；它自带 `done` 闸，重复调用无副作用。
+    // 这里**不能**再补偿一次 —— 补两次会把页面往上顶掉整整一页。
+    current.end()
+  }, [])
+
+  /**
+   * 开始一次翻页过渡：先把**当前画布**拷进旧页层，主画布随即被新页覆盖。
+   *
+   * 为什么用位图拷贝而不是再渲染一遍旧页：逐页许可是按页向主进程申请的，为了动画多取一次
+   * 许可就把安全时序搅进来了 —— 拷贝只是像素搬运，不碰许可、不碰 `renderSeq`。
+   * 返回 null 表示这次不做动画（离屏、尺寸为 0、不支持平滑滚动），调用方直接瞬切。
+   */
+  const beginTransition = useCallback((): { height: number } | null => {
+    const stage = stageRef.current
+    const canvas = canvasRef.current
+    const outgoing = outgoingRef.current
+    const copy = outgoingCanvasRef.current
+    if (stage === null || canvas === null || outgoing === null || copy === null) return null
+    const height = canvas.offsetHeight
+    if (height <= 0 || typeof stage.scrollTo !== 'function') return null
+    const context = copy.getContext('2d')
+    if (context === null) return null
+    try {
+      copy.width = canvas.width
+      copy.height = canvas.height
+      copy.style.width = canvas.style.width
+      copy.style.height = canvas.style.height
+      context.clearRect(0, 0, copy.width, copy.height)
+      context.drawImage(canvas, 0, 0)
+      outgoing.style.display = 'block'
+      outgoing.removeAttribute('aria-hidden')
+      return { height }
+    } catch {
+      // 任何一步失败都退化成瞬切：不留"两页同时存在"的中间态。
+      outgoing.style.display = 'none'
+      return null
+    }
+  }, [])
+
+  /** 新页已经画好：平滑滚到它，滚完再收掉旧页。`scrollend` 不触发时用 520ms 兜底。 */
+  const scrollToNewPage = useCallback((height: number): void => {
+    const stage = stageRef.current
+    const sheet = sheetRef.current
+    if (stage === null || sheet === null) { finishTransition(); return }
+    const offset = sheet.getBoundingClientRect().top - stage.getBoundingClientRect().top + stage.scrollTop
+    let done = false
+    const end = (): void => {
+      if (done) return
+      done = true
+      stage.removeEventListener('scrollend', end)
+      window.clearTimeout(timer)
+      // 由 `finishTransition` 负责收尾；这里只摘听，避免重复补偿。
+      transition.current = null
+      const outgoing = outgoingRef.current
+      if (outgoing !== null) {
+        outgoing.style.display = 'none'
+        outgoing.setAttribute('aria-hidden', 'true')
+      }
+      stage.scrollTop = Math.max(0, stage.scrollTop - height)
+    }
+    const timer = window.setTimeout(end, 520)
+    stage.addEventListener('scrollend', end, { once: true })
+    transition.current = { height, end }
+    try { stage.scrollTo({ top: Math.max(0, offset), behavior: 'smooth' }) }
+    catch { end() }
+  }, [finishTransition])
+
   const showPage = useCallback(async (page: number, target: { anchor: DocAnchor; highlight: boolean } | null) => {
+    // 连续推进：先把上一次过渡收干净（它会补偿滚动位置），再开始这一次。
+    finishTransition()
     const seq = ++renderSeq.current
     const desc = descriptorRef.current
     const pdf = pdfRef.current
@@ -106,6 +191,8 @@ function App() {
     if (seq !== renderSeq.current) return
     if (!grant.ok) { drop(grant.problem); return }
     const pdfPage = await pdf.getPage(page)
+    // 旧画面在这里被拷走：主画布马上要被新页覆盖，而用户还没看到滚动的过程。
+    const outgoing = beginTransition()
     try {
       const stage = stageRef.current
       const canvas = canvasRef.current
@@ -152,11 +239,24 @@ function App() {
           if (rects.length > 0) highlight = 'text'
         }
       }
+      const pageChanged = shown?.page !== page
       setShown({ page, numPages: pdf.numPages, textMatch, highlight, rects, anchor })
       setPageInput(String(page))
       setFailure(null)
       api.report(desc.token, { kind: 'rendered', page, numPages: pdf.numPages, textMatch })
+
+      if (outgoing !== null) {
+        // 翻页：平滑滚到新页，滚完再收旧页（观感是"往下滑一页"，不是瞬切）。
+        scrollToNewPage(outgoing.height)
+      } else if (!pageChanged && rects.length > 0 && stage !== null) {
+        // 同一页内的下一段：文字层已经给出这一段的矩形，按它在页内的位置滚过去。
+        // 没有矩形（扫描件 / 文字层对不上）就什么都不做 —— 宁可不动，也不要按猜测的位置跳。
+        const top = stage.scrollTop + rects[0].top - 48
+        try { stage.scrollTo({ top: Math.max(0, top), behavior: 'smooth' }) } catch { /* 保持原位 */ }
+      }
     } catch (error) {
+      // 出错的这一帧绝不能留下"旧页还在上面"的中间态：立刻收掉，退回当前页。
+      finishTransition()
       if (seq !== renderSeq.current) return
       const message = error instanceof Error ? error.message : String(error)
       api.report(desc.token, { kind: 'error', message: `第 ${page} 页渲染失败：${message}` })
@@ -164,7 +264,7 @@ function App() {
     } finally {
       pdfPage.cleanup()
     }
-  }, [drop])
+  }, [beginTransition, drop, finishTransition, scrollToNewPage, shown?.page])
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current
@@ -291,7 +391,13 @@ function App() {
       {loading && !failure && <div className="dv-loading">正在加载…</div>}
 
       <div className="dv-stage" ref={stageRef}>
+        {/* 两页上下排：上面那层只在翻页过渡的几百毫秒里存在，装的是上一页的位图。 */}
+        <div className="dv-pages">
+          <div className="dv-sheet dv-sheet-outgoing" ref={outgoingRef} aria-hidden="true" style={{ display: 'none' }}>
+            <canvas ref={outgoingCanvasRef} />
+          </div>
         <div
+          ref={sheetRef}
           className={`dv-sheet${shown?.highlight === 'page' ? ' dv-sheet-current' : ''}`}
           data-testid="sheet"
           data-rendered-page={shown?.page ?? ''}
@@ -307,6 +413,7 @@ function App() {
               style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
             />
           ))}
+        </div>
         </div>
       </div>
     </div>

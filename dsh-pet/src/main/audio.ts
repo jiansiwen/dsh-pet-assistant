@@ -136,15 +136,21 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
       const focus = { ...state, focus: event.on }
       if (event.on) {
         // 正在听写的不掐断：这一次收音是用户自己刚按下去的，会议开始了也不该丢他半句话。
-        if (state.holder === 'wake') return done({ ...focus, holder: null }, ['stop-wake'])
+        const effects: AudioEffect[] = []
+        let holder = state.holder
+        // 会议期间唤醒也在听（共享采集/独立进程），专注时同样要停。
+        if ((holder === 'wake' || holder === 'meeting') && canStartWake(state)) effects.push('stop-wake')
+        if (holder === 'wake') holder = null
         // 会议里的插话监听是给评委提问用的，不因专注停掉；其余场景旁人说话不能打断播报。
-        if (state.holder === 'barge-in' && !state.bargeHandover && !state.meetingActive) {
-          return done({ ...focus, holder: null }, ['stop-barge-in'])
-        }
-        return done(focus)
+        if (holder === 'barge-in' && !state.bargeHandover && !state.meetingActive) { effects.push('stop-barge-in'); holder = null }
+        return done({ ...focus, holder }, effects)
       }
-      if (focus.holder === null && !focus.meetingActive && canStartWake(focus)) {
+      if (canStartWake(focus) && focus.holder === null && !focus.meetingActive) {
         return done({ ...focus, holder: 'wake' }, ['start-wake'])
+      }
+      // 会议期间专注解除：仅当唤醒此前确实被停掉（专注/不可用）才恢复，避免重复拉起。
+      if (focus.holder === 'meeting' && !canStartWake(state) && canStartWake(focus)) {
+        return done(focus, ['start-wake'])
       }
       return done(focus)
     }
@@ -156,11 +162,11 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
         return done(state, [], '正在听你说，这一次听完再按')
       }
       if (state.holder === 'meeting') {
-        // 会议期间只放插话交接的听写：那正是要听评审/评委说什么。
-        // 手动按键听写仍拒绝，免得把参会者的话喂给命令识别器。
-        if (event.source !== 'barge-in') return done(state, [], '正在录制会议，结束会议后再用听写')
-        return done({ ...state, holder: 'dictation', bargeHandover: false, bargeInMeeting: false },
-          state.bargeInMeeting ? ['stop-barge-in'] : [])
+        // 会议期间也允许本人按键听写：共享采集支持多消费者，会议轨不受影响。
+        // 听写是用户自己按的，不存在把参会者的话当指令；唤醒先让路保证这一句干净。
+        const effects: AudioEffect[] = canStartWake(state) ? ['stop-wake'] : []
+        if (state.bargeInMeeting) effects.push('stop-barge-in')
+        return done({ ...state, holder: 'dictation', bargeHandover: false, bargeInMeeting: false }, effects)
       }
       // 插话监听让路给听写：共享采集的设备不关，预滚动音频由渲染层交给听写。
       const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake']
@@ -172,8 +178,10 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
       // 超时和正常结束可能各触发一次收尾，第二次必须什么都不做 —— 否则会把刚拉起来的
       // 唤醒监听又停掉，用户下一次喊"小潘同学"没人应。
       if (state.holder !== 'dictation') return done(state)
-      // 会议还在录：设备交回会议，不启唤醒（参会者的话不是指令）。
-      if (state.meetingActive) return done({ ...state, holder: 'meeting', bargeHandover: false })
+      // 会议还在录：设备交回会议；唤醒若可用就恢复监听（录音不打断正常唤醒）。
+      if (state.meetingActive) {
+        return done({ ...state, holder: 'meeting', bargeHandover: false }, canStartWake(state) ? ['start-wake'] : [])
+      }
       return release(state)
     }
 
@@ -183,9 +191,10 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
         // 听写最多二十秒就收尾，等它说完再开会议，不掐断用户已经说出口的话。
         return done(state, [], '正在听写，这一句收完再开会议')
       }
-      // 专注模式不拦显式会议；唤醒在听就先停掉——会议期间参会者的话不是指令。
-      const effects: AudioEffect[] = state.holder === 'wake' ? ['stop-wake']
-        : state.holder === 'barge-in' ? ['stop-barge-in'] : []
+      // 专注模式不拦显式会议。录音不打断正常唤醒：共享采集/独立唤醒进程可与会议轨并存。
+      // 唤醒原本在听就保持；原本没听（如插话占着）且可用则拉起。
+      const effects: AudioEffect[] = state.holder === 'barge-in' ? ['stop-barge-in'] : []
+      if (canStartWake(state) && state.holder !== 'wake') effects.push('start-wake')
       return done({ ...state, holder: 'meeting', meetingActive: true, bargeHandover: false, bargeInMeeting: false }, effects)
     }
 
@@ -193,22 +202,31 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
       // 与听写收尾同理：重复收尾必须幂等，否则会把唤醒监听错误地停掉。
       const next: AudioState = { ...state, meetingActive: false, bargeInMeeting: false, bargeHandover: false }
       if (state.holder !== 'meeting') return done(next)
-      return release(next, state.bargeInMeeting ? ['stop-barge-in'] : [])
+      // 会议期间唤醒若可用是一直在听的（没停过），收尾只需把 holder 记回 wake，不重复拉起。
+      return done({ ...next, holder: canStartWake(next) ? 'wake' : null }, state.bargeInMeeting ? ['stop-barge-in'] : [])
     }
 
     case 'wake-lost': {
       // 标志粘住，等用户自己重试。
       const lost = { ...state, wakeUnavailable: true }
-      if (state.holder !== 'wake') return done(lost)
-      // 进程是自己没的，但仍然要真的停一次：wake.ts 在意外退出时排了一个三秒后的自动重启，
-      // 不调用停止就不会清掉那个定时器，它会把仲裁器刚决定放弃的监听又拉起来。
-      return done({ ...lost, holder: null }, ['stop-wake'])
+      if (state.holder === 'wake') {
+        // 进程是自己没的，但仍然要真的停一次：wake.ts 在意外退出时排了一个三秒后的自动重启，
+        // 不调用停止就不会清掉那个定时器，它会把仲裁器刚决定放弃的监听又拉起来。
+        return done({ ...lost, holder: null }, ['stop-wake'])
+      }
+      // 会议期间唤醒也在听；它挂了同样要清掉自动重启定时器（听写占用时唤醒本就停着，不重复停）。
+      if (state.meetingActive && state.holder === 'meeting' && canStartWake(state)) return done(lost, ['stop-wake'])
+      return done(lost)
     }
 
     case 'wake-retry': {
       const retried = { ...state, wakeUnavailable: false }
       if (retried.holder === null && canStartWake(retried)) {
         return done({ ...retried, holder: 'wake' }, ['start-wake'])
+      }
+      // 会议期间唤醒挂掉后重试：恢复监听（录音不剥夺唤醒）。
+      if (state.wakeUnavailable && retried.holder === 'meeting' && canStartWake(retried)) {
+        return done(retried, ['start-wake'])
       }
       return done(retried)
     }
@@ -217,21 +235,25 @@ export function nextAudio(state: AudioState, event: AudioEvent): AudioTransition
       const next = { ...state, wakeEnabled: event.enabled }
       if (!event.enabled) {
         // 关掉就立刻不再监听 —— "关唤醒后不再监听"是验收项，不等下一次空闲。
-        if (state.holder === 'wake') return done({ ...next, holder: null }, ['stop-wake'])
+        if (state.holder === 'wake' || (state.holder === 'meeting' && canStartWake(state))) {
+          return done({ ...next, holder: state.holder === 'wake' ? null : state.holder }, ['stop-wake'])
+        }
         return done(next)
       }
       if (next.holder === null && canStartWake(next)) return done({ ...next, holder: 'wake' }, ['start-wake'])
+      if (next.holder === 'meeting' && !canStartWake(state) && canStartWake(next)) return done(next, ['start-wake'])
       return done(next)
     }
 
     case 'wake-engine-changed': {
       // 换引擎是用户的明确动作，视同重试：旧引擎的失败不该粘在新引擎上。
       const next = { ...state, wakeUnavailable: false }
-      if (state.holder === 'wake') {
-        if (canStartWake(next)) return done(next, ['stop-wake', 'start-wake'])
-        return done({ ...next, holder: null }, ['stop-wake'])
+      const wasRunning = canStartWake(state) && (state.holder === 'wake' || state.holder === 'meeting')
+      if (canStartWake(next) && (next.holder === null || next.holder === 'wake' || next.holder === 'meeting')) {
+        return done({ ...next, holder: next.holder === null ? 'wake' : next.holder },
+          wasRunning ? ['stop-wake', 'start-wake'] : ['start-wake'])
       }
-      if (next.holder === null && canStartWake(next)) return done({ ...next, holder: 'wake' }, ['start-wake'])
+      if (wasRunning) return done({ ...next, holder: next.holder === 'wake' ? null : next.holder }, ['stop-wake'])
       return done(next)
     }
 

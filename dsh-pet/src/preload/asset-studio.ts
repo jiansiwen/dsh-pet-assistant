@@ -15,6 +15,7 @@ const invoke = (channel: string, input?: unknown): Promise<Result> => ipcRendere
 
 const api = {
   state: () => invoke('asset-studio-state'),
+  assist: (request: string) => invoke('asset-studio-assist', { request }),
   saveProviders: (config: unknown, secrets?: Record<string, string>) => invoke('asset-studio-save-providers', { config, secrets }),
   testProvider: (kind: string, id: string) => invoke('asset-studio-test-provider', { kind, id }),
   startJob: (input: unknown) => invoke('asset-studio-start-job', input),

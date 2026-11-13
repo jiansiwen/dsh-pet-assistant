@@ -11,7 +11,11 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { OFFICE_EXTENSIONS, OUTLINE_EXTENSIONS } from '../main/doc-formats.js'
-import { formatDate, formatSize, progressLabel, sectionLabel, shortenDir } from './doc-panel.js'
+import {
+  DOC_SPEECH_CODE_HINT, DOC_SPEECH_SWITCH_HINT, docSpeechModeOf, docSpeechOptions,
+  formatDate, formatSize, presenterLabel, progressLabel, sectionLabel, shortenDir,
+  type DocSpeechMode,
+} from './doc-panel.js'
 import type { DocRoots, DocState } from './types.js'
 import './doc.css'
 
@@ -35,6 +39,9 @@ interface DocPanelProps {
   readonly onAddRoot: () => void
   readonly onRemoveRoot: (path: string) => void
   readonly onForgetDir: (path: string) => void
+  /** 讲解形态：`source` 照原文念稿（默认），`ai` 每段让模型生成解释。 */
+  readonly docSpeechMode?: DocSpeechMode
+  readonly onDocSpeechModeChange: (mode: DocSpeechMode) => void
 }
 
 export default function DocPanel({
@@ -51,6 +58,8 @@ export default function DocPanel({
   onAddRoot,
   onRemoveRoot,
   onForgetDir,
+  docSpeechMode,
+  onDocSpeechModeChange,
 }: DocPanelProps) {
   const outline = state.kind === 'outline' ? state : null
   const [selected, setSelected] = useState(0)
@@ -127,6 +136,9 @@ export default function DocPanel({
           <p className="doc-hint" role="status">
             {progressLabel(outline.next, outline.total, outline.estMinutes)}
           </p>
+          {presenterLabel(outline.assistantName) !== '' && (
+            <p className="doc-hint" role="status">{presenterLabel(outline.assistantName)}</p>
+          )}
 
           {/*
             提纲是目录，不是正文：一行只有标题和状态，正文在对话页里。
@@ -257,6 +269,23 @@ export default function DocPanel({
             添加目录…
           </button>
         </div>
+      </section>
+
+      <section className="doc-section" aria-label="讲解模式">
+        <h3 className="doc-section-title">讲解模式</h3>
+        {/*
+          放在"允许目录"之后、"讲得了什么"之前：它回答的是"怎么讲"，不是"讲什么"。
+          切换只写设置，不调用任何讲解控制命令 —— 正在播的那一段不该因为改个偏好被打断。
+        */}
+        {docSpeechOptions().map(option => (
+          <label className="doc-hint" key={option.value}>
+            <input type="radio" name="doc-speech-mode" checked={docSpeechModeOf(docSpeechMode) === option.value}
+              disabled={busy} onChange={() => onDocSpeechModeChange(option.value)} />
+            {' '}<strong>{option.label}</strong>：{option.detail}
+          </label>
+        ))}
+        <p className="doc-hint">{DOC_SPEECH_SWITCH_HINT}</p>
+        <p className="doc-hint">{DOC_SPEECH_CODE_HINT}</p>
       </section>
 
       <section className="doc-section">

@@ -46,3 +46,13 @@ body {
 .dv-sheet-current { outline: 3px solid rgba(37, 99, 235, 0.55); outline-offset: 2px; }
 /* 文字层片段高亮：画在整个文字项上，而不是按字切，避免暗示逐字精度。 */
 .dv-mark { position: absolute; background: rgba(250, 204, 21, 0.38); border-radius: 2px; pointer-events: none; mix-blend-mode: multiply; }
+
+/*
+ * 翻页过渡的两页容器。
+ *
+ * 平时只有一页；翻页的那几百毫秒里上面多出一层"上一页"的位图，滚动结束后立刻撤掉。
+ * 纵向排列而不是绝对定位：绝对定位需要手工算高度，而两页高度未必相同（不同纸张尺寸），
+ * 算错就会在收尾时跳一下。用文档流排，移除上面那层时只需补偿相等的 scrollTop。
+ */
+.dv-pages { display: flex; flex-direction: column; align-items: center; }
+.dv-sheet-outgoing { pointer-events: none; }

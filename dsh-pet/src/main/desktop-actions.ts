@@ -111,6 +111,14 @@ export type SemanticProfile = 'wps-pdf'
 export interface PagePosition {
   page: number
   total: number
+  /**
+   * 跳页后读回的文字（只有 WPS 的键盘绝对跳页会给）。
+   *
+   * 注意它的**口径**：这是 Ctrl+A / Ctrl+C 抓下来的选区文本，在 WPS 12.x 里是**整份文档**，
+   * 不是"当前页"。所以它只能用来做"这份文档里有没有这段原文"的判断，不能用来断言页码。
+   * 页码本身由 Ctrl+G 的绝对跳转保证（应用自己的页码导航）。
+   */
+  pageText?: string
 }
 
 export interface ScrollRequest {

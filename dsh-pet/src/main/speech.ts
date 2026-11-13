@@ -31,6 +31,11 @@ export interface SpeechRequest {
    * 「#0」，续讲按序号定位时落在哪一句就说不准了。单次请求（文档整段、整条回复）不用传。
    */
   readonly indexBase?: number
+  /**
+   * 临时话语（快速应答旁路）：照常播出，但不算"这一轮对模型说过什么"。
+   * 它不进 DSH 会话，打断后的上下文说明里也不能出现，否则等于间接进了会话。
+   */
+  readonly ephemeral?: boolean
 }
 
 /** 切好的一句，是播放与打断的最小单位。 */
@@ -39,6 +44,7 @@ export interface Segment {
   readonly index: number
   readonly text: string
   readonly origin?: SpeechOrigin
+  readonly ephemeral?: boolean
 }
 
 /** 一句的播出结果。complete=false 表示播到一半被打断。 */
@@ -69,13 +75,85 @@ const SOFT_CUT_POINTS = new Set(['，', '、', ',', ' ', ':', '：'])
 const WORTH_SPEAKING = /[\p{L}\p{N}]/u
 
 /**
+ * 讲解三段标签：`【原文】` / `【解释】` / `【补充】`，以及带后缀的变体（`【原文·第 3 页】`、
+ * `【解释：这里说的是…】`）。
+ *
+ * `document.ts` 的 `explainPrompt` 要求模型分三段并各自标明，但模型经常连整块方括号一起吐
+ * 出来。送进合成器就念成"方括号原文方括号"，听起来就是一台朗读器。
+ *
+ * **只删这三个词开头的方括号块，不无差别删所有 `【…】`**：`【会议结论】`、`【工作事项】`
+ * 这类标签在耳朵里是有信息量的分隔，删掉会让后面那句话失去主语；而讲解三段标签的作用只是
+ * 给屏幕排版，念出来纯属噪音。这是**白名单**——将来加新的讲解标签得往这里加，
+ * 别图省事改成 `【[^】]*】`。
+ *
+ * 屏幕为什么不清洗：结构标签在屏幕上正是导航（用户一眼看出哪句是原文、哪句是补充），
+ * 只有声音这一路需要口语化。所以清洗只发生在 `splitIntoSegments` 里，原文原样留在界面上。
+ */
+const EXPLAIN_LABEL = /【(?:原文|解释|补充)[^】]*】/gu
+
+/**
+ * 行首 / 句首的圆点与短横列表符号。
+ *
+ * `*` 后面必须跟空白才算列表，否则 `*斜体*` 会被吃掉星号、只剩半截记号；
+ * `+` 不收 —— 正文里的加号（`A + B`）比列表更常见。
+ */
+const BULLET_MARK = /(?:^|(?<=[。！？；!?;\n]))[ \t]*[-*•][ \t]+/gmu
+
+/**
+ * 有序列表序号：`1. `、`1) `、`1、`。
+ *
+ * **点号后面必须有空白**，这是 `3.5 版本` 不被误伤的唯一依据：小数点的后面是数字，
+ * 不是空格。用行首/句首锚点再加一层保险，避免把正文里的 "版本 1. 2" 之类当成列表。
+ */
+const ORDERED_MARK = /(?:^|(?<=[。！？；!?;\n]))[ \t]*(?:\d+[.)][ \t]+|\d+、[ \t]*)/gmu
+
+/** 引用符号只在行首成立：正文中间的 `>` 多半是箭头（`->`），不该吃。 */
+const QUOTE_MARK = /^[ \t]*>[ \t]?/gmu
+
+/** Markdown 标题号。只在行首；正文中间的 `#` 是井号或标签。 */
+const HEADING_MARK = /^[ \t]*#{1,6}[ \t]*/gmu
+
+/** 成对的粗体 / 斜体记号：只去记号，里面的字要留下。 */
+const EMPHASIS_MARK = /\*\*|__/gu
+
+/**
+ * 朗读前的文本清洗：去掉机器编号、讲解用的结构标签与列表符号。
+ *
+ * 两条原则：
+ * - **只清洗声音这一路**。屏幕上保留原文（编号、标签、列表都是有用的结构），
+ *   `splitIntoSegments` 在切句前调用本函数，界面从不经过这里。
+ * - **只删能确定是"排版给眼睛看的"东西**。删不准的（所有方括号、正文里的星号与大于号）
+ *   一律留着 —— 多念一个符号只是难听，少念一个字是信息丢失。
+ *
+ * 清洗后只剩空白时不做特殊处理：`splitIntoSegments` 的 `WORTH_SPEAKING` 会把这样的片段丢掉，
+ * 在这里再造一套判断只会多一处会漂移的规则。
+ */
+export function cleanForSpeech(raw: string): string {
+  return raw
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu, '')
+    .replace(/\b[0-9a-f]{32}\b/giu, '')
+    .replace(/([：:])\s*([，,、。])/gu, '$2')
+    .replace(/\s+([，,、。！？!?；;…])/gu, '$1')
+    // 结构性的东西先摘掉，再统一收拢留下的空格（顺序不能反：先收空格的话，
+    // 标签被删掉后原地会留下两个空格，而那时已经没有收拢规则兜着了）。
+    .replace(EXPLAIN_LABEL, '')
+    .replace(BULLET_MARK, '')
+    .replace(ORDERED_MARK, '')
+    .replace(QUOTE_MARK, '')
+    .replace(HEADING_MARK, '')
+    .replace(EMPHASIS_MARK, '')
+    .replace(/[ \t]{2,}/gu, ' ')
+    .trim()
+}
+
+/**
  * 把一次讲话请求切成正好由合成器一口吃掉的那些句子。
  *
  * 标点留在句尾（合成器要靠它决定停顿），空白段直接丢掉，序号从 0 递增 ——
  * 序号是"播放位置"的一部分，续讲要靠它接着往下走。
  */
 export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
-  const { sentences, rest } = drainSentences(request.text)
+  const { sentences, rest } = drainSentences(cleanForSpeech(request.text))
   const pieces = rest.length > 0 ? [...sentences, rest] : sentences
 
   const base = request.indexBase ?? 0
@@ -88,6 +166,7 @@ export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
       index: base + segments.length,
       text: trimmed,
       ...(request.origin ? { origin: request.origin } : {}),
+      ...(request.ephemeral ? { ephemeral: true } : {}),
     })
   }
   return segments

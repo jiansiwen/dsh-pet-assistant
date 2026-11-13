@@ -77,6 +77,7 @@ export class Narrator {
   private readonly hooks: NarratorHooks
   private readonly ttsApi: () => ResolvedVoiceApi | null
   private readonly cache: TtsCache | null
+  private readonly fixedVoiceKey: () => string | null
   /** 本次派发用的音色指纹（缓存键的一半）；由 cachedAudio 顺带记下。 */
   private cachedVoiceKey: string | null = null
   private state: SpeechState = INITIAL_SPEECH_STATE
@@ -100,12 +101,21 @@ export class Narrator {
   constructor(open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport, hooks: NarratorHooks = {}, options: {
     /** 当前选中的自定义 TTS 服务；null 走默认合成。派发时才取，用户中途换服务不用重启播放器。 */
     ttsApi?: () => ResolvedVoiceApi | null
-    /** 固定话术的音频缓存；null = 不缓存（默认 edge-tts 路径）。 */
+    /** 固定话术的音频缓存；null = 不缓存。 */
     cache?: TtsCache | null
+    /**
+     * 默认合成（没配自定义服务）时，固定话术该用哪个音色键查缓存。
+     *
+     * 缓存是按音色分组的，而默认合成那条路上的音色指纹只有主进程知道（见 index.ts 的
+     * `greetingVoiceKey`）。不注入的话，唤醒应答在默认配置下永远查不到缓存 ——
+     * 每喊一次都要现场联网合成，用户听到的就是"有时候要等一秒才回话"。
+     */
+    fixedVoiceKey?: () => string | null
   } = {}) {
     this.open = open
     this.hooks = hooks
     this.ttsApi = options.ttsApi ?? (() => null)
+    this.fixedVoiceKey = options.fixedVoiceKey ?? (() => null)
     this.cache = options.cache ?? null
   }
 
@@ -219,7 +229,9 @@ export class Narrator {
     const turn = nextSpeech(this.state, event)
     // spoken 只增不减，按旧长度切出来的正好是这次新增的记录。必须在覆盖 this.state 之前算。
     const records = turn.state.spoken.slice(this.state.spoken.length)
-    this.roundSpoken.push(...records)
+    // 临时话语（快速应答）不进本轮播出记录：打断后要告诉模型的只有正式回答，
+    // 旁路内容一旦混进去就等于间接进了会话。
+    for (const record of records) if (!record.segment.ephemeral) this.roundSpoken.push(record)
     this.state = turn.state
     for (const record of records) this.hooks.onSpoken?.(record)
     for (const effect of turn.effects) {
@@ -285,11 +297,20 @@ export class Narrator {
     this.apply({ type: 'dispatched' })
   }
 
-  /** 查固定话术缓存。只在启用缓存且有自定义语音服务时生效（默认 edge-tts 不缓存，它本身很快）。 */
+  /**
+   * 查固定话术缓存。
+   *
+   * 自定义服务用"服务+端点+模型+音色"当键；默认合成用调用方注入的 `fixedVoiceKey`
+   * （主进程知道默认音色是什么）。固定话术之外的文本绝不查缓存：每句回答都不同，
+   * 查了也只是空转，还会让缓存无限长大。
+   */
   private cachedAudio(text: string, api: ResolvedVoiceApi | null): Buffer | null {
-    if (this.cache === null || api === null) return null
+    if (this.cache === null) return null
     if (!FIXED_PHRASES.has(text)) return null
-    const voiceKey = `${api.provider}|${api.endpoint}|${api.model}|${api.voice}`
+    const voiceKey = api === null
+      ? this.fixedVoiceKey()
+      : `${api.provider}|${api.endpoint}|${api.model}|${api.voice}`
+    if (voiceKey === null) return null
     this.cachedVoiceKey = voiceKey
     return this.cache.get({ voiceKey, text })
   }

@@ -793,3 +793,109 @@
 .pet-management ::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/*
+ * 悬停快捷工具栏（3.7.1）。
+ *
+ * 视觉要"轻"：半透明底 + 圆角 + 小阴影，和头顶的说话气泡是一族，不用新颜色体系。
+ * `pointer-events: auto` 是必须的 —— 舞台根节点平时是穿透的，工具栏若继承穿透就点不到。
+ * `pointer-events` 与 `data-interactive` 一起管：后者让主进程把这块区域算进命中盒。
+ */
+.hover-bar {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 12px;
+  background: rgba(40, 44, 60, 0.82);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+  /* 横向居中、纵向底边贴在 top 上：定位只给 left/top，尺寸由内容决定，
+     所以必须靠 transform 自己往回挪半个宽度、一整个高度。 */
+  transform: translate(-50%, -100%);
+}
+/* 上方空间不足时翻到角色脚下：顶边贴在 bottom 上，不再往上挪一整个高度。 */
+.hover-bar-below {
+  transform: translate(-50%, 0);
+}
+.hover-bar-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  padding: 7px 9px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.hover-bar-btn:hover { background: rgba(255, 255, 255, 0.16); }
+.hover-bar-btn:focus-visible { outline: 2px solid #8fd3c7; outline-offset: 1px; }
+
+/*
+ * 停靠态：屏幕边上的 48×48 小圆。
+ *
+ * 视觉上比角色安静得多，但仍要"看得出它在"：一层浅底 + 1px 描边 + 一个状态点。
+ * 呼吸动画只给"录音中"用 —— 与"出错"同为红点，靠动/不动区分，不靠两个相近的红。
+ */
+.docked-pet {
+  position: absolute;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(128, 128, 140, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.docked-pet:hover { background: #fff; }
+/*
+ * 圆形的宠物头像。裁切放在这一层：button 本身不裁，好让右下角的徽标能压到边外一点。
+ * object-fit: contain —— 素材是方图、角色居中偏下，contain 比 cover 更不容易切掉耳朵。
+ */
+.docked-pet-face {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 40%, #ffffff 0%, #f1f2f5 100%);
+}
+.docked-pet-img { display: block; width: 100%; height: 100%; object-fit: contain; }
+/* 拿不到素材时的退路：剪影，不是圆点 —— 圆点会让用户以为宠物丢了（这次报障的本体）。 */
+.docked-pet-silhouette {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 58%;
+  height: 58%;
+  fill: #9aa0ad;
+}
+/* 状态徽标：12px，2px 白边压在右下角，不遮脸。 */
+.docked-pet-dot {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  box-sizing: content-box;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #fff;
+  border-radius: 999px;
+  display: block;
+}
+.docked-pet.is-breathing .docked-pet-dot { animation: docked-breathe 1.8s ease-in-out infinite; }
+@keyframes docked-breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .docked-pet.is-breathing .docked-pet-dot { animation: none; }
+}
