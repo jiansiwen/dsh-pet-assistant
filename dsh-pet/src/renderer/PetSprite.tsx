@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { SkinImages, SkinImageKey, SkinVideos } from './usePetImage.js'
 import { nextFrame, oneShot } from './pet-interaction.js'
+import { customActionsFor, isCustomSkinId } from './custom-skin-registry.js'
 
 export type PetSkin = 'panda' | 'girl-glasses' | 'boy-glasses'
 
@@ -304,6 +305,9 @@ export default function PetSprite({
   const canGrab = Boolean(grabVideo || frames['grab']?.length)
   const grabFallback = dragging && !canGrab
   const effective = dragging && canGrab ? 'grab' : action
+  // 自定义皮肤的自有动作（帧序列/透明 webm）按"播一整轮"处理：不循环、播完触发完成回调，
+  // 避免随机动作被 hold 定时器掐断或无限循环。
+  const isCustomAction = Boolean(effective) && isCustomSkinId(skin) && customActionsFor(skin).includes(effective as string)
   const frameList = effective ? frames[effective] : undefined
   const candidateVideo = effective ? videos[effective] : undefined
   // 缺挣扎素材时优先用静态/帧素材做降级动画；只有视频时也保留可见形象。
@@ -320,9 +324,9 @@ export default function PetSprite({
     return () => window.clearInterval(timer)
   }, [action, animationVersion, dragging, frameList, videoSrc])
   const pose: Pose | null = videoSrc
-    ? { id: `video:${skin}:${effective}:${animationVersion}:${videoSrc}`, kind: 'video', src: videoSrc, loop: !oneShot(effective) && !(effective !== undefined && ONE_CYCLE_ACTIONS.has(effective)), action: effective }
+    ? { id: `video:${skin}:${effective}:${animationVersion}:${videoSrc}`, kind: 'video', src: videoSrc, loop: !oneShot(effective) && !(effective !== undefined && ONE_CYCLE_ACTIONS.has(effective)) && !isCustomAction, action: effective }
     : frameList?.length
-    ? { id: `frames:${skin}:${effective}:${animationVersion}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS, once: oneShot(effective) }
+    ? { id: `frames:${skin}:${effective}:${animationVersion}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS, once: oneShot(effective) || isCustomAction }
     : effective === 'walk' && images.walk
       ? { id: `walk:${images.walk}`, kind: 'walk', src: images.walk }
       : (() => {

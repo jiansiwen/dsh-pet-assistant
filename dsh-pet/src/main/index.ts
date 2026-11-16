@@ -494,6 +494,12 @@ function createWindow(): void {
     console.error('[dsh-pet] setVisibleOnAllWorkspaces failed', error)
   }
   win.setIgnoreMouseEvents(true, { forward: true })
+  // 渲染层带 [dsh-pet] 前缀的日志转发到主进程 stdout（落 launch.log），便于真机取证随机动作等调度。
+  if (typeof win.webContents.on === 'function') {
+    win.webContents.on('console-message', (_event: unknown, _level: unknown, message: unknown) => {
+      if (typeof message === 'string' && message.startsWith('[dsh-pet]')) console.log(new Date().toISOString(), message)
+    })
+  }
   // 插拔显示器或改分辨率后重新铺满桌面；只绑一次，避免窗口自愈重建时重复注册。
   // 测试宿主只 mock 了 getPrimaryDisplay，没有 screen.on。
   if (!screenEventsBound && typeof screen.on === 'function') {
@@ -4012,7 +4018,10 @@ const PET_OPTIONS: Array<{ id: PetId; label: string }> = [
  */
 function setCharacterSkin(target: MenuTarget, skin: string): void {
   const current = loadSettings().characters ?? {}
-  const next = { ...current, [target.assistantId]: { ...current[target.assistantId], skin } }
+  // 换形象=换一套动作素材：随机集合重置为该皮肤自有动作，避免沿用上一套皮肤的勾选。
+  const custom = listCustomSkins(app.getPath('userData')).find(s => s.id === skin)?.actions ?? []
+  const randomActions = custom.length > 0 ? [...custom] : [...DEFAULT_RANDOM_ACTIONS]
+  const next = { ...current, [target.assistantId]: { ...current[target.assistantId], skin, randomActions } }
   saveSettings({ characters: next })
   sendToRenderer('characters-changed', next)
 }
@@ -4076,10 +4085,20 @@ function buildContextMenu(target: MenuTarget | null): Menu {
       ],
     })
     const randomNow = loadSettings().characters?.[target.assistantId]?.randomActions ?? [...DEFAULT_RANDOM_ACTIONS]
+    // 候选跟随当前形象：内置生活动作 + 该皮肤登记的自定义动作（帧序列/透明 webm）。
+    const skinNow = stored ?? target.skin ?? 'panda'
+    const customActions = listCustomSkins(app.getPath('userData')).find(s => s.id === skinNow)?.actions ?? []
+    const randomCandidates = [...new Set([...RANDOM_CANDIDATES, ...customActions])]
+    const ACTION_LABELS: Record<string, string> = {
+      walk: '走路', jump: '蹦跳', wave: '挥手', read: '看书', play: '玩耍', write: '敲电脑',
+      'laptop-in': '开电脑', 'laptop-out': '收电脑站起', think: '思考', sleep: '睡觉',
+      turnaround: '转身', breathe: '呼吸待机', swagger: '插兜swagger走',
+      'declare-fate': '我命由我不由天', 'recite-poem': '念诗', transform: '变身火焰',
+    }
     items.push({
       label: '随机动作（只随机勾选的）',
-      submenu: RANDOM_CANDIDATES.map(action => ({
-        label: action,
+      submenu: randomCandidates.map(action => ({
+        label: ACTION_LABELS[action] ?? action,
         type: 'checkbox' as const,
         checked: randomNow.includes(action),
         click: (item: { checked: boolean }) => setCharacterRandomAction(target, action, item.checked),

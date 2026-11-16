@@ -6,6 +6,8 @@ import { subscribeTick } from './scene-clock.js'
 import { initialInteraction, interactionProtected, reduceInteraction, type ConversationEvent, type InteractionEvent } from './pet-interaction.js'
 
 const DRAG_MOVE_THRESHOLD = 6
+/** 交互相位（由状态机管理完成时机）；之外的动作视为自定义/环境动作，播完一轮即收。 */
+const INTERACTION_PHASES = new Set(['idle', 'drag', 'drop', 'sleep-in', 'sleep-loop', 'sleep-out', 'laptop-in', 'think', 'write', 'laptop-out'])
 export type PetAction =
   | 'idle' | 'walk' | 'jump' | 'wave' | 'sleep' | 'happy' | 'sit' | 'read' | 'play' | 'lie' | 'write'
   | 'drop' | 'think' | 'laptop-in' | 'laptop-out'
@@ -120,7 +122,15 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   }, [])
   const wake = useCallback(() => dispatch({ type: 'wake' }), [dispatch])
   const conversation = useCallback((event: ConversationEvent) => dispatch(event), [dispatch])
-  const completeAnimation = useCallback((phase: string, version: number) => dispatch({ type: 'complete', phase, version }), [dispatch])
+  const completeAnimation = useCallback((phase: string, version: number) => {
+    dispatch({ type: 'complete', phase, version })
+    // 自定义动作（非交互相位）播完一整轮即收回 idle，不被 hold 定时器掐断也不无限循环。
+    if (!INTERACTION_PHASES.has(phase) && actionRef.current === phase) {
+      busyUntilRef.current = 0
+      window.clearTimeout(holdTimer.current)
+      setAction('idle')
+    }
+  }, [dispatch])
 
   const say = useCallback((text: string, ms = 3200) => {
     speechReservedUntil = Date.now() + ms
@@ -242,7 +252,9 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
               startActivity('play', 6600, 6600)
               if (Math.random() < 0.3) chatter(pick(currentLines.activity))
             } else if (act === 'write') startActivity('write', 3000, 4500)
-            else setAction('idle')
+            // 自定义动作（转身/呼吸/swagger/经典动作等帧序列或透明 webm）：通用播放一轮，
+            // 素材缺失时 PetSprite 的 resolveAction 会优雅退到 idle。
+            else { console.log('[dsh-pet] random action', act); startActivity(act, 12000, 12000) }
             if (Math.random() < 0.22) chatter(pick(assistantActive ? currentLines.work : currentLines.idle))
           } else {
             const r = Math.random()

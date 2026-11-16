@@ -613,17 +613,20 @@ test('右键换形象菜单含本地登记的自定义皮肤：生成形象不�
   mkdirSync(customDir, { recursive: true })
   const registry = path.join(customDir, 'custom-skins.json')
   writeFileSync(registry, JSON.stringify({ skins: [
-    { id: 'nezha', name: '哪吒（电影版）', createdAt: 1, actions: ['write'], sourceJobId: 'test', license: 'generated' },
+    { id: 'nezha', name: '哪吒（电影版）', createdAt: 1, actions: ['turnaround', 'swagger'], sourceJobId: 'test', license: 'generated' },
   ] }))
   try {
     const stageWin = windows[0]
     const frame = (stageWin.webContents as unknown as { mainFrame?: unknown }).mainFrame
     ipcListeners.get('context-menu')?.({ sender: stageWin.webContents, senderFrame: frame } as object,
-      { assistantId: 'member-tangseng', displayName: '小潘同学', skin: 'panda' })
+      { assistantId: 'member-tangseng', displayName: '小潘同学', skin: 'nezha' })
     const menu = builtMenus[builtMenus.length - 1] as { template: Array<{ label?: string; submenu?: Array<{ label?: string }> }> }
     const entry = menu.template.find(item => String(item.label ?? '').startsWith('换个形象'))
     assert.ok(entry?.submenu?.some(item => item.label === '哪吒（电影版）'), '自定义皮肤应出现在右键形象菜单')
     assert.ok(entry?.submenu?.some(item => item.label === '国宝熊猫'), '内置三个仍在')
+    const random = menu.template.find(item => String(item.label ?? '').startsWith('随机动作'))
+    assert.ok(random?.submenu?.some(item => item.label === '转身'), '随机候选应跟随当前皮肤的自定义动作（中文标签）')
+    assert.ok(random?.submenu?.some(item => item.label === '插兜swagger走'), '随机候选应跟随当前皮肤的自定义动作（中文标签）')
   } finally {
     rmSync(registry, { force: true })
   }

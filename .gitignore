@@ -25,3 +25,4 @@ spark-output/
 # 生成的形象/动作素材不进发布仓库：只有初始三个内置皮肤在 assets/pets，
 # 其余生成资产一律落 userData（custom-assets/asset-studio），ImageGen 默认输出目录也忽略。
 vibe_images/
+vibe_videos/
