@@ -25,7 +25,7 @@ function text(node: ReactNode): string {
 function snapshot(): MemberSnapshot {
   return { enabled: false, defaultModel: { provider: '主服务商', model: '主模型' }, members: [{ profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', description: '通用研究', persona: '按证据回答',
     roleId: 'wukong', skinId: 'wukong', voiceProfile: '', voiceDesign: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision: 3, sessionId: '独立会话甲', provider: '', model: '',
-    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' },
+    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai', kind: 'expert', binding: null },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 60, totalReserved: 60, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
     requests: [{ requestId: '申请甲', assistantId: '成员甲', reason: '达到阈值', state: 'pending', createdAt: 1, quotaRevision: 9 }] }
 }

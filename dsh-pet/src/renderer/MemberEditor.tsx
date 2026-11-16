@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { MIMO_PRESET_VOICES } from '../shared/speaker-voice.ts'
 import {
-  MEMBER_CAPABILITIES, MEMBER_CAPABILITY_LABELS, MEMBER_PERMISSION_LABELS, MEMBER_PERMISSION_MODES,
+MEMBER_CAPABILITIES, MEMBER_CAPABILITY_LABELS, MEMBER_KINDS, MEMBER_KIND_LABELS, MEMBER_PERMISSION_LABELS, MEMBER_PERMISSION_MODES,
   MEMBER_REPORT_LABELS, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, MEMBER_SPEECH_LABELS,
-  type MemberCapability, type MemberDraft, type MemberEditorContext, type MemberPermissionMode, type MemberReportMode,
-  type MemberResult, type MemberSnapshot, type MemberSpeechBy, type MemberView,
+  type MemberCapability, type MemberDraft, type MemberEditorContext, type MemberKind, type MemberPermissionMode, type MemberReportMode,
+  type MemberResult, type MemberSnapshot, type MemberSpeechBy, type MemberView, type SubAssistantReportMode,
 } from '../member-types.ts'
 
 const CAPABILITY_HINTS: Record<MemberCapability, string> = {
@@ -20,19 +20,26 @@ const EXAMPLES = ['每天帮我整理工作日报', '专门接收企业微信消
 const SKINS: Array<[string, string]> = [['panda', '熊猫'], ['boy-glasses', '眼镜男生'], ['girl-glasses', '眼镜女生']]
 const limitLabel = (limit: number): string => limit === 0 ? '不限' : limit.toLocaleString('zh-CN')
 
-type DraftForm = Omit<MemberDraft, 'maxTokens' | 'dailyTokenLimit' | 'totalTokenLimit' | 'thresholdPercent'> & {
+type DraftForm = Omit<MemberDraft, 'maxTokens' | 'dailyTokenLimit' | 'totalTokenLimit' | 'thresholdPercent' | 'kind' | 'binding' | 'reportMode' | 'apiKey'> & {
   maxTokens: string; dailyTokenLimit: string; totalTokenLimit: string; thresholdPercent: string
+  kind: MemberKind; reportMode: SubAssistantReportMode
+  endpoint: string; platformModel: string; secretId: string
+  command: string; argsText: string
+  apiKey: string
 }
 const COMPARE_FIELDS: ReadonlyArray<readonly [keyof DraftForm, string]> = [
   ['displayName', '名称'], ['description', '职责'], ['personality', '性格'], ['persona', '工作要求'],
-  ['permissionMode', '权限'], ['reportMode', '汇报方式'], ['skinId', '形象'], ['enabled', '启用状态'], ['capabilities', '能力'],
+['kind', '成员类型'], ['reportMode', '汇报模式'], ['endpoint', '平台端点'], ['platformModel', '平台模型'],
+  ['command', '工具命令'], ['argsText', '工具参数'],
+  ['permissionMode', '权限'], ['skinId', '形象'], ['enabled', '启用状态'], ['capabilities', '能力'],
   ['provider', '模型服务商'], ['model', '模型'], ['maxTokens', '单次最大输出量'], ['dailyTokenLimit', '日额度'],
   ['totalTokenLimit', '总额度'], ['thresholdPercent', '申请阈值'], ['timezone', '时区'],
 ]
 function displayDraftValue(key: keyof DraftForm, value: DraftForm[keyof DraftForm]): string {
   if (key === 'permissionMode' && typeof value === 'string') return MEMBER_PERMISSION_LABELS[value as MemberPermissionMode]?.title ?? value
-  if (key === 'reportMode' && typeof value === 'string') return MEMBER_REPORT_LABELS[value as MemberReportMode]?.title ?? value
+if (key === 'reportMode' && typeof value === 'string') return MEMBER_REPORT_LABELS[value as MemberReportMode]?.title ?? value
   if (key === 'speechBy' && typeof value === 'string') return MEMBER_SPEECH_LABELS[value as MemberSpeechBy]?.title ?? value
+  if (key === 'kind' && typeof value === 'string') return MEMBER_KIND_LABELS[value as MemberKind]?.title ?? value
   if (key === 'skinId' && typeof value === 'string') return SKINS.find(([id]) => id === value)?.[1] ?? value
   if (Array.isArray(value)) return value.length ? value.map(item => MEMBER_CAPABILITY_LABELS[item as MemberCapability] ?? item).join('、') : '（无）'
   if (typeof value === 'boolean') return value ? '已启用' : '未启用'
@@ -45,6 +52,7 @@ function localTimezone(): string {
 }
 function initialForm(member: MemberView | null): DraftForm {
   const p = member?.profile
+  const binding = p?.binding ?? null
   return {
     displayName: p?.displayName ?? '新成员', description: p?.description ?? '', personality: p?.personality ?? '',
     permissionMode: p?.permissionMode ?? 'ask', reportMode: p?.reportMode ?? 'chief', speechBy: p?.speechBy ?? 'self',
@@ -53,10 +61,22 @@ function initialForm(member: MemberView | null): DraftForm {
     capabilities: [...(p?.capabilities ?? [])], allowedTools: [], dailyTokenLimit: String(p?.dailyTokenLimit ?? 0),
     totalTokenLimit: String(p?.totalTokenLimit ?? 0), thresholdPercent: String(p?.thresholdPercent ?? 80),
     timezone: p?.timezone ?? localTimezone(),
+    kind: p?.kind ?? 'expert',
+    endpoint: binding?.kind === 'platform' ? binding.endpoint : '', platformModel: binding?.kind === 'platform' ? binding.model : '',
+    secretId: binding?.kind === 'platform' ? binding.secretId : '',
+    command: binding?.kind === 'local-cli' ? binding.command : '', argsText: binding?.kind === 'local-cli' ? binding.args.join(' ') : '',
+    apiKey: '',
   }
 }
 function fromDraft(draft: MemberDraft): DraftForm {
-  return { ...draft, capabilities: [...draft.capabilities], allowedTools: [], maxTokens: String(draft.maxTokens),
+  const { kind, reportMode, binding, apiKey, ...rest } = draft
+  const bound = binding ?? null
+  return { ...rest, kind: kind ?? 'expert', reportMode: reportMode ?? 'chief',
+    endpoint: bound?.kind === 'platform' ? bound.endpoint : '', platformModel: bound?.kind === 'platform' ? bound.model : '',
+    secretId: bound?.kind === 'platform' ? bound.secretId : '',
+    command: bound?.kind === 'local-cli' ? bound.command : '', argsText: bound?.kind === 'local-cli' ? bound.args.join(' ') : '',
+    apiKey: '',
+    capabilities: [...draft.capabilities], allowedTools: [], maxTokens: String(draft.maxTokens),
     dailyTokenLimit: String(draft.dailyTokenLimit), totalTokenLimit: String(draft.totalTokenLimit), thresholdPercent: String(draft.thresholdPercent) }
 }
 function safeInteger(value: string, fallback: number, min = 0): number {
@@ -64,14 +84,35 @@ function safeInteger(value: string, fallback: number, min = 0): number {
   return value.trim() && Number.isSafeInteger(n) && n >= min ? n : fallback
 }
 /** 给 AI 的基准草稿；表单临时空值用默认值补齐，不用于保存。 */
+/** 由表单构建外部绑定；expert 成员恒为 null（绑定变化会清空子助理会话，属预期）。 */
+function bindingOf(form: DraftForm): MemberDraft['binding'] {
+  if (form.kind === 'platform') return { kind: 'platform', endpoint: form.endpoint.trim(), model: form.platformModel.trim(), secretId: form.secretId }
+  if (form.kind === 'local-cli') return { kind: 'local-cli', command: form.command.trim(), args: form.argsText.split(/\s+/).filter(Boolean) }
+  return null
+}
+/** 基础形状校验：深度校验（https/回环、未知字段）在插件录入侧完成，错误如实回显。 */
+function validBinding(form: DraftForm): boolean {
+  if (form.kind === 'platform') {
+    try {
+      const url = new URL(form.endpoint.trim())
+      if (!/^https?:$/.test(url.protocol)) return false
+      if (url.protocol === 'http:' && !/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(url.host)) return false
+    } catch { return false }
+    return form.platformModel.trim().length > 0
+  }
+  if (form.kind === 'local-cli') return form.command.trim().length > 0
+  return true
+}
 function formDraft(form: DraftForm, member: MemberView | null): MemberDraft {
+  const { endpoint, platformModel, secretId, command, argsText, apiKey, ...rest } = form
   return {
-    ...form, displayName: form.displayName.trim() || '新成员', provider: form.provider.trim(), model: form.model.trim(),
-    maxTokens: safeInteger(form.maxTokens, member?.profile.maxTokens ?? 16384, 1),
-    dailyTokenLimit: safeInteger(form.dailyTokenLimit, member?.profile.dailyTokenLimit ?? 0),
-    totalTokenLimit: safeInteger(form.totalTokenLimit, member?.profile.totalTokenLimit ?? 0),
-    thresholdPercent: safeInteger(form.thresholdPercent, member?.profile.thresholdPercent ?? 80, 1),
-    timezone: form.timezone.trim() || localTimezone(), allowedTools: [],
+    ...rest, displayName: rest.displayName.trim() || '新成员', provider: rest.provider.trim(), model: rest.model.trim(),
+    maxTokens: safeInteger(rest.maxTokens, member?.profile.maxTokens ?? 16384, 1),
+    dailyTokenLimit: safeInteger(rest.dailyTokenLimit, member?.profile.dailyTokenLimit ?? 0),
+    totalTokenLimit: safeInteger(rest.totalTokenLimit, member?.profile.totalTokenLimit ?? 0),
+    thresholdPercent: safeInteger(rest.thresholdPercent, member?.profile.thresholdPercent ?? 80, 1),
+    timezone: rest.timezone.trim() || localTimezone(), allowedTools: [],
+    kind: rest.kind, reportMode: rest.reportMode, binding: bindingOf(form),
   }
 }
 function validDraft(form: DraftForm): boolean {
@@ -80,12 +121,14 @@ function validDraft(form: DraftForm): boolean {
     || Number(form[key]) < (key === 'maxTokens' || key === 'thresholdPercent' ? 1 : 0))) return false
   if (Number(form.maxTokens) > 131072 || Number(form.thresholdPercent) > 100 || !form.displayName.trim()
     || !!form.model.trim() !== !!form.provider.trim() || !form.timezone.trim()) return false
+  if (!validBinding(form)) return false
   try { new Intl.DateTimeFormat('zh-CN', { timeZone: form.timezone }).format(); return true } catch { return false }
 }
 function toDraft(form: DraftForm): MemberDraft {
-  return { ...form, displayName: form.displayName.trim(), provider: form.provider.trim(), model: form.model.trim(), allowedTools: [],
-    maxTokens: Number(form.maxTokens), dailyTokenLimit: Number(form.dailyTokenLimit), totalTokenLimit: Number(form.totalTokenLimit),
-    thresholdPercent: Number(form.thresholdPercent), timezone: form.timezone.trim() }
+  const draft = formDraft(form, null)
+  // 平台密钥只在用户本次填了才上桥：留空＝沿用已存密钥；经桥后即入加密存储，永不回显。
+  if (form.kind === 'platform' && form.apiKey.trim()) draft.apiKey = form.apiKey.trim()
+  return draft
 }
 
 export interface MemberEditorPanelProps {
@@ -355,6 +398,38 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
       </div>
     </section>
 
+    <section className="editor-card" aria-label="成员类型与外部绑定">
+      <h2>成员类型</h2>
+      <p className="editor-hint">本机专家在本机运行并按权限使用本地工具；平台智能体与本地 AI 工具是子助理——持久独立会话、没有本地工具，越权任务会回退给总助理重新分析。</p>
+      <div className="editor-permissions" role="radiogroup" aria-label="成员类型">
+        {MEMBER_KINDS.map(kind => <label key={kind} className={form.kind === kind ? 'is-selected' : undefined}>
+          <input type="radio" name="memberKind" value={kind} checked={form.kind === kind} disabled={busy}
+            onChange={() => setForm(previous => ({ ...previous, kind }))} />
+          <strong>{MEMBER_KIND_LABELS[kind].title}</strong>
+          <span>{MEMBER_KIND_LABELS[kind].hint}</span>
+        </label>)}
+      </div>
+      {form.kind === 'platform' && <div className="editor-grid">
+        <label className="editor-field"><span>平台端点（OpenAI 兼容，https 或本机回环）</span>
+          <input autoComplete="off" maxLength={2048} value={form.endpoint} disabled={busy} onChange={event => set('endpoint', event.target.value)}
+            placeholder="例：https://api.platform-a.com/v1" /></label>
+        <label className="editor-field"><span>平台模型名</span>
+          <input autoComplete="off" maxLength={256} value={form.platformModel} disabled={busy} onChange={event => set('platformModel', event.target.value)}
+            placeholder="例：agent-1" /></label>
+        <label className="editor-field"><span>API 密钥{form.secretId ? '（已配置，留空＝沿用原密钥）' : '（未配置）'}</span>
+          <input type="password" autoComplete="new-password" maxLength={4096} value={form.apiKey} disabled={busy}
+            onChange={event => set('apiKey', event.target.value)} placeholder={form.secretId ? '留空保持不变' : '保存在本机加密存储，不会回显'} /></label>
+      </div>}
+      {form.kind === 'local-cli' && <div className="editor-grid">
+        <label className="editor-field"><span>工具命令（绝对路径或命令名）</span>
+          <input autoComplete="off" maxLength={2048} value={form.command} disabled={busy} onChange={event => set('command', event.target.value)}
+            placeholder="例：/usr/local/bin/claude" /></label>
+        <label className="editor-field"><span>启动参数（空格分隔）</span>
+          <input autoComplete="off" maxLength={2048} value={form.argsText} disabled={busy} onChange={event => set('argsText', event.target.value)}
+            placeholder="例：--print --output-format json" /></label>
+      </div>}
+    </section>
+
     <section className="editor-card" aria-label="权限">
       <h2>它可以自己动手吗</h2>
       <div className="editor-permissions" role="radiogroup" aria-label="权限">
@@ -509,7 +584,7 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
     {error && <p className="editor-error" role="alert">{error}</p>}
     {notice && <p className="editor-notice" role="status">{notice}</p>}
     {latest?.busy && <p className="editor-warning">成员正在工作，草稿会保留，结束后才能保存。</p>}
-    <p className="editor-summary">权限：{MEMBER_PERMISSION_LABELS[form.permissionMode].title} · 日额度：{limitLabel(safeInteger(form.dailyTokenLimit, 0))} · 总额度：{limitLabel(safeInteger(form.totalTokenLimit, 0))}</p>
+    <p className="editor-summary">类型：{MEMBER_KIND_LABELS[form.kind].title} · 权限：{MEMBER_PERMISSION_LABELS[form.permissionMode].title} · 日额度：{limitLabel(safeInteger(form.dailyTokenLimit, 0))} · 总额度：{limitLabel(safeInteger(form.totalTokenLimit, 0))}</p>
     <footer className="editor-actions">
       {member && onDelete && <button type="button" className="editor-danger" disabled={busy || stale} onClick={() => void remove()}>删除成员…</button>}
       <button type="button" className="editor-secondary" disabled={pending} onClick={onClose}>取消</button>

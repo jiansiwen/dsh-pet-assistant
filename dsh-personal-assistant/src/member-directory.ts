@@ -2,7 +2,9 @@
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS, READ_ONLY_DENY_CANDIDATES } from './gate.ts'
-import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberProfile, type MemberQuotaRequest, type MemberQuotaView } from './member-contract.ts'
+import { MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY,
+  type MemberDraft, type MemberProfile, type MemberKind, type MemberQuotaRequest, type MemberQuotaView,
+  type NormalizedMemberDraft, type SubAssistantBinding } from './member-contract.ts'
 import type { MemberConfig, RoleId, ToolPolicy } from './team-domain.ts'
 
 export type { MemberDraft, MemberProfile, MemberQuotaRequest, MemberQuotaView } from './member-contract.ts'
@@ -14,8 +16,9 @@ const MAX = Number.MAX_SAFE_INTEGER
 const SKINS = ['panda', 'girl-glasses', 'boy-glasses']
 
 function defaults(): Extension {
-  return { description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceDesign: '', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
-    dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai', sessionId: null }
+return { description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceDesign: '', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
+    dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai', sessionId: null,
+    kind: 'expert', binding: null }
 }
 
 /** 只在 TeamStore 的版本迁移事务中调用，当前版本打开时不重复建表、写默认值。 */
@@ -102,12 +105,49 @@ function saturatedAdd(a: number, b: number): number { return b > MAX - a ? MAX :
 function sameSet(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every(value => b.includes(value))
 }
+// 子助理绑定的录入校验：命令与参数必须全可打印（无控制字符），spawn 侧另有 shell:false 与白名单复核。
+function printable(value: string, label: string, max: number, required: boolean): string {
+  const result = text(value, label, max, required)
+  if (/[\u0000-\u001f\u007f]/.test(result)) throw new Error(`${label}不能包含控制字符`)
+  return result
+}
+// 平台端点只认 https 或本机回环 http；不带认证信息、查询或片段（纪律对齐桌宠 voice-api 的端点校验）。
+function platformEndpoint(value: unknown): string {
+  const source = printable(String(value ?? ''), '平台端点', 2048, true)
+  let url: URL
+  try { url = new URL(source) } catch { throw new Error('平台端点格式无效') }
+  const loopback = url.hostname === 'localhost' || url.hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(url.hostname)
+  if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) || url.username || url.password) {
+    throw new Error('平台端点仅支持 https 或本机回环地址，且不能内嵌认证信息')
+  }
+  if (url.search || url.hash) throw new Error('平台端点不能包含查询或片段')
+  return url.href
+}
+function normalizeBinding(kind: MemberKind, value: unknown): SubAssistantBinding | null {
+  if (value === undefined || value === null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('子助理绑定无效')
+  const record = value as Record<string, unknown>
+  if (kind === 'expert') throw new Error('普通成员不使用外部绑定')
+  if (kind === 'platform') {
+    if (Object.keys(record).some(key => !['kind', 'endpoint', 'model', 'secretId'].includes(key))) throw new Error('平台绑定包含未知字段')
+    if (record.kind !== 'platform') throw new Error('绑定类型与成员类型不一致')
+    return { kind: 'platform', endpoint: platformEndpoint(record.endpoint), model: printable(String(record.model ?? ''), '平台模型名', 200, true),
+      secretId: printable(String(record.secretId ?? ''), '密钥标识', 64, false) }
+  }
+  if (Object.keys(record).some(key => !['kind', 'command', 'args'].includes(key))) throw new Error('本地工具绑定包含未知字段')
+  if (record.kind !== 'local-cli') throw new Error('绑定类型与成员类型不一致')
+  const command = printable(String(record.command ?? ''), '工具命令', 2048, true)
+  const args = record.args ?? []
+  if (!Array.isArray(args) || args.length > 32 || args.some(item => typeof item !== 'string')) throw new Error('工具参数必须是至多 32 个字符串')
+  return { kind: 'local-cli', command, args: args.map(item => printable(item, '工具参数', 1024, false)) }
+}
 function extension(profile: MemberProfile): Extension {
   return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, reportMode: profile.reportMode, speechBy: profile.speechBy, voiceDesign: profile.voiceDesign, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
     capabilities: profile.capabilities, allowedTools: profile.allowedTools, dailyTokenLimit: profile.dailyTokenLimit,
-    totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId }
+    totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId,
+    kind: profile.kind, binding: profile.binding }
 }
-function normalize(draft: MemberDraft): MemberDraft {
+function normalize(draft: MemberDraft): NormalizedMemberDraft {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) throw new Error('成员配置无效')
   const skinId = text(draft.skinId ?? 'panda', '形象', 80) || 'panda'
   if (!SKINS.includes(skinId)) throw new Error('请选择已有成员形象')
@@ -124,10 +164,14 @@ function normalize(draft: MemberDraft): MemberDraft {
   if (!!text(draft.provider, '模型提供方', 200) !== !!text(draft.model, '模型名称', 200)) throw new Error('模型提供方和模型必须同时填写，或同时留空使用默认模型')
   const permissionMode = draft.permissionMode ?? 'ask'
   if (!MEMBER_PERMISSION_MODES.includes(permissionMode)) throw new Error('权限只能是每次询问、自动审批或完全访问')
-  const reportMode = draft.reportMode ?? 'chief'
+const reportMode = draft.reportMode ?? 'chief'
   if (!MEMBER_REPORT_MODES.includes(reportMode)) throw new Error('汇报方式只能由总助理汇报，或由该成员自己汇报')
   const speechBy = draft.speechBy ?? 'self'
   if (!MEMBER_SPEECH_BY.includes(speechBy)) throw new Error('语音朗读只能是成员自己读，或由总助理代读')
+  const kind = draft.kind ?? 'expert'
+  if (!MEMBER_KINDS.includes(kind)) throw new Error('成员类型无效')
+  const binding = normalizeBinding(kind, draft.binding)
+  if (kind !== 'expert' && binding === null) throw new Error('子助理必须配置外部绑定')
   return { displayName: text(draft.displayName, '成员名称', 80, true), description: text(draft.description, '职责说明', 4000),
     personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode, reportMode, speechBy,
     persona: text(draft.persona, '人设', 16000), skinId, enabled: draft.enabled,
@@ -136,7 +180,8 @@ function normalize(draft: MemberDraft): MemberDraft {
     provider: text(draft.provider, '模型提供方', 200), model: text(draft.model, '模型名称', 200),
     maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 131072), capabilities: [...new Set(draft.capabilities)],
     allowedTools: [...new Set(draft.allowedTools)], dailyTokenLimit: integer(draft.dailyTokenLimit, '日额度'),
-    totalTokenLimit: integer(draft.totalTokenLimit, '总额度'), thresholdPercent: integer(draft.thresholdPercent ?? 80, '申请阈值', 1, 100), timezone }
+    totalTokenLimit: integer(draft.totalTokenLimit, '总额度'), thresholdPercent: integer(draft.thresholdPercent ?? 80, '申请阈值', 1, 100), timezone,
+    kind, binding }
 }
 
 export class MemberDirectory {
@@ -231,14 +276,18 @@ export class MemberDirectory {
       const permissionsChanged = current.permissionMode !== normalized.permissionMode
         || !sameSet(current.capabilities, normalized.capabilities) || !sameSet(current.allowedTools, normalized.allowedTools)
         || current.toolPolicy.mode !== 'read-only'
+      // 换类型或换绑定后，旧会话上下文对新平台/新工具不再成立，与权限变化同规则：清会话引用。
+      const bindingChanged = current.kind !== normalized.kind
+        || JSON.stringify(current.binding ?? null) !== JSON.stringify(normalized.binding ?? null)
+      const sessionInvalidated = permissionsChanged || bindingChanged
       const next: MemberProfile = { ...current, ...normalized, revision: current.revision + 1,
-        toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: permissionsChanged ? null : current.sessionId }
+toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: sessionInvalidated ? null : current.sessionId }
       const changed = this.db.prepare(`UPDATE assistants SET display_name = ?, skin_id = ?, persona = ?, voice_profile = ?, enabled = ?, tool_policy = ?, revision = ?
         WHERE assistant_id = ? AND revision = ?`).run(next.displayName, next.skinId, next.persona, next.voiceProfile, Number(next.enabled),
         JSON.stringify(next.toolPolicy), next.revision, id, expectedRevision)
       if (Number(changed.changes) !== 1) throw new Error('成员修订冲突，请刷新后重试')
       this.saveExtra(next)
-      if (permissionsChanged) this.db.prepare('DELETE FROM member_channel_sessions WHERE assistant_id = ?').run(id)
+      if (sessionInvalidated) this.db.prepare('DELETE FROM member_channel_sessions WHERE assistant_id = ?').run(id)
       if (current.dailyTokenLimit !== next.dailyTokenLimit || current.totalTokenLimit !== next.totalTokenLimit
         || current.thresholdPercent !== next.thresholdPercent || current.timezone !== next.timezone) {
         this.advanceQuota(id, this.quotaRevision(id))

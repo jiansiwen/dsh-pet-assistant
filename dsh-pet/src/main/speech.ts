@@ -32,6 +32,7 @@ export interface SpeechRequest {
    */
   readonly indexBase?: number
   /**
+/**
    * 临时话语（快速应答旁路）：照常播出，但不算"这一轮对模型说过什么"。
    * 它不进 DSH 会话，打断后的上下文说明里也不能出现，否则等于间接进了会话。
    */
@@ -56,6 +57,12 @@ export interface SpeechRequest {
   readonly voiceSampleMime?: string
   /** 成员级 TTS 配置 id；空＝跟随全局选中。 */
   readonly ttsProfileId?: string
+  /**
+   * 本次讲话的音色档案名（§4.6 ★④）：edge-tts 音色名（如 zh-CN-XiaoxiaoNeural）或
+   * 语音设置里的自定义 TTS 档案名。未传走全局默认音色（向后兼容）。
+   * 子助理自行汇报（self 模式）按成员音色播报。
+   */
+  readonly voiceProfile?: string
 }
 
 /** 切好的一句，是播放与打断的最小单位。 */
@@ -64,7 +71,7 @@ export interface Segment {
   readonly index: number
   readonly text: string
   readonly origin?: SpeechOrigin
-  readonly ephemeral?: boolean
+readonly ephemeral?: boolean
   /** 这一句的音色设计描述（来自说话人），缺省沿用服务配置。 */
   readonly voiceDesign?: string
   /** 克隆出来的音色 ID（服务商侧）。优先于 voiceDesign —— 克隆就是"就是那个声音"。 */
@@ -78,6 +85,8 @@ export interface Segment {
   readonly voiceSampleMime?: string
   /** 成员级 TTS 配置 id；空＝跟随全局选中。 */
   readonly ttsProfileId?: string
+  /** 本句的音色档案名；随请求透传，未传走全局默认音色。 */
+  readonly voiceProfile?: string
 }
 
 /** 一句的播出结果。complete=false 表示播到一半被打断。 */
@@ -205,7 +214,7 @@ export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
       index: base + segments.length,
       text: trimmed,
       ...(request.origin ? { origin: request.origin } : {}),
-      ...(request.ephemeral ? { ephemeral: true } : {}),
+...(request.ephemeral ? { ephemeral: true } : {}),
     ...(request.voiceDesign === undefined ? {} : { voiceDesign: request.voiceDesign }),
     ...(request.voice === undefined ? {} : { voice: request.voice }),
     ...(request.voiceStyle === undefined ? {} : { voiceStyle: request.voiceStyle }),
@@ -213,6 +222,7 @@ export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
     ...(request.voiceSample === undefined ? {} : { voiceSample: request.voiceSample }),
     ...(request.voiceSampleMime === undefined ? {} : { voiceSampleMime: request.voiceSampleMime }),
     ...(request.ttsProfileId === undefined ? {} : { ttsProfileId: request.ttsProfileId }),
+      ...(request.voiceProfile ? { voiceProfile: request.voiceProfile } : {}),
     })
   }
   return segments

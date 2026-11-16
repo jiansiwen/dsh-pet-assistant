@@ -783,6 +783,11 @@ function onWakeWord(): void {
   sendToRenderer('wake-triggered', greeting)
 }
 
+/** edge-tts 音色名（如 zh-CN-XiaoxiaoNeural、en-US-AriaNeural）：成员音色档案可直接填。 */
+function isEdgeTtsVoiceName(name: string): boolean {
+  return /^[a-z]{2,3}(-[A-Z][a-zA-Z]*)?-[A-Za-z]+Neural$/u.test(name)
+}
+
 /** 缓存键：自定义服务按服务+模型+音色（含设计/语气/样本），默认 edge-tts 也要有稳定的键，否则永远不预热。 */
 function greetingVoiceKey(api: ResolvedVoiceApi | null): string {
   if (api === null) {
@@ -3951,10 +3956,23 @@ const narrator = new Narrator(playbackTap.wrap(openTtsTransport), {
 }, {
   // 派发每一句时才取配置：用户中途换服务，下一句就走新的，不用重启播放器。
   ttsApi: (): ResolvedVoiceApi | null => voiceApiStore?.resolve('tts') ?? null,
-  // 没自带音色的句子（唤醒应答/快答/讲解）默认用总助理的嗓子，三条链路不再各用各的。
+// 没自带音色的句子（唤醒应答/快答/讲解）默认用总助理的嗓子，三条链路不再各用各的。
   defaultVoice: () => chiefSpeakerVoice(),
   // 成员级音色服务：编辑窗里选的某条 TTS 配置（MiMo 三模型等）。
   resolveProfile: id => voiceApiStore?.resolveId(id) ?? null,
+  // 按句携带音色档案名时按档案解析（§4.6 ★④ 子助理按成员音色播报）：
+  // ①名字唯一命中自定义 TTS 档案 → 用该档案；
+  // ②形如 edge-tts 音色名（zh-CN-XiaoxiaoNeural）→ 当前服务仅换音色；
+  // ③解析不出 → 返回 null，Narrator 回退全局默认音色并告警，不静默丢文本。
+  voiceProfileApi: (voiceProfile: string): ResolvedVoiceApi | null => {
+    const byName = voiceApiStore?.resolveByName('tts', voiceProfile) ?? null
+    if (byName !== null) return byName
+    if (isEdgeTtsVoiceName(voiceProfile)) {
+      const base = voiceApiStore?.resolve('tts') ?? null
+      return base === null ? null : { ...base, voice: voiceProfile }
+    }
+    return null
+  },
   // 固定话术（唤醒应答等）合成一次就落盘复用；换音色自动失效重合成。
   cache: ttsCache,
   // 默认合成（没配自定义服务）时的音色键：和 greetingVoiceKey(null) 必须一致，
@@ -3964,6 +3982,9 @@ const narrator = new Narrator(playbackTap.wrap(openTtsTransport), {
 
 let exitFallbackTimer: NodeJS.Timeout | null = null
 let exitRequested = false
+
+/** 已播报过的子助理 runId（§4.6 ★②）：断线重连重放事件环时不重播；环形上限 200 条。 */
+const subAssistantSpokenRunIds = new Set<string>()
 
 /**
  * 请求渲染层播退场动画（漩涡通道 + 挥手告别）。
@@ -6177,6 +6198,28 @@ if (!gotLock) {
               notification.show()
             }
           } catch (error) { console.error('[dsh-pet] member notice failed:', error) }
+          return
+        }
+        if (event.type === 'subassistant-report') {
+          // runId 幂等去重：断线重连会重放事件环里的旧事件，重播会吓到人。
+          const runId = typeof event.runId === 'string' ? event.runId : ''
+          const text = typeof event.text === 'string'
+            ? event.text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, ' ').slice(0, 8000) : ''
+          if (!runId || !text || subAssistantSpokenRunIds.has(runId)) return
+          subAssistantSpokenRunIds.add(runId)
+          if (subAssistantSpokenRunIds.size > 200) {
+            subAssistantSpokenRunIds.delete(subAssistantSpokenRunIds.values().next().value as string)
+          }
+          // ★③ 独立播报入口：不占会话 reply 的 utteranceId 空间，打断纪律沿用现有四层管线。
+          narrator.speak({ utteranceId: `sub-${runId}`, text,
+            ...(typeof event.voiceProfile === 'string' && event.voiceProfile ? { voiceProfile: event.voiceProfile } : {}) })
+          // ★② 舞台形象：让该成员的角色出气泡；角色不在 cast（未启用等）时只播语音不出气泡。
+          sendToRenderer('subassistant-report', {
+            assistantId: typeof event.assistantId === 'string' ? event.assistantId : '',
+            displayName: typeof event.displayName === 'string' ? event.displayName : '',
+            skinId: typeof event.skinId === 'string' ? event.skinId : '',
+            text,
+          })
           return
         }
         if (event.type === 'session/update') {

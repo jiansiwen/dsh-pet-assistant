@@ -254,7 +254,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
             } else if (act === 'write') startActivity('write', 3000, 4500)
             // 自定义动作（转身/呼吸/swagger/经典动作等帧序列或透明 webm）：通用播放一轮，
             // 素材缺失时 PetSprite 的 resolveAction 会优雅退到 idle。
-            else { console.log('[dsh-pet] random action', act); startActivity(act, 12000, 12000) }
+            else { console.log('[dsh-pet] random action', act); startActivity(act as PetAction, 12000, 12000) }
             if (Math.random() < 0.22) chatter(pick(assistantActive ? currentLines.work : currentLines.idle))
           } else {
             const r = Math.random()

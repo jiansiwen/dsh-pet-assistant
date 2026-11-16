@@ -80,6 +80,8 @@ export class Narrator {
   private readonly open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport
   private readonly hooks: NarratorHooks
   private readonly ttsApi: () => ResolvedVoiceApi | null
+  /** 按音色档案名解析本次音色（§4.6 ★④）；null = 未配置，走全局默认。 */
+  private readonly voiceProfileApi: ((voiceProfile: string) => ResolvedVoiceApi | null) | null
   private readonly cache: TtsCache | null
   private readonly fixedVoiceKey: () => string | null
   private readonly defaultVoice: () => SpeakerVoice | null
@@ -107,6 +109,8 @@ export class Narrator {
   constructor(open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport, hooks: NarratorHooks = {}, options: {
     /** 当前选中的自定义 TTS 服务；null 走默认合成。派发时才取，用户中途换服务不用重启播放器。 */
     ttsApi?: () => ResolvedVoiceApi | null
+/** 按音色档案名解析本次音色（§4.6 ★④）：返回 null 表示解析不出（回退全局默认音色）。 */
+    voiceProfileApi?: (voiceProfile: string) => ResolvedVoiceApi | null
     /** 固定话术的音频缓存；null = 不缓存。 */
     cache?: TtsCache | null
     /**
@@ -125,6 +129,7 @@ export class Narrator {
     this.open = open
     this.hooks = hooks
     this.ttsApi = options.ttsApi ?? (() => null)
+this.voiceProfileApi = options.voiceProfileApi ?? null
     this.fixedVoiceKey = options.fixedVoiceKey ?? (() => null)
     this.defaultVoice = options.defaultVoice ?? (() => null)
     this.resolveProfile = options.resolveProfile ?? (() => null)
@@ -287,7 +292,17 @@ export class Narrator {
     // 配置读不出来就停在这里报错：悄悄退回默认服务等于把用户挑的服务换掉。
     let api: ResolvedVoiceApi | null = null
     try {
-      api = this.ttsApi()
+      // 本句带音色档案名时先按档案解析（§4.6 ★④）；解析不出回退全局默认并告警，
+      // 绝不静默丢文本——子助理汇报至少要念出来。
+      if (segment.voiceProfile !== undefined && this.voiceProfileApi !== null) {
+        const resolved = this.voiceProfileApi(segment.voiceProfile)
+        if (resolved === null) {
+          console.warn('[dsh-pet] voice profile unresolvable, falling back to default voice:', segment.voiceProfile)
+        } else {
+          api = resolved
+        }
+      }
+      if (api === null) api = this.ttsApi()
     } catch (error) {
       this.fail(error instanceof Error ? error.message : String(error))
       return

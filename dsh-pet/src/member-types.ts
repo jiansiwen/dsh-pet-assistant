@@ -29,6 +29,23 @@ export const MEMBER_CAPABILITY_LABELS: Record<MemberCapability, string> = {
 }
 /** 仅普通观测工具，镜像宿主 gate.ts；不包含子代理控制、脚本和写入工具。 */
 export const MEMBER_READ_TOOLS = ['read', 'read_image', 'glob', 'grep', 'web_fetch', 'web_search'] as const
+/** 子助理类型（AI 智能体接入）：expert=本机专家子代理；platform=外部平台智能体；local-cli=本地 AI CLI 工具。 */
+export const MEMBER_KINDS = ['expert', 'platform', 'local-cli'] as const
+export type MemberKind = typeof MEMBER_KINDS[number]
+export const MEMBER_KIND_LABELS: Record<MemberKind, { title: string; hint: string }> = {
+  expert: { title: '本机专家', hint: '在本机运行的专家子代理，可按权限使用本地工具。' },
+  platform: { title: '平台智能体', hint: '接入外部 AI 平台的智能体（OpenAI 兼容 API），需要端点、模型与密钥。' },
+  'local-cli': { title: '本地 AI 工具', hint: '常驻本地命令行 AI 工具（如 Claude Code、Qoder），上下文由工具自持。' },
+}
+export type PlatformBinding = { kind: 'platform'; endpoint: string; model: string; secretId: string }
+export type LocalCliBinding = { kind: 'local-cli'; command: string; args: string[] }
+export type SubAssistantBinding = PlatformBinding | LocalCliBinding
+/** 汇报模式：chief=总助理汇总播报；self=子助理直接以其形象与音色播报（两种模式总助理都收到结果文本）。 */
+export const SUB_ASSISTANT_REPORT_MODES = ['chief', 'self'] as const
+export type SubAssistantReportMode = typeof SUB_ASSISTANT_REPORT_MODES[number]
+export const SUB_ASSISTANT_REPORT_LABELS: Record<SubAssistantReportMode, string> = {
+  chief: '总助理汇总播报', self: '子助理直接播报',
+}
 export interface MemberDraft {
   displayName: string
   description: string
@@ -54,6 +71,10 @@ export interface MemberDraft {
   totalTokenLimit: number
   thresholdPercent: number
   timezone: string
+  kind?: MemberKind
+  binding?: SubAssistantBinding | null
+  /** 平台密钥只写不读：仅在保存时经桥送插件加密存储，快照与回显永不携带。 */
+  apiKey?: string
 }
 export interface MemberProfile extends MemberDraft {
   assistantId: string
@@ -61,6 +82,9 @@ export interface MemberProfile extends MemberDraft {
   toolPolicy: { mode: 'read-only' | 'side-effect'; denyTools: readonly string[] }
   revision: number
   sessionId: string | null
+  kind: MemberKind
+  reportMode: SubAssistantReportMode
+  binding: SubAssistantBinding | null
 }
 export interface MemberQuotaView {
   day: string

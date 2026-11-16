@@ -186,12 +186,24 @@ export class VoiceApiStore {
     return { ...data, apiKey: this.decrypt(profile) }
   }
 
-  /** 按 id 取某条配置（成员级音色服务选择用）；不存在返回 null，调用方回落全局。 */
+/** 按 id 取某条配置（成员级音色服务选择用）；不存在返回 null，调用方回落全局。 */
   resolveId(id: string): ResolvedVoiceApi | null {
     const profile = this.state.profiles.find(item => item.id === id)
     if (!profile) return null
     const { encryptedKey: _encryptedKey, ...data } = profile
     return { ...data, apiKey: this.decrypt(profile) }
+  }
+
+  /**
+   * 按档案名解析语音服务（§4.6 ★④ 子助理按成员音色播报）。
+   * 名字唯一命中同种类的档案才用；重名或未命中返回 null（调用方回退全局默认音色）。
+   */
+  resolveByName(kind: VoiceApiKind, name: string): ResolvedVoiceApi | null {
+    const validKind = kindOf(kind)
+    const matches = this.state.profiles.filter(item => item.kind === validKind && item.name === name)
+    if (matches.length !== 1) return null
+    const { encryptedKey: _encryptedKey, ...data } = matches[0]!
+    return { ...data, apiKey: this.decrypt(matches[0]) }
   }
 
   private decrypt(profile: StoredProfile): string {

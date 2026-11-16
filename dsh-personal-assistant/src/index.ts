@@ -101,6 +101,9 @@ import { WorkItemStore } from './work-items.ts'
 import { MaterialStore } from './materials.ts'
 import { intakeEvidence, type IntakeResult } from './evidence-intake.ts'
 import { mountReportWorkbench } from './workbench.ts'
+import { fileKeyCodec, SubAssistantSecrets } from './sub-assistant-secrets.ts'
+import { SubAssistantRegistry } from './sub-assistant-registry.ts'
+import { SubAssistantDispatch } from './sub-assistant-dispatch.ts'
 
 export { Config } from './config.ts'
 
@@ -881,6 +884,29 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   // 不能再连带关闭这里——否则关掉团队模式时，用户交给小潘的提醒也会一起消失。
   const teamStorePath = config.teamStorePath || path.join(home, 'desktop-team', 'team.sqlite')
   const teamStore = new TeamStore(teamStorePath)
+  // 子助理分派（AI 智能体接入）：启动对账沿用 recoverMailSends 先例——
+  // 上一进程留下的 dispatched 行标记中断失败，常驻会话随进程消失、由下次分派重建。
+  teamStore.failInterruptedSubAssistantRuns(Date.now())
+  // 平台密钥：独立加密文件（AES-256-GCM + 0600 密钥文件），不入团队库、不入模型上下文。
+  const subAssistantSecrets = new SubAssistantSecrets(path.join(home, 'sub-assistant-secrets.json'),
+    fileKeyCodec(path.join(home, 'sub-assistant-secrets.key')))
+  const subAssistantRegistry = new SubAssistantRegistry({
+    idleTtlMs: config.subAssistantIdleTtlMs,
+    maxSessions: config.maxSubAssistantSessions,
+    resolveKey: secretId => subAssistantSecrets.resolve(secretId),
+  })
+  const subAssistantDispatch = new SubAssistantDispatch({
+    directory: teamStore.directory,
+    registry: subAssistantRegistry,
+    ledger: teamStore,
+    maxDispatchDepth: config.maxDispatchDepth,
+    timeoutMs: config.subAssistantTimeoutMs,
+    // 汇报分发（§4.6 ★①）：self 模式完成后推桥接事件，桌宠以其形象+音色播报。
+    onSelfReport: report => bridge.notifySubAssistantReport(report),
+  })
+  // 空闲回收定时（一个回收周期内必然被扫到）；不阻塞插件退出。
+  const subAssistantSweeper = setInterval(() => subAssistantRegistry.sweepIdle(), Math.max(60_000, config.subAssistantIdleTtlMs))
+  subAssistantSweeper.unref?.()
   let teamRuntime: TeamRuntime | null = null
   const memberMemories = new MemberMemory({
     store: memories, ownerId: teamStore.companionIdentity().principalId,
@@ -1350,6 +1376,13 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       return glossary.list().map(item => ({ term: item.term, expansion: item.expansion, createdAt: item.createdAt }))
     },
     enabled: () => teamRuntime !== null,
+    // 子助理平台密钥：桥上 apiKey → 加密存储 secretId；删除成员时尽力清理条目。
+    secrets: {
+      save: input => input.id && subAssistantSecrets.has(input.id)
+        ? subAssistantSecrets.save({ id: input.id, apiKey: input.apiKey })
+        : subAssistantSecrets.save({ apiKey: input.apiKey }),
+      remove: id => { subAssistantSecrets.remove(id) },
+    },
     setMode: async enabled => {
       if (enabled) enableTeamMode()
       else {
@@ -1527,6 +1560,9 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     enableTeamMode,
     disableTeamMode,
     approvalMode: () => config.approvalMode,
+    subAssistantDispatch: {
+      dispatch: (assistantId, task, dispatchId) => subAssistantDispatch.dispatch(assistantId, task, dispatchId),
+    },
   })
   // 一键入口：输入框「+ → 指令」里的召唤与开关，不经过模型、不产生消息。
   // 工作台概览的数据源：全部只读，且都复用既有存储（team.sqlite 的任务表 / work_items 表）。
@@ -1671,6 +1707,12 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   })
   // 插件卸载：通知宠物退场、关闭桥接服务，并按所有权释放桥接自建的会话（返回的 Promise 交给宿主等）。
   ctx.effect(() => () => bridge.dispose(), 'personal-assistant:bridge')
+
+  // 子助理常驻会话与回收定时器：插件卸载时一并回收（SIGTERM→SIGKILL 由 CliAgent.dispose 负责）。
+  ctx.effect(() => () => {
+    clearInterval(subAssistantSweeper)
+    subAssistantRegistry.dispose()
+  }, 'personal-assistant:sub-assistants')
 
   // 采样器是插件的托管子进程：插件卸载时（web 服务停止 / profile 卸载）必须回收，
   // 否则会遗留孤儿进程。清理钩子早于任何可能抛错的初始化注册，保证一定生效。

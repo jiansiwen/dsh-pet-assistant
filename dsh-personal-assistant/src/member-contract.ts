@@ -30,6 +30,31 @@ export type MemberReportMode = typeof MEMBER_REPORT_MODES[number]
 /** 成员的话由谁朗读：self=它自己用自己音色，chief=总助理代读（只出文字）。 */
 export const MEMBER_SPEECH_BY = ['self', 'chief'] as const
 export type MemberSpeechBy = typeof MEMBER_SPEECH_BY[number]
+
+/** 成员类型：expert=现有 spawn 子代理；platform=外部平台智能体（OpenAI 兼容）；local-cli=本地 AI CLI 工具。 */
+export const MEMBER_KINDS = ['expert', 'platform', 'local-cli'] as const
+export type MemberKind = typeof MEMBER_KINDS[number]
+/** 子助理汇报模式与成员汇报方式是同一组值：别名保留，两条链路各用各的名字不再分叉。 */
+export const SUB_ASSISTANT_REPORT_MODES = MEMBER_REPORT_MODES
+export type SubAssistantReportMode = MemberReportMode
+/** 子助理外部绑定元数据；密钥绝不入此结构，单独加密存储（sub-assistant-secrets）。 */
+export interface PlatformBinding {
+  kind: 'platform'
+  /** OpenAI 兼容端点（仅 https 或本机回环）；路径不以 /chat/completions 结尾时由适配层补全。 */
+  endpoint: string
+  model: string
+  /** 指向加密密钥库中密钥条目的标识；空串=尚未配置密钥（分派时如实拒绝）。 */
+  secretId: string
+}
+export interface LocalCliBinding {
+  kind: 'local-cli'
+  /** 可执行文件绝对路径或 PATH 上的命令名；spawn 一律 shell:false、参数数组化，启动时再做白名单复核。 */
+  command: string
+  args: readonly string[]
+}
+export type SubAssistantBinding = PlatformBinding | LocalCliBinding
+/** normalize 之后的完整草稿：子助理三字段已定值，可直接并入 MemberProfile。 */
+export type NormalizedMemberDraft = MemberDraft & Required<Pick<MemberDraft, 'kind' | 'binding' | 'reportMode'>>
 export interface MemberProfile extends MemberConfig {
   description: string
   personality: string
@@ -49,6 +74,8 @@ export interface MemberProfile extends MemberConfig {
   thresholdPercent: number
   timezone: string
   sessionId: string | null
+  kind: MemberKind
+  binding: SubAssistantBinding | null
 }
 export interface MemberQuotaView {
   day: string
@@ -152,4 +179,7 @@ export interface MemberDraft {
   totalTokenLimit: number
   thresholdPercent: number
   timezone: string
+  /** 子助理两字段；缺省=expert/无绑定（normalize 补默认，旧调用方零改动）。 */
+  kind?: MemberKind
+  binding?: SubAssistantBinding | null
 }

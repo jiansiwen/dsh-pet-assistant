@@ -113,6 +113,14 @@ export interface Config {
    * 注意这个值来自配置文件（用户自己改的），模型无法在会话中修改它。
    */
   approvalMode: 'manual' | 'auto'
+  /** 子助理会话空闲回收时长（毫秒，设计建议 8 分钟）；空闲超时的子助理会话被回收。 */
+  subAssistantIdleTtlMs: number
+  /** 子助理常驻会话数量上限（设计建议 8）；超限按 LRU 淘汰最旧会话。 */
+  maxSubAssistantSessions: number
+  /** 越权回退后最大重分派深度（设计建议 2）；超过即拒绝并汇报，防「总助理反复转发同任务」循环。 */
+  maxDispatchDepth: number
+  /** 单次子助理分派的超时（毫秒，设计建议 10 分钟）。 */
+  subAssistantTimeoutMs: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -151,4 +159,8 @@ export const Config: Schema<Config> = Schema.object({
   proactiveIdleMs: Schema.number().default(480000),
   proactiveCooldownMs: Schema.number().default(3600000),
   approvalMode: Schema.union(['manual', 'auto']).default('manual'),
+  subAssistantIdleTtlMs: Schema.number().default(480000),
+  maxSubAssistantSessions: Schema.number().default(8),
+  maxDispatchDepth: Schema.number().default(2),
+  subAssistantTimeoutMs: Schema.number().default(600000),
 })

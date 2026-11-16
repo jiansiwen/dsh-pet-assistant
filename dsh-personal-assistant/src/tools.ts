@@ -132,6 +132,16 @@ export interface ToolOptions {
    * 只能按当天记录识别重复；项目资料读取、资料列表、发送授权与资料删除明确拒绝。
    */
   materials?: MaterialStore
+  /**
+   * 子助理分派服务（AI 智能体接入）。未装配时该工具明确拒绝，不降级成普通成员对话。
+   * 返回值始终携带结果文本：无论汇报模式如何，总助理总会收到一份汇总。
+   */
+  subAssistantDispatch?: {
+    dispatch(assistantId: string, task: string, dispatchId: string): Promise<{
+      runId: string | null; assistantId: string; displayName: string
+      status: 'completed' | 'escalated' | 'failed' | 'refused'; text: string; depth: number; elapsedMs: number
+    }>
+  }
   /** 运行时挂载团队服务（团队模式开关的「开」）；已挂载时幂等。 */
   enableTeamMode(): { toolsRegistered: boolean }
   /** 运行时卸载团队服务（团队模式开关的「关」）；有运行中任务时拒绝。 */
@@ -749,6 +759,37 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
               ? `会话已绑定到桥接，但拉不起桌面宠物（${petDir}）：请在该目录运行 pnpm install && pnpm start；启动日志在 ~/.dsh/dsh-pet/launch.log`
               : '会话已绑定到桥接，但没有找到 dsh-pet：把 dsh-pet 目录放在插件同级（与 dsh-personal-assistant 并排），或在 profile 里给 personal-assistant 配置 config.petDir，或手动在 dsh-pet 目录运行 pnpm start（启动后会自动接入桥接）',
       })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'personal_assistant_dispatch_subassistant',
+    description: '把任务分派给子助理（接入外部 AI 平台智能体或本地 AI CLI 工具的成员，如平台助理、Claude Code、Qoder）。子助理是持久独立会话：跨任务保持自己的上下文；它没有本地工具——需要本地文件操作、执行命令或访问本系统其他成员时它会返回 out-of-scope（escalated），此时你必须重新分析任务（拆解、改写或换成员/自己完成），不可原样转发。status=escalated 表示越权回退；status=refused 表示重分派深度超限被拒；返回值始终携带结果文本。用户说"让XX（成员名）做/回答/处理某事"且该成员是子助理类型时调用。',
+    parameters: {
+      assistantId: { type: 'string', required: true, description: '子助理的成员 ID（assistantId）' },
+      task: { type: 'string', required: true, description: '给子助理的任务描述；越权回退后再分派请重新表述任务，不要原样转发' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { assistantId?: unknown; task?: unknown }, exec: unknown) {
+      if (!options.subAssistantDispatch) {
+        return json({ ok: false, error: '子助理分派服务未装配（请检查插件配置与团队库）' })
+      }
+      const assistantId = typeof args.assistantId === 'string' ? args.assistantId : ''
+      const task = typeof args.task === 'string' ? args.task : ''
+      if (!assistantId || !task || task.length > 8192) {
+        return json({ ok: false, error: 'assistantId 与 task 必填（task 至多 8192 字符）' })
+      }
+      // 工具调用幂等键：同一次调用重放命中账本既有 run，直接返回既有结果。
+      const callId = (exec as { rootCallId?: unknown }).rootCallId
+      const dispatchId = typeof callId === 'string' && callId !== '' ? callId : `adhoc-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const result = await options.subAssistantDispatch.dispatch(assistantId, task, dispatchId)
+      const summary = result.status === 'completed' ? `子助理 ${result.displayName} 已完成`
+        : result.status === 'escalated' ? `子助理 ${result.displayName} 越权回退，需重新分析：${result.text}`
+        : result.status === 'refused' ? `分派被拒绝：${result.text}`
+        : `分派失败：${result.text}`
+      return json({ ok: result.status === 'completed', runId: result.runId, assistantId: result.assistantId,
+        displayName: result.displayName, status: result.status, text: result.text, depth: result.depth,
+        elapsedMs: result.elapsedMs, summary })
     },
   }))
 

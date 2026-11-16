@@ -284,6 +284,12 @@ export interface BridgeEventPayload {
   payload?: unknown
   /** proactive：气泡正文（插件侧固定常量，不是模型生成的）。 */
   message?: string
+  /** subassistant-report：本次运行的账本行标识（去重用）。 */
+  runId?: string
+  /** subassistant-report：本次播报的音色档案名，未传走全局默认音色。 */
+  voiceProfile?: string
+  /** subassistant-report：汇报模式（self=子助理直接播报）。 */
+  reportMode?: 'chief' | 'self'
 }
 
 export type ApprovalDecision = 'approve' | 'reject'
@@ -688,6 +694,8 @@ export interface PetApi extends MemberApi {
   onTeamEvent(callback: (event: BridgeEventPayload) => void): void
   /** 成员值守结果（邮件分析等）的桌面提示；点击系统通知会打开团队页。 */
   onMemberNotice(callback: (notice: MemberNotice) => void): () => void
+  /** 子助理自行汇报（self 模式）：主进程已按成员音色播报，渲染层只出角色气泡。 */
+  onSubassistantReport(callback: (report: { assistantId: string; displayName: string; skinId: string; text: string }) => void): () => void
   /** 壳的生命周期状态：启动握手的阶段、失败原因、角色可见性、专注模式。 */
   onCompanionState(callback: (state: CompanionState) => void): void
   /** 角色该不该显示。false 时界面把整个舞台卸掉，场景时钟随之停下。 */
