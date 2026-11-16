@@ -204,6 +204,21 @@ test('ackSystemPrompt：名字、性格、字数都进提示词', () => {
   assert.ok(prompt.includes('30'))
 })
 
+/*
+ * 钉住一次真实翻车：用户问"你在干嘛"，快答说"我正在闲着发慌"，
+ * 主脑随后说"我在等你发话，没在干别的" —— 两句互相打脸。
+ *
+ * 根因是快答在**回答问题**、在**陈述自己的状态**，而它既不知道答案也不知道自己此刻在干什么。
+ * 所以提示词必须把这两件事明确禁止，只允许"我收到了、正在办"这类过渡语。
+ */
+test('ackSystemPrompt：明令禁止抢答与自述状态', () => {
+  const prompt = ackSystemPrompt('小潘', '', 20)
+  assert.match(prompt, /绝对不要回答问题本身/u)
+  assert.match(prompt, /绝对不要陈述你的状态/u)
+  assert.match(prompt, /我在闲着/u, '要把翻车那句话作为反例点出来')
+  assert.match(prompt, /我想一下|我整理一下/u, '给出正确的说法示范')
+})
+
 test('临时话语照常播出，但不进打断后要告诉模型的内容', () => {
   const lines: string[] = []
   let deliver: (event: TtsWorkerEvent) => void = () => { throw new Error('合成进程还没被拉起') }

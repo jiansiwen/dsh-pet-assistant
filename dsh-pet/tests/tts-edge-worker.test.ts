@@ -130,7 +130,7 @@ for (const completed of [true, false]) {
 test('生产合成选择：真实选择函数连接引擎，合成边界全部模拟且不出网', async (t) => {
   const api: ResolvedVoiceApi = {
     id: '自定义', kind: 'tts', name: '测试服务', endpoint: 'https://voice.invalid/v1',
-    model: 'custom-model', voice: 'custom-voice', apiKey: 'test-key', provider: 'openai',
+    model: 'custom-model', voice: 'custom-voice', voiceDesign: '', apiKey: 'test-key', provider: 'openai',
   }
   const audio = Buffer.from([0xff, 0xfb, 0x90, 0x00])
   const { synthesizeApi } = await import('../src/main/voice-api.ts')
@@ -277,7 +277,7 @@ test('自定义 API 合成失败不偷换服务：报错收场，不走本地回
   })
   h.engine.speak('一', '第一句。', {
     id: 'p1', kind: 'tts', name: '我的服务', endpoint: 'https://example.com/v1',
-    model: 'tts-1', voice: 'alloy', apiKey: 'sk-test', provider: 'openai',
+    model: 'tts-1', voice: 'alloy', voiceDesign: '', apiKey: 'sk-test', provider: 'openai',
   })
   await Promise.resolve()
   await Promise.resolve()
@@ -293,7 +293,7 @@ test('自定义 API 合成成功照常播放，不吃本地回退', async () => 
   const h = makeEngine()
   h.engine.speak('一', '第一句。', {
     id: 'p1', kind: 'tts', name: '我的服务', endpoint: 'https://example.com/v1',
-    model: 'tts-1', voice: 'alloy', apiKey: 'sk-test', provider: 'openai',
+    model: 'tts-1', voice: 'alloy', voiceDesign: '', apiKey: 'sk-test', provider: 'openai',
   })
   await Promise.resolve()
   assert.equal(h.plays.length, 1)

@@ -561,6 +561,7 @@ interface Row {
 
 export class MeetingStore {
   private readonly db: DatabaseSync
+  private closed = false
   private readonly userDataDir: string
   private readonly deps: MeetingStoreDeps
   private readonly gapThresholdMs: number
@@ -598,6 +599,7 @@ export class MeetingStore {
   }
 
   close(): void {
+    this.closed = true
     this.db.close()
   }
 
@@ -881,6 +883,8 @@ export class MeetingStore {
   }
 
   listMeetings(limit = 20): MeetingRow[] {
+    // 退出收尾会先关库；托盘/面板的轮询可能还在退出窗口里跑，关库后如实返回空，不抛异常崩进程。
+    if (this.closed) return []
     const rows = this.db.prepare('SELECT * FROM meetings ORDER BY startedAt DESC LIMIT ?').all(limit) as Row[]
     return rows.map(row => this.toMeetingRow(row))
   }

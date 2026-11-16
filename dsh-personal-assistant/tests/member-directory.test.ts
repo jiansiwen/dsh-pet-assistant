@@ -143,8 +143,8 @@ test('v13 迁移失败时回滚；成功后保留已有成员和会话，渠道�
   assert.equal(original.beginMailSend({ intentId: '旧邮件', accountKey: '账户', digest: '摘要', subject: '主题',
     recipients: ['a@example.com'], epoch: '旧代次' }, beforeMidnight), true)
   const raw = fixture.raw()
-  raw.exec(`DROP TABLE member_channel_sessions; DROP TABLE meeting_mail_followups; DELETE FROM migrations WHERE version = 14; PRAGMA user_version = 13;
-    CREATE TRIGGER fail_member_scope_migration BEFORE INSERT ON migrations WHEN NEW.version = 14
+  raw.exec(`DROP TABLE member_channel_sessions; DROP TABLE meeting_mail_followups; DELETE FROM migrations WHERE version = 15; PRAGMA user_version = 13;
+    CREATE TRIGGER fail_member_scope_migration BEFORE INSERT ON migrations WHEN NEW.version = 15
     BEGIN SELECT RAISE(ABORT, '模拟渠道会话迁移失败'); END;`)
   assert.throws(() => fixture.open(), /模拟渠道会话迁移失败/u)
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 13)
@@ -453,7 +453,7 @@ test('迁移 v8 到当前版本保留身份，当前版本再次打开不重跑�
   raw.prepare('INSERT INTO assistants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(old.assistantId, old.roleId, old.displayName,
     old.skinId, old.persona, old.voiceProfile, JSON.stringify(old.toolPolicy), 1, old.revision)
   const store = fixture.open()
-  assert.equal(TEAM_SCHEMA_VERSION, 14)
+  assert.equal(TEAM_SCHEMA_VERSION, 15)
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, TEAM_SCHEMA_VERSION)
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_notice_deliveries'").get())
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_send_intents'").get())

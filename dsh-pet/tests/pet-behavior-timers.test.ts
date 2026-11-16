@@ -196,5 +196,5 @@ test('工作与睡眠保护不会被随机动作覆盖，醒来后恢复', t => 
   pet.render()
   pet.update({ working: true })
   pet.seconds(5)
-  assert.equal(pet.behavior.action, 'read')
+  assert.equal(pet.behavior.action, 'write')
 })

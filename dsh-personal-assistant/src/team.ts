@@ -926,6 +926,13 @@ export class TeamService {
     this.recovered = true
   }
 
+  /** 成员最新工作汇报：同步给总助理_prompt 知悉；成员已亲自汇报过，总助不再复述。 */
+  private readonly recentReports: Array<{ at: number; member: string; text: string }> = []
+  latestReports(): string {
+    if (this.recentReports.length === 0) return ''
+    return this.recentReports.map(item => `- ${item.member}：${item.text}`).join('\n')
+  }
+
   /** 只有产物可核验才算完成；跑完但拿不出证据的进复核，不伪装成功；副作用结果不明的进 unknown。 */
   private settle(taskId: string, runId: string, member: MemberConfig, task: Task, result: SubagentResult): TaskOutcome {
     const report = this.parseReport(result.structured)
@@ -958,6 +965,8 @@ export class TeamService {
       for (const artifact of artifacts) this.store.appendEvent('task/artifact', { taskId, artifact }, { taskId, assistantId: member.assistantId })
       const ledger = ledgerLine(operations)
       const text = report?.summary ?? this.fallbackText(result)
+      this.recentReports.push({ at: Date.now(), member: member.displayName, text: text.slice(0, 1200) })
+      if (this.recentReports.length > 5) this.recentReports.shift()
       this.store.appendEvent('reply/done', {
         requestId: updated.originRequestId, taskId, assistantId: member.assistantId, displayName: member.displayName,
         skinId: member.skinId, status, text: ledger ? `${ledger}\n${text}` : text, diagnostic,

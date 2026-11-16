@@ -350,3 +350,13 @@
  * "可配置"变成"不能用"。变量由角色容器（.character-slot）下发，默认 1。
  */
 .pet-svg, .pet-img, .pet-video, .pet-walk-strip { opacity: var(--pet-opacity, 1); }
+
+/*
+ * 交接登场/退场：退场的淡出上移，登场的从下方弹入。
+ * 用独立的 translate/opacity 属性，不与容器 transform（大小档位缩放）打架；
+ * 也不依赖皮肤帧素材 —— 静态图皮肤（如眼镜女生）一样有完整的登退场动效。
+ */
+.character-slot.entering { animation: pa-enter 0.9s cubic-bezier(0.34, 1.56, 0.64, 1); }
+.character-slot.leaving { animation: pa-leave 0.85s ease-in forwards; pointer-events: none; }
+@keyframes pa-enter { from { opacity: 0; translate: 0 32px; } to { opacity: 1; translate: 0 0; } }
+@keyframes pa-leave { from { opacity: 1; translate: 0 0; } to { opacity: 0; translate: 0 -24px; } }

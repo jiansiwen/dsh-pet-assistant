@@ -33,7 +33,7 @@ const HOUR = 60 * MINUTE
  * 抬头的期望值。这里**字面重抄**而不是只从实现 import：抬头是给模型看的语义契约，
  * "只是背景，不是本轮任务"这句话被删掉或被改软，必须有用例失败。
  */
-const EXPECTED_HEADER = '以下是最近 24 小时的工作事项（只是背景，不是本轮任务）：'
+const EXPECTED_HEADER = '以下是最近 7 天的工作事项（只是背景，不是本轮任务）：'
 
 /** 与实现同口径的本地时间戳渲染，用来做逐字比对（不依赖机器时区）。 */
 function expectedStamp(at: number): string {
@@ -155,17 +155,17 @@ test('selectWorkContext：同时刻 updatedAt 用 start 倒序，再同时刻用
   assert.deepEqual(selectWorkContext(items, { now: NOW, limit: 5 }).map(entry => entry.id), ['m', 'a', 'z'])
 })
 
-test('buildWorkContext：默认最多 3 条', () => {
-  assert.equal(WORK_CONTEXT_LIMIT, 3)
+test('buildWorkContext：默认最多 5 条', () => {
+  assert.equal(WORK_CONTEXT_LIMIT, 5)
   const items = Array.from({ length: 5 }, (_, index) => item({
     id: `w-${index}`,
     start: NOW - (index + 1) * MINUTE,
     updatedAt: NOW - (index + 1) * MINUTE,
   }))
   const lines = buildWorkContext(items, { now: NOW }).split('\n')
-  assert.equal(lines.length, 4)
-  // 截断留下的是最新的三条（updatedAt 最大），不是最早的三条。
-  assert.deepEqual(selectWorkContext(items, { now: NOW }).map(entry => entry.id), ['w-0', 'w-1', 'w-2'])
+  assert.equal(lines.length, 6)
+  // 截断留下的是最新的五条（updatedAt 最大），不是最早的五条。
+  assert.deepEqual(selectWorkContext(items, { now: NOW }).map(entry => entry.id), ['w-0', 'w-1', 'w-2', 'w-3', 'w-4'])
 })
 
 test('selectWorkContext：limit 可调，超限只留最新的几条', () => {
@@ -183,13 +183,13 @@ test('selectWorkContext：limit 可调，超限只留最新的几条', () => {
 
 test('selectWorkContext：开始时间落在窗外的被排除（过旧、未来、刚好边界）', () => {
   const items = [
-    item({ id: 'old', start: NOW - days(1) - MINUTE, updatedAt: NOW }),
-    item({ id: 'edge-old', start: NOW - days(1), updatedAt: NOW }),
+    item({ id: 'old', start: NOW - days(7) - MINUTE, updatedAt: NOW }),
+    item({ id: 'edge-old', start: NOW - days(7), updatedAt: NOW }),
     item({ id: 'inside', start: NOW - HOUR, updatedAt: NOW }),
     item({ id: 'edge-now', start: NOW, updatedAt: NOW }),
     item({ id: 'future', start: NOW + MINUTE, updatedAt: NOW }),
   ]
-  // 两端都闭：正好 24 小时前与正好此刻都算"最近"，超出 1ms 就不算。
+  // 两端都闭：正好 7 天前与正好此刻都算"最近"，超出 1ms 就不算。
   // 三条的 updatedAt 相同，所以这里顺带验证了第二级排序（start 倒序）。
   assert.deepEqual(
     selectWorkContext(items, { now: NOW, limit: 10 }).map(entry => entry.id),
@@ -198,10 +198,10 @@ test('selectWorkContext：开始时间落在窗外的被排除（过旧、未来
 })
 
 test('selectWorkContext：窗口宽度可调', () => {
-  // 放宽：30 小时前的事项默认被 24h 窗丢掉，放到 48h 窗里就进来。
+  // 收窄：30 小时前的事项在默认 7 天窗里，但 24 小时窗里就不该出现。
   const old = [item({ id: 'w-30h', start: NOW - 30 * HOUR, updatedAt: NOW })]
-  assert.deepEqual(selectWorkContext(old, { now: NOW }), [])
-  assert.deepEqual(selectWorkContext(old, { now: NOW, windowMs: 48 * HOUR }).map(entry => entry.id), ['w-30h'])
+  assert.deepEqual(selectWorkContext(old, { now: NOW, windowMs: 24 * HOUR }), [])
+  assert.deepEqual(selectWorkContext(old, { now: NOW }).map(entry => entry.id), ['w-30h'])
   // 收窄：2 小时前的事项在默认窗内，1 小时窗里就不该再出现。
   const recent = [item({ id: 'w-2h', start: NOW - 2 * HOUR, updatedAt: NOW })]
   assert.deepEqual(selectWorkContext(recent, { now: NOW }).map(entry => entry.id), ['w-2h'])
@@ -295,7 +295,7 @@ test('renderWorkContext：未装配 workItems 时返回空串', () => {
   assert.equal(renderWorkContext(source, NOW), '')
 })
 
-test('renderWorkContext：按 24 小时窗取数，上界多留 1ms 兜住"正好此刻"', () => {
+test('renderWorkContext：按 7 天窗取数，上界多留 1ms 兜住"正好此刻"', () => {
   const calls: Array<[number, number]> = []
   const source = {
     workItems: {

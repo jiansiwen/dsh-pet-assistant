@@ -139,7 +139,14 @@ function ProviderEditor(props: {
 
 function App() {
   const { state, error, refresh, setError } = useStudio()
-  const [tab, setTab] = useState<'pipeline' | 'voice' | 'providers'>('pipeline')
+  const [tab, setTab] = useState<'pipeline' | 'clip' | 'voice' | 'providers'>('pipeline')
+  /*
+   * 从视频裁动作的表单状态。
+   *
+   * 起止用**秒数输入**而不是时间轴拖拽：拖拽要做好多交互（缩略图、帧对齐、预览），
+   * 而这里真正需要的只是"从第几秒到第几秒"，播一遍原片记下数字更快。
+   */
+  const [clip, setClip] = useState({ sourcePath: '', from: '0', to: '1.5', matte: 'background', action: 'wave', skinId: '', skinName: '', busy: false, note: '' })
   const [draft, setDraft] = useState<StudioState['config'] | null>(null)
   const [secrets, setSecrets] = useState<Record<string, string>>({})
   const [job, setJob] = useState({ name: '', prompt: '', imageProviderId: '', videoProviderId: '', approved: false, actions: ['idle', 'walk', 'think', 'wave', 'jump', 'sleep'] as string[] })
@@ -190,10 +197,62 @@ function App() {
       <h1>形象与音色工作室</h1>
       <div className="row tabs">
         <button className={tab === 'pipeline' ? 'on' : ''} onClick={() => setTab('pipeline')}>形象流水线</button>
+        <button className={tab === 'clip' ? 'on' : ''} onClick={() => setTab('clip')}>从视频裁动作</button>
         <button className={tab === 'voice' ? 'on' : ''} onClick={() => setTab('voice')}>自定义音色</button>
         <button className={tab === 'providers' ? 'on' : ''} onClick={() => setTab('providers')}>模型接入配置</button>
       </div>
       {error && <div className="error">{error}<button onClick={() => setError('')}>关闭</button></div>}
+
+      {tab === 'clip' && <>
+        <p className="muted">
+          从你本地已有的视频里截一小段，扣掉背景，变成某个动作。**不需要视频模型。**
+          抠像是靠估计静态背景，所以镜头会动的片段扣不干净——那种情况会如实失败，不会塞一段半透明鬼影给你。
+        </p>
+        <label>视频文件
+          <div className="row">
+            <input readOnly value={clip.sourcePath} placeholder="还没选" />
+            <button onClick={async () => {
+              const result = await api().pickVideo()
+              if (!result.ok) { setError(result.error); return }
+              const picked = Array.isArray(result.value) ? String(result.value[0] ?? '') : ''
+              if (picked !== '') setClip({ ...clip, sourcePath: picked })
+            }}>选择…</button>
+          </div>
+        </label>
+        <div className="row">
+          <label>从第几秒<input value={clip.from} onChange={e => setClip({ ...clip, from: e.target.value })} /></label>
+          <label>到第几秒<input value={clip.to} onChange={e => setClip({ ...clip, to: e.target.value })} /></label>
+        </div>
+        <div className="row">
+          <label>抠像方式
+            <select value={clip.matte} onChange={e => setClip({ ...clip, matte: e.target.value })}>
+              <option value="background">静态背景估计（镜头不动）</option>
+              <option value="chroma">绿幕抠像</option>
+              <option value="none">不抠，保留原背景</option>
+            </select>
+          </label>
+          <label>动作名<input value={clip.action} onChange={e => setClip({ ...clip, action: e.target.value })} placeholder="wave" /></label>
+        </div>
+        <div className="row">
+          <label>加到皮肤（留空则新建）
+            <select value={clip.skinId} onChange={e => setClip({ ...clip, skinId: e.target.value })}>
+              <option value="">新建一个</option>
+              {(state.skins ?? []).map(skin => <option key={skin.id} value={skin.id}>{skin.name}</option>)}
+            </select>
+          </label>
+          {clip.skinId === '' && <label>新皮肤名<input value={clip.skinName} onChange={e => setClip({ ...clip, skinName: e.target.value })} placeholder="例如 小张" /></label>}
+        </div>
+        <button disabled={clip.busy || clip.sourcePath === '' || clip.action.trim() === ''} onClick={async () => {
+          setClip({ ...clip, busy: true, note: '' })
+          const result = await api().extractClip({
+            sourcePath: clip.sourcePath, from: Number(clip.from), to: Number(clip.to),
+            matte: clip.matte, action: clip.action.trim(), skinId: clip.skinId, skinName: clip.skinName.trim(),
+          })
+          setClip({ ...clip, busy: false, note: result.ok ? `已生成：${clip.action}（皮肤 ${String((result.value as { skinId?: string })?.skinId ?? clip.skinId)}）` : (result.error ?? '失败') })
+          if (result.ok) await refresh()
+        }}>{clip.busy ? '正在裁剪…' : '裁出这个动作'}</button>
+        {clip.note !== '' && <p className="muted">{clip.note}</p>}
+      </>}
 
       {tab === 'providers' && <>
         <p className="muted">接你自己的模型：填 baseUrl 与协议字段即可。密钥加密落盘，配置里只留引用。ffmpeg：{state.ffmpeg ?? '未找到（后处理会停住并提示）'}</p>

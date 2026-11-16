@@ -84,6 +84,20 @@ export function makeReportId(subject: string, date: string): string {
   return `${clean}:${date}`
 }
 
+/**
+ * 周报主体的日期键：取该周**周一**（本地时区）。
+ *
+ * 用周一起始而不是"今天"：同一周里任何一天让助理写周报，都应该落到同一份草稿上，
+ * 否则周二写一份、周三又写一份，两份都叫"本周周报"，用户没法确认哪份是定稿。
+ */
+export function weekKeyOf(now: number): string {
+  const date = new Date(now)
+  const offset = (date.getDay() + 6) % 7
+  date.setDate(date.getDate() - offset)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
 /** 临时产物名带 revision：并发发布两次不同版本时不会互相踩，崩溃后也认得出是谁留下的。 */
 export function tempPathFor(targetPath: string, revision: number): string {
   return `${targetPath}.r${revision}.tmp`

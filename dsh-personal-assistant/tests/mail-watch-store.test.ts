@@ -98,9 +98,9 @@ test('新近登记事务回滚、重放和旧版 v10 重启均保留原游标与
       old.exec(`DROP TABLE channel_inbound; DROP TABLE mail_send_intents; DROP TABLE mail_notice_deliveries; DELETE FROM migrations WHERE version = ${TEAM_SCHEMA_VERSION}; PRAGMA user_version = 10`)
     } finally { old.close() }
   })
-  assert.equal(TEAM_SCHEMA_VERSION, 14)
+  assert.equal(TEAM_SCHEMA_VERSION, 15)
   const raw = new DatabaseSync(f.dbPath, { readOnly: true })
-  try { assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 14) } finally { raw.close() }
+  try { assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 15) } finally { raw.close() }
   assert.equal(f.store.getMailWatchScope(scope.scopeId)?.scannedUid, 25)
   assert.deepEqual(f.store.listMailWatchMessages(scope.scopeId, 'analyzed').map(item => item.uid), [10_001])
   assert.deepEqual(f.store.listMailWatchMessages(scope.scopeId, 'missing').map(item => item.uid), [10_002])

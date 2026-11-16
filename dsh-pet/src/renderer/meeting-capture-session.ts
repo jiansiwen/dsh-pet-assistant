@@ -107,8 +107,18 @@ async function startMeetingCapture(
   const progress: Record<MeetingTrack, { sent: number | null; acknowledged: number | null }> = {
     mic: { sent: null, acknowledged: null }, loopback: { sent: null, acknowledged: null },
   }
-  const noteError = (reason: string): void => {
-    if (errors.length < 32) {
+  /*
+    采集缺口只报告**一次**：麦克风被语音助手短暂占用时这种小缺口会反复出现，
+    每次都弹窗就是噪音。完整性判定不受影响（缺口仍然记进 errors / integrity），
+    真正严重的情况（整条音轨没了）走 reportMissing。
+  */
+  let gapReported = false
+  const reportGapOnce = (): void => {
+    if (gapReported) return
+    gapReported = true
+    noteError('mic 音轨采集出现时间缺口')
+  }
+  const noteError = (reason: string): void => {    if (errors.length < 32) {
       errors.push(reason.slice(0, 240))
       onError(reason)
     }
@@ -262,7 +272,12 @@ async function startMeetingCapture(
       onFrame: (frame) => {
         if (stopped || micEnded) return
         lastFrameAt.mic = performance.now()
-        if (frame.gapBefore) noteError('mic 音轨设备重开或采集出现时间缺口')
+        /*
+      采集出现时间缺口**只记日志、不弹提示**。
+      麦克风被别的进程（语音助手听写、唤醒词）短暂占用时必然出现这种小缺口，
+      每来一次就弹窗只会变成噪音。真正"整条音轨没了"仍走 meetingTrackMissing 那条严重路径。
+    */
+    if (frame.gapBefore) reportGapOnce()
         if (micChunker === null || frame.sampleRate !== micRate) {
           const rest = micChunker?.flush() ?? null
           if (rest !== null) send(rest)

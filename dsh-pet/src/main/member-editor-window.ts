@@ -14,7 +14,13 @@ export const MEMBER_EDITOR_CHANNELS = { context: 'member-editor-context', close:
 export const MEMBER_EDITOR_OPEN = 'member-editor-open'
 export const MEMBER_EDITOR_PARTITION = 'dsh-member-editor'
 
-export interface MemberEditorContext { memberId: string | null }
+/**
+ * 编辑窗口的上下文。
+ *
+ * `skins` 是**可选**的：它带的是自定义皮肤的 id 与显示名，让"形象"下拉能列出
+ * 用户自己在工作室做出来的皮肤。不带它时编辑器退回三个内置形象 —— 旧调用方不受影响。
+ */
+export interface MemberEditorContext { memberId: string | null; skins?: Array<{ id: string; name: string }> }
 export interface MemberEditorOptions {
   readonly pagePath?: string
   readonly preloadPath?: string
@@ -37,7 +43,7 @@ export class MemberEditorWindow {
   get window(): BrowserWindow | null { return this.win }
 
   open(context: MemberEditorContext): boolean {
-    this.context = { memberId: context.memberId }
+    this.context = { memberId: context.memberId, ...(context.skins === undefined ? {} : { skins: context.skins }) }
     if (this.win && !this.win.isDestroyed()) {
       if (this.win.isMinimized()) this.win.restore()
       this.win.show()

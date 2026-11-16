@@ -36,6 +36,7 @@ import { manifestFor, manifestForLegacySkin, registerCustomSkins } from './chara
 import { clearPetAssetCache } from './usePetImage.js'
 import { PROACTIVE_ACCEPT_MESSAGE } from './proactive-ui.js'
 import { arrayBufferToBase64, pcm16Base64, recordDictation, stopDictation, type DictationHandover } from './dictation.js'
+import { agentVoicePatch, preferNonEmpty } from '../shared/agent-voice-rule.ts'
 import { installAudioBridge, isWakePhraseOnly } from './barge-in.ts'
 import { DEFAULT_QUEUE_LIMITS, drainForStop, enqueue, takeNext, type QueuedInput } from './input-queue.ts'
 import { isSelfSpeech, rememberSelfSpeech } from './self-speech.ts'
@@ -59,6 +60,7 @@ import type {
   TeamProposalSnapshot,
   TeamSnapshot,
 } from './types.js'
+import './tokens.css'
 import './pet-anim.css'
 import './portal.css'
 import './team.css'
@@ -74,13 +76,22 @@ const QUICK_COMMANDS = ['开启个人助理模式', '我今天干了啥？', '�
 const PROACTIVE_BUBBLE_TTL_MS = 30 * 60_000
 
 /**
+ * 拖拽 / 退场两个标志的最长存活时间。
+ *
+ * 正常拖拽不到 15 秒（真实拖拽是 1–3 秒），退场动画 4.3 秒、主进程 7 秒兜底退出。
+ * 超过这个时长标志仍为真，就只能是**收尾事件丢了**，不是用户还在操作。
+ * 那时强制放行，否则窗口会永久停在"鼠标穿透"——形象还在，但什么都点不动。
+ */
+const STALL_RELEASE_MS = 15_000
+
+/**
  * 宠物界面的构建标识，显示在通用设置的诊断区。
  *
  * 有个说不清的显示问题时，第一件要排除的事就是「跑的是不是这个构建」——
  * 插件与宠物都是**进程内加载 + 模块缓存**，重建磁盘文件对已运行的进程毫无影响。
  * 看一眼这个标记就知道，不用再靠猜。
  */
-const UI_BUILD = '1031-settings2'
+const UI_BUILD = '1113-rail-glass.3'
 
 /** 语音唤醒命中时的应答。角色被隐藏时这句要等舞台挂回来再补说，所以提成常量。 */
 const WAKE_GREETING = '我在呢！找我什么事？'
@@ -112,12 +123,517 @@ function SettingsEntryCard({ title, description, action, onAction, secondary, di
   disabled?: boolean
   pending?: string
 }) {
-  return <section className="management-section" aria-label={title}>
-    <h3>{title}</h3>
-    <p className="management-hint">{description}</p>
-    <button className="management-button" disabled={disabled} onClick={onAction}>{pending ?? action}</button>
-    {secondary && <button className="management-button ghost" onClick={secondary.onAction}>{secondary.label}</button>}
-    <p className="management-hint">完整页面正在建设中，当前通过独立窗口使用。</p>
+  /*
+   * 一行，不是一张卡。
+   *
+   * 旧版是「标题 + 说明 + 主按钮 + 次按钮 + 再一句'完整页面正在建设中'」竖着堆在白卡里，
+   * 三张卡就是三句一模一样的抱歉；而且用户点了卡片，得到的还是另一个窗口。
+   * 现在左边说清是什么、右边一个去处，去向已经写进说明里，那句免责就不必再占一行。
+   */
+  return <section className="management-entry" aria-label={title}>
+    <div className="management-entry-copy">
+      <h3>{title}</h3>
+      <p className="management-hint">{description}</p>
+    </div>
+    <div className="management-entry-actions">
+      {secondary && <button className="management-button" onClick={secondary.onAction}>{secondary.label}</button>}
+      <button className="management-button primary" disabled={disabled} onClick={onAction}>{pending ?? action}</button>
+    </div>
+  </section>
+}
+
+/**
+ * 专属词库：行话与它指的是什么。
+ *
+ * 这一页的存在理由：老板说"去 kms 查一下"，助理得知道 kms 是哪套系统。
+ * 与记忆分开是因为它**不是判断而是映射**——查到就替换，不需要模型理解语义。
+ *
+ * 交互上刻意只有"加一个/删一个"，没有编辑：改一个小词的解释等于换了个词的意思，
+ * 删了重加更清楚。
+ */
+function GlossarySettings({ showToast }: { showToast: (text: string) => void }) {
+  const [terms, setTerms] = useState<Array<{ term: string; expansion: string }> | null>(null)
+  const [term, setTerm] = useState('')
+  const [expansion, setExpansion] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [problem, setProblem] = useState('')
+
+  const load = useCallback(async (): Promise<void> => {
+    try {
+      const result = await window.petApi.glossaryState()
+      if (result.ok) setTerms(result.terms ?? [])
+      else setProblem(result.message ?? '词库暂时读不到')
+    } catch { setProblem('词库暂时读不到，请稍后刷新') }
+  }, [])
+  useEffect(() => { void load() }, [load])
+
+  const apply = async (nextTerm: string, nextExpansion?: string, remove = false): Promise<void> => {
+    setBusy(true); setProblem('')
+    try {
+      const result = await window.petApi.glossaryUpdate(nextTerm, nextExpansion, remove)
+      if (!result.ok) { setProblem(result.message ?? '没有保存成功'); return }
+      setTerms(result.terms ?? [])
+      if (!remove) { setTerm(''); setExpansion('') }
+      showToast(remove ? '术语已删除' : '术语已加入词库')
+    } catch { setProblem('没有保存成功，请稍后重试') } finally { setBusy(false) }
+  }
+
+  return <section className="management-section" aria-label="专属词库">
+    <h3>专属词库</h3>
+    <p className="management-hint">把公司里的行话记下来。下次你说到这个词，助理就知道它指的是什么；没说到就一个字都不加。</p>
+    {problem !== '' && <p className="assistant-settings-error" role="alert">{problem}</p>}
+    {terms === null && <p className="management-hint">正在读取词库…</p>}
+    {terms !== null && terms.length === 0 && <p className="management-hint">还没有术语。比如：kms → 公司内部知识管理系统。</p>}
+    {!!terms?.length && <ul className="management-checklist">{terms.map(item => <li key={item.term}>
+      <strong>{item.term}</strong>
+      <span>→ {item.expansion}</span>
+      <button type="button" className="management-button" disabled={busy}
+        onClick={() => void apply(item.term, undefined, true)}>删除</button>
+    </li>)}</ul>}
+    <div className="management-voice">
+      <input aria-label="术语" placeholder="术语，例如 kms" value={term} disabled={busy} maxLength={120}
+        onChange={event => setTerm(event.target.value)} />
+      <input aria-label="术语的意思" placeholder="它指的是什么" value={expansion} disabled={busy} maxLength={2000}
+        onChange={event => setExpansion(event.target.value)} />
+      <button type="button" className="management-button primary" disabled={busy || term.trim() === '' || expansion.trim() === ''}
+        onClick={() => void apply(term.trim(), expansion.trim())}>加入词库</button>
+    </div>
+  </section>
+}
+
+/**
+ * 最近产物：助理给你做出过哪些文件。
+ *
+ * 这一页回答的是"上次那个文件在哪"。**不显示内容摘要**：它是指针不是记忆，
+ * 摘要一放上去，用户就会以为"内容还在这"，而文件可能已经被改过或删了。
+ * `state='missing'` 要如实标出来 —— 悄悄从列表消失，用户会以为自己记错了。
+ */
+function ArtifactsSettings() {
+  const [items, setItems] = useState<Array<{ path: string; label: string; state: 'ok' | 'missing'; createdAt: number }> | null>(null)
+  const [problem, setProblem] = useState('')
+  const load = useCallback(async (): Promise<void> => {
+    try {
+      const result = await window.petApi.artifactsState()
+      if (result.ok) setItems((result.artifacts ?? []).map(item => ({ path: item.path, label: item.label, state: item.state, createdAt: item.createdAt })))
+      else setProblem(result.message ?? '产物列表暂时读不到')
+    } catch { setProblem('产物列表暂时读不到，请稍后刷新') }
+  }, [])
+  useEffect(() => { void load() }, [load])
+  const stamp = (at: number): string => {
+    if (!Number.isFinite(at) || at <= 0) return ''
+    const date = new Date(at)
+    const pad = (value: number): string => String(value).padStart(2, '0')
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+  return <section className="management-section" aria-label="最近产物">
+    <h3>最近产物</h3>
+    <p className="management-hint">助理给你做出过的文件。这里只记位置，不存内容；文件被改了或删了，会如实标出来。</p>
+    {problem !== '' && <p className="assistant-settings-error" role="alert">{problem}</p>}
+    {items === null && problem === '' && <p className="management-hint">正在读取…</p>}
+    {items !== null && items.length === 0 && <p className="management-hint">还没有产物记录。日报、纪要这类文件真正写进磁盘之后才会出现在这里。</p>}
+    {!!items?.length && <ul className="management-checklist">{items.map(item => <li key={item.path}>
+      <strong>{item.label || '产物'}</strong>
+      <span className="management-hint">{item.path}</span>
+      {item.state === 'missing'
+        ? <span className="management-status" data-missing>文件已不在</span>
+        : <span className="management-status">{stamp(item.createdAt)}</span>}
+    </li>)}</ul>}
+    <button type="button" className="management-button" onClick={() => { setItems(null); setProblem(''); void load() }}>刷新</button>
+  </section>
+}
+
+/**
+ * 技能：每个助理自己攒下来的做法。
+ *
+ * 界面上刻意把**候选**与**生效**分开显示：候选不参与回答，晋升才生效。
+ * 回滚只有一个按钮，点它回到上一版 —— 这一版技能是一份文本，
+ * 没有可调参数，"回到上一版"就是用户能理解的全部语义。
+ */
+function SkillsSettings({ showToast }: { showToast: (text: string) => void }) {
+  type Row = { id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }
+  const [rows, setRows] = useState<Row[] | null>(null)
+  const [pending, setPending] = useState<Array<{ assistantName: string; shape: string; count: number }>>([])
+  const [unverified, setUnverified] = useState<Array<{ assistantId: string; assistantName: string; shape: string; count: number }>>([])
+  const [problem, setProblem] = useState('')
+  const [busy, setBusy] = useState('')
+
+  const load = useCallback(async (): Promise<void> => {
+    try {
+      const result = await window.petApi.skillsState()
+      if (result.ok) { setRows(result.skills ?? []); setPending(result.pending ?? []); setUnverified(result.unverified ?? []) }
+      else setProblem(result.message ?? '技能库暂时读不到')
+    } catch { setProblem('技能库暂时读不到，请稍后刷新') }
+  }, [])
+  useEffect(() => { void load() }, [load])
+
+  const act = async (action: 'promote' | 'rollback' | 'retire', row: Row, version?: number): Promise<void> => {
+    setBusy(`${row.id}:${action}`); setProblem('')
+    try {
+      const result = await window.petApi.skillsUpdate(action, row.id, version)
+      if (!result.ok) { setProblem(result.message ?? '没有保存成功'); return }
+      setRows(result.skills ?? [])
+      showToast(action === 'promote' ? '技能已生效' : action === 'retire' ? '技能已退役' : '已回到上一版')
+    } catch { setProblem('没有保存成功，请稍后重试') } finally { setBusy('') }
+  }
+
+  const evidence = async (action: 'verify' | 'retract', assistantId: string, shape: string): Promise<void> => {
+    setBusy(`${assistantId}:${shape}:${action}`); setProblem('')
+    try {
+      const result = await window.petApi.skillsEvidence(action, assistantId, shape)
+      if (!result.ok) { setProblem(result.message ?? '没有保存成功'); return }
+      setRows(result.skills ?? []); setPending(result.pending ?? []); setUnverified(result.unverified ?? [])
+      showToast(action === 'verify' ? '已确认这几次是真的' : '已撤回这类记录')
+    } catch { setProblem('没有保存成功，请稍后重试') } finally { setBusy('') }
+  }
+
+  const label = (status: string): string => status === 'active' ? '生效中' : status === 'candidate' ? '候选（还没生效）' : '已退役'
+  return <section className="management-section" aria-label="技能">
+    <h3>技能</h3>
+    <p className="management-hint">每个助理在某一类活上攒下来的做法。只在他自己被调用时生效，**不进总助理的提示词**，也不影响别的助理。</p>
+    {problem !== '' && <p className="assistant-settings-error" role="alert">{problem}</p>}
+    {rows === null && problem === '' && <p className="management-hint">正在读取…</p>}
+    {!!unverified.length && <ul className="management-checklist">{unverified.map(item => <li key={`u:${item.assistantId}:${item.shape}`}>
+      <strong>{item.assistantName}</strong>
+      <span>{item.shape} 有 {item.count} 次「做完了」，但还没核实</span>
+      <span className="management-hint">助理自己说做完了不算证据。你确认这几次确实做成了，它才会开始攒成技能。</span>
+      <button type="button" className="management-button primary" disabled={busy !== ''}
+        onClick={() => void evidence('verify', item.assistantId, item.shape)}>确认这几次是真的</button>
+      <button type="button" className="management-button" disabled={busy !== ''}
+        onClick={() => void evidence('retract', item.assistantId, item.shape)}>记错了，删掉</button>
+    </li>)}</ul>}
+    {rows !== null && rows.length === 0 && <p className="management-hint">还没有技能。助理同类活做多了才会攒出候选，届时会出现在这里。</p>}
+    {!!pending.length && <ul className="management-checklist">{pending.map(item => <li key={`${item.assistantName}:${item.shape}`}>
+      <strong>{item.assistantName}</strong>
+      <span>{item.shape} 已经做成功 {item.count} 次</span>
+      <span className="management-hint">够格形成技能了。技能正文要由你自己写，代码不替你编经验——告诉总助理"把这个经验总结成技能"即可。</span>
+    </li>)}</ul>}
+    {!!rows?.length && <ul className="management-checklist">{rows.map(row => <li key={row.id}>
+      <strong>{row.assistantName}</strong>
+      <span>{row.name}（第 {row.version} 版 · {label(row.status)}）</span>
+      <span className="management-hint">{row.body.length > 80 ? `${row.body.slice(0, 80)}…` : row.body}</span>
+      {row.status !== 'active' && <button type="button" className="management-button" disabled={busy !== ''}
+        onClick={() => void act('promote', row)}>让它生效</button>}
+      {row.version > 1 && <button type="button" className="management-button" disabled={busy !== ''}
+        onClick={() => void act('rollback', row, row.version - 1)}>回到上一版</button>}
+      {row.status === 'active' && <button type="button" className="management-button" disabled={busy !== ''}
+        onClick={() => void act('retire', row)}>停用</button>}
+    </li>)}</ul>}
+    <button type="button" className="management-button" onClick={() => { setRows(null); setProblem(''); void load() }}>刷新</button>
+  </section>
+}
+
+/**
+ * 工作时间线：某段时间里"我干了什么"。
+ *
+ * 只显示**已经解释过的工作事项**，不显示原始窗口采样。
+ * 这条边界很关键：原始片段只说明用过什么应用，没解释过就摆上时间线，
+ * 用户会把它当成"我做过的事"，那是把线索当结论。
+ */
+function TimelineSettings() {
+  type Row = { id: string; start: number; end: number; action: string; outcome: string; project: string | null; status: string }
+  const [rows, setRows] = useState<Row[] | null>(null)
+  const [problem, setProblem] = useState('')
+  const [days, setDays] = useState(1)
+  const load = useCallback(async (spanDays: number): Promise<void> => {
+    setProblem('')
+    try {
+      const to = Date.now() + 1
+      const from = to - spanDays * 24 * 3600_000
+      const result = await window.petApi.timelineState(from, to)
+      if (result.ok) setRows(result.items ?? [])
+      else setProblem(result.message ?? '时间线暂时读不到')
+    } catch { setProblem('时间线暂时读不到，请稍后刷新') }
+  }, [])
+  useEffect(() => { void load(days) }, [days, load])
+  const clock = (at: number): string => {
+    if (!Number.isFinite(at) || at <= 0) return ''
+    const date = new Date(at)
+    const pad = (value: number): string => String(value).padStart(2, '0')
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+  const statusLabel = (status: string): string => status === 'user_confirmed' ? '已确认' : status === 'direct' ? '直接证据' : status === 'inferred' ? '推断' : status === 'evidence_removed' ? '证据已删除' : status
+  return <section className="management-section" aria-label="工作时间线">
+    <h3>工作时间线</h3>
+    <p className="management-hint">这里只有「解释过的工作事项」。助理只看到过哪个窗口开着，并不等于你做过什么，所以原始采样不会出现在这里。</p>
+    <div className="management-voice" role="radiogroup" aria-label="时间范围">
+      <span>范围</span>
+      {[1, 7, 30].map(value => <label key={value} style={{ display: 'inline-flex', flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        <input type="radio" name="timeline-days" checked={days === value} onChange={() => setDays(value)} />
+        <span>{value === 1 ? '今天' : `最近 ${value} 天`}</span>
+      </label>)}
+    </div>
+    {problem !== '' && <p className="assistant-settings-error" role="alert">{problem}</p>}
+    {rows === null && problem === '' && <p className="management-hint">正在读取…</p>}
+    {rows !== null && rows.length === 0 && <p className="management-hint">这段时间还没有解释过的工作事项。问助理"我今天干了啥"，它会把活动片段解释成事项记下来。</p>}
+    {!!rows?.length && <ul className="management-checklist">{rows.map(item => <li key={item.id}>
+      <strong>{clock(item.start)}</strong>
+      <span>{item.action || '（无动作记录）'}</span>
+      <span className="management-hint">{item.project ? `项目：${item.project} · ` : ''}{item.outcome || '（无成果记录）'} · {statusLabel(item.status)}</span>
+    </li>)}</ul>}
+    <button type="button" className="management-button" onClick={() => void load(days)}>刷新</button>
+  </section>
+}
+
+/**
+ * 总助理的「形象与声音」。
+ *
+ * 为什么和名字、性格放同一页：这三样回答的是同一个问题 —— **这是谁**。
+ * 之前形象只能在工作室里"应用到角色"，音色只能去语音设置里挑全局值，
+ * 用户在"总助理设置"里找不到，就等于这两件事没地方配。
+ *
+ * 形象写进 `characters[总助理id].skin`（与舞台读的是同一份）；
+ * 音色写的是全局 TTS 选中项 —— 总助理说话用的就是它。
+ */
+const CHIEF_ASSISTANT_ID = 'member-tangseng'
+const BUILT_IN_SKINS: Array<[string, string]> = [['panda', '熊猫'], ['boy-glasses', '眼镜男生'], ['girl-glasses', '眼镜女生']]
+
+function ChiefLookSettings({ characters, onSkin }: {
+  characters: SkinOverrides
+  onSkin: (skin: string) => void
+}) {
+  const [custom, setCustom] = useState<string[]>([])
+  /*
+   * 这里要拿到**完整**的已选配置：保存音色描述时要把 endpoint/model/provider 一起回传，
+   * 只传 id 是不行的（后端 save 是全量字段校验）。
+   */
+  const [profiles, setProfiles] = useState<Array<{ id: string; name: string; endpoint: string; model: string; voice: string; voiceDesign: string; provider: string }>>([])
+  const [selectedVoice, setSelectedVoice] = useState<string | null>(null)
+  const [persona, setPersona] = useState('')
+  const [agentName, setAgentName] = useState('')
+  const [design, setDesign] = useState('')
+  /** 克隆音色 ID：从「形象与音色工作室」克隆出来的那个声音。 */
+  const [voiceId, setVoiceId] = useState('')
+  /** 复刻样本（base64 + mime）；有它就用 voiceclone 模型，优先于描述与克隆 ID。 */
+  const [sample, setSample] = useState<{ data: string; mime: string; name: string } | null>(null)
+  const [recording, setRecording] = useState(false)
+  /** 已保存样本的 base64 长度（0 = 没存过）。 */
+  const [savedBytes, setSavedBytes] = useState(0)
+  /** 语气/情绪/方言/角色扮演的自然语言指令。 */
+  const [voiceStyle, setVoiceStyle] = useState('')
+  const [generating, setGenerating] = useState(false)
+  const [savingVoice, setSavingVoice] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [problem, setProblem] = useState('')
+  const refreshVoices = useCallback(async (): Promise<void> => {
+    /*
+      音色三项（描述 / 风格 / 样本）**先从设置读**，而且不论语音配置列表成没成功，
+      都要读到 —— 以前它排在语音列表后面，列表一报错就提前 return，
+      输入框永远是空的，用户一保存就把空值写回去，等于把自己的配置擦掉。
+    */
+    try {
+      const voice = await window.petApi.agentVoiceState()
+      /* 空值不覆盖已输入内容：宁可留旧值，也不能把用户刚写的东西清掉。 */
+      setDesign(prev => preferNonEmpty(prev, voice.design))
+      setVoiceStyle(prev => preferNonEmpty(prev, voice.style))
+      setVoiceId(prev => preferNonEmpty(prev, voice.voiceId))
+      setSavedBytes(voice.sampleLength)
+      if (voice.sample !== '') setSample({ data: voice.sample, mime: voice.mime || 'audio/wav', name: '已保存的样本' })
+    } catch { /* 读不到就保留当前输入框内容，不要清空 */ }
+    try {
+      const result = await window.petApi.voiceApiState()
+      if (!result.ok) { setProblem(result.error); return }
+      const tts = result.state.profiles.filter(item => item.kind === 'tts')
+      setProfiles(tts.map(item => ({ id: item.id, name: item.name, endpoint: item.endpoint, model: item.model,
+        voice: item.voice, voiceDesign: item.voiceDesign, provider: item.provider })))
+      setSelectedVoice(result.state.selected.tts)
+      /* 音色现在存在总助理自己的设置里，不再属于某条语音配置。 */
+    } catch { setProblem('读取语音配置失败，请稍后重试') }
+  }, [])
+  useEffect(() => {
+    void window.petApi.customSkins().then(items => setCustom(Array.isArray(items) ? items.map(item => item.id) : [])).catch(() => undefined)
+    void refreshVoices()
+    /* 性格和名字从总助理设置里取：音色是**按性格**设计的，不读性格就无从生成。 */
+    void window.petApi.assistantSettingsState().then(result => {
+      if (!result.ok || !result.state) return
+      setPersona(result.state.agent.persona ?? '')
+      setAgentName(result.state.agent.name ?? '')
+    }).catch(() => undefined)
+  }, [refreshVoices])
+  const skin = characters[CHIEF_ASSISTANT_ID]?.skin ?? 'panda'
+  const current = profiles.find(item => item.id === selectedVoice) ?? null
+  const pickVoice = async (id: string): Promise<void> => {
+    try {
+      const result = await window.petApi.voiceApiSelect('tts', id === '' ? null : id)
+      if (!result.ok) { setProblem(result.error); return }
+      setSelectedVoice(result.state.selected.tts)
+      setProblem(''); setNotice('')
+    } catch { setProblem('切换音色失败，请稍后重试') }
+  }
+  /** 按性格生成一段音色描述。产出是**起点**：生成完还能手改，再试听。 */
+  const generate = async (): Promise<void> => {
+    if (generating) return
+    setGenerating(true); setProblem(''); setNotice('')
+    try {
+      const result = await window.petApi.voiceDesignAssist({ name: agentName, personality: persona })
+      if (!result.ok) { setProblem(result.error); return }
+      setDesign(result.description)
+      /* 语气风格也一起自动填：只填音色、风格让人手写，等于把这事做了一半。 */
+      /* 总是写回去：空串也写，免得旧风格残留让人以为这次生成了。 */
+      setVoiceStyle(result.style ?? '')
+      if (!result.style) setNotice('音色描述已生成；这次没拿到语气风格，可以再点一次或手写一句。')
+      setNotice('已按性格生成，可以改一改再试听。')
+    } catch { setProblem('生成失败，请稍后重试') } finally { setGenerating(false) }
+  }
+  /** 录一段样本（16k 单声道），直接作为复刻样本。 */
+  const recordSample = async (): Promise<void> => {
+    if (recording) return
+    setRecording(true); setProblem(''); setNotice('')
+    try {
+      const granted = await window.petApi.asrBegin()
+      if (!granted.ok) { setProblem(granted.error ?? '麦克风不可用，请检查系统权限'); return }
+      /*
+        样本录制**关掉静音收尾**：念一段话中间停顿是正常的，
+        按静音判定会把句子截断，克隆出来的音色就不完整。
+        这里只按 15 秒上限或用户手动停来收尾。
+      */
+      const { wav, error } = await recordDictation({ maxDurationMs: 15_000, outputSampleRate: 16000, endOnSilence: false })
+      await window.petApi.asrStreamStop().catch(() => undefined)
+      if (!wav) { setProblem(error ?? '没有录到声音，请靠近麦克风重试'); return }
+      setSample({ data: arrayBufferToBase64(wav), mime: 'audio/wav', name: '刚录的样本' })
+      setNotice('录音已就绪：点「保存音色描述」存下，再试听效果。')
+    } catch (error) {
+      setProblem(`录音失败：${error instanceof Error ? error.message : '请检查麦克风权限'}`)
+    } finally { setRecording(false) }
+  }
+  const saveDesign = async (): Promise<void> => {    if (!current || savingVoice) return
+    setSavingVoice(true); setProblem(''); setNotice('')
+    try {
+      /*
+       * apiKey 不传 = 保留原密钥（后端语义如此），否则会把已存的密钥覆盖成空。
+       * voice 也原样回传：用预置音色时它仍然有效，用设计模型时后端不强制它非空。
+       */
+      /*
+        音色属于"这个人怎么说"，不属于"接哪家服务"：存到总助理自己的设置里，
+        不再写进语音配置 —— 那一页只配模型。
+      */
+      const result = await window.petApi.saveSettings(agentVoicePatch({
+        design, style: voiceStyle, voiceId,
+        sampleData: sample?.data ?? '', sampleMime: sample?.mime ?? '',
+      }))
+      if (!result.ok) { setProblem('保存失败：没能写入总助理设置'); return }
+      await refreshVoices()
+      setNotice('音色描述已保存。')
+    } catch { setProblem('保存失败，请稍后重试') } finally { setSavingVoice(false) }
+  }
+  const preview = async (): Promise<void> => {
+    if (!current || previewing) return
+    setPreviewing(true); setProblem(''); setNotice('')
+    try {
+      const result = await window.petApi.voiceApiPreview(current.id, design.trim(), voiceId.trim(),
+        sample ? { data: sample.data, mime: sample.mime } : undefined, voiceStyle.trim())
+      if (!result.ok) { setProblem(`试听失败：${result.error}`); return }
+      const binary = atob(result.audio)
+      const bytes = new Uint8Array(binary.length)
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+      const url = URL.createObjectURL(new Blob([bytes], { type: result.mime }))
+      const audio = new Audio(url)
+      audio.addEventListener('ended', () => URL.revokeObjectURL(url), { once: true })
+      await audio.play()
+      setNotice('正在试听。觉得对就留着，不对可以改描述再来。')
+    } catch (cause) {
+      setProblem(`试听失败：${cause instanceof Error ? cause.message : '无法播放音频'}`)
+    } finally { setPreviewing(false) }
+  }
+  return <section className="management-section" aria-label="总助理的形象与声音">
+    <h3>形象与声音</h3>
+    <p className="management-hint">这决定「你自己」长什么样、用什么声音说话。子助理各有一套，在成员编辑窗口里改。</p>
+    {problem !== '' && <p className="assistant-settings-error" role="alert">{problem}</p>}
+    {notice !== '' && <p className="management-hint" role="status">{notice}</p>}
+    <label className="assistant-settings-field">形象
+      <select value={skin} onChange={event => onSkin(event.target.value)}>
+        {BUILT_IN_SKINS.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+        {custom.map(id => <option key={id} value={id}>{id}（自定义）</option>)}
+        {!BUILT_IN_SKINS.some(([id]) => id === skin) && !custom.includes(skin) && <option value={skin}>{skin}</option>}
+      </select>
+    </label>
+    <label className="assistant-settings-field">用哪套语音服务
+      <select value={selectedVoice ?? ''} onChange={event => void pickVoice(event.target.value)}>
+        <option value="">默认（内置离线音色）</option>
+        {profiles.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+      </select>
+    </label>
+    {profiles.length === 0 && <p className="management-hint">还没接入语音服务：先用内置离线音色。接入后这里会列出可用配置（在语音设置里接）。</p>}
+    {current !== null && <>
+      <div className="management-voice" role="group" aria-label="音色设计">
+        <button type="button" className="management-button primary" disabled={generating || persona.trim() === ''}
+          onClick={() => void generate()}>{generating ? '正在按性格生成…' : '按性格生成音色'}</button>
+        {persona.trim() === '' && <p className="management-hint">先在上面写一点「性格与说话风格」，我才能按它配色。</p>}
+      </div>
+      <label className="assistant-settings-field">音色描述（生成后可改；用它合成时就按这段演）
+        <textarea rows={5} maxLength={2000} value={design} onChange={event => setDesign(event.target.value)}
+          placeholder="例如：中低音，语速偏慢，句间留白明显，尾音收得干净。" />
+      </label>
+      {/*
+        克隆音色：从「形象与音色工作室 → 自定义音色」克隆出来的那个声音。
+        填了就**优先于**上面的描述 —— 描述是"照我说的演"，克隆是"就是那个声音"。
+        想复刻影视/动画角色的嗓音，只有这条路，设计描述做不到。
+      */}
+      {/*
+        MiMo 的预置音色：填这里就**不再需要样本**，稳妥、不会因为样本不合格而报错。
+        复刻失败时也会自动回落到这里选的那个。
+      */}
+      <label className="assistant-settings-field">预置音色（填了它就不必用样本；复刻失败会自动回落到这里）
+        <select value={voiceId} onChange={event => setVoiceId(event.target.value)}>
+          <option value="">不用（跟随语音配置里的音色）</option>
+          {['冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dean'].map(name => (
+            <option key={name} value={name}>{name}</option>
+          ))}
+        </select>
+      </label>
+      <label className="assistant-settings-field">声音样本（复刻用；选文件或直接录一段，优先于上面两项）
+        <input type="file" accept="audio/*" onChange={event => {
+          const file = event.target.files?.[0]
+          if (!file) return
+          if (file.size > 3 * 1024 * 1024) { setProblem('音频太大：请控制在 3MB 以内（十几秒的片段就够）'); return }
+          const reader = new FileReader()
+          reader.onload = () => {
+            const raw = String(reader.result ?? '')
+            const comma = raw.indexOf(',')
+            setSample(comma < 0 ? null : { data: raw.slice(comma + 1), mime: file.type || 'audio/wav', name: file.name })
+            setProblem('')
+            setNotice('样本已就绪：点「保存音色描述」存下来，再试听。')
+          }
+          reader.readAsDataURL(file)
+        }} />
+      </label>
+      {/* 语气风格：MiMo 认自然语言指令（走 user 消息），标签会自动拼进正文开头。 */}
+      <label className="assistant-settings-field">语气风格（可选：情绪、语速、方言、角色扮演都写这里）
+        <textarea rows={3} maxLength={500} value={voiceStyle} onChange={event => setVoiceStyle(event.target.value)}
+          placeholder="例如：慵懒、低沉，语速偏慢，句间留白明显，尾音带一点不屑；或「东北话」「御姐音」「孙悟空」。" />
+      </label>
+      <div className="management-voice" role="group" aria-label="常用风格">
+        {['开心', '慵懒', '温柔', '凌厉', '磁性', '沙哑', '御姐音', '正太音', '东北话', '粤语', '四川话', '孙悟空'].map(tag => (
+          <button key={tag} type="button" className="management-button" disabled={savingVoice}
+            onClick={() => setVoiceStyle(voiceStyle.trim() === '' ? tag : `${voiceStyle.trim()}、${tag}`)}>{tag}</button>
+        ))}
+      </div>
+      <p className="management-hint" role="status">
+        {sample !== null
+          ? `当前样本：${sample.name}（${sample.mime}，约 ${Math.round(sample.data.length * 0.75 / 1024)} KB）${savedBytes > 0 ? '，已保存' : '，尚未保存'}。复刻会用它，优先于描述与克隆 ID。`
+          : `当前没有样本${savedBytes > 0 ? `（配置里存着约 ${Math.round(savedBytes * 0.75 / 1024)} KB，但没读出来）` : '。录一段或选个文件，复刻才有效果。'}`}
+      </p>
+      {/* 诊断行：把"读到了什么"摆出来，免得再靠猜是没配还是没读到。 */}
+      <p className="management-hint">诊断：语音配置 {profiles.length} 条；当前选中 {selectedVoice === null ? '无' : profiles.find(p => p.id === selectedVoice)?.name ?? '未知'}；已保存样本 {savedBytes === 0 ? '无' : `${Math.round(savedBytes * 0.75 / 1024)} KB`}；描述 {design.trim() === '' ? '无' : `${design.trim().length} 字`}。</p>
+      {/*
+        录音复刻：走的是语音听写那套录音链路（16k 单声道），所以麦克风权限、
+        静音检测、时长上限都是现成的。
+        想复刻手机里放出来的声音也行 —— 把手机贴着麦克风外放，一边放一边录。
+      */}
+      <div className="management-voice">
+        <button type="button" className="management-button" disabled={recording} onClick={() => void recordSample()}>
+          {recording ? '正在录音…（最多 15 秒）' : '打开麦克风录一段'}</button>
+        {sample !== null && <button type="button" className="management-button" disabled={recording}
+          onClick={() => { setSample(null); setNotice('样本已清除，保存后生效。') }}>清除样本</button>}
+      </div>
+      <div className="management-voice">
+        <button type="button" className="management-button" disabled={previewing} onClick={() => void preview()}>
+          {previewing ? '正在合成…' : '试听'}</button>
+        <button type="button" className="management-button" disabled={savingVoice} onClick={() => void saveDesign()}>
+          {savingVoice ? '保存中…' : '保存音色描述'}</button>
+      </div>
+      <p className="management-hint">试听会真实调用一次语音服务（消耗额度）。当前模型：{current.model}；用设计描述时模型名要写成 mimo-v2.5-tts-voicedesign。</p>
+    </>}
   </section>
 }
 
@@ -323,6 +839,8 @@ export default function App() {
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const interactiveRef = useRef(false)
   const dragCleanupRef = useRef<(() => void) | null>(null)
+  /** 拖拽/退场标志从什么时候开始一直为真；0 = 没卡住。见 100ms 轮询里的自愈分支。 */
+  const stallSinceRef = useRef(0)
   /** 最近一次鼠标位置：角色会自己走动，不能只在 mousemove 时判断命中。 */
   const lastMouseRef = useRef({ x: -1, y: -1 })
   /** 唤醒去抖：连续识别到唤醒词时只响应一次。 */
@@ -369,12 +887,43 @@ export default function App() {
     }
   }, [members, statusByAssistant, docState])
 
+  /**
+   * 交接编排：总助 ↔ 成员的讲解者切换瞬间，退场者演 0.9s 退场动画再下台，
+   * 登场者播入场动画。没有这一层，换人就是瞬切，成员也没有登场动效。
+   */
+  const [handover, setHandover] = useState<{ leaving: string | null; entering: string | null }>({ leaving: null, entering: null })
+  const handoverTimer = useRef(0)
+  const prevPresenterRef = useRef<string | null>(null)
+  useEffect(() => {
+    const chief = members?.find(member => member.roleId === 'tangseng') ?? members?.[0]
+    const chiefId = chief?.assistantId ?? null
+    const presenter = docState.kind === 'outline' && docState.active ? docState.assistantId ?? chiefId : null
+    const prev = prevPresenterRef.current
+    prevPresenterRef.current = presenter
+    if (presenter === prev || !members?.length) return
+    let leaving: string | null = null
+    let entering: string | null = null
+    if (prev === null && presenter && presenter !== chiefId) { leaving = chiefId; entering = presenter }
+    else if (prev && prev !== chiefId && (presenter === null || presenter === chiefId)) { leaving = prev; entering = chiefId }
+    else return
+    // 退场成员只留退场动画那么长，不走任务结束后的 10 秒 linger。
+    if (leaving && leaving !== chiefId) lingerUntil.current[leaving] = Date.now() + 900
+    setHandover({ leaving, entering })
+    window.clearTimeout(handoverTimer.current)
+    handoverTimer.current = window.setTimeout(() => setHandover({ leaving: null, entering: null }), 900)
+  }, [docState, members])
+  useEffect(() => () => window.clearTimeout(handoverTimer.current), [])
+
   const cast = useMemo<StageMember[]>(() => {
     if (members?.length) {
       const chief = members.find(member => member.roleId === 'tangseng') ?? members[0]
       const active = members.filter(member => member !== chief
         && (lingerUntil.current[member.assistantId] ?? 0) > stageTick)
-      return [chief, ...active]
+      // 成员在台上讲解时总助退场；讲完/暂停（active 落下）总助再登场。
+      // 交接过渡期（handover.leaving）总助多留 0.9s 把退场动画演完。
+      const presenter = docState.kind === 'outline' && docState.active ? docState.assistantId ?? null : null
+      const chiefOnStage = presenter === null || presenter === chief.assistantId || handover.leaving === chief.assistantId
+      return [...(chiefOnStage ? [chief] : []), ...active]
     }
     const legacy = manifestForLegacySkin(pet)
     return [
@@ -386,7 +935,7 @@ export default function App() {
         enabled: true,
       },
     ]
-  }, [members, pet, stageTick])
+  }, [members, pet, stageTick, docState, handover])
 
   const selectedMember = useMemo(() => {
     const found = cast.find((item) => item.assistantId === selectedId)
@@ -401,7 +950,10 @@ export default function App() {
 
   /** 会话只临时补充选中角色的工作状态；已有团队任务优先，结束后恢复原投影。讲解中的委派成员同样投影为工作中。 */
   const stageStatuses = useMemo(() => {
-    const presenter = docState.kind === 'outline' && docState.active ? docState.assistantId ?? null : null
+    // 总助自己讲解时 assistantId 为空：落到总助头上，否则讲解期间宠物还在走来走去。
+    const presenter = docState.kind === 'outline' && docState.active
+      ? docState.assistantId ?? chiefIdRef.current
+      : null
     let projected = statusByAssistant
     if (presenter && !isWorking(projected[presenter])) projected = { ...projected, [presenter]: 'running' as const }
     if (!selectedMember || (session?.status !== 'running' && session?.status !== 'waiting')) return projected
@@ -1363,7 +1915,38 @@ export default function App() {
     // 重新显示时 effect 重挂，末尾那次 update() 会立刻按最新命中盒校准一次穿透状态。
     if (!stageVisible) return
     const update = () => {
-      if (exitingRef.current || dragCleanupRef.current) return
+      /*
+       * 两个"应该很短命"的标志：一次拖拽、一次退场。
+       *
+       * 它们都靠**收尾事件**清空：拖拽等 `mouseup`/`blur`，退场等主进程真正 quit。
+       * 收尾事件一旦丢了（在窗口外松手、退出被 before-quit 挡下后没再放行、渲染层换绑），
+       * 标志就永久为真，而这个函数是**唯一定期调用 mouseState 的地方**——
+       * 于是窗口永远停在"鼠标穿透"，表现就是：形象还在，但右键、悬停、拖拽、快捷键全部没反应。
+       *
+       * 真机出现过一次。修法不是猜哪条收尾路径漏了，而是**不让任何标志无限期成立**：
+       * 正常拖拽不到 15 秒、正常退场 4.3 秒，超过 15 秒仍是真值就说明收尾丢了，强制放行。
+       * 强制放行走正规收尾（`onBlur` 会自己注销监听并清空引用），不绕过任何状态。
+       */
+      const stalled = exitingRef.current || dragCleanupRef.current !== null
+      if (stalled) {
+        if (stallSinceRef.current === 0) stallSinceRef.current = Date.now()
+        else if (Date.now() - stallSinceRef.current > STALL_RELEASE_MS) {
+          // 先留证据再释放：下次再出现"点不动"，日志里能直接看出卡的是哪一个标志。
+          console.warn('[dsh-pet] 交互标志长期未释放，已强制放行', {
+            exiting: exitingRef.current, dragging: dragCleanupRef.current !== null,
+            heldMs: Date.now() - stallSinceRef.current, uiBuild: UI_BUILD,
+          })
+          stallSinceRef.current = 0
+          exitingRef.current = false
+          setExitStage('none')
+          setPortalPhase('closed')
+          dragCleanupRef.current?.()
+          interactiveRef.current = false
+          window.petApi.mouseState(false)
+        }
+        return
+      }
+      stallSinceRef.current = 0
       const { x, y } = lastMouseRef.current
       if (x < 0) return
       const interactive = hitTest(x, y)
@@ -1743,7 +2326,7 @@ export default function App() {
           {settingsPage === 'general' ? (
             <div className="management-general">
               <section className="management-section" aria-label="运行时与诊断">
-                <h3>运行时与诊断</h3>
+                <h3>运行状态</h3>
                 {runtime ? (
                   <div className={`runtime-row tone-${runtime.tone}`} role="status">
                     <div className="runtime-line">
@@ -1755,18 +2338,7 @@ export default function App() {
                     {runtime.detail && <div className="runtime-detail">{runtime.detail}</div>}
                   </div>
                 ) : <p className="management-hint">正在获取运行时状态…</p>}
-                <dl aria-label="助理能力实际状态">
-                  {operations ? operationLabels(operations).map(item => (
-                    <div className="card-row" key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>
-                  )) : <div><dt>能力状态</dt><dd>尚未取得状态，不能据此判断正在记录或已停止。</dd></div>}
-                </dl>
-                <p className="management-diagnostic">界面构建 <code>{UI_BUILD}</code></p>
-                {companion && <p className="management-diagnostic">运行配置 <code>{companion.profile}</code></p>}
-                <button className="management-button" onClick={() => void mirror.refresh().catch(error => showToast(String(error)))}>重新同步会话</button>
-                {/* 总助理设置不在九项导航里（导航要精确到九项），但从这里必须进得去：
-                    否则改名字与性格的功能就等于被藏起来了。 */}
-                <button className="management-button" onClick={() => setSettingsPage('agent')}>总助理设置（名字与性格）</button>
-                <label className="management-hint" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label className="management-voice">
                   <input type="checkbox" checked={hoverEnabled} onChange={event => {
                     const next = event.target.checked
                     setHoverEnabled(next)
@@ -1776,8 +2348,28 @@ export default function App() {
                     hoverTimer.current = undefined
                     try { localStorage.setItem('dsh-pet.hoverToolbar', next ? '1' : '0') } catch { /* 存不了就只在本次会话生效 */ }
                   }} />
-                  悬停宠物时显示快捷工具栏
+                  <span>悬停宠物时显示快捷工具栏</span>
                 </label>
+                {/* 总助理设置已经挪到「助理团」页（那里才是"管理这支队伍"的地方）。
+                    这里保留一行指路，避免用过旧版本的找不到。 */}
+                <p className="management-hint">总助理的名字与性格在「助理团」页最上面。</p>
+                {/*
+                 * 诊断信息收进折叠。
+                 *
+                 * 八条能力状态 + 构建号 + 运行配置 + 重新同步，原来默认全部铺开，占掉首屏一大半，
+                 * 而它们**出问题时才需要看**。默认收起，标题只留"诊断信息"四个字。
+                 */}
+                <details className="setting-details">
+                  <summary>诊断信息</summary>
+                  <dl aria-label="助理能力实际状态">
+                    {operations ? operationLabels(operations).map(item => (
+                      <div className="card-row" key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>
+                    )) : <div><dt>能力状态</dt><dd>尚未取得状态，不能据此判断正在记录或已停止。</dd></div>}
+                  </dl>
+                  <p className="management-diagnostic">界面构建 <code>{UI_BUILD}</code></p>
+                  {companion && <p className="management-diagnostic">运行配置 <code>{companion.profile}</code></p>}
+                  <button className="management-button" onClick={() => void mirror.refresh().catch(error => showToast(String(error)))}>重新同步会话</button>
+                </details>
               </section>
               <section className="management-section" aria-label="外观">
                 <h3>外观</h3>
@@ -1834,8 +2426,11 @@ export default function App() {
                   }} />
                   <span>拖到屏幕边缘时收起</span>
                 </label>
-                <p className="management-hint">透明度只作用于角色本身，气泡与快捷工具栏保持清晰。</p>
-                <p className="management-hint">收起后仍会用一个小圆点显示录音、待处理与出错状态；单击展开。</p>
+                <details className="setting-details">
+                  <summary>透明度与收起后的行为</summary>
+                  <p>透明度只作用于角色本身，气泡与快捷工具栏保持清晰。</p>
+                  <p>收起后仍会用一个小圆点显示录音、待处理与出错状态；单击展开。</p>
+                </details>
               </section>
 
               <section className="management-section" aria-label="睡眠与唤醒">
@@ -1862,7 +2457,7 @@ export default function App() {
                       } catch { showToast('语音对话设置未保存') }
                       if (!enabled && conversation.active) stopContinuous()
                     }} />
-                  唤醒后自动听取并发送本次语音
+                  <span>唤醒后自动听取并发送本次语音</span>
                 </label>
                 <label className="management-voice">
                   <input type="checkbox" checked={continuousVoice} disabled={listening || !voiceConversation}
@@ -1875,8 +2470,12 @@ export default function App() {
                       } catch { showToast('连续对话设置未保存') }
                       if (!enabled && conversation.active) stopContinuous()
                     }} />
-                  唤醒后的连续对话：最多 10 轮或 5 分钟；一轮回答播完后会继续听，连续 10 秒没听到你开口才结束。沿用当前识别、朗读服务与数据去向。保存后从下一次唤醒起生效，不会立刻开麦。
+                  <span>唤醒后的连续对话</span>
                 </label>
+                <details className="setting-details">
+                  <summary>连续对话的规则</summary>
+                  <p>最多 10 轮或 5 分钟；一轮回答播完后会继续听，连续 10 秒没听到你开口才结束。沿用当前识别、朗读服务与数据去向。保存后从下一次唤醒起生效，不会立刻开麦。</p>
+                </details>
                 <label className="management-voice">
                   <input type="checkbox" checked={readReplies}
                     onChange={async event => {
@@ -1887,7 +2486,7 @@ export default function App() {
                         else showToast('朗读回复设置未保存')
                       } catch { showToast('朗读回复设置未保存') }
                     }} />
-                  朗读回复：打字发出的消息也把回答念出来（语音发起的那一轮本来就会念）
+                  <span>朗读回复，打字发出的消息也念出来</span>
                 </label>
                 <label className="management-voice">
                   <input type="checkbox" checked={chatDock === 'top'}
@@ -1900,8 +2499,12 @@ export default function App() {
                         else showToast('会话框设置未保存')
                       } catch { showToast('会话框设置未保存') }
                     }} />
-                  会话框固定在宠物头顶（关闭后按屏幕空间自动换到上/下/左/右）
+                  <span>会话框固定在宠物头顶</span>
                 </label>
+                <details className="setting-details">
+                  <summary>关闭固定后会怎样</summary>
+                  <p>会话框按屏幕空间自动换到上、下、左、右四侧，避免超出屏幕。</p>
+                </details>
               </section>
               <ResidencySettings
                 activity={operations && operations.connection === 'connected' ? operations.activity : null}
@@ -1929,10 +2532,18 @@ export default function App() {
                     }} />
                   会议录音与文档讲解自动审批（默认开启）
                 </label>
-                <p className="management-hint">开启后，当前桌面请求可不经逐次弹窗开始或停止会议录音、讲解授权目录内的文档。录音会采集麦克风和所选系统音频，讲解会把文档片段发送给当前模型服务商；请确保参会者知情。关闭后恢复逐次确认。邮件、纪要及其他操作仍按各自规则审批。</p>
-                <p className="management-hint">讲解期间会监听麦克风以支持插话；语音识别使用当前配置的识别服务，可能将插话音频发送给该服务。</p>
+                {/* 同意条款收进折叠：它必须能查到，但不该默认占掉半屏、把相邻的开关挤散。 */}
+                <details className="setting-details">
+                  <summary>开启后会发生什么</summary>
+                  <p>开启后，当前桌面请求可不经逐次弹窗开始或停止会议录音、讲解授权目录内的文档。录音会采集麦克风和所选系统音频，讲解会把文档片段发送给当前模型服务商；请确保参会者知情。关闭后恢复逐次确认。邮件、纪要及其他操作仍按各自规则审批。</p>
+                  <p>讲解期间会监听麦克风以支持插话；语音识别使用当前配置的识别服务，可能将插话音频发送给该服务。</p>
+                </details>
               </section>
               <EnvironmentCheck showToast={showToast} />
+              <ArtifactsSettings />
+              <TimelineSettings />
+              <SkillsSettings showToast={showToast} />
+              <GlossarySettings showToast={showToast} />
               <WorkEvidenceSettings showToast={showToast} />
               <PresentationSettings active={presentation} />
               <VoiceApiSettings />
@@ -1964,6 +2575,17 @@ export default function App() {
                     onClick={() => void openApproval(banner.proposalId)}>去审批</button>}
                 </div>
               )}
+              {/*
+               * 总助理也在这支队伍里，所以它的名字与性格放在这一页最上面。
+               *
+               * 原来它只挂在「通用」页一个按钮上：用户来"管理我的助理们"时，
+               * 看到的是成员列表，却改不了队长的性格 —— 那等于把队伍的头放在别处。
+               */}
+              <section className="management-section" aria-label="总助理">
+                <h3>总助理（你自己）</h3>
+                <p className="management-hint">成员干活时听你的，而这里定的是"你自己"叫什么、怎么说话。子助理各有自己的性格，在各自的编辑窗口里改。</p>
+                <button className="management-button primary" onClick={() => setSettingsPage('agent')}>总助理设置（名字与性格）</button>
+              </section>
               <p className="management-hint">运行时启停与连接诊断请到通用设置。</p>
               <MemberManagement feed={memberFeed} />
               <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} bindingId={session?.bindingId} />
@@ -2029,7 +2651,15 @@ export default function App() {
               }}
             />
           ) : settingsPage === 'wecom' || settingsPage === 'reminders' || settingsPage === 'agent' ? (
-            <AssistantSettings key={settingsPage} section={settingsPage} />
+            <>
+              <AssistantSettings key={settingsPage} section={settingsPage} />
+              {/* 形象与声音只属于"总助理"这一页：企业微信与提醒页不需要。 */}
+              {settingsPage === 'agent' && <ChiefLookSettings characters={characters} onSkin={skin => {
+                const next: SkinOverrides = { ...characters, [CHIEF_ASSISTANT_ID]: { ...characters[CHIEF_ASSISTANT_ID], skin } }
+                setCharacters(next)
+                void window.petApi.saveSettings({ characters: next }).catch(() => showToast('形象没保存成功，请重试'))
+              }} />}
+            </>
           ) : (
             <>
               <section className="management-doc-results" aria-label="文档操作结果">
@@ -2150,6 +2780,8 @@ export default function App() {
         // 共享协议没有个人助理模式字段，不从回答措辞猜测模式开关；这里的"活跃"只是会话级闩锁。
         assistantActive={presence.active}
         statusByAssistant={stageStatuses}
+        enteringIds={handover.entering ? new Set([handover.entering]) : null}
+        leavingIds={handover.leaving ? new Set([handover.leaving]) : null}
         positions={positions}
         key={assetEpoch}
         selectedId={selectedId}

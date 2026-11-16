@@ -3,6 +3,30 @@ import { pathToFileURL } from 'node:url'
 import { ASSISTANT_SETTINGS_LIMITS as LIMITS, type AssistantAgentSettings, type AssistantSettingsInputs, type AssistantSettingsResult, type AssistantSettingsSection, type AssistantSettingsSnapshot } from '../assistant-settings-types.ts'
 
 export const ASSISTANT_SETTINGS_CHANNELS = { state: 'assistant-settings-state', save: 'assistant-settings-save' } as const
+/** 专属词库的读写通道；与设置共用发送方校验，但回包是列表而不是配置投影。 */
+export const ASSISTANT_GLOSSARY_CHANNELS = { state: 'assistant-glossary-state', update: 'assistant-glossary-update' } as const
+export type GlossaryResult =
+  | { ok: true; terms: Array<{ term: string; expansion: string }> }
+  | { ok: false; error: string; message: string }
+/** 最近产物列表通道（只读）。 */
+export const ASSISTANT_ARTIFACTS_CHANNEL = 'assistant-artifacts-state'
+export type ArtifactsResult =
+  | { ok: true; artifacts: Array<{ path: string; label: string; kind: string; state: 'ok' | 'missing'; createdAt: number }> }
+  | { ok: false; message: string }
+/** 技能读写通道。 */
+export const ASSISTANT_SKILLS_CHANNELS = { state: 'assistant-skills-state', update: 'assistant-skills-update' } as const
+/** 技能证据的确认/撤回通道：作用于"还没形成技能"的样本，没有技能编号可用。 */
+export const ASSISTANT_SKILL_EVIDENCE_CHANNEL = 'assistant-skills-evidence'
+/** 工作时间线（只读）。 */
+export const ASSISTANT_TIMELINE_CHANNEL = 'assistant-timeline-state'
+export interface TimelineRow { id: string; start: number; end: number; action: string; outcome: string; project: string | null; status: string }
+export type TimelineResult = { ok: true; items: TimelineRow[] } | { ok: false; message: string }
+export interface SkillRow {
+  id: string; assistantId: string; assistantName: string; name: string; body: string
+  version: number; status: string; createdAt: number
+}
+export type SkillsResult = { ok: true; skills: SkillRow[]; pending?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }> } | { ok: false; message: string }
+const deniedGlossary = (): GlossaryResult => ({ ok: false, error: 'denied', message: '请求不是来自当前舞台的本地入口，未执行。' })
 interface Options {
   getStageWindow(): BrowserWindow | null
   pagePath: string
@@ -141,6 +165,156 @@ export function registerAssistantSettings(options: Options): () => void {
     }
   }
   ipcMain.handle(ASSISTANT_SETTINGS_CHANNELS.state, async event => allowed(event) ? call(event) : denied())
+  /*
+   * 专属词库：与设置同一套发送方校验（只有当前舞台的本地页面能读写），
+   * 但回包形状不同 —— 它是一张列表，不是一份配置投影，所以单独两个通道，
+   * 不硬塞进 AssistantSettingsResult。
+   */
+  const glossaryCall = async (event: IpcMainInvokeEvent, body?: { term: string; expansion?: string; remove?: boolean }): Promise<GlossaryResult> => {
+    let result: { status: number; body: unknown }
+    try {
+      result = body === undefined
+        ? await options.request('GET', '/companion/v1/glossary', undefined, 'owner')
+        : await options.request('POST', '/companion/v1/glossary', body, 'owner')
+    } catch {
+      return { ok: false, error: 'unavailable', message: '连接中断，词库暂时读不到；请确认助理已连接后刷新。' }
+    }
+    if (!allowed(event)) return { ok: false, error: 'denied', message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (result.status === 400) return { ok: false, error: 'invalid_input', message: '新增术语必须写清楚它指的是什么。' }
+    if (result.status < 200 || result.status >= 300) return { ok: false, error: 'unavailable', message: '词库服务暂时不可用，请刷新核对。' }
+    try {
+      const payload = record(result.body)
+      const terms = Array.isArray(payload.terms) ? payload.terms : []
+      return { ok: true, terms: terms.map(item => {
+        const row = record(item)
+        return { term: String(row.term ?? ''), expansion: String(row.expansion ?? '') }
+      }).filter(item => item.term !== '') }
+    } catch {
+      return { ok: false, error: 'invalid_response', message: '词库回执不完整，请刷新核对。' }
+    }
+  }
+  ipcMain.handle(ASSISTANT_GLOSSARY_CHANNELS.state, async event => allowed(event) ? glossaryCall(event) : deniedGlossary())
+  /*
+   * 工作时间线：只读，区间缺省"今天"。
+   *
+   * 只显示**解释过的工作事项**。原始采样（前台是哪个窗口）不入界面：
+   * 它是线索不是事实，没解释过就摆上时间线，用户会以为那是"我做过的事"。
+   */
+  ipcMain.handle(ASSISTANT_TIMELINE_CHANNEL, async (event, from?: unknown, to?: unknown): Promise<TimelineResult> => {
+    const query = new URLSearchParams()
+    if (typeof from === 'number' && Number.isFinite(from)) query.set('from', String(from))
+    if (typeof to === 'number' && Number.isFinite(to)) query.set('to', String(to))
+    const suffix = query.toString() === '' ? '' : `?${query.toString()}`
+    let result: { status: number; body: unknown }
+    try { result = await options.request('GET', `/companion/v1/timeline${suffix}`, undefined, 'owner') }
+    catch { return { ok: false, message: '连接中断，时间线暂时读不到；请确认助理已连接后刷新。' } }
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (result.status === 400) return { ok: false, message: '时间区间无效或超过 366 天，请缩小区间。' }
+    if (result.status < 200 || result.status >= 300) return { ok: false, message: '时间线暂时不可用，请刷新核对。' }
+    try {
+      const payload = record(result.body)
+      const rows = Array.isArray(payload.items) ? payload.items : []
+      return { ok: true, items: rows.map(item => {
+        const row = record(item)
+        return {
+          id: String(row.id ?? ''), start: Number(row.start ?? 0), end: Number(row.end ?? 0),
+          action: String(row.action ?? ''), outcome: String(row.outcome ?? ''),
+          project: row.project === null || row.project === undefined ? null : String(row.project),
+          status: String(row.status ?? ''),
+        }
+      }).filter(item => item.id !== '') }
+    } catch { return { ok: false, message: '时间线回执不完整，请刷新核对。' } }
+  })
+  /*
+   * 技能：列表 + 三种操作（晋升/回滚/退役）。
+   *
+   * 回滚必须带版本号；晋升/退役作用于最新一版。技能是"这个助理自己的做法"，
+   * 所以操作只影响该助理自己的注入内容，不会波及别人。
+   */
+  const skillsCall = async (event: IpcMainInvokeEvent, body?: Record<string, unknown>): Promise<SkillsResult> => {
+    let result: { status: number; body: unknown }
+    try {
+      result = body === undefined
+        ? await options.request('GET', '/companion/v1/skills', undefined, 'owner')
+        : await options.request('POST', '/companion/v1/skills', body, 'owner')
+    } catch { return { ok: false, message: '连接中断，技能库暂时读不到；请确认助理已连接后刷新。' } }
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (result.status === 400) return { ok: false, message: '操作参数不对：回滚需要指定版本号。' }
+    if (result.status < 200 || result.status >= 300) return { ok: false, message: '技能库暂时不可用，请刷新核对。' }
+    try {
+      const payload = record(result.body)
+      const rows = Array.isArray(payload.skills) ? payload.skills : []
+      const pendingRows = Array.isArray(payload.pending) ? payload.pending : []
+      return { ok: true, skills: rows.map(item => {
+        const row = record(item)
+        return {
+          id: String(row.id ?? ''), assistantId: String(row.assistantId ?? ''), assistantName: String(row.assistantName ?? ''),
+          name: String(row.name ?? ''), body: String(row.body ?? ''), version: Number(row.version ?? 0),
+          status: String(row.status ?? 'candidate'), createdAt: Number(row.createdAt ?? 0),
+        }
+      }).filter(item => item.id !== ''), pending: pendingRows.map(item => {
+        const row = record(item)
+        return {
+          assistantId: String(row.assistantId ?? ''), assistantName: String(row.assistantName ?? ''),
+          shape: String(row.shape ?? ''), count: Number(row.count ?? 0),
+        }
+      }).filter(item => item.shape !== '') }
+    } catch { return { ok: false, message: '技能回执不完整，请刷新核对。' } }
+  }
+  ipcMain.handle(ASSISTANT_SKILLS_CHANNELS.state, async event => allowed(event) ? skillsCall(event) : { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' })
+  /*
+   * 技能证据：本人确认 / 撤回。
+   *
+   * 这是**唯一**能把"成员自报成功"的样本转正的路径 —— 四态回执那条在受管执行器里，
+   * 成员任务暂时拿不到。所以这个按钮不是便利功能，是技能成形的必要一步。
+   */
+  ipcMain.handle(ASSISTANT_SKILL_EVIDENCE_CHANNEL, async (event, action: unknown, assistantId: unknown, shape: unknown): Promise<SkillsResult> => {
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (action !== 'verify' && action !== 'retract') return { ok: false, message: '不支持的证据操作。' }
+    if (typeof assistantId !== 'string' || assistantId.trim() === '' || assistantId.length > 200) return { ok: false, message: '成员编号无效。' }
+    if (typeof shape !== 'string' || shape.trim() === '' || shape.length > 120) return { ok: false, message: '同类工作的名称无效。' }
+    return skillsCall(event, { action, assistantId: assistantId.trim(), shape: shape.trim() })
+  })
+  ipcMain.handle(ASSISTANT_SKILLS_CHANNELS.update, async (event, action: unknown, id: unknown, version: unknown): Promise<SkillsResult> => {
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (action !== 'promote' && action !== 'rollback' && action !== 'retire') return { ok: false, message: '不支持的技能操作。' }
+    if (typeof id !== 'string' || id.trim() === '' || id.length > 400) return { ok: false, message: '技能编号无效。' }
+    if (action === 'rollback' && (typeof version !== 'number' || !Number.isInteger(version) || version < 1)) {
+      return { ok: false, message: '回滚需要指定要回到哪一版。' }
+    }
+    return skillsCall(event, { action, id: id.trim(), ...(action === 'rollback' ? { version: version as number } : {}) })
+  })
+  /*
+   * 最近产物列表：只读。含 state='missing' 的条目 —— 界面上要如实标"文件已不在"，
+   * 悄悄从列表里消失会让用户以为"我记错了，它没给我做过这个"。
+   */
+  ipcMain.handle(ASSISTANT_ARTIFACTS_CHANNEL, async (event): Promise<ArtifactsResult> => {
+    let result: { status: number; body: unknown }
+    try { result = await options.request('GET', '/companion/v1/artifacts', undefined, 'owner') }
+    catch { return { ok: false, message: '连接中断，产物列表暂时读不到；请确认助理已连接后刷新。' } }
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (result.status < 200 || result.status >= 300) return { ok: false, message: '产物索引暂时不可用，请刷新核对。' }
+    try {
+      const payload = record(result.body)
+      const rows = Array.isArray(payload.artifacts) ? payload.artifacts : []
+      return { ok: true, artifacts: rows.map(item => {
+        const row = record(item)
+        return {
+          path: String(row.path ?? ''), label: String(row.label ?? ''), kind: String(row.kind ?? 'other'),
+          state: row.state === 'missing' ? 'missing' as const : 'ok' as const, createdAt: Number(row.createdAt ?? 0),
+        }
+      }).filter(item => item.path !== '') }
+    } catch { return { ok: false, message: '产物回执不完整，请刷新核对。' } }
+  })
+  ipcMain.handle(ASSISTANT_GLOSSARY_CHANNELS.update, async (event, term: unknown, expansion: unknown, remove: unknown): Promise<GlossaryResult> => {
+    if (!allowed(event)) return deniedGlossary()
+    if (typeof term !== 'string' || term.trim() === '' || term.length > 120) return { ok: false, error: 'invalid_input', message: '术语不能为空且最长 120 字。' }
+    if (remove === true) return glossaryCall(event, { term: term.trim(), remove: true })
+    if (typeof expansion !== 'string' || expansion.trim() === '' || expansion.length > 2000) {
+      return { ok: false, error: 'invalid_input', message: '新增术语必须写清楚它指的是什么（最长 2000 字）。' }
+    }
+    return glossaryCall(event, { term: term.trim(), expansion: expansion.trim() })
+  })
   ipcMain.handle(ASSISTANT_SETTINGS_CHANNELS.save, async (event, section: unknown, input: unknown): Promise<AssistantSettingsResult> => {
     if (!allowed(event)) return denied()
     if (section !== 'wecom' && section !== 'reminders' && section !== 'agent' && section !== 'wecom/reconnect') {
@@ -158,5 +332,10 @@ export function registerAssistantSettings(options: Options): () => void {
   return () => {
     disposed = true
     for (const channel of Object.values(ASSISTANT_SETTINGS_CHANNELS)) ipcMain.removeHandler(channel)
+    for (const channel of Object.values(ASSISTANT_GLOSSARY_CHANNELS)) ipcMain.removeHandler(channel)
+    ipcMain.removeHandler(ASSISTANT_ARTIFACTS_CHANNEL)
+    for (const channel of Object.values(ASSISTANT_SKILLS_CHANNELS)) ipcMain.removeHandler(channel)
+    ipcMain.removeHandler(ASSISTANT_SKILL_EVIDENCE_CHANNEL)
+    ipcMain.removeHandler(ASSISTANT_TIMELINE_CHANNEL)
   }
 }

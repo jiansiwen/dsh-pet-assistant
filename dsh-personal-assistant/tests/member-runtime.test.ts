@@ -131,6 +131,8 @@ async function fixture(t: TestContext, file?: string) {
   let desktopBinding: string | null = '当前桌面绑定'
   let notifications = 0
   const memories = new Map<string, string>()
+  /** 总助理共享给子助理的投影；由各用例自己改，验证"来源分成两段"。 */
+  let sharedMemory = '总助理这次没有共享给你的记忆。'
   const proposals: Array<{ id: string; input: unknown }> = []
   const desktopCalls: Array<{ command: string; payload: Record<string, unknown> }> = []
   const mailReads: number[] = []
@@ -191,7 +193,7 @@ async function fixture(t: TestContext, file?: string) {
   await owner
   const options = { ctx, directory: store.directory as MemberDirectory, enabled: () => enabled,
     defaultModel: () => ({ provider: '默认提供方', model: '默认模型' }),
-    memories: { injectable: (id: string) => memories.get(id) ?? '', propose: (id: string, input: unknown) => { proposals.push({ id, input }); return { status: 'candidate' } } },
+    memories: { injectable: (id: string) => memories.get(id) ?? '', shared: () => sharedMemory, propose: (id: string, input: unknown) => { proposals.push({ id, input }); return { status: 'candidate' } } },
     desktop: { binding: () => desktopBinding,
       request: async (command: string, payload: Record<string, unknown>) => { desktopCalls.push({ command, payload }); return { ok: true, command } } },
     mailUnread: async (limit?: number) => { mailReads.push(limit ?? 5); return { uidValidity: '1', messages: [{ uid: 1, subject: '主题', from: 'a@example.com', date: '', text: '正文' }] } },
@@ -691,4 +693,110 @@ test('增量观察器支持当前输入游标，旧会话文本不重播', async
   events.push({ type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: '新' } } })
   const keepAlive = setTimeout(() => received.resolve('超时'), 500)
   try { assert.equal(await received.promise, '新') } finally { clearTimeout(keepAlive); stop() }
+})
+
+test('成员会话创建成功后按 cwd 挂入侧栏工作区分组', async t => {
+  const h = await fixture(t)
+  h.options.cwd = () => 'D:\\work\\dsh-github'
+  const resolved: string[] = []
+  const attached: string[] = []
+  h.options.ctx.provide('workspaceRegistry', {
+    resolveByPath: async (p: string) => { resolved.push(p); return { attachSession: async (id: string) => { attached.push(id) } } },
+  })
+  const member = h.store.directory.create(draft('入组成员'))
+  const { driver, activation } = await h.start(member.assistantId)
+  assert.deepEqual(resolved, ['D:\\work\\dsh-github'], '按成员 cwd 解析工作区')
+  assert.deepEqual(attached, [driver.agent.id], 'create 成功后 attach 该会话')
+  await complete(driver)
+  assert.equal((await activation.result).stopReason, 'completed')
+  await activation.dispose()
+})
+
+test('attach 失败只记日志，不阻塞成员派活', async t => {
+  const h = await fixture(t)
+  const logs: string[] = []
+  h.options.log = (message: string) => { logs.push(message) }
+  h.options.cwd = () => 'D:\\work\\dsh-github'
+  h.options.ctx.provide('workspaceRegistry', {
+    resolveByPath: async () => ({ attachSession: async () => { throw new Error('工作区写入失败') } }),
+  })
+  const member = h.store.directory.create(draft('attach失败成员'))
+  const { driver, activation } = await h.start(member.assistantId)
+  assert.equal(driver.agent.id, h.store.directory.get(member.assistantId)?.sessionId, 'attach 失败仍持久会话并交付')
+  assert.ok(logs.some(message => /挂入工作区失败/u.test(message)), '失败要记日志')
+  await complete(driver)
+  assert.equal((await activation.result).stopReason, 'completed')
+  await activation.dispose()
+})
+
+test('找不到 cwd 对应工作区时只记日志，不阻塞派活', async t => {
+  const h = await fixture(t)
+  const logs: string[] = []
+  h.options.log = (message: string) => { logs.push(message) }
+  h.options.cwd = () => 'D:\\work\\未注册目录'
+  h.options.ctx.provide('workspaceRegistry', { resolveByPath: async () => undefined })
+  const member = h.store.directory.create(draft('无工作区成员'))
+  const { driver, activation } = await h.start(member.assistantId)
+  assert.ok(logs.some(message => /未找到.*工作区/u.test(message)))
+  await complete(driver)
+  assert.equal((await activation.result).stopReason, 'completed')
+  await activation.dispose()
+})
+
+test('workspaceRegistry 服务不可用时记日志并照常派活', async t => {
+  const h = await fixture(t)
+  const logs: string[] = []
+  h.options.log = (message: string) => { logs.push(message) }
+  h.options.cwd = () => 'D:\\work\\dsh-github'
+  // 夹具宿主未挂载 workspaceRegistry：ctx.get 返回 undefined。
+  const member = h.store.directory.create(draft('无注册表成员'))
+  const { driver, activation } = await h.start(member.assistantId)
+  assert.ok(logs.some(message => /workspaceRegistry 服务不可用/u.test(message)))
+  await complete(driver)
+  assert.equal((await activation.result).stopReason, 'completed')
+  await activation.dispose()
+})
+
+test('旧成员会话 cwd 与当前目录不一致时清除绑定并重建，不 resume 错误会话', async t => {
+  const h = await fixture(t)
+  h.options.cwd = () => 'D:\\work\\新目录'
+  const member = h.store.directory.create(draft('清理成员'))
+  const first = await h.start(member.assistantId)
+  await complete(first.driver); await first.activation.dispose()
+  // 旧会话的不可变 header 仍指向错误的桌面进程目录。
+  h.options.ctx.provide('sessions', {
+    get: (id: string) => id === first.child.id ? { header: { cwd: 'C:\\Users\\lakala\\.dsh\\profiles\\desktop' } } : undefined,
+  })
+  const second = await h.start(member.assistantId)
+  assert.notEqual(second.child.id, first.child.id, 'cwd 不一致必须重建')
+  assert.deepEqual(h.calls.map(item => item.kind), ['create', 'create'], '不走 resume')
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, second.child.id)
+  await complete(second.driver); await second.activation.dispose()
+})
+
+test('旧成员会话 cwd 一致时保留 resume', async t => {
+  const h = await fixture(t)
+  h.options.cwd = () => 'D:\\work\\同一目录'
+  const member = h.store.directory.create(draft('保留成员'))
+  const first = await h.start(member.assistantId)
+  await complete(first.driver); await first.activation.dispose()
+  h.options.ctx.provide('sessions', { get: (id: string) => id === first.child.id ? { header: { cwd: 'D:\\work\\同一目录' } } : undefined })
+  const second = await h.start(member.assistantId)
+  assert.equal(second.child.id, first.child.id)
+  assert.deepEqual(h.calls.map(item => item.kind), ['create', 'resume'])
+  await complete(second.driver); await second.activation.dispose()
+})
+
+test('读不到旧会话 cwd 时保留原绑定，不误清', async t => {
+  const h = await fixture(t)
+  h.options.cwd = () => 'D:\\work\\同一目录'
+  const member = h.store.directory.create(draft('未知cwd成员'))
+  const first = await h.start(member.assistantId)
+  await complete(first.driver); await first.activation.dispose()
+  // 活注册表查不到该会话，宿主也没有持久层：cwd 未知，不能据此清绑定。
+  h.options.ctx.provide('sessions', { get: () => undefined })
+  const second = await h.start(member.assistantId)
+  assert.equal(second.child.id, first.child.id)
+  assert.deepEqual(h.calls.map(item => item.kind), ['create', 'resume'])
+  await complete(second.driver); await second.activation.dispose()
 })

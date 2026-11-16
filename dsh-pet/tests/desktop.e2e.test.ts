@@ -14,7 +14,7 @@
  * 还注册了 window-all-closed / before-quit，没有回头路。
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { mock, test } from 'node:test'
@@ -22,6 +22,7 @@ import { BridgeClient } from '../src/main/harness.ts'
 
 // ── 隔离：所有写盘都落在临时目录，绝不碰真用户的 ~/.dsh 与 pet-settings.json ──
 const sandbox = mkdtempSync(path.join(tmpdir(), 'dsh-pet-e2e-'))
+const builtMenus: Array<{ template: unknown; popup: () => void }> = []
 process.env.DSH_HOME = path.join(sandbox, 'dsh-home')
 
 const wakeStarts: Array<{ onWake: unknown; onLost: unknown }> = []
@@ -282,10 +283,10 @@ const fakeElectron = {
     },
   },
   Menu: {
-    buildFromTemplate: (template: unknown) => ({
-      template,
-      popup: () => {},
-    }),
+    buildFromTemplate: (template: unknown) => {
+      const menu = { template, popup: () => { builtMenus.push(menu) } }
+      return menu
+    },
   },
   shell: {
     openPath: () => Promise.resolve(''),
@@ -415,7 +416,7 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'report-workbench:request-share',
     'team-get', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
-    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select',
+    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines',
     // 环境检查（M5-06）：只查、只按用户确认执行，不主动下载、不主动改系统设置。
     'first-run-report', 'first-run-download', 'first-run-open-settings',
     // 会议系统音频能力查询（M4-03）：渲染层开会前问一次，拿不到就不去反复试。
@@ -426,11 +427,16 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'meeting-state', 'meeting-delete', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-todo-import',
     'audio-sync', 'residency-state', 'residency-set',
+    // 记忆共享 / 词库 / 产物 / 技能 / 时间线：全部走同一套舞台发送方校验，只回列表，不返回凭据。
+    'assistant-glossary-state', 'assistant-glossary-update',
+    'assistant-artifacts-state', 'assistant-timeline-state',
+    'assistant-skills-state', 'assistant-skills-update', 'assistant-skills-evidence',
     // 声纹唤醒：注册只接收舞台窗口送来的 WAV，只落加密特征；状态查询不返回 embedding。
-    'voiceprint-status', 'voiceprint-enroll', 'voiceprint-clear',
+    'voiceprint-status', 'voiceprint-enroll', 'voiceprint-clear', 'voiceprint-diagnose',
     // 成员目录、成员编辑窗口与额度（团队管理）。
     'members-state', 'member-command', 'member-memories', 'member-assist',
-    'member-editor-open', 'member-editor-context', 'member-editor-close',
+    'member-editor-open', 'member-editor-context', 'member-editor-close', 'member-session-view',
+    'member-voice-get', 'member-voice-save', 'member-voice-pick-sample', 'member-model-options', 'member-tts-profiles', 'member-voice-preview',
     // 普通任务与提醒窗口（P0-02/P0-03）。
     'companion-tasks-open', 'companion-tasks:list', 'companion-tasks:detail', 'companion-tasks:create',
     'companion-tasks:control', 'companion-tasks:reminders', 'companion-tasks:respond',
@@ -447,6 +453,8 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'asset-studio-assist',
     'asset-studio-start-job', 'asset-studio-cancel-job', 'asset-studio-rerun-post',
     'asset-studio-apply-skin', 'asset-studio-delete-skin', 'asset-studio-pick-audio',
+    // 从本地视频裁动作：选文件、裁剪、登记为皮肤动作（不需要视频模型）。
+    'asset-studio-pick-video', 'asset-studio-extract-clip',
     'asset-studio-start-clone', 'asset-studio-apply-voice', 'asset-studio-revoke-voice',
     // 快速应答（快嘴旁路）：配置/测试只认舞台窗口；开启在主进程过原生隐私确认。
     'fast-reply-state', 'fast-reply-save', 'fast-reply-test',
@@ -476,7 +484,7 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'session-get', 'session-command', 'session-start', 'overlay-state', 'report-workbench-open',
     'team-get', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
-    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'runtime-start', 'runtime-stop',
+    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines', 'runtime-start', 'runtime-stop',
     'stage-set-visible', 'stage-set-focus',
     'doc-open', 'doc-explain', 'doc-ask', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
@@ -485,6 +493,9 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'exit-done',
     'audio-sync', 'kws-feed', 'audio-consumer-lost', 'tts-playback-receipt', 'barge-in-detected', 'barge-in-metrics',
     'residency-state', 'residency-set',
+    'assistant-glossary-state', 'assistant-glossary-update',
+    'assistant-artifacts-state', 'assistant-timeline-state',
+    'assistant-skills-state', 'assistant-skills-update', 'assistant-skills-evidence',
     'custom-skins-list', 'asset-studio-open',
     'fast-reply-state', 'fast-reply-save', 'fast-reply-test',
   ]
@@ -595,6 +606,27 @@ test('before-quit：第一次挡下退出收尾，收尾完放行第二次；资
   beforeQuit({ preventDefault: () => { prevented = true } })
   assert.equal(prevented, false, '第二次不再挡')
   assert.equal(narrator.disposed, 2, 'dispose 幂等，多次触发无害')
+})
+
+test('右键换形象菜单含本地登记的自定义皮肤：生成形象不进仓库也选得到', () => {
+  const customDir = path.join(sandbox, 'electron-userData', 'custom-assets')
+  mkdirSync(customDir, { recursive: true })
+  const registry = path.join(customDir, 'custom-skins.json')
+  writeFileSync(registry, JSON.stringify({ skins: [
+    { id: 'nezha', name: '哪吒（电影版）', createdAt: 1, actions: ['write'], sourceJobId: 'test', license: 'generated' },
+  ] }))
+  try {
+    const stageWin = windows[0]
+    const frame = (stageWin.webContents as unknown as { mainFrame?: unknown }).mainFrame
+    ipcListeners.get('context-menu')?.({ sender: stageWin.webContents, senderFrame: frame } as object,
+      { assistantId: 'member-tangseng', displayName: '小潘同学', skin: 'panda' })
+    const menu = builtMenus[builtMenus.length - 1] as { template: Array<{ label?: string; submenu?: Array<{ label?: string }> }> }
+    const entry = menu.template.find(item => String(item.label ?? '').startsWith('换个形象'))
+    assert.ok(entry?.submenu?.some(item => item.label === '哪吒（电影版）'), '自定义皮肤应出现在右键形象菜单')
+    assert.ok(entry?.submenu?.some(item => item.label === '国宝熊猫'), '内置三个仍在')
+  } finally {
+    rmSync(registry, { force: true })
+  }
 })
 
 test('收尾：桥接轮询与托盘定时器都停了，沙盒目录清掉', async () => {

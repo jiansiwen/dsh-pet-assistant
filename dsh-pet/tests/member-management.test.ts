@@ -23,11 +23,11 @@ const memoryId = '记忆 一'
 const requestId = '申请 一'
 const ROOT = '/companion/v1/members'
 const base = `${ROOT}/${memberPathIdentifier(id)}`
-const draft: MemberDraft = { displayName: '研究员甲', personality: '', permissionMode: 'ask', description: '通用研究成员', persona: '只根据证据回答', skinId: 'wukong', enabled: true,
+const draft: MemberDraft = { displayName: '研究员甲', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceProfile: '', voiceDesign: '', description: '通用研究成员', persona: '只根据证据回答', skinId: 'wukong', enabled: true,
   provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' }
 function snapshot(): MemberSnapshot {
   return { enabled: false, defaultModel: { provider: '宿主', model: '默认模型' }, members: [{ profile: { ...draft, assistantId: id, roleId: 'wukong',
-    voiceProfile: '', toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 3, sessionId: '独立会话甲' },
+    voiceProfile: '', voiceDesign: '', toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 3, sessionId: '独立会话甲' },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 0, totalReserved: 0, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
     requests: [{ requestId, assistantId: id, reason: '日用量达到阈值', state: 'pending', createdAt: 1, quotaRevision: 9 }] }
 }

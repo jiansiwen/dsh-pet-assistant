@@ -24,8 +24,8 @@ export type DocViewApi = {
   page(token: string, fingerprint: string, page: number): Promise<DocViewGrant>
   resource(token: string, kind: string, filename: string): Promise<Uint8Array | null>
   report(token: string, report: DocViewReport): void
-  onSessionChanged(callback: () => void): void
-  onCommand(callback: (command: DocViewCommand) => void): void
+  onSessionChanged(callback: () => void): () => void
+  onCommand(callback: (command: DocViewCommand) => void): () => void
 }
 
 contextBridge.exposeInMainWorld('docView', {
@@ -38,11 +38,13 @@ contextBridge.exposeInMainWorld('docView', {
     ipcRenderer.invoke('doc-view-resource', token, kind, filename) as Promise<Uint8Array | null>,
   report: (token: string, report: DocViewReport) => ipcRenderer.send('doc-view-report', token, report),
   onSessionChanged: (callback: () => void) => {
-    ipcRenderer.removeAllListeners('doc-view-session-changed')
-    ipcRenderer.on('doc-view-session-changed', () => callback())
+    const listener = () => callback()
+    ipcRenderer.on('doc-view-session-changed', listener)
+    return () => { ipcRenderer.removeListener('doc-view-session-changed', listener) }
   },
   onCommand: (callback: (command: DocViewCommand) => void) => {
-    ipcRenderer.removeAllListeners('doc-view-command')
-    ipcRenderer.on('doc-view-command', (_event, command: DocViewCommand) => callback(command))
+    const listener = (_event: unknown, command: DocViewCommand) => callback(command)
+    ipcRenderer.on('doc-view-command', listener)
+    return () => { ipcRenderer.removeListener('doc-view-command', listener) }
   },
 } satisfies DocViewApi)

@@ -24,6 +24,10 @@ const api = {
   applySkin: (skinId: string, assistantId: string) => invoke('asset-studio-apply-skin', { skinId, assistantId }),
   deleteSkin: (id: string) => invoke('asset-studio-delete-skin', { id }),
   pickAudio: () => invoke('asset-studio-pick-audio'),
+  /** 选一个本地视频，用来截取其中一段做动作。 */
+  pickVideo: () => invoke('asset-studio-pick-video'),
+  /** 从本地视频裁一个动作，产出透明 WebM 并登记为皮肤动作。 */
+  extractClip: (input: unknown) => invoke('asset-studio-extract-clip', input),
   startClone: (input: unknown) => invoke('asset-studio-start-clone', input),
   applyVoice: (id: string) => invoke('asset-studio-apply-voice', { id }),
   revokeVoice: (id: string) => invoke('asset-studio-revoke-voice', { id }),

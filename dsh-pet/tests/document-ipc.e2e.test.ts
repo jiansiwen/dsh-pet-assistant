@@ -463,7 +463,7 @@ beforeEach(async () => {
   // 续讲、进度落盘、部分完成都建立在这条链上）。产品默认已经改成 source（照原文念稿），
   // 而那不是这批用例的对象 —— 显式声明模式，免得将来默认值一动就整片红。
   // 原文朗读模式由文件末尾「原文朗读」那两条用例单独覆盖。
-  await invoke('save-settings', { meetingDocumentAutoApprove: false, docSpeechMode: 'ai' })
+  await invoke('save-settings', { meetingDocumentAutoApprove: false, docSpeechMode: 'ai', memberHandover: false })
 })
 afterEach(async () => {
   await prompt('结束讲解')
@@ -1926,6 +1926,21 @@ test('代码或无法提取的文档段落不会冒充整份讲完，状态和�
   } finally { await finishAudioMeeting(prepared.meetingId); rmSync(file, { force: true }) }
 })
 
+test('TTS 合成失败后本轮立即收掉，后续讲解委派不被挡', async () => {
+  const sending = prompt('你好，介绍一下你自己', true)
+  const chat = await chatAt(0)
+  chat.resolve({ ok: true, reply: '先说明授权范围。' })
+  await nextTurn()
+  // 合成 worker 报错：真实链路里 Narrator.fail 会调 onError，这里直接喂错误事件。
+  deliver({ ok: false, error: '模拟合成失败' })
+  await nextTurn()
+  await sending
+  // 失败前这一轮若没被收掉，spokenRound 永远非空，下面的委派会被闸门挡死。
+  const result = await invoke('doc-explain', documentPath, 0, false)
+  assert.equal(result.ok, true, result.error)
+  await prompt('结束讲解')
+})
+
 test('隔离黄金链：双轨讲解、停录转写、本人确认文件、审批发信和企微提醒逐步衔接', async () => {
   fakeMeetingTranscription = true
   const prepared = await prepareMeetingPresentation('完整模拟会议')
@@ -1943,6 +1958,12 @@ test('隔离黄金链：双轨讲解、停录转写、本人确认文件、审�
       finishSentence()
     }
     await nextTurn()
+    // 负载高时采集块可能还没到就停录，转写会空。等至少一条实时字幕再停，消除偶发。
+    for (let i = 0; i < 200; i++) {
+      const st = await invoke<{ captions?: unknown[] }>('meeting-state')
+      if ((st.captions?.length ?? 0) > 0) break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
     bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '黄金链停录', command: 'meeting.presentation.finish',
       payload: { presentationId: prepared.presentationId }, expiresAt: Date.now() + 10_000 } })
     for (let i = 0; i < 50 && sent('meeting-stopping').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
@@ -2700,6 +2721,25 @@ test('没点名成员时，讲解与追问自动交给会议+文档子助理', a
   assert.equal(question.assistantId, 'member-bailongma', '追问沿用同一个成员')
   await answer(question, '避免误读。')
   assert.equal((await asking).ok, true)
+})
+
+test('委派讲解先演交接：叫人→应声→成员开口，不重复总助交代、不写死称谓', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  await invoke('save-settings', { memberHandover: true })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(result.ok, true, result.error)
+    const texts = narrator.requests.map(request => request.text)
+    assert.ok(texts.some(text => text.includes('来一下，这边需要你')), '总助叫人')
+    assert.ok(texts.some(text => text.includes('我这就来')), '成员应声')
+    assert.ok(texts.some(text => text.includes('接下来由我来给你讲')), '成员开口')
+    assert.ok(!texts.some(text => text.includes('老板')), '用户没设置过"老板"，不能写死称谓')
+    assert.ok(!texts.some(text => text.includes('这件事我交给')), '总助真实回复已交代过，不重复念固定台词')
+  } finally {
+    await invoke('save-settings', { memberHandover: false })
+  }
 })
 
 test('独立讲解回执与面板状态点名委派成员', async () => {

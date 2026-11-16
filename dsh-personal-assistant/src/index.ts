@@ -94,6 +94,9 @@ import { applyRetention, startRetention } from './retention.ts'
 import { registerAssistantTools } from './tools.ts'
 import { ensureRecallSchema, RECALL_EMPTY_INJECTION, recallMemories, reconcileRecallIndex } from './recall-index.ts'
 import { ActivityTracker } from './tracker.ts'
+import { ArtifactStore } from './artifacts.ts'
+import { GlossaryStore } from './glossary.ts'
+import { SkillStore } from './skills.ts'
 import { WorkItemStore } from './work-items.ts'
 import { MaterialStore } from './materials.ts'
 import { intakeEvidence, type IntakeResult } from './evidence-intake.ts'
@@ -690,6 +693,19 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
   return true
 }
 
+/**
+ * 成员会话工作目录的解析顺序：总助理绑定会话的真实 cwd > 插件 ctx 上的会话 header > 进程目录。
+ *
+ * 绑定会话优先是关键：插件根 ctx 没有 session，进程目录又是桌面端的安装目录
+ * （如 ~/.dsh/profiles/desktop），拿它建成员会话会落进错误的工作区分组。
+ * 导出供单元测试直接验证优先级。
+ */
+export function resolveMemberCwd(boundCwd: string | null | undefined, headerCwd: unknown, processCwd: string): string {
+  if (typeof boundCwd === 'string' && boundCwd !== '') return boundCwd
+  if (typeof headerCwd === 'string' && headerCwd !== '') return headerCwd
+  return processCwd
+}
+
 export async function apply(ctx: PluginContext, config: ConfigType): Promise<void> {
   const home = dshHome()
   const logger = ctx.logger?.('personal-assistant')
@@ -714,6 +730,9 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const memories = new MemoryStore(db)
   const observations = new ObservationStore(db)
   const reports = new ReportStore(db)
+  const artifacts = new ArtifactStore(db)
+  const glossary = new GlossaryStore(db)
+  const skills = new SkillStore(db)
   const workItems = new WorkItemStore(db)
   const migrations = new MigrationStore(db)
   ctx.effect(() => () => db.close(), 'personal-assistant:store')
@@ -872,8 +891,59 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     },
   })
   const memberRuntime = new MemberRuntime({
-    ctx: ctx as never, directory: teamStore.directory, defaultModel: () => resolveDefaultModel(home),
-    enabled: () => teamRuntime !== null, memories: memberMemories,
+    ctx: ctx as never,
+  /* 成员会话挂到总助理当前的工作目录下：这里取一次，运行时才知道该挂哪儿。 */
+  cwd: () => {
+    /* 优先用绑定会话的真实 cwd：插件根 ctx 没有 session，process.cwd() 是桌面进程目录，
+       拿它建成员会话会落进错误分组。取不到再退回 ctx 会话 header，最后才是进程目录。 */
+    let bound: string | null = null
+    try { bound = bridge.boundSessionCwd() } catch { /* 取不到就退回下面的逻辑 */ }
+    let headerCwd: unknown
+    try {
+      headerCwd = (ctx as unknown as { session?: { header?: { cwd?: unknown } } }).session?.header?.cwd
+    } catch { /* 取不到就退回进程目录 */ }
+    /*
+      退路：插件拿不到当前会话的 cwd 时用宿主进程的工作目录。
+      没有退路时的后果是成员会话落进 `_no-cwd`，在工作区列表里根本看不见 ——
+      用户只会觉得"小会没有会话"，而不是"cwd 传丢了"。
+    */
+    return resolveMemberCwd(bound, headerCwd, process.cwd())
+  },
+  directory: teamStore.directory, defaultModel: () => resolveDefaultModel(home),
+    log,
+    enabled: () => teamRuntime !== null,
+    /*
+     * 显式转成三个函数，不能用对象展开：`memberMemories` 是类实例，
+     * 方法在原型上，`{...instance}` 只拷自有字段，展开之后一个方法都没有。
+     */
+    memories: {
+      injectable: (id: string) => memberMemories.injectable(id),
+      shared: () => memberMemories.shared(),
+      propose: (id: string, input: { kind: never; topic: string; text: string; sourceRefs?: string[] }) => memberMemories.propose(id, input),
+    },
+    skills: { renderFor: (id: string) => skills.renderFor(id) },
+    /*
+     * 底座能力「操作电脑」：给成员 ctx 注册一套**该次运行私有**的电脑工具。
+     *
+     * 关键取舍：成员的电脑动作**永远走 manual 审批**，不跟随全局 approvalMode。
+     * 全局 auto 是本人对自己（主会话）的信任，不等于"允许子助理替你点鼠标"。
+     * 想减少确认次数，应当用带范围/次数/期限的常驻授权，而不是把这一行改成 auto。
+     */
+    computer: (memberCtx: unknown) => registerComputerTools(memberCtx as never, {
+      scriptDir: path.join(pluginDir, 'assets'), shotDir: path.join(home, 'personal-assistant', 'screenshots'),
+      approvalMode: () => 'manual', bridge, log,
+      attachComputerExecutor: fn => companionRuntime.attachComputerExecutor(fn),
+    }),
+    /*
+     * 成员自报"做完了"只记**未核实**样本：技能判定只数本人确认过的，
+     * 所以这条路径不会让技能自动生效，只会让桌面的"待核实"列表里出现一条。
+     * 长度与空值在存储层还有一道校验，这里先过滤掉明显无意义的 shape。
+     */
+    noteWork: (assistantId: string, shape: string) => {
+      const clean = shape.trim()
+      if (clean.length < 2 || clean.length > 30) return
+      skills.noteSuccess(assistantId, clean, false)
+    },
     desktop: { binding: () => bridge.currentDesktopBinding(),
       request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options) },
     mailUnread: async limit => {
@@ -1166,6 +1236,21 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ttlMs: Math.max(10_000, config.approvalTtlMs),
     stop: () => tracker.stop(),
     active: () => tracker.active,
+    /*
+     * 日报发布成功后登记产物指针：这样"上次那份日报"第二天还能被找到。
+     * 记的是路径 + 摘要，不存正文；同路径重复发布会覆盖，不堆历史。
+     */
+    onPublished: record => {
+      if (!record.targetPath) return
+      try {
+        artifacts.record({
+          kind: 'report',
+          path: record.targetPath,
+          digest: record.digest,
+          label: `日报 ${record.reportId}`,
+        })
+      } catch { /* 指针登记失败不影响发布本身 */ }
+    },
   }), config.approvalMode)
   // 桌面专家助理团：默认关闭，由 desktop-team profile 显式打开；
   // 也允许用户在会话里说「开启团队模式」动态挂载（personal_assistant_set_team_mode），
@@ -1209,6 +1294,61 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }
   const memberManagement = new MemberManagement({
     directory: teamStore.directory, runtime: memberRuntime, memories: memberMemories,
+    /*
+     * 记忆共享开关的数据面：只列**已确认的全局记忆**。
+     * 候选、项目范围、冲突态不进列表 —— 列表里出现开关，用户就会以为点了能共享，
+     * 而那些本来就不该共享（见 MemoryStore.setShared 的三条约束）。
+     */
+    sharedMemories: () => memories.list({}, Date.now())
+      .filter(record => record.scope.kind === 'global' && record.status === 'confirmed')
+      .map(record => ({ id: record.id, topic: record.topic, text: record.text, revision: record.revision, shared: memories.isShared(record.id) })),
+    toggleShared: (memoryId, shared) => memories.setShared(memoryId, shared),
+    /*
+     * 词库的读写：列表按加入时间倒序，新增/删除都返回最新列表，
+     * 让界面一次往返就拿到"改完之后是什么样"，不用再发一次 GET 去对账。
+     */
+    /*
+     * 技能：列表带成员显示名（界面要给人看，不能只给 member-xxxx 的编号）。
+     * 名字查不到就退回编号——比空着强，也能看出是哪个助理的。
+     */
+    skills: () => skills.list().map(item => ({
+      id: item.id, assistantId: item.assistantId,
+      assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId,
+      name: item.name, body: item.body, version: item.version, status: item.status, createdAt: item.createdAt,
+    })),
+    skillEdit: input => {
+      if (input.action === 'rollback') skills.rollback(input.id, input.version ?? 1)
+      else {
+        const current = skills.history(input.id)[0]
+        if (!current) throw new Error('技能不存在或已被删除')
+        skills.save(current.assistantId, { name: current.name, body: current.body },
+          input.action === 'promote' ? 'active' : 'retired')
+      }
+      return skills.list().map(item => ({
+        id: item.id, assistantId: item.assistantId,
+        assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId,
+        name: item.name, body: item.body, version: item.version, status: item.status, createdAt: item.createdAt,
+      }))
+    },
+    skillUnverified: () => teamStore.directory.list().flatMap(member => skills.listShapes(member.assistantId)
+      .filter(shape => skills.unverifiedCount(member.assistantId, shape) > 0)
+      .map(shape => ({ assistantId: member.assistantId, assistantName: member.displayName, shape, count: skills.unverifiedCount(member.assistantId, shape) }))),
+    skillVerify: (assistantId, shape) => skills.verifyAll(assistantId, shape),
+    skillRetract: (assistantId, shape) => skills.retract(assistantId, shape),
+    skillPending: () => teamStore.directory.list().flatMap(member => skills.pendingShapes(member.assistantId)
+      .map(item => ({ assistantId: member.assistantId, assistantName: member.displayName, shape: item.shape, count: item.count }))),
+    timeline: (from, to) => workItems.listInRange(from, to).map(item => ({
+      id: item.id, start: item.start, end: item.end, action: item.action,
+      outcome: item.outcome, project: item.project, status: item.status,
+    })),
+    artifacts: () => artifacts.recent(20, true)
+      .map(item => ({ path: item.path, label: item.label, kind: item.kind, state: item.state, createdAt: item.createdAt })),
+    glossary: () => glossary.list().map(item => ({ term: item.term, expansion: item.expansion, createdAt: item.createdAt })),
+    glossaryEdit: input => {
+      if (input.remove === true) glossary.remove(input.term)
+      else glossary.add(input.term, input.expansion ?? '')
+      return glossary.list().map(item => ({ term: item.term, expansion: item.expansion, createdAt: item.createdAt }))
+    },
     enabled: () => teamRuntime !== null,
     setMode: async enabled => {
       if (enabled) enableTeamMode()
@@ -1362,6 +1502,26 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     },
     maxInjectedMemories: Math.max(0, Math.floor(config.maxInjectedMemories)),
     recall: recallForPrompt,
+    artifacts: { recent: (limit?: number, includeMissing?: boolean) => artifacts.recent(limit ?? 5, includeMissing ?? false) },
+    glossary: { match: (text: string) => glossary.match(text) },
+    /*
+     * 技能：只给"存一版"的能力（模型只能写候选）。
+     * 晋升/回滚走桌面「技能」那一节，模型拿不到，也就无法替本人决定生效。
+     */
+    skills: { save: (assistantId: string, plan: { name: string; body: string }, status: 'candidate') => skills.save(assistantId, plan, status) },
+    memberExists: (assistantId: string) => teamStore.directory.get(assistantId) !== null,
+    /*
+     * 人格来自设置页「总助理」（settings.getAgent）。getAgent 会校验设置文件，
+     * 文件坏了会抛 —— 这里吞成空人设，不能让一次提示词装配失败把整轮对话打断。
+     */
+    identity: () => {
+      try {
+        const agent = settings.getAgent()
+        return { name: agent.name, persona: agent.persona }
+      } catch {
+        return { name: '', persona: '' }
+      }
+    },
     captureBlockedReason,
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
     enableTeamMode,

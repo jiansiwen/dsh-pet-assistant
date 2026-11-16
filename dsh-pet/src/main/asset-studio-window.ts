@@ -3,13 +3,23 @@
  * 独立 preload + 固定 IPC；发送方校验只认本窗口；生成/克隆/删除前原生确认费用与影响。
  */
 import { BrowserWindow, dialog, ipcMain } from 'electron'
+import { execFile } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AssetPipeline, probeFfmpeg } from './asset-pipeline.ts'
+import { customAssetsRoot, listCustomSkins, registerCustomSkin } from './custom-skins.ts'
+import { extractClip, type SpawnLike } from './video-clip.ts'
 import { MediaProviderStore, type MediaProvidersConfig } from './media-providers.ts'
 import { VoiceCloneService, type VoiceStoreLike } from './voice-clone.ts'
-import { listCustomSkins } from './custom-skins.ts'
 import { loadSettings, saveSettings } from './settings.ts'
+
+/** 与 asset-pipeline 同形状的 ffmpeg 调用；单独放这里是为了让 video-clip 不依赖 electron。 */
+const spawnFfmpeg: SpawnLike = (command, args) => new Promise(resolve => {
+  execFile(command, [...args], { timeout: 180_000, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
+    resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0, stderr: String(stderr ?? '') })
+  })
+})
 
 export interface AssetStudioDeps {
   userDataDir: string
@@ -182,6 +192,73 @@ export class AssetStudio {
       this.deps.pipeline.deleteSkin(skinId)
       this.deps.broadcast('pet-settings-changed')
       return ok()
+    })
+
+    this.handle('asset-studio-pick-video', async () => {
+      const options = {
+        title: '选择要截取动作的视频文件',
+        properties: ['openFile'] as 'openFile'[],
+        filters: [{ name: '视频', extensions: ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'gif'] }],
+      }
+      const result = this.win && !this.win.isDestroyed()
+        ? await dialog.showOpenDialog(this.win, options)
+        : await dialog.showOpenDialog(options)
+      if (result.canceled) return ok([])
+      return ok(result.filePaths.slice(0, 1))
+    })
+
+    /*
+     * 从本地视频裁一个动作。
+     *
+     * 与生成流水线共用同一套落地位置与登记表：产出写进
+     * `<userData>/custom-assets/pets/webm/<skinId>/<action>.webm`，然后登记皮肤。
+     * 这样它在成员编辑器的形象下拉里能直接选到 —— 用户做完的东西必须用得上。
+     */
+    this.handle('asset-studio-extract-clip', async (input) => {
+      const raw = (input ?? {}) as Record<string, unknown>
+      const sourcePath = typeof raw.sourcePath === 'string' ? raw.sourcePath : ''
+      const action = typeof raw.action === 'string' ? raw.action.trim() : ''
+      const skinIdRaw = typeof raw.skinId === 'string' ? raw.skinId.trim() : ''
+      const skinName = typeof raw.skinName === 'string' ? raw.skinName.trim() : ''
+      if (sourcePath === '') return fail('请先选一个视频文件')
+      if (!/^[a-z][a-z0-9-]{0,31}$/.test(action)) return fail('动作名只能是小写字母开头的短横线命名，例如 wave')
+      const skinId = skinIdRaw !== '' ? skinIdRaw : `clip-${Date.now().toString(36)}`
+      if (!/^[a-z0-9-]{1,64}$/.test(skinId)) return fail('皮肤编号不合法')
+      const known = listCustomSkins(this.deps.userDataDir).some(s => s.id === skinId)
+      if (skinIdRaw !== '' && !known) return fail('目标皮肤不存在，请先创建或留空新建')
+      if (skinIdRaw === '' && skinName === '') return fail('新建皮肤需要起一个名字')
+
+      const config = this.deps.providers.load()
+      const ffmpeg = this.ffmpegCache?.value ?? probeFfmpeg(config.ffmpegPath)
+      const confirmed = await this.confirm('从这段视频裁一个动作？',
+        `源文件：${sourcePath}\n起止：${String(raw.from)}s → ${String(raw.to)}s\n抠像：${String(raw.matte)}\n` +
+        `产物会写进：custom-assets/pets/webm/${skinId}/${action}.webm\n` +
+        '抠像靠静态背景估计，镜头在动的话会抠不干净；这时会如实失败，不会强行写入。')
+      if (!confirmed) return fail('已取消')
+
+      const webmDir = path.join(customAssetsRoot(this.deps.userDataDir), 'pets', 'webm', skinId)
+      mkdirSync(webmDir, { recursive: true })
+      const output = path.join(webmDir, `${action}.webm`)
+      const result = await extractClip({ ffmpeg, spawn: spawnFfmpeg }, sourcePath, output, {
+        from: Number(raw.from), to: Number(raw.to),
+        matte: raw.matte === 'chroma' ? 'chroma' : raw.matte === 'none' ? 'none' : 'background',
+        ...(typeof raw.keyColor === 'string' ? { keyColor: raw.keyColor } : {}),
+        ...(typeof raw.size === 'number' ? { size: raw.size } : {}),
+      })
+      if (!result.ok) return fail(`${result.error ?? '裁剪失败'}${result.hint ? `｜${result.hint}` : ''}`)
+
+      const existing = listCustomSkins(this.deps.userDataDir).find(s => s.id === skinId)
+      registerCustomSkin(this.deps.userDataDir, {
+        id: skinId,
+        name: existing?.name ?? skinName,
+        createdAt: existing?.createdAt ?? Date.now(),
+        // 已有的动作保留，新动作追加或覆盖 —— 不做"整份替换"，那会把别的动作一起删掉。
+        actions: [...new Set([...(existing?.actions ?? []), action])],
+        sourceJobId: existing?.sourceJobId ?? `clip-${Date.now().toString(36)}`,
+        license: 'generated',
+      })
+      this.deps.broadcast('pet-settings-changed')
+      return ok({ skinId, action, path: output })
     })
 
     this.handle('asset-studio-pick-audio', async () => {

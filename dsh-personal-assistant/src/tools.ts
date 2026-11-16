@@ -43,6 +43,7 @@ import {
   isPendingEntry,
   linkEntries,
   makeReportId,
+  weekKeyOf,
   parseReportLines,
   partitionWorkItemsForReport,
   REPORT_EVIDENCE_RULES,
@@ -53,7 +54,8 @@ import type { ActivityTracker } from './tracker.ts'
 import { planWorkItem, type EvidenceType, type PlannedWorkItem, type SourceResolver, type WorkItemInput, type WorkItemStore } from './work-items.ts'
 // 近期工作上下文：纯函数在 work-context.ts，这里只做"取数据 + 拼段落"。
 // 只 import 渲染所需的最小形状（WorkContextItem），不 import WorkItemStore。
-import { buildWorkContext, WORK_CONTEXT_WINDOW_MS, type WorkContextItem } from './work-context.ts'
+import { renderGlossary } from './glossary.ts'
+import { buildArtifactContext, buildWorkContext, WORK_CONTEXT_WINDOW_MS, type WorkContextItem } from './work-context.ts'
 // 只取类型与"召回依赖"的形状：真正的检索实现在 recall-index.ts，由 index.ts 装配进来。
 // 这里刻意只 `import type`，工具层不持有库连接，也不参与索引的建表/对账。
 import type { RecallBundle } from './recall-index.ts'
@@ -81,6 +83,26 @@ export interface ToolOptions {
   reports: ReportStore
   /** 注入系统提示词的记忆条数上限。 */
   maxInjectedMemories: number
+  /** 最近产出过的文件指针；未装配时整段产物索引不注入。 */
+  artifacts?: { recent(limit?: number, includeMissing?: boolean): Array<{ path: string; label: string }> }
+  /** 专属词库；未装配时本轮不提任何术语。 */
+  glossary?: { match(text: string): Array<{ term: string; expansion: string }> }
+  /**
+   * 技能库：只暴露"存一版"。
+   *
+   * 晋升/回滚/退役**不在工具面**：那些是本人的动作，走桌面「技能」那一节。
+   * 模型只能把经验写成候选，不能替本人决定它生效。
+   */
+  skills?: { save(assistantId: string, plan: { name: string; body: string }, status: 'candidate'): { id: string; version: number; status: string } }
+  /** 成员是否存在；未装配时跳过校验（工具仍会写库，由技能归属自己兜底）。 */
+  memberExists?(assistantId: string): boolean
+  /**
+   * 总助理的名字与性格，来自设置页「总助理」（assistant-settings 的 agent 段）。
+   *
+   * 做成注入依赖而不是让工具层自己去读设置文件：这里只是装配链上的一次只读取值，
+   * 未装配时安静退回无人设版，不该因为设置读不出来把整轮提示词炸掉。
+   */
+  identity?(): { name: string; persona: string }
   /**
    * 记忆召回：给定确定性查询词返回召回结果。
    *
@@ -292,11 +314,45 @@ export interface PreferencesSource {
   maxInjectedMemories: number
   recall?: RecallDependency
   /**
+   * 最近产出过的文件指针。只声明 `recent` 一个方法：提示词只需要"东西在哪"，
+   * 不需要登记/标缺失这些写接口（那些在发布路径上做）。
+   * 未装配时整段产物索引不注入。
+   */
+  artifacts?: { recent(limit?: number, includeMissing?: boolean): Array<{ path: string; label: string }> }
+  /**
+   * 专属词库：只声明 `match`，提示词只需要"这句话里提到了哪些行话"。
+   * 增删术语走设置页，不经过这条链路。
+   */
+  glossary?: { match(text: string): Array<{ term: string; expansion: string }> }
+  /**
    * 近期工作事项（M2）。刻意只声明 `listInRange` 一个方法：
    * 工具层渲染提示词只需要读，不需要 `add`/`confirm`/`remove` 这些写接口。
    * 未装配时整段工作上下文不注入（见 {@link renderWorkContext}）。
    */
   workItems?: { listInRange(from: number, to: number): WorkContextItem[] }
+}
+
+/**
+ * 渲染 `personal_assistant_identity` 变量的取值。**返回值永远是字符串。**
+ *
+ * 宿主把"变量没有值"当装配错误直接炸（真机踩过：新库无记忆时报
+ * `prompt variable has no value`），所以这里三层兜底：空人设也要给一句能读的话。
+ *
+ * 两件事刻意不写在这里：
+ * - 不写"每次回答都要符合人格"这种空话 —— 人格要落到句长、称呼、语气上，
+ *   那属于渠道表达规则（语音一套、文字一套），不是身份块能约束的。
+ * - 不复述用户写的原文之外的揣测。用户没写性格就给一个中性的默认，不替他编。
+ */
+export function renderIdentity(identity: { name?: string; persona?: string } | undefined | null): string {
+  const name = typeof identity?.name === 'string' ? identity.name.trim() : ''
+  const persona = typeof identity?.persona === 'string' ? identity.persona.trim() : ''
+  const who = name === ''
+    ? '你是用户桌面上的个人电脑助理。'
+    : `你是用户桌面上的个人电脑助理，名字叫「${name}」，用户会这么叫你。`
+  const style = persona !== ''
+    ? `性格与说话方式（用户自己写的，优先遵守）：${persona}`
+    : '性格与说话方式：友好、干脆、说人话。不要用客服腔，不要念工具名和内部编号。'
+  return `${who}\n${style}`
 }
 
 /**
@@ -376,11 +432,45 @@ export function joinSections(...parts: Array<string | undefined | null>): string
  * 取数范围写成 `[now - 24h, now + 1)`：`listInRange` 的上界是开区间（`start_at < to`），
  * 不加 1 会把"正好此刻开始"的事项漏掉，而这条恰恰是最可能被"继续刚才那个"指向的。
  */
+/**
+ * 本轮话语命中词库时返回一段术语对照；没命中返回空串。
+ *
+ * 与工作上下文同一个取舍：词库是**强化项**，装配期出任何问题都只能退化成"不加这一段"，
+ * 绝不能让整轮提示词炸掉（真机踩过变量回调抛错＝助理完全不回话）。
+ */
+export function renderGlossaryFor(
+  source: { glossary?: { match(text: string): Array<{ term: string; expansion: string }> } },
+  lastUserText: string,
+): string {
+  try {
+    if (!source.glossary || lastUserText.trim() === '') return ''
+    const hits = source.glossary.match(lastUserText)
+    return renderGlossary(hits.map(item => ({ id: item.term, term: item.term, expansion: item.expansion, createdAt: 0 })))
+  } catch {
+    return ''
+  }
+}
+
 export function renderWorkContext(source: PreferencesSource, now = Date.now()): string {
   try {
-    if (!source.workItems) return ''
-    const items = source.workItems.listInRange(now - WORK_CONTEXT_WINDOW_MS, now + 1)
-    return buildWorkContext(items, { now })
+    const parts: string[] = []
+    if (source.workItems) {
+      const items = source.workItems.listInRange(now - WORK_CONTEXT_WINDOW_MS, now + 1)
+      const rendered = buildWorkContext(items, { now })
+      if (rendered !== '') parts.push(rendered)
+    }
+    /*
+     * 最近产物：只给路径与标签，条数与工作事项分开算。
+     * 它回答的是"上次那个文件在哪"，与"我干了什么"是两个问题，
+     * 合进同一段会让模型把"产出了某文件"当成"做完了某件事"。
+     */
+    if (source.artifacts) {
+      let pointers: Array<{ path: string; label: string }> = []
+      try { pointers = source.artifacts.recent(5, false) } catch { pointers = [] }
+      const rendered = buildArtifactContext(pointers)
+      if (rendered !== '') parts.push(rendered)
+    }
+    return parts.join('\n')
   } catch {
     return ''
   }
@@ -1124,11 +1214,17 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
     },
   }))
 
+  const reportSubject = (period: unknown): 'daily' | 'weekly' => period === 'week' ? 'weekly' : 'daily'
+  /** 报告主体对应的日期键：周报取本周周一，日报取今天。 */
+  const reportDateKey = (subject: 'daily' | 'weekly', now: number): string =>
+    subject === 'weekly' ? weekKeyOf(now) : localDateOf(now)
+
   ctx.tools.register(defineTool({
     name: 'personal_assistant_save_draft',
-    description: '保存日报草稿，产生一个新版本；旧版本上的待确认/已确认状态随之作废。生成或修改草稿后必须调用，并把返回的 revision 与 digest 一并展示给用户。尽量用 entries 写明每一条对应的工作事项：text 与正文中的列表条目逐字一致；推断事项所在的条目必须带"（待确认）"，证据已删除的事项不能引用。',
+    description: '保存日报或周报草稿，产生一个新版本；旧版本上的待确认/已确认状态随之作废。生成或修改草稿后必须调用，并把返回的 revision 与 digest 一并展示给用户。周报传 period=week：它和同一天的日报是**两份互不覆盖的文件**，各自独立确认。尽量用 entries 写明每一条对应的工作事项：text 与正文中的列表条目逐字一致；推断事项所在的条目必须带"（待确认）"，证据已删除的事项不能引用。',
     parameters: {
-      content: { type: 'string', required: true, description: '日报草稿全文（Markdown 格式）' },
+      period: { type: 'string', description: '报告周期：day（日报，默认）或 week（周报，按本周周一出稿）' },
+      content: { type: 'string', required: true, description: '日报或周报草稿全文（Markdown 格式）' },
       entries: {
         type: 'array',
         description: '条目与工作事项的对应关系（可选）',
@@ -1142,9 +1238,10 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       },
     },
     output: { schema: { type: 'string' }, render: textRender },
-    async execute(args: { content: string; entries?: Array<{ text: string; workItemIds: string[] }> }) {
-      const date = localDateOf(Date.now())
-      const reportId = makeReportId('daily', date)
+    async execute(args: { content: string; entries?: Array<{ text: string; workItemIds: string[] }>; period?: 'day' | 'week' }) {
+      const subject = reportSubject(args.period)
+      const date = reportDateKey(subject, Date.now())
+      const reportId = makeReportId(subject, date)
       let links: Map<number, string[]> | null = null
       if (Array.isArray(args.entries) && args.entries.length > 0) {
         const store = options.workItems
@@ -1194,12 +1291,13 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
 
   ctx.tools.register(defineTool({
     name: 'personal_assistant_get_draft',
-    description: '读取今天最新的日报草稿版本与历史版本清单。用户要求修改日报而当前对话没有草稿内容时，必须先调用本工具取回上次草稿。',
-    parameters: {},
+    description: '读取今天最新的日报草稿版本与历史版本清单；传 period=week 读本周周报。用户要求修改报告而当前对话没有草稿内容时，必须先调用本工具取回上次草稿。',
+    parameters: { period: { type: 'string', description: '报告周期：day（日报，默认）或 week（周报）' } },
     output: { schema: { type: 'string' }, render: textRender },
-    async execute() {
-      const date = localDateOf(Date.now())
-      const reportId = makeReportId('daily', date)
+    async execute(args: { period?: 'day' | 'week' }) {
+      const subject = reportSubject(args.period)
+      const date = reportDateKey(subject, Date.now())
+      const reportId = makeReportId(subject, date)
       const record = options.reports.current(reportId)
       if (!record) return json({ hasDraft: false, date })
       const links = options.reports.links(reportId, record.revision)
@@ -1228,12 +1326,13 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
 
   ctx.tools.register(defineTool({
     name: 'personal_assistant_submit_report',
-    description: '把当前草稿发布出去。默认（manual）只提交到桌面专用审批窗口，等你批准后才写文件；若用户在设置里选了 auto（自动记录），则直接把这一版写进目标文件。运行时结果里的 mode 会说明走的是哪条路：mode=auto 且 published.ok 才是真的保存了，mode=manual 一律是"尚未发布"。',
-    parameters: {},
+    description: '把当前草稿发布出去（日报或周报，按 period 区分）。默认（manual）只提交到桌面专用审批窗口，等你批准后才写文件；若用户在设置里选了 auto（自动记录），则直接把这一版写进目标文件。运行时结果里的 mode 会说明走的是哪条路：mode=auto 且 published.ok 才是真的保存了，mode=manual 一律是"尚未发布"。',
+    parameters: { period: { type: 'string', description: '报告周期：day（日报，默认）或 week（周报）' } },
     output: { schema: { type: 'string' }, render: textRender },
-    async execute() {
-      const date = localDateOf(Date.now())
-      const reportId = makeReportId('daily', date)
+    async execute(args: { period?: 'day' | 'week' }) {
+      const subject = reportSubject(args.period)
+      const date = reportDateKey(subject, Date.now())
+      const reportId = makeReportId(subject, date)
       const current = options.reports.current(reportId)
       if (!current) {
         return json({ submitted: false, message: '还没有草稿可提交，先调用 personal_assistant_save_draft' })
@@ -1519,6 +1618,33 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
   }))
 
   ctx.tools.register(defineTool({
+    name: 'personal_assistant_save_skill',
+    description: '把一个助理在一类工作上攒下来的做法写成技能。技能只在该助理自己的会话里注入，不进总助理提示词，也不影响其他助理。**只保存为候选**：要不要生效由本人在桌面「技能」那一节点"让它生效"，模型不能替本人晋升。正文必须来自用户或该助理的真实经验，不得凭空编写步骤或工具名。',
+    parameters: {
+      assistantId: { type: 'string', required: true, description: '技能归属的成员编号（来自团队成员列表）' },
+      name: { type: 'string', required: true, description: '技能名称，同时作为"同类工作"的标识，例如「写周报」' },
+      body: { type: 'string', required: true, description: '技能正文：做什么、按什么步骤、注意什么。只能写真实发生过的做法，不得编造' },
+    }, output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { assistantId: string; name: string; body: string }) {
+      const assistantId = String(args.assistantId ?? '').trim()
+      if (assistantId === '') return json({ ok: false, message: '必须指定技能归属的成员编号' })
+      if (!options.skills) return json({ ok: false, message: '技能库未装配，未保存' })
+      if (options.memberExists && !options.memberExists(assistantId)) {
+        return json({ ok: false, message: '这个成员不存在或已删除，未保存技能' })
+      }
+      try {
+        const saved = options.skills.save(assistantId, { name: args.name, body: args.body }, 'candidate')
+        return json({
+          ok: true, id: saved.id, version: saved.version, status: saved.status,
+          message: '技能已保存为候选，需要本人在桌面「技能」一节点「让它生效」之后才会在回答里起作用',
+        })
+      } catch (error) {
+        return json({ ok: false, message: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'personal_assistant_list_memory_tidy',
     description: '列出本人可见范围内的记忆整理历史及是否仍可撤回，不读取已删除记忆的旧正文。',
     parameters: {}, output: { schema: { type: 'string' }, render: textRender },
@@ -1710,6 +1836,34 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
     },
   }))
 
+  /*
+   * 身份块：把设置里写的名字与性格真正送进主会话。
+   *
+   * 改之前这里是空的 ——「总助理：名字 + 性格」只落在设置文件里，生产代码里唯一的读者是
+   * 设置快照回显（assistant-settings.ts:222），另有企微渠道和快答旁路各自读一次。
+   * 也就是说用户在设置里写的性格，**主对话一个字都收不到**，那它当然只有一种说话方式。
+   *
+   * order 149：排在「个人电脑助理」主块之前，先立人、再讲规矩。
+   */
+  ctx.systemPrompt.section({
+    name: 'personal-assistant-identity',
+    order: 149,
+    text: [
+      '## 你是谁',
+      '{{personal_assistant_identity}}',
+    ].join('\n'),
+  })
+  ctx.systemPrompt.variable('personal_assistant_identity', () => {
+    let identity: { name: string; persona: string } | undefined
+    try {
+      identity = options.identity?.()
+    } catch {
+      // 设置读不出来不是这一轮的错：退回无人设版，绝不因为装配抛错让整轮没有回复。
+      identity = undefined
+    }
+    return renderIdentity(identity)
+  })
+
   ctx.systemPrompt.section({
     name: 'personal-assistant',
     order: 150,
@@ -1717,7 +1871,11 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       '## 个人电脑助理',
       '',
       '本环境装有"个人电脑助理"插件，提供 personal_assistant_* 工具，用于记录用户当天的电脑活动并生成工作日报。',
-      '状态（模式、活动记录、草稿版本、记忆）必须通过工具读写，不要假设记得之前的对话。',
+      '状态（模式、活动记录、草稿版本）必须通过工具读写，不要凭印象断言当前状态。',
+      '',
+      '## 关于「之前 / 上次 / 刚才那个」',
+      '只依据下方注入的记忆与工作上下文；其中没有的就明说未找到，不要用常识、印象或语气补全。',
+      '下方记忆是**本机检索出来的**，不是你这次听用户说的：可能和本轮完全无关。用到了哪一条，就在句尾标出处（如 `[偏好·11-05·mem:8f3c]`）；一条都没用到就别提"根据我的记忆"，那会让人以为你翻了一遍旧账。',
       '',
       '## 已确认的记忆（默认遵守，无需用户重复说明）',
       '这里只有全局记忆。每条都标了类型，标了"导入"的来自旧版本，内容仍是用户当时亲口说过的。项目范围的规则不在这里：只在 personal_assistant_read_project_evidence 返回该项目证据时随 projectRules 一起给出，且只适用于那个项目：',
@@ -1744,7 +1902,8 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       '- 只有引用了用户导入的聊天片段或本人确认的会议纪要，才能写"讨论/沟通了什么"并填写 discussionTopic；仅凭聊天窗口标题或进程停留，只能说用过某个应用，不得编造讨论主题或对象身份。引用片段只代表片段本身，不代表完整历史。',
       '- 用户要拿项目里的某个文件或仓库差异当证据：确认已有帮助授权后调用 personal_assistant_import_project_material（只提交可信审批，批准后用 personal_assistant_list_materials 读取）。可见窗口的控件只能按单次授权读取；不解密聊天数据库、不注入客户端。资料正文未获准发送时，需要的话调用 personal_assistant_request_material_share。',
       '- 用户要删除导入的资料或已导出的日报文件：调用 personal_assistant_delete_material 或 personal_assistant_delete_exported_report，把返回的影响范围（将删除/将失效/仍保留/无法控制）如实转告；只提交可信审批，批准前尚未删除。撤销版本、删除导出文件、删除原始记录是不同操作，分别说明范围。用户也可以在桌面"日报工作台"里查看历史并逐类删除。',
-      `- 用户说"总结今日工作内容"或"生成日报"：按上方"已确认的记忆"撰写（记忆已在提示词中，不必再调用工具读取），调用 personal_assistant_today（detail 用 full），依据返回的 workItems 撰写中文日报草稿（按工作类别组织，标注时长与具体内容）。${REPORT_EVIDENCE_RULES}调用 personal_assistant_save_draft 保存（在 entries 里写明每一条依据的工作事项编号），再调用 personal_assistant_submit_report 提交确认，然后把草稿全文连同返回的 revision、digest、targetPath 一起展示给用户请求确认；用户也可以打开桌面"日报工作台"逐条改写、删除、补充，每次都会产生新版本。`,
+      `- 用户说"总结今日工作内容"或"生成日报"：按上方"已确认的记忆"撰写（记忆已在提示词中，不必再调用工具读取），调用 personal_assistant_today（detail 用 full）。**若返回的 uninterpretedSpans 非空，先把它们逐条解释并调用 personal_assistant_commit_events 入库，再开始写草稿**——只看 workItems 会漏掉用户当天没有问过"我今天干了啥"时的全部电脑活动，日报会变成只剩会议和笔记的残稿。随后依据 workItems 撰写中文日报草稿（按工作类别组织，标注时长与具体内容）。${REPORT_EVIDENCE_RULES}调用 personal_assistant_save_draft 保存（在 entries 里写明每一条依据的工作事项编号），再调用 personal_assistant_submit_report 提交确认，然后把草稿全文连同返回的 revision、digest、targetPath 一起展示给用户请求确认；用户也可以打开桌面"日报工作台"逐条改写、删除、补充，每次都会产生新版本。`,
+      `- 用户说"写周报"或"总结本周"：调用 personal_assistant_today（detail 用 full）取最近 7 天的记录，必要时用 personal_assistant_project_timeline 补项目维度；**有 uninterpretedSpans 就先逐条 commit_events 再写**，否则周报会漏掉整周的电脑活动。周报六段：本周重点工作 / 项目进展 / 重要会议及结论 / 已完成任务 / 未完成事项 / 下周计划与风险。写完后调用 personal_assistant_save_draft **并传 period="week"**（周报和同一天的日报是两份互不覆盖的文件，各自独立确认），再调用 personal_assistant_submit_report 同样传 period="week"。${REPORT_EVIDENCE_RULES}`,
       '- 用户对日报提出修改：若当前对话没有草稿内容，先调用 personal_assistant_get_draft 取回最新版本；按用户要求调整后，再次调用 personal_assistant_save_draft（内容一改就是新版本，旧版本的确认自动作废），重新调用 personal_assistant_submit_report，并展示新草稿。只有用户明确表示"以后"、"今后"或长期有效，才调用 personal_assistant_remember_preference 记录；单次修改只改当前草稿。用户明确替换旧规则时填写 replaceIds，不能因主题相同自动替换。',
       '- 用户在聊天中确认定稿（如"可以了"、"确认"）：只能查询 personal_assistant_confirm_report 的待批状态，并引导用户在桌面专用审批窗口阅读全文、核对版本和目标后批准。模型工具不能发布，不能把聊天确认当作授权；未连接桌面壳时保持待批，不得降级。只有可信通道实际发布后才能说已保存，停止采集失败要如实转述。',
       '- 用户表达对日报或助理行为的长期喜好：主动调用 personal_assistant_remember_preference。用户明确说只适用于某个项目时填 projectDir（须是仍有效的帮助授权目录）；项目规则只在处理该项目时遵守，不得带到其他项目或无项目的对话。',
@@ -1803,7 +1962,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
   // joinSections 丢空段：今天没记事项时输出与 M1 逐字一致，不出现空行；
   // renderPreferences 保证非空，所以拼接结果永远非空（宿主不接受空变量值）。
   ctx.systemPrompt.variable('personal_assistant_preferences',
-    () => joinSections(renderPreferences(options, lastUserText), renderWorkContext(options)))
+    () => joinSections(renderPreferences(options, lastUserText), renderWorkContext(options), renderGlossaryFor(options, lastUserText)))
 
   // 矛盾的记忆一律不注入（isInjectable 只放 confirmed）。但"不注入"不等于"没这回事"：
   // 用户需要知道有两条互相打架的说法停在那里，否则助理看起来像是把他教过的东西忘了。

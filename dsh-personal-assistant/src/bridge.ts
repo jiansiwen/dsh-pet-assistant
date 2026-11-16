@@ -2369,8 +2369,10 @@ export class SessionBridge {
   boundSessionCwd(): string | null {
     if (this.agent === null) return null
     if (this.owned !== null && this.owned.handle.agent === this.agent) return this.options.sessionHost?.cwd() ?? null
-    const meta = (this.agent as { session?: { meta?: { cwd?: unknown } } }).session?.meta
-    return typeof meta?.cwd === 'string' && path.isAbsolute(meta.cwd) ? meta.cwd : null
+    // 会话的创建元数据落在不可变 header 上（Session.header.cwd）；旧写法读 session.meta 取不到值。
+    const session = (this.agent as { session?: { header?: { cwd?: unknown }; meta?: { cwd?: unknown } } }).session
+    const cwd = session?.header?.cwd ?? session?.meta?.cwd
+    return typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : null
   }
 
   /**

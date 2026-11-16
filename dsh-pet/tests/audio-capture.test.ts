@@ -367,3 +367,15 @@ describe('预滚动缓冲：有界、只在有人需要时保留', () => {
     assert.equal(h.capture.snapshot().prerollFrames, 0)
   })
 })
+
+/* 抖动不是丢音频：主线程被占几十~几百毫秒时，样本一个不少，不该记缺口。 */
+test('回调晚到但样本没丢：不标缺口（以前会误报）', async () => {
+  const h = harness()
+  h.capture.setGrants(ALL)
+  const frames: CaptureFrame[] = []
+  const sub = await h.capture.subscribe({ kind: 'dictation', onFrame: f => frames.push(f) })
+  h.pump(); h.pump(); h.pump(0.01, { skipMs: 250 }); h.pump()
+  assert.deepEqual(frames.map(f => f.gapBefore), [false, false, false, false])
+  assert.equal(h.capture.snapshot().gaps, 0)
+  sub.close()
+})

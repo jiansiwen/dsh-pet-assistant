@@ -4,7 +4,7 @@ import './voice-api-settings.css'
 
 const KIND_LABELS: Record<VoiceApiKind, string> = { tts: '语音合成（TTS）', asr: '语音听写（ASR）' }
 const PROVIDER_LABELS: Record<VoiceApiProvider, string> = { openai: 'OpenAI 兼容', mimo: 'MiMo（流式）' }
-const emptyDraft = (): VoiceApiInput => ({ kind: 'tts', name: '', endpoint: '', model: '', voice: '', provider: 'openai' })
+const emptyDraft = (): VoiceApiInput => ({ kind: 'tts', name: '', endpoint: '', model: '', voice: '', voiceDesign: '', provider: 'openai' })
 
 export default function VoiceApiSettings() {
   const [state, setState] = useState<VoiceApiState | null>(null)
@@ -14,6 +14,8 @@ export default function VoiceApiSettings() {
   const [clearKey, setClearKey] = useState(false)
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [pending, setPending] = useState(true)
+  /** 正在试听的那条配置 id；null 表示没有在合成。 */
+  const [previewing, setPreviewing] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const inFlight = useRef(false)
@@ -43,6 +45,33 @@ export default function VoiceApiSettings() {
 
   useEffect(() => { void run(() => window.petApi.voiceApiState()) }, [run])
 
+  /**
+   * 试听：用已保存且已选中的那条配置合成一句样例并播放。
+   *
+   * 每次都会真实调用一次语音服务（会花钱、会占额度），所以按钮只在"当前选中"那条上出现，
+   * 避免误点一堆。播放用最小实现：把 base64 拼成 blob 交给 Audio 播一次。
+   */
+  async function preview(id: string): Promise<void> {
+    if (previewing !== null) return
+    setPreviewing(id); setError(''); setNotice('')
+    try {
+      const result = await window.petApi.voiceApiPreview(id)
+      if (!result.ok) { setError(`试听失败：${result.error}`); return }
+      const binary = atob(result.audio)
+      const bytes = new Uint8Array(binary.length)
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+      const url = URL.createObjectURL(new Blob([bytes], { type: result.mime }))
+      const audio = new Audio(url)
+      audio.addEventListener('ended', () => URL.revokeObjectURL(url), { once: true })
+      await audio.play()
+      setNotice('正在试听；听完觉得合适就留着，不合适换一条再试。')
+    } catch (cause) {
+      setError(`试听失败：${cause instanceof Error ? cause.message : '无法播放音频'}`)
+    } finally {
+      setPreviewing(null)
+    }
+  }
+
   function resetEditor() {
     setDraft(emptyDraft())
     setApiKey('')
@@ -54,6 +83,7 @@ export default function VoiceApiSettings() {
     setDraft(profile ? {
       id: profile.id, kind: profile.kind, name: profile.name,
       endpoint: profile.endpoint, model: profile.model, voice: profile.voice,
+      voiceDesign: profile.voiceDesign,
       provider: profile.provider,
     } : emptyDraft())
     setApiKey('')
@@ -71,9 +101,11 @@ export default function VoiceApiSettings() {
       endpoint: draft.endpoint.trim(),
       model: draft.model.trim(),
       voice: draft.kind === 'tts' ? (draft.voice ?? '').trim() : '',
+      voiceDesign: draft.kind === 'tts' ? (draft.voiceDesign ?? '').trim() : '',
     }
-    if (!input.name || !input.endpoint || !input.model || (input.kind === 'tts' && !input.voice)) {
-      setError('请填写名称、接口地址、模型，以及语音合成所需的音色 ID。')
+    // 这页只校验模型三件套；音色由说话人（总助理 / 成员）各自带着走。
+    if (!input.name || !input.endpoint || !input.model) {
+      setError('请填写名称、接口地址和模型。')
       return
     }
     // 不传代表保留原密钥；只有明确勾选清除才发送空串。
@@ -124,6 +156,11 @@ export default function VoiceApiSettings() {
             <li key={profile.id}>
               <span>{profile.name} · {KIND_LABELS[profile.kind]} · {profile.hasKey ? '已设置密钥' : '未设置密钥'}</span>
               <div className="voice-api-actions">
+                {/* 试听只对当前选中的 TTS 配置开放：它用的就是"现在说话的那个音色"，听完才知道该不该留。 */}
+                {profile.kind === 'tts' && state.selected.tts === profile.id && (
+                  <button type="button" disabled={previewing !== null} onClick={() => void preview(profile.id)}
+                    aria-label={`试听 ${profile.name}`}>{previewing === profile.id ? '正在合成…' : '试听'}</button>
+                )}
                 <button type="button" onClick={() => edit(profile)} aria-label={`编辑 ${profile.name}`}>编辑</button>
                 <button type="button" onClick={() => { setDeleteId(profile.id); setError(''); setNotice('') }}
                   aria-label={`删除 ${profile.name}`}>删除</button>
@@ -173,11 +210,11 @@ export default function VoiceApiSettings() {
             <label>模型
               <input name="model" required value={draft.model} onChange={event => setDraft({ ...draft, model: event.target.value })} />
             </label>
-            {draft.kind === 'tts' && (
-              <label>音色 ID（不是音色描述）
-                <input name="voice" required value={draft.voice ?? ''} onChange={event => setDraft({ ...draft, voice: event.target.value })} />
-              </label>
-            )}
+            {/*
+              这里**只配模型**（地址 / 模型 / 密钥）。
+              音色不在这页：它是"每个助理自己的事"，在总助理设置或成员编辑里填，
+              合成时由说话人带着走（见 narrator.speak 的 voiceDesign）。
+            */}
             <label>接口密钥{currentProfile?.hasKey ? '（已设置，不回显）' : '（可选）'}
               <input name="apiKey" type="password" autoComplete="new-password" value={apiKey} disabled={clearKey}
                 aria-describedby="voice-api-key-help" onChange={event => setApiKey(event.target.value)} />

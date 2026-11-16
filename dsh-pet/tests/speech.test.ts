@@ -367,13 +367,18 @@ describe('讲解文本的清洗：只去眼睛用的结构，不动信息', () =
   })
 
   test('行首的列表、引用、标题符号去掉，文字留下', () => {
-    assert.equal(cleanForSpeech('- 需求一\n- 需求二'), '需求一\n需求二')
+    assert.equal(cleanForSpeech('- 需求一\n- 需求二'), '需求一 需求二')
     assert.equal(cleanForSpeech('* 需求一'), '需求一')
     assert.equal(cleanForSpeech('• 需求一'), '需求一')
-    assert.equal(cleanForSpeech('1. 需求一\n2. 需求二'), '需求一\n需求二')
-    assert.equal(cleanForSpeech('1、需求一\n2、需求二'), '需求一\n需求二')
+    assert.equal(cleanForSpeech('1. 需求一\n2. 需求二'), '需求一 需求二')
+    assert.equal(cleanForSpeech('1、需求一\n2、需求二'), '需求一 需求二')
     assert.equal(cleanForSpeech('> 引用一句原文。'), '引用一句原文。')
     assert.equal(cleanForSpeech('## 标题一'), '标题一')
+  })
+
+  test('换行不拆句：跨行的同一句合成一段完整播报', () => {
+    const segments = splitIntoSegments(request('小潘同学会帮你记录会议，\n并在结束后生成纪要。'))
+    assert.deepEqual(segments.map(segment => segment.text), ['小潘同学会帮你记录会议， 并在结束后生成纪要。'])
   })
 
   test('句首（同一行里跟在句号后面）的列表符号也去掉', () => {
@@ -406,7 +411,7 @@ describe('讲解文本的清洗：只去眼睛用的结构，不动信息', () =
 
   test('摘掉标签与列表后留下的空行/空格被收拢，不会念出连串停顿', () => {
     const cleaned = cleanForSpeech('- 需求一\n\n- 需求二')
-    assert.equal(cleaned, '需求一\n\n需求二')
+    assert.equal(cleaned, '需求一 需求二')
     assert.ok(!cleaned.includes('- '))
   })
 
@@ -431,7 +436,7 @@ describe('讲解文本的清洗：只去眼睛用的结构，不动信息', () =
     const cleaned = cleanForSpeech(answer)
     assert.ok(!cleaned.includes('【') && !cleaned.includes('】'), `还留着方括号：${cleaned}`)
     assert.ok(!cleaned.includes('**'), '粗体记号不该被念出来')
-    for (const line of cleaned.split('\n')) {
+    for (const line of cleaned.split(/\s+/)) {
       assert.ok(!looksLikeMarker(line), `行首还留着列表符号：${line}`)
     }
     // 信息不丢：三段的正文、小数、数字都在。

@@ -54,11 +54,14 @@ interface CharacterSlotProps {
   onPersist(x: number, y: number): void
   onContextMenu(): void
   onDragStart(event: React.MouseEvent, behavior: PetBehavior): void
+  /** 交接登场/退场标记：由 App 的交接编排下发，只影响容器动画。 */
+  entering?: boolean
+  leaving?: boolean
 }
 
 function CharacterSlot({ manifest, home, scene, assistantActive, status, selected, hideBubble, exitStage, portalPhase,
   showPortal, quiet, idleSleepMinutes, sleepMinutes, petScale = 1, petOpacity = 1, proactive, onProactiveRespond, onBehavior,
-  onSelect, onPersist, onContextMenu, onDragStart }: CharacterSlotProps) {
+  onSelect, onPersist, onContextMenu, onDragStart, entering = false, leaving = false }: CharacterSlotProps) {
   const behavior = usePetBehavior({ assistantActive, lines: manifest.lines, home, working: isWorking(status),
     sceneBound: scene.bound, quiet, idleSleepMinutes, sleepMinutes, randomActions: manifest.randomActions, onPersist })
   const images = usePetSkinImages(manifest.skin)
@@ -105,20 +108,41 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
     if (!behavior.protected && sceneAction && !projected) force(sceneAction)
   }, [sceneAction, projected, force, behavior.protected])
   useEffect(() => {
-    if (!behavior.protected && projected) force(projected)
+    // write 走下面的工作弧线（开电脑→敲键盘循环），force 一次性赋值演不出收电脑。
+    if (!behavior.protected && projected && projected !== 'write') force(projected)
   }, [projected, force, behavior.protected])
+  /**
+   * 工作投影接交互弧线：running 出现时开电脑进入 write 循环（streaming 闩住不让它收），
+   * running 落下时 stop → laptop-out → idle，把"收起电脑站起来"整段演完。
+   */
+  const workRoundRef = useRef(0)
+  const wasWorkingRef = useRef(false)
+  const conversation = behavior.conversation
+  useEffect(() => {
+    const working = projected === 'write'
+    if (working === wasWorkingRef.current) return
+    wasWorkingRef.current = working
+    if (working) {
+      workRoundRef.current += 1
+      conversation({ type: 'start', id: workRoundRef.current })
+      conversation({ type: 'delta', id: workRoundRef.current })
+    } else {
+      conversation({ type: 'stop', id: workRoundRef.current })
+    }
+  }, [projected, conversation])
   /**
    * 任务/会话结束后必须**主动收回**工作姿态。
    *
    * `actionForStatus` 在"没有状态"时返回 null 表示"不投影"，但 force 是一次性赋值：
-   * 上一拍设成 write/read 之后，没有任何代码把它改回去 —— 于是回复结束了，角色还在
-   * 对着电脑敲个不停。这里盯住"从有动作变回没有动作"这个沿，把它收回 idle。
+   * 上一拍设成 read/wave 之后，没有任何代码把它改回去 —— 于是回复结束了，角色还在
+   * 演那个动作。这里盯住"从有动作变回没有动作"这个沿，把它收回 idle；
+   * write 的收交由工作弧线自己演（收电脑站起来），不能硬切。
    */
   const previousProjected = useRef<PetAction | null>(null)
   useEffect(() => {
-    const wasWorking = previousProjected.current !== null
+    const was = previousProjected.current
     previousProjected.current = projected
-    if (behavior.protected || projected !== null || !wasWorking) return
+    if (behavior.protected || projected !== null || was === null || was === 'write') return
     force('idle')
   }, [projected, force, behavior.protected])
 
@@ -131,7 +155,8 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
   return (
     <div
       className={['pet-stage', 'character-slot', `action-${behavior.action}`, facing === -1 ? 'facing-left' : '',
-        exitStage === 'turn' ? 'exit-turn' : '', exitStage === 'jump' ? 'exit-jump' : '', selected ? 'selected' : ''].filter(Boolean).join(' ')}
+        exitStage === 'turn' ? 'exit-turn' : '', exitStage === 'jump' ? 'exit-jump' : '', selected ? 'selected' : '',
+        entering ? 'entering' : '', leaving ? 'leaving' : ''].filter(Boolean).join(' ')}
       style={{ left: behavior.x, top: behavior.y, width: PET_WIDTH, zIndex: depthToZIndex(scene.depth),
         // 缩放锚在底部中心：放大时脚不离地，看起来是"站起来"而不是"掉下去"。
         // 只在这一层做 transform —— 位置仍由座位坐标（left/top）负责，两者混在一起会互相打架。
@@ -200,12 +225,15 @@ export interface TeamStageProps {
   proactive: { message: string; suggestDisable: boolean } | null
   onProactiveRespond(kind: 'accept' | 'decline' | 'disable'): void
   handleRef?: React.MutableRefObject<TeamStageHandle | null>
+  /** 交接中的登场/退场角色 id 集合。 */
+  enteringIds?: ReadonlySet<string> | null
+  leavingIds?: ReadonlySet<string> | null
 }
 
 export default function TeamStage({ members, assistantActive, statusByAssistant, positions, selectedId, chatOpen = false, onSelect,
   exitStage, portalPhase, showPortal = false, focusMode = false, characterSkins, idleSleepMinutes = 2, sleepMinutes = 20,
   petScale = 1, petOpacity = 1, dockedId = null,
-  onPersist, onContextMenu, onDragStart, proactive, onProactiveRespond, handleRef }: TeamStageProps) {
+  onPersist, onContextMenu, onDragStart, proactive, onProactiveRespond, handleRef, enteringIds = null, leavingIds = null }: TeamStageProps) {
   const cast = useMemo(() => members.filter(member => member.enabled !== false && member.assistantId)
     .map(member => manifestFor(member, characterSkins)), [members, characterSkins])
   const [viewport, setViewport] = useState(() => ({
@@ -308,6 +336,7 @@ export default function TeamStage({ members, assistantActive, statusByAssistant,
           idleSleepMinutes={idleSleepMinutes} sleepMinutes={sleepMinutes}
           petScale={petScale} petOpacity={petOpacity}
           proactive={manifest.assistantId === selected ? proactive : null} onProactiveRespond={onProactiveRespond}
+          entering={enteringIds?.has(manifest.assistantId) ?? false} leaving={leavingIds?.has(manifest.assistantId) ?? false}
           onBehavior={callbackFor(manifest.assistantId)} onSelect={position => onSelect(manifest.assistantId, position)}
           onPersist={(x, y) => onPersist(manifest.assistantId, x, y)}
           onContextMenu={() => onContextMenu({ assistantId: manifest.assistantId, displayName: manifest.displayName, skin: manifest.skin })}

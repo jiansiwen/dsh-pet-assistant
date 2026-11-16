@@ -18,7 +18,7 @@ function fakeVoiceStore() {
       calls.push(`save:${input.voice}`)
       const profile = {
         id: `p-${state.profiles.length + 1}`, kind: 'tts' as const, name: input.name, endpoint: input.endpoint,
-        model: input.model, voice: input.voice, hasKey: Boolean(input.apiKey), provider: 'openai' as const,
+        model: input.model, voice: input.voice, voiceDesign: '', hasKey: Boolean(input.apiKey), provider: 'openai' as const,
       }
       state.profiles = [...state.profiles, profile]
       return state

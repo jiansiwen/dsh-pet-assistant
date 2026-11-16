@@ -212,6 +212,13 @@ export interface RecordOptions {
   maxDurationMs?: number
   /** 输出的 WAV 采样率；目前只支持 16000（声纹模型只吃 16k）。不传保持设备原始采样率。 */
   outputSampleRate?: 16000
+  /**
+   * 是否用"静音多久算说完"来收尾。默认 true（听写就该这样）。
+   *
+   * 录**音色样本**时必须关掉：真人念一段话中间一定有停顿，
+   * 按静音收尾会把句子拦腰截断，样本就废了。关掉后只按 maxDurationMs 或手动停。
+   */
+  endOnSilence?: boolean
 }
 
 export async function recordDictation(options: RecordOptions = {}): Promise<DictationResult> {
@@ -269,7 +276,7 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
     if (hasSpoken) {
       if (rms < threshold) {
         silenceMs += frame.durationMs
-        if (silenceMs >= END_SILENCE_MS) finished = true
+        if ((options.endOnSilence ?? true) && silenceMs >= END_SILENCE_MS) finished = true
       } else {
         silenceMs = 0
       }
@@ -282,6 +289,12 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
     subscription = await capture.subscribe({
       kind: 'dictation',
       onFrame: (frame) => {
+        /*
+          宠物自己正在朗读：扬声器放出来的声音会被麦克风收回去。
+          这一段不能当成用户在说话，否则它会把自己念的内容转成你的提问。
+          录音侧不受影响 —— 会议轨自己决定要不要保留这段现场声。
+        */
+        if (frame.assistantSpeaking) return
         if (!takenOver && options.takeHandover) {
           // 交接还没取走时先攒着，取走后按序号去重再处理。
           live.push(frame)

@@ -62,6 +62,7 @@ contextBridge.exposeInMainWorld('petApi', {
   onVoiceConversationStop: (callback: () => void) => listen('voice-conversation-stop', callback),
   onSessionUpdate: (callback: (update: SessionUpdate) => void) => listen('session-update', callback),
   onSessionConnection: (callback: (status: string) => void) => listen('bridge-status', callback),
+
   onSettingsOpen: (callback: (page: SettingsPage) => void) => listen('settings-open', callback),
   onSettingsClose: (callback: () => void) => listen('settings-close', callback),
   onMemberStepDown: (callback: (assistantId: string) => void) => listen('member-step-down', callback),
@@ -71,6 +72,21 @@ contextBridge.exposeInMainWorld('petApi', {
   overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
   saveSettings: (patch: PetSettingsPatch) => ipcRenderer.invoke('save-settings', patch) as Promise<{ ok: boolean }>,
   assistantSettingsState: () => ipcRenderer.invoke('assistant-settings-state') as Promise<AssistantSettingsResult>,
+  /* 专属词库：列表 / 新增 / 删除。写操作会经主进程的发送方校验，页面拿不到桥接凭据。 */
+  /* 技能证据：本人确认 / 撤回（作用于还没形成技能的样本）。 */
+  skillsEvidence: (action: 'verify' | 'retract', assistantId: string, shape: string) =>
+    ipcRenderer.invoke('assistant-skills-evidence', action, assistantId, shape) as Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; pending?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; unverified?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; verified?: number; removed?: number; message?: string }>,
+  /* 工作时间线：缺省查今天；只含解释过的工作事项。 */
+  timelineState: (from?: number, to?: number) => ipcRenderer.invoke('assistant-timeline-state', from, to) as Promise<{ ok: boolean; items?: Array<{ id: string; start: number; end: number; action: string; outcome: string; project: string | null; status: string }>; message?: string }>,
+  /* 技能：列表 / 晋升 / 回滚 / 退役。只影响该助理自己的注入内容。 */
+  skillsState: () => ipcRenderer.invoke('assistant-skills-state') as Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; pending?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; unverified?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; message?: string }>,
+  skillsUpdate: (action: 'promote' | 'rollback' | 'retire', id: string, version?: number) =>
+    ipcRenderer.invoke('assistant-skills-update', action, id, version) as Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; message?: string }>,
+  /* 统一产物列表（最近产出过的文件）；只读。 */
+  artifactsState: () => ipcRenderer.invoke('assistant-artifacts-state') as Promise<{ ok: boolean; artifacts?: Array<{ path: string; label: string; kind: string; state: 'ok' | 'missing'; createdAt: number }>; message?: string }>,
+  glossaryState: () => ipcRenderer.invoke('assistant-glossary-state') as Promise<{ ok: boolean; terms?: Array<{ term: string; expansion: string }>; message?: string }>,
+  glossaryUpdate: (term: string, expansion?: string, remove?: boolean) =>
+    ipcRenderer.invoke('assistant-glossary-update', term, expansion, remove) as Promise<{ ok: boolean; terms?: Array<{ term: string; expansion: string }>; message?: string }>,
   assistantSettingsSave: (section: AssistantSettingsSection, input: unknown) =>
     ipcRenderer.invoke('assistant-settings-save', section, input) as Promise<AssistantSettingsResult>,
   membersState: () => ipcRenderer.invoke('members-state') as Promise<MemberResult>,
@@ -80,11 +96,22 @@ contextBridge.exposeInMainWorld('petApi', {
   memberAssist: (input: { request: string; current?: MemberDraft }) =>
     ipcRenderer.invoke('member-assist', input) as Promise<MemberResult>,
   openMemberEditor: (memberId: string | null = null) => ipcRenderer.invoke('member-editor-open', memberId) as Promise<{ ok: boolean }>,
+  viewMemberSession: (memberId: string) => ipcRenderer.invoke('member-session-view', memberId) as Promise<{ ok: boolean; error?: string }>,
   onMembersChanged: (callback: () => void) => listen('members-changed', callback),
   openCompanionTasks: () => ipcRenderer.invoke('companion-tasks-open') as Promise<{ ok: boolean }>,
   voiceApiState: () => ipcRenderer.invoke('voice-api-state') as Promise<VoiceApiResult>,
   voiceApiSave: (input: VoiceApiInput) => ipcRenderer.invoke('voice-api-save', input) as Promise<VoiceApiResult>,
   voiceApiRemove: (id: string) => ipcRenderer.invoke('voice-api-remove', id) as Promise<VoiceApiResult>,
+  /** 交接台词：总助交给某成员时四方各一句（按各自性格生成；只用于朗读，不进会话）。 */
+  handoverLines: (input: { chiefName?: string; chiefPersona?: string; memberName?: string; memberPersona?: string; task: string }) =>
+    ipcRenderer.invoke('handover-lines', input) as Promise<{ ok: true; lines: Record<string, string> } | { ok: false; error: string }>,
+  /** 按性格生成音色描述（交给主助理模型；产出可手改）。 */
+  voiceDesignAssist: (input: { name?: string; personality: string }) =>
+    ipcRenderer.invoke('voice-design-assist', input) as Promise<{ ok: true; description: string; style: string } | { ok: false; error: string }>,
+  /** 试听：用**已保存且已选中**的语音配置合成一句样例，返回 base64 音频。每次都会真实调用一次语音服务。 */
+  agentVoiceState: () => ipcRenderer.invoke('agent-voice-state') as Promise<{ design: string; style: string; voiceId: string; sampleLength: number; mime: string; sample: string }>,
+  voiceApiPreview: (id: string, voiceDesign?: string, voice?: string, sample?: { data: string; mime: string }, style?: string) =>
+    ipcRenderer.invoke('voice-api-preview', id, voiceDesign, voice, sample, style) as Promise<{ ok: true; audio: string; mime: string } | { ok: false; error: string }>,
   voiceApiSelect: (kind: VoiceApiKind, id: string | null) =>
     ipcRenderer.invoke('voice-api-select', kind, id) as Promise<VoiceApiResult>,
   /** 快速应答（快嘴旁路）：配置、测试连接；短应答事件只用于宠物气泡显示。 */
@@ -164,6 +191,8 @@ contextBridge.exposeInMainWorld('petApi', {
   residencyState: () => ipcRenderer.invoke('residency-state') as Promise<ResidencyState>,
   residencySet: (patch: ResidencyPatch) => ipcRenderer.invoke('residency-set', patch) as Promise<ResidencyResult>,
   voiceprintStatus: () => ipcRenderer.invoke('voiceprint-status') as Promise<{ registered: boolean; count: number; createdAt: number | null; problem: string | null }>,
+  /** 声纹环境自检：逐步返回原始报错，便于定位是模型/原生模块/密钥哪一层。 */
+  voiceprintDiagnose: () => ipcRenderer.invoke('voiceprint-diagnose') as Promise<{ ok: boolean; steps: Array<{ name: string; ok: boolean; detail: string }> }>,
   voiceprintEnroll: (wavs: string[]) => ipcRenderer.invoke('voiceprint-enroll', wavs) as Promise<{ ok: boolean; count?: number; error?: string }>,
   voiceprintClear: () => ipcRenderer.invoke('voiceprint-clear') as Promise<{ ok: boolean; removed?: boolean; error?: string }>,
   openReportDir: () => ipcRenderer.invoke('open-report-dir') as Promise<{ ok: boolean }>,

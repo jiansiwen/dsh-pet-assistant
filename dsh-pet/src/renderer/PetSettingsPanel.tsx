@@ -3,7 +3,7 @@ import { arrayBufferToBase64, recordDictation } from './dictation.js'
 import type { ResidencyPatch, ResidencyState, SettingsPage } from './types.js'
 import type { FastReplyInput, FastReplySnapshot } from '../main/fast-reply.js'
 import { registerCharacterHitbox, unregisterCharacterHitbox } from './stage-layout.js'
-import { settingsNavGroups, settingsNavOrdinal, settingsPageMeta } from './settings-nav.js'
+import { settingsNavGroups, settingsPageMeta } from './settings-nav.js'
 
 interface Props {
   page: SettingsPage
@@ -43,15 +43,19 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
 
   const groups = settingsNavGroups()
   const meta = settingsPageMeta(page)
-  const ordinal = settingsNavOrdinal(page)
 
+  /*
+   * 标题区只留三样：方印、当前页标题、一句话说明。
+   *
+   * 上一版这里是「小潘 · 桌面伙伴 / 设置与管理 / 一句说明」三行堆叠，正文开头又重复一遍
+   * 「第 N 项 / 页名 + 页名」——同一个页名在一屏里出现两次，中间夹着一个 10px 加字距的眉标。
+   * 眉标与序号都不编码信息（九项是菜单不是序列），一并删掉；标题层级靠字号差就能立住。
+   */
   return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台">
     <header className="management-header">
       <div className="management-brand" aria-hidden="true">潘</div>
       <div className="management-brand-copy">
-        <span>小潘 · 桌面伙伴</span>
-        <h2>设置与管理</h2>
-        {/* 当前页的一句话，取自同一份导航真源；标题区说清"这一页是干什么的"，用户不用先点进去猜。 */}
+        <h2>{meta.title}</h2>
         <p className="management-header-sub">{meta.summary}</p>
       </div>
       <button type="button" onClick={onClose} aria-label="关闭设置">×</button>
@@ -61,21 +65,17 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
         <Fragment key={group.id}>
           {/* 组标题只是分组，不可点：它不是页面，点它没有去处。 */}
           <div className="management-nav-group" role="presentation">{group.label}</div>
-          {group.items.map(item => {
-            const number = settingsNavOrdinal(item.id)
-            return <button key={item.id} id={`panel-tab-${item.id}`} type="button"
+          {group.items.map(item => (
+            <button key={item.id} id={`panel-tab-${item.id}`} type="button"
               aria-current={page === item.id ? 'page' : undefined} onClick={() => onPage(item.id)}>
-              <span className="management-tab-index" aria-hidden="true">{number === null ? '' : String(number).padStart(2, '0')}</span>
               <span>{item.title}</span>
               {item.id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
             </button>
-          })}
+          ))}
         </Fragment>
       ))}
     </nav>
-    <div className="management-content" ref={content}>
-      {/* 说明已上移到标题区，这里只留眉标与页名，避免同一句话在同一屏出现两次。 */}
-      <div className="management-intro"><span className="management-eyebrow">{ordinal === null ? '设置' : `第 ${ordinal} 项`} / {meta.title}</span><h3>{meta.title}</h3></div>
+    <div className="management-content" ref={content} key={page}>
       {children}
     </div>
   </section>
@@ -127,6 +127,8 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
   const wakeNameProblem = /^[\u4e00-\u9fff]{2,5}$/u.test(wakeNameDraft.trim())
     ? null : '唤醒词只能是 2–5 个汉字'
   const [enrolling, setEnrolling] = useState(false)
+  const [diagnosing, setDiagnosing] = useState(false)
+  const [diagnosis, setDiagnosis] = useState<Array<{ name: string; ok: boolean; detail: string }>>([])
   const [enrollStep, setEnrollStep] = useState(0)
 
   /** 录 3 次唤醒词；每次说完停一下自动收尾。录音只在内存里，交给主进程提取后即丢弃。 */
@@ -265,6 +267,24 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
       </p>
       {enrollStep > 0 && (
         <p className="management-hint" role="status">第 {enrollStep}/3 次：请说「{wake.name}」，说完停一下。</p>
+      )}
+      {/*
+        声纹自检：把"注册失败"背后的英文原始报错逐层暴露出来。
+        注册可能死在模型文件 / 原生模块 / 系统密钥 / 推理四处，只给一句"注册失败"分不出是哪层。
+      */}
+      <button className="management-button" disabled={diagnosing} onClick={() => {
+        setDiagnosing(true)
+        void window.petApi.voiceprintDiagnose().then(result => setDiagnosis(result.steps))
+          .catch(() => setDiagnosis([{ name: '自检', ok: false, detail: '无法调用自检' }]))
+          .finally(() => setDiagnosing(false))
+      }}>{diagnosing ? '正在自检…' : '声纹自检'}</button>
+      {diagnosis.length > 0 && (
+        <ul className="management-checklist" aria-label="声纹自检结果">
+          {diagnosis.map(step => <li key={step.name}>
+            <strong>{step.ok ? '✅' : '❌'} {step.name}</strong>
+            <span className="management-hint">{step.detail}</span>
+          </li>)}
+        </ul>
       )}
       <button className="management-button" disabled={saving || enrolling} onClick={() => void enrollVoice(wake.name)}>
         {enrolling ? '正在录制…' : wake.voiceprint.registered ? '重新录制声纹（3 次）' : '录制声纹（3 次）'}

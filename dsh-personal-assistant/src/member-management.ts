@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import type { MemberDirectory } from './member-directory.ts'
 import type { MemberRuntime } from './member-runtime.ts'
-import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, type MemberDraft, type MemberSnapshot } from './member-contract.ts'
+import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberSnapshot } from './member-contract.ts'
 import type { MemberMemory } from './member-memory.ts'
 import type { CompanionHttpResult } from './companion-contract.ts'
 
@@ -10,6 +10,11 @@ const limit = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 const draft = z.object({
   displayName: z.string().trim().min(1).max(80), description: z.string().trim().max(2000),
   personality: z.string().max(2000).default(''), permissionMode: z.enum(MEMBER_PERMISSION_MODES).default('ask'),
+  reportMode: z.enum(MEMBER_REPORT_MODES).default('chief'),
+  speechBy: z.enum(MEMBER_SPEECH_BY).default('self'),
+  /** 音色标识：服务商 voice id 或内置音色名；留空用总助理默认音色。 */
+  voiceProfile: z.string().trim().max(200).default(''),
+  voiceDesign: z.string().trim().max(2000).default(''),
   persona: z.string().max(8000),
   skinId: z.string().min(1).max(100), enabled: z.boolean(), provider: z.string().trim().max(128), model: z.string().trim().max(256),
   maxTokens: z.number().int().min(1).max(32768), capabilities: z.array(z.enum(MEMBER_CAPABILITIES)).max(MEMBER_CAPABILITIES.length),
@@ -19,7 +24,8 @@ const draft = z.object({
 const reset = z.enum(['daily', 'total', 'both'])
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject']), expectedQuotaRevision: revision,
   change: z.object({ dailyTokenLimit: limit.optional(), totalTokenLimit: limit.optional(), reset: reset.optional() }).strict().optional() }).strict()
-const assistSchema = z.object({ request: z.string().trim().min(1).max(4000), current: draft.optional() }).strict()
+const assistSchema = z.object({ request: z.string().trim().min(1).max(4000), current: draft.optional(),
+  model: z.object({ provider: z.string().trim().max(128), model: z.string().trim().max(256) }).optional() }).strict()
 const noticeAcknowledgement = z.object({ attemptId: z.string().uuid(), expectedState: z.enum(['failed', 'unknown']) }).strict()
 const sendAcknowledgement = z.object({ expectedState: z.enum(['partial', 'unknown']) }).strict()
 const channelAcknowledgement = z.object({ expectedRevision: revision }).strict()
@@ -37,9 +43,47 @@ export class MemberManagement {
     acknowledgeMailSend?(intentId: string, expectedState: 'partial' | 'unknown'): boolean
     channelInboundAttention?(): NonNullable<MemberSnapshot['channelInboundAttention']>
     acknowledgeChannelInbound?(id: string, expectedRevision: number): boolean
+    /**
+     * 总助理的全局记忆 + 各自的"可共享"标记。
+     *
+     * 只暴露**已确认的全局记忆**：候选、项目范围、冲突态不进这个列表，
+     * 因为界面上的开关一旦出现，用户就会以为"点了就能共享"，而它们本来就不该共享。
+     */
+    sharedMemories?(): NonNullable<MemberSnapshot['sharedMemories']>
+    /** 切换某条记忆的可共享状态；不可共享时返回 null，由上层如实回一句。 */
+    toggleShared?(memoryId: string, shared: boolean): { shared: boolean } | null
+    /** 词库列表（设置页展示用）。 */
+    glossary?(): Array<{ term: string; expansion: string; createdAt: number }>
+    /** 增删术语；返回最新列表。 */
+    glossaryEdit?(input: { term: string; expansion?: string; remove?: boolean }): Array<{ term: string; expansion: string; createdAt: number }>
+    /** 最近产出过的文件指针（含已消失的，界面上要如实标出来）。 */
+    artifacts?(): Array<{ path: string; label: string; kind: string; state: 'ok' | 'missing'; createdAt: number }>
+    /** 技能列表（每个助理最新一版）；界面用来展示与操作。 */
+    skills?(): Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>
+    /** 技能操作：晋升为生效 / 切回某版 / 退役。返回最新列表。 */
+    skillEdit?(input: { action: 'promote' | 'rollback' | 'retire'; id: string; version?: number }): Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>
+    /** 攒够可信成功、但还没成形的"同类工作"；只提示，不自动写正文。 */
+    skillPending?(): Array<{ assistantId: string; assistantName: string; shape: string; count: number }>
+    /** 有样本但都还没核实的"同类工作"：界面据此请本人确认。 */
+    skillUnverified?(): Array<{ assistantId: string; assistantName: string; shape: string; count: number }>
+    /** 本人确认后把该类的未核实样本转正；返回转正后的已核实条数。 */
+    skillVerify?(assistantId: string, shape: string): number
+    /** 记错的样本整类撤回。 */
+    skillRetract?(assistantId: string, shape: string): number
+    /**
+     * 工作时间线：某段时间里解释过的工作事项。
+     *
+     * 只回 work_items（"我干了什么"），不回原始采样（"前台是什么窗口"）：
+     * 原始片段是**线索**，没有解释过就不该当成事实摆在时间线上。
+     */
+    timeline?(from: number, to: number): Array<{ id: string; start: number; end: number; action: string; outcome: string; project: string | null; status: string }>
     assistant?: {
       draft(input: { request: string; current?: MemberDraft }): Promise<{ draft: MemberDraft; notes: string }>
       studio?(input: { request: string }): Promise<{ name: string; prompt: string; actions: string[]; notes: string }>
+      /** 按性格生成音色描述（交给语音合成模型做 voicedesign）。 */
+      voice?(input: { name?: string; personality: string; model?: { provider: string; model: string } }): Promise<{ description: string; style: string }>
+      /** 交接台词：总助把活交给某成员时四方各说一句（按各自性格生成）。 */
+      handover?(input: { chiefName: string; chiefPersona: string; memberName: string; memberPersona: string; task: string }): Promise<Record<'chiefToUser' | 'chiefToMember' | 'memberToChief' | 'memberToUser' | 'memberFarewell', string>>
     }
   }
   constructor(options: MemberManagement['options']) { this.options = options }
@@ -63,11 +107,18 @@ export class MemberManagement {
       try { channelInboundAttention = this.options.channelInboundAttention() }
       catch { channelInboundAttentionError = true }
     }
+    let sharedMemories: MemberSnapshot['sharedMemories']
+    let sharedMemoriesError = false
+    if (this.options.sharedMemories) {
+      try { sharedMemories = this.options.sharedMemories() }
+      catch { sharedMemoriesError = true }
+    }
     return { enabled: this.options.enabled(), members: directory.list().map(profile => ({ profile, quota: directory.quota(profile.assistantId), busy: runtime.busy(profile.assistantId) })),
       requests: directory.requests(), defaultModel: this.options.defaultModel(),
       ...(mailNoticeAttention ? { mailNoticeAttention } : {}), ...(mailNoticeAttentionError ? { mailNoticeAttentionError } : {}),
       ...(mailSendAttention ? { mailSendAttention } : {}), ...(mailSendAttentionError ? { mailSendAttentionError } : {}),
-      ...(channelInboundAttention ? { channelInboundAttention } : {}), ...(channelInboundAttentionError ? { channelInboundAttentionError } : {}) }
+      ...(channelInboundAttention ? { channelInboundAttention } : {}), ...(channelInboundAttentionError ? { channelInboundAttentionError } : {}),
+      ...(sharedMemories ? { sharedMemories } : {}), ...(sharedMemoriesError ? { sharedMemoriesError } : {}) }
   }
   private idle(id: string): void {
     if (!this.options.directory.get(id)) throw new Error('智能体不存在')
@@ -81,10 +132,38 @@ export class MemberManagement {
         if (!this.options.assistant) return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: '成员配置助手尚未启用' } }
         const input = assistSchema.parse(raw)
         try {
-          const output = await this.options.assistant.draft({ request: input.request, current: input.current as MemberDraft | undefined })
+          const output = await this.options.assistant.draft({ request: input.request, current: input.current as MemberDraft | undefined, ...(input.model ? { model: input.model } : {}) })
           return { status: 200, body: { draft: draft.parse(output.draft), notes: output.notes.slice(0, 2000) } }
         } catch (error) {
           return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '成员配置助手暂时不可用' } }
+        }
+      }
+      if (method === 'POST' && pathname === '/companion/v1/members/handover') {
+        if (!this.options.assistant?.handover) return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: '交接助手尚未启用' } }
+        const input = z.object({
+          chiefName: z.string().trim().max(80).default(''),
+          chiefPersona: z.string().trim().max(4000).default(''),
+          memberName: z.string().trim().max(80).default(''),
+          memberPersona: z.string().trim().max(4000).default(''),
+          task: z.string().trim().min(1).max(500),
+        }).strict().parse(raw)
+        try {
+          return { status: 200, body: { lines: await this.options.assistant.handover(input) } }
+        } catch (error) {
+          return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '交接助手暂时不可用' } }
+        }
+      }
+      if (method === 'POST' && pathname === '/companion/v1/members/voice-design') {
+        if (!this.options.assistant?.voice) return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: '音色助手尚未启用' } }
+        const input = z.object({
+          name: z.string().trim().max(80).optional(),
+          personality: z.string().trim().min(1).max(4000),
+          model: z.object({ provider: z.string().trim().max(128), model: z.string().trim().max(256) }).optional(),
+        }).strict().parse(raw)
+        try {
+          return { status: 200, body: await this.options.assistant.voice(input) }
+        } catch (error) {
+          return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '音色助手暂时不可用' } }
         }
       }
       if (method === 'POST' && pathname === '/companion/v1/members/studio-assist') {
@@ -131,6 +210,108 @@ export class MemberManagement {
         const result = memories.request(memory[1], memory[3] ?? 'create', raw, memory[2])
         this.options.changed()
         return { status: 200, body: result }
+      }
+      /*
+       * 记忆共享开关。
+       *
+       * 放在这里而不是新开一套接口：界面（成员管理页）已经通过 `/companion/v1/members`
+       * 拿快照、用同一个 `changed()` 通知刷新，复用它就不用再往 preload 里加通道。
+       * 语义仍是"总助理 → 子助理的只读投影"，不是把记忆复制给某个成员。
+       */
+      /*
+       * 专属词库：查看、新增、删除。
+       *
+       * 只有三种操作，没有"编辑解释"——改一个小词的解释等于换了个词的意思，
+       * 让用户删了重加更清楚，也避免"改完之后旧解释还在别处被引用"。
+       */
+      /*
+       * 最近产物列表。
+       *
+       * 含 state='missing' 的条目：界面上要如实显示"这个文件已经不在了"，
+       * 而不是悄悄从列表里消失 —— 用户看到过的东西突然不见，比看到"已不存在"更让人困惑。
+       */
+      /*
+       * 工作时间线。
+       *
+       * 区间参数走查询串，缺省"今天"。区间最多 366 天（与工具一致），
+       * 超了如实拒绝而不是悄悄截断 —— 截断会让用户以为那段时间什么都没干。
+       */
+      if (pathname.startsWith('/companion/v1/timeline')) {
+        if (!this.options.timeline) return { status: 503, body: { code: 'TIMELINE_UNAVAILABLE', message: '时间线尚未启用' } }
+        const query = pathname.includes('?') ? new URLSearchParams(pathname.slice(pathname.indexOf('?') + 1)) : new URLSearchParams()
+        const rawFrom = query.get('from'), rawTo = query.get('to')
+        const now = Date.now()
+        const from = rawFrom === null ? new Date(now).setHours(0, 0, 0, 0) : Number(rawFrom)
+        const to = rawTo === null ? now + 1 : Number(rawTo)
+        if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+          return { status: 400, body: { code: 'INVALID_INPUT', message: '时间区间无效' } }
+        }
+        if (to - from > 366 * 24 * 3600_000) {
+          return { status: 400, body: { code: 'INVALID_INPUT', message: '一次最多查 366 天，请缩小区间' } }
+        }
+        return { status: 200, body: { items: this.options.timeline(from, to), from, to } }
+      }
+      if (pathname === '/companion/v1/skills') {
+        if (!this.options.skills) return { status: 503, body: { code: 'SKILLS_UNAVAILABLE', message: '技能库尚未启用' } }
+        if (method === 'GET') return { status: 200, body: { skills: this.options.skills(), pending: this.options.skillPending?.() ?? [], unverified: this.options.skillUnverified?.() ?? [] } }
+        if (!this.options.skillEdit) return { status: 503, body: { code: 'SKILLS_UNAVAILABLE', message: '技能库尚未启用' } }
+        /*
+         * 证据的两个动作单独走：它们作用在"还没形成技能"的样本上，没有技能编号可用。
+         * 本人确认是**唯一**能把自报样本转正的路径 —— 四态回执那条路在受管执行器里，
+         * 成员任务目前拿不到，见交付清单。
+         */
+        if (raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as Record<string, unknown>).action === 'verify') {
+          const input = z.object({ action: z.literal('verify'), assistantId: z.string().trim().min(1).max(200), shape: z.string().trim().min(1).max(120) }).strict().parse(raw)
+          if (!this.options.skillVerify) return { status: 503, body: { code: 'SKILLS_UNAVAILABLE', message: '技能库尚未启用' } }
+          const verified = this.options.skillVerify(input.assistantId, input.shape)
+          return { status: 200, body: { verified, skills: this.options.skills(), pending: this.options.skillPending?.() ?? [], unverified: this.options.skillUnverified?.() ?? [] } }
+        }
+        if (raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as Record<string, unknown>).action === 'retract') {
+          const input = z.object({ action: z.literal('retract'), assistantId: z.string().trim().min(1).max(200), shape: z.string().trim().min(1).max(120) }).strict().parse(raw)
+          if (!this.options.skillRetract) return { status: 503, body: { code: 'SKILLS_UNAVAILABLE', message: '技能库尚未启用' } }
+          const removed = this.options.skillRetract(input.assistantId, input.shape)
+          return { status: 200, body: { removed, skills: this.options.skills(), pending: this.options.skillPending?.() ?? [], unverified: this.options.skillUnverified?.() ?? [] } }
+        }
+        const input = z.object({
+          action: z.enum(['promote', 'rollback', 'retire']),
+          id: z.string().trim().min(1).max(400),
+          version: z.number().int().min(1).optional(),
+        }).strict().parse(raw)
+        if (input.action === 'rollback' && input.version === undefined) {
+          return { status: 400, body: { code: 'INVALID_INPUT', message: '回滚需要指定要回到哪一版' } }
+        }
+        return { status: 200, body: { skills: this.options.skillEdit(input) } }
+      }
+      if (pathname === '/companion/v1/artifacts') {
+        if (!this.options.artifacts) return { status: 503, body: { code: 'ARTIFACTS_UNAVAILABLE', message: '产物索引尚未启用' } }
+        return { status: 200, body: { artifacts: this.options.artifacts() } }
+      }
+      if (pathname === '/companion/v1/glossary') {
+        if (!this.options.glossary) return { status: 503, body: { code: 'GLOSSARY_UNAVAILABLE', message: '词库尚未启用' } }
+        if (method === 'GET') return { status: 200, body: { terms: this.options.glossary() } }
+        if (!this.options.glossaryEdit) return { status: 503, body: { code: 'GLOSSARY_UNAVAILABLE', message: '词库尚未启用' } }
+        const input = z.object({
+          term: z.string().trim().min(1).max(120),
+          expansion: z.string().trim().max(2000).optional(),
+          remove: z.boolean().optional(),
+        }).strict().parse(raw)
+        if (input.remove !== true && (input.expansion ?? '').trim() === '') {
+          return { status: 400, body: { code: 'INVALID_INPUT', message: '新增术语必须写清楚它指的是什么' } }
+        }
+        const terms = this.options.glossaryEdit(input)
+        this.options.changed()
+        return { status: 200, body: { terms } }
+      }
+      if (pathname === '/companion/v1/memories/shared') {
+        if (method !== 'POST') return { status: 200, body: { records: this.options.sharedMemories?.() ?? [] } }
+        if (!this.options.toggleShared) return { status: 503, body: { code: 'SHARING_UNAVAILABLE', message: '记忆共享尚未启用' } }
+        const input = z.object({ memoryId: z.string().trim().min(1).max(200), shared: z.boolean() }).strict().parse(raw)
+        const result = this.options.toggleShared(input.memoryId, input.shared)
+        if (result === null) {
+          return { status: 409, body: { code: 'NOT_SHAREABLE', message: '只有已确认的全局记忆可以共享给子助理' } }
+        }
+        this.options.changed()
+        return { status: 200, body: { shared: result.shared, records: this.options.sharedMemories?.() ?? [] } }
       }
       if (method !== 'POST') return { status: 404, body: { code: 'NOT_FOUND', message: '成员接口不存在' } }
       if (pathname === '/companion/v1/members') directory.create(draft.parse(raw) as MemberDraft)

@@ -343,6 +343,20 @@ export class MemoryStore {
         PRIMARY KEY (source_id, derived_id)
       );
 
+      /*
+       * 总助理 → 子助理的「可共享」标记。
+       *
+       * 单独一张表而不是给 memories 加列：memories 的写入语义、CAS、删除传播、
+       * 墓碑都被多处在依赖，往那张表上加列等于给每一条写入路径都加一个字段；
+       * 而共享只是一个**旁路标记**，删掉整张表也只损失"共享状态"，不损失任何记忆。
+       *
+       * 这里**只存引用**，不复制正文：取消共享或删除记忆，子助理下一轮立刻看不见。
+       */
+      CREATE TABLE IF NOT EXISTS memory_sharing (
+        memory_id TEXT PRIMARY KEY,
+        shared_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS deletion_ledger (
         dedup_key TEXT PRIMARY KEY,
         memory_id TEXT NOT NULL,
@@ -540,6 +554,46 @@ export class MemoryStore {
   /** 只有已确认的才进提示词。候选和冲突留给界面展示，不喂给模型当事实。 */
   injectable(context: MemoryContext, now: number): MemoryRecord[] {
     return this.list(context, now).filter(record => record.status === 'confirmed')
+  }
+
+  /**
+   * 把一条**全局、已确认**的记忆标记为「可共享给子助理」。
+   *
+   * 三条约束都是刻意的：
+   * - 只认全局：项目规则不该漂到别的项目去，子助理也有自己的项目边界；
+   * - 只认已确认：候选记忆连总助理自己都不能当事实用，更不能下发；
+   * - 找不到或状态不对返回 `null`，由调用方如实回一句"这条不能共享"，不静默当成成功。
+   */
+  setShared(memoryId: string, shared: boolean, now = Date.now()): { shared: boolean } | null {
+    const record = this.get(memoryId, now)
+    if (!record || record.scope.kind !== 'global' || record.status !== 'confirmed') return null
+    if (shared) {
+      this.db.prepare('INSERT INTO memory_sharing(memory_id, shared_at) VALUES (?, ?) ON CONFLICT(memory_id) DO UPDATE SET shared_at = excluded.shared_at')
+        .run(memoryId, now)
+    } else {
+      this.db.prepare('DELETE FROM memory_sharing WHERE memory_id = ?').run(memoryId)
+    }
+    return { shared }
+  }
+
+  /** 某条记忆当前是否标记为可共享。 */
+  isShared(memoryId: string): boolean {
+    return this.db.prepare('SELECT 1 FROM memory_sharing WHERE memory_id = ?').get(memoryId) !== undefined
+  }
+
+  /**
+   * 可共享投影：**只读、只存引用、不复制正文**。
+   *
+   * 每次调用都回连 memories 真源，所以取消共享、改判冲突、删除、到期，
+   * 子助理下一轮立刻看不到 —— 这正是"投影"与"复制"的区别。
+   */
+  sharedGlobals(now = Date.now(), limit = 20): MemoryRecord[] {
+    const rows = this.db.prepare('SELECT memory_id FROM memory_sharing').all() as Array<Record<string, unknown>>
+    if (rows.length === 0) return []
+    const shared = new Set(rows.map(row => String(row.memory_id)))
+    return this.list({}, now)
+      .filter(record => record.status === 'confirmed' && shared.has(record.id))
+      .slice(0, Math.max(0, limit))
   }
 
   /**

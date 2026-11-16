@@ -260,6 +260,13 @@ export async function enrollVoiceprint(input: {
   const problems: string[] = []
   for (const wav of input.wavs.slice(0, 5)) {
     const samples = wavToSamples(wav)
+    /*
+     * 解析出 0 个采样有两种完全不同的原因，必须分开报：
+     * - 录音**格式不对**（不是 16k/单声道/16bit PCM）：这是代码或设备的问题，重说没用；
+     * - 录音**太短**：重说一遍就能解决。
+     * 以前两种都报"太短"，用户会一直重录同一个格式错误的音频，永远录不上。
+     */
+    if (samples.length === 0) { problems.push('录音格式不对（需要 16k 单声道 PCM），请重录一次'); continue }
     const problem = voiceprintSampleProblem(samples)
     if (problem !== null) { problems.push(problem); continue }
     try {

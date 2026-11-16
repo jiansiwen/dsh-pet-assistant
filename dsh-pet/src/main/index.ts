@@ -8,7 +8,8 @@
  */
 import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, net, Notification, safeStorage, screen, session, shell, systemPreferences, type MenuItemConstructorOptions } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { zstdDecompressSync } from 'node:zlib'
 import os, { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -91,10 +92,15 @@ import { VoiceCloneService } from './voice-clone.ts'
 import { AssetStudio } from './asset-studio-window.ts'
 import { registerPetAssetProtocol } from './asset-protocol.ts'
 import { listCustomSkins } from './custom-skins.ts'
+import { agentVoicePayload } from './agent-voice.ts'
+import { handoverClosing, handoverOpening, type HandoverLines } from './handover-sequence.ts'
+import { hasSpeakerVoice, normalizePresetId, speakerOverlay, speakerRequestFields, type SpeakerVoice } from '../shared/speaker-voice.ts'
+import { ttsVoiceKey } from './tts-cache.ts'
+import { modelForIntent } from '../shared/agent-voice-rule.ts'
 import type { VoiceApiKind, VoiceApiResult, VoiceApiState, ResolvedVoiceApi } from '../voice-api-types.ts'
 import { createMeetingRecorder, markAssistantSpeech, registerMeetingIpc, type MeetingRecorder } from './meeting-recorder.ts'
 import type { MeetingConsentInput, MeetingPresentationRecord, MeetingPresentationState } from './meeting-store.ts'
-import { splitIntoSegments } from './speech.ts'
+import { configureSpeech, splitIntoSegments } from './speech.ts'
 import { HISTORY_MAX_LIMIT, meetingHistoryRows } from './meeting-history.ts'
 import { startWakeListener, stopWakeListener } from './wake.ts'
 import { PointerWatcher } from './pointer-watch.ts'
@@ -155,6 +161,14 @@ function speechLog(message: string): void {
     appendFileSync(speechLogPath, `${new Date().toISOString()} ${message}\n`)
   } catch { /* 日志失败不影响主流程 */ }
 }
+
+// 主进程心跳 + 事件循环延迟：卡死/同步阻塞时心跳会停或 lag 飙升，凭它区分"主进程冻住"和"渲染层没发事件"。
+let lastBeat = Date.now()
+setInterval(() => {
+  const now = Date.now()
+  speechLog(`hb lag=${now - lastBeat - 2000}ms`)
+  lastBeat = now
+}, 2000).unref()
 
 /** 出声或录音期间不节流渲染层：渲染层播放/回声消除一旦被后台节流挂起，主回复就会哑巴。 */
 function applyThrottling(): void {
@@ -409,13 +423,29 @@ function stageBounds(): { x: number; y: number; width: number; height: number } 
 
 let screenEventsBound = false
 
+/** 崩溃留证：闪退时终端日志拿不到，落盘才能在事后查到栈。 */
+function crashLog(kind: string, error: unknown): void {
+  try {
+    appendFileSync(path.join(app.getPath('userData'), 'crash.log'),
+      `${new Date().toISOString()} ${kind} ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`)
+  } catch { /* 落盘失败不改变退出行为 */ }
+}
+
 process.on('uncaughtException', error => {
   // 透明置顶窗口在个别显卡/系统组合上会直接抛主进程异常；退出前留下可读的日志。
+  crashLog('uncaughtException', error)
   console.error('[dsh-pet] uncaughtException', error)
   app.exit(1)
 })
 process.on('unhandledRejection', reason => {
+  crashLog('unhandledRejection', reason)
   console.error('[dsh-pet] unhandledRejection', reason)
+})
+app.on('render-process-gone', (_event, details) => {
+  crashLog('render-process-gone', new Error(JSON.stringify(details)))
+})
+app.on('child-process-gone', (_event, details) => {
+  crashLog('child-process-gone', new Error(JSON.stringify(details)))
 })
 // 个别 Win11 显卡驱动在透明置顶窗口上会让 GPU 进程崩溃（表现为一召唤就闪退）。
 // 这类机器可以设 DSH_PET_DISABLE_GPU=1 强制软件渲染；默认仍走 GPU 以保证动画流畅。
@@ -607,6 +637,11 @@ function applyAudio(event: AudioEvent): AudioTransition {
     else if (effect === 'stop-wake') stopWake()
     // 插话监听本身在渲染层：起停就是授权里 bargeIn 的有无，下面统一下发。
   }
+    /*
+      记下每次仲裁结果：会议/听写/唤醒抢设备时，靠这行日志判断是谁把谁停了。
+      以前这类问题只能靠猜，因为日志里只有播报事件，没有"设备归谁"。
+    */
+    speechLog(`audio holder=${audioState.holder ?? 'none'} meeting=${audioState.meetingActive} wake=${runningWake ?? 'off'} effects=${turn.effects.join('|') || '-'}`)
   pushAudioGrants()
   return turn
 }
@@ -742,14 +777,12 @@ function onWakeWord(): void {
   sendToRenderer('wake-triggered', greeting)
 }
 
-/** 缓存键：自定义服务按服务+模型+音色，默认 edge-tts 也要有稳定的键，否则永远不预热。 */
+/** 缓存键：自定义服务按服务+模型+音色（含设计/语气/样本），默认 edge-tts 也要有稳定的键，否则永远不预热。 */
 function greetingVoiceKey(api: ResolvedVoiceApi | null): string {
   if (api === null) {
     return voiceFingerprint({ provider: 'edge-tts', model: 'edge-tts', voice: DEFAULT_TTS_VOICE })
   }
-  return voiceFingerprint({
-    provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
-  })
+  return ttsVoiceKey(withAgentVoice(api) as ResolvedVoiceApi)
 }
 
 /**
@@ -842,9 +875,32 @@ async function fallbackWakeGreeting(utteranceId: string, text: string): Promise<
   finishWakeGreeting(utteranceId, '播放结束（系统播放器兜底）')
 }
 
+/** 总助理的音色配置（克隆样本 > 设计描述 > 预置音色，语气单独叠）。 */
+function chiefSpeakerVoice(): SpeakerVoice {
+  const s = loadSettings()
+  return {
+    voiceId: s.agentVoiceId ?? '',
+    design: s.agentVoiceDesign ?? '',
+    style: s.agentVoiceStyle ?? '',
+    sampleFile: s.agentVoiceSampleFile ?? '',
+    sampleMime: s.agentVoiceSampleMime ?? '',
+    sample: s.agentVoiceSample ?? '',
+  }
+}
+
+/**
+ * 总助理音色叠到语音服务配置上：唤醒、快答、回复、预热、兜底**所有**入口共用。
+ * 模型与互斥字段由 speakerOverlay 统一裁决，不再各写一套。
+ */
+function withAgentVoice(api: ResolvedVoiceApi | null): ResolvedVoiceApi | null {
+  if (api === null) return null
+  return { ...api, ...speakerOverlay(api.provider, api.model, chiefSpeakerVoice()) }
+}
+
 /** 合成一句（自定义服务优先，否则 edge-tts）。 */
 async function synthesizeOneShot(text: string, api: ResolvedVoiceApi | null): Promise<Buffer> {
-  if (api !== null) return synthesizeApi(api, text)
+  const merged = withAgentVoice(api)
+  if (merged !== null) return synthesizeApi(merged, text)
   return synthesizeSpeech({ text, voice: DEFAULT_TTS_VOICE, rate: '+0%', pitch: '+0Hz' })
 }
 
@@ -1007,25 +1063,139 @@ async function chiefContext(): Promise<{ name: string; persona: string }> {
 }
 
 /** 成员名字缓存：讲解委派要在回复和面板里点名，不能只给内部 id。 */
-let memberNamesCache: { at: number; names: Map<string, string> } | null = null
+let memberNamesCache: { at: number; names: Map<string, string>; voices: Map<string, SpeakerVoice>; meta: Map<string, { persona: string; speechBy: string }> } | null = null
 async function memberDisplayName(assistantId: string): Promise<string> {
   // 命中缓存才用缓存；查无此 id 就重取——目录可能刚变，空缓存不能把新成员挡一分钟。
   if (!memberNamesCache || Date.now() - memberNamesCache.at >= 60_000 || !memberNamesCache.names.has(assistantId)) {
     try {
       const result = await bridge.companionRequest('GET', '/companion/v1/members', undefined, 'owner', 5000)
       const body = result.status === 200
-        ? result.body as { members?: Array<{ profile?: { assistantId?: unknown; displayName?: unknown } }> } | null
+        ? result.body as { members?: Array<{ profile?: { assistantId?: unknown; displayName?: unknown; voiceProfile?: unknown; voiceDesign?: unknown; persona?: unknown; speechBy?: unknown } }> } | null
         : null
       const names = new Map<string, string>()
+      const voices = new Map<string, SpeakerVoice>()
+      const meta = new Map<string, { persona: string; speechBy: string }>()
       for (const item of body?.members ?? []) {
-        if (typeof item.profile?.assistantId === 'string' && typeof item.profile?.displayName === 'string') {
-          names.set(item.profile.assistantId, item.profile.displayName)
+        const p = item.profile
+        if (typeof p?.assistantId === 'string' && typeof p?.displayName === 'string') {
+          names.set(p.assistantId, p.displayName)
+          voices.set(p.assistantId, {
+            voiceId: typeof p.voiceProfile === 'string' ? p.voiceProfile : '',
+            design: typeof p.voiceDesign === 'string' ? p.voiceDesign : '',
+          })
+          meta.set(p.assistantId, {
+            persona: typeof p.persona === 'string' ? p.persona : '',
+            speechBy: typeof p.speechBy === 'string' ? p.speechBy : 'self',
+          })
         }
       }
-      memberNamesCache = { at: Date.now(), names }
+      memberNamesCache = { at: Date.now(), names, voices, meta }
     } catch { /* 取不到就沿用旧缓存或空名，不挡讲解 */ }
   }
   return memberNamesCache?.names.get(assistantId) ?? ''
+}
+
+/**
+ * 某个说话人该用谁的嗓子：壳侧按成员存的音色优先（成员编辑窗写入），
+ * 其次是插件目录里的 voiceProfile/voiceDesign，都没配就沿用总助理的默认音色。
+ */
+async function speakerForAssistant(assistantId: string | undefined): Promise<SpeakerVoice> {
+  const chief = chiefSpeakerVoice()
+  if (assistantId === undefined || assistantId.trim() === '') return chief
+  await memberDisplayName(assistantId)
+  const fromDirectory = memberNamesCache?.voices.get(assistantId) ?? { voiceId: '', design: '' }
+  const override = loadSettings().memberVoices?.[assistantId]
+  const merged: SpeakerVoice = {
+    voiceId: normalizePresetId(override?.voiceId || fromDirectory.voiceId || ''),
+    design: override?.design || fromDirectory.design || '',
+    style: override?.style ?? '',
+    sampleFile: override?.sampleFile ?? '',
+    sampleMime: override?.sampleMime ?? '',
+    profileId: override?.profileId ?? '',
+  }
+  return hasSpeakerVoice(merged) ? merged : chief
+}
+
+/**
+ * 同步版：讲解这类**逐段连续出声**的场合用它。
+ *
+ * 为什么要有同步版：文档讲解一口气要念几十段，如果在每段前面都 await 一次
+ * 成员名字、成员音色，段与段之间会冒出可听见的空档，停顿变得忽长忽短。
+ * 名字缓存没热时退化成"只有壳侧覆盖的音色"，宁可少一层来源，也不要断句。
+ */
+function speakerForAssistantSync(assistantId: string | undefined): SpeakerVoice {
+  const chief = chiefSpeakerVoice()
+  if (assistantId === undefined || assistantId.trim() === '') return chief
+  const fromDirectory = memberNamesCache?.voices.get(assistantId) ?? { voiceId: '', design: '' }
+  const override = loadSettings().memberVoices?.[assistantId]
+  const merged: SpeakerVoice = {
+    voiceId: normalizePresetId(override?.voiceId || fromDirectory.voiceId || ''),
+    design: override?.design || fromDirectory.design || '',
+    style: override?.style ?? '',
+    sampleFile: override?.sampleFile ?? '',
+    sampleMime: override?.sampleMime ?? '',
+    profileId: override?.profileId ?? '',
+  }
+  return hasSpeakerVoice(merged) ? merged : chief
+}
+
+/** 讲解正文用谁的嗓子：成员设置"由总助理代念"时用总助理，否则成员自己。 */
+function presentationSpeakerVoice(assistantId: string | undefined): SpeakerVoice {
+  if (assistantId && memberNamesCache?.meta.get(assistantId)?.speechBy === 'chief') return chiefSpeakerVoice()
+  return speakerForAssistantSync(assistantId)
+}
+
+const handoverLinesCache = new Map<string, HandoverLines>()
+/** 兜底台词：中性称谓。用户没设置过"老板"这类称呼，不能把举例当配置写死。 */
+function fixedHandoverLines(who: string): HandoverLines {
+  return {
+    chiefToUser: `这件事我交给${who}了，接下来由${who}给你讲。`,
+    chiefToMember: `${who}，来一下，这边需要你。`,
+    memberToChief: '好，我这就来。',
+    memberToUser: `你好，接下来由我来给你讲！`,
+    memberFarewell: '那我先退下了。',
+  }
+}
+/** 派工时预取按性格生成的交接台词；取不到就用固定台词，不挡讲解时序。 */
+function prefetchHandoverLines(assistantId: string, task: string): void {
+  if (handoverLinesCache.has(assistantId)) return
+  void (async () => {
+    try {
+      await memberDisplayName(assistantId)
+      const meta = memberNamesCache?.meta.get(assistantId)
+      const chief = await chiefContext()
+      const response = await bridge.companionRequest('POST', '/companion/v1/members/handover', {
+        chiefName: chief.name, chiefPersona: chief.persona,
+        memberName: memberNamesCache?.names.get(assistantId) ?? '', memberPersona: meta?.persona ?? '', task,
+      }, 'owner', 8000)
+      if (response.status !== 200) return
+      const lines = (response.body as { lines?: Record<string, unknown> } | null)?.lines
+      if (!lines) return
+      const str = (k: string): string => (typeof lines[k] === 'string' ? (lines[k] as string).slice(0, 300) : '')
+      handoverLinesCache.set(assistantId, {
+        chiefToUser: str('chiefToUser'), chiefToMember: str('chiefToMember'), memberToChief: str('memberToChief'),
+        memberToUser: str('memberToUser'), memberFarewell: str('memberFarewell'),
+      })
+    } catch { /* 固定台词兜底 */ }
+  })()
+}
+
+/** 讲完收场：成员道别（设了代念则由总助说），随后舞台换回总助。 */
+function speakMemberClosing(assistantId: string | undefined): void {
+  if (loadSettings().memberHandover === false) return
+  if (assistantId === undefined || assistantId === '') return
+  const who = memberNamesCache?.names.get(assistantId) ?? ''
+  const lines = handoverLinesCache.get(assistantId) ?? fixedHandoverLines(who === '' ? '成员' : who)
+  const memberSpeaks = memberNamesCache?.meta.get(assistantId)?.speechBy !== 'chief'
+  for (const step of handoverClosing(lines, { memberSpeaks })) {
+    narrator.beginRound()
+    narrator.speak({
+      utteranceId: `handover-close-${step.speaker}-${randomUUID()}`,
+      text: step.text,
+      ephemeral: true,
+      ...speakerRequestFields(step.speaker === 'chief' ? chiefSpeakerVoice() : speakerForAssistantSync(assistantId)),
+    })
+  }
 }
 
 /** 取消还在生成/排队的快嘴。音频由调用方的打断统一处理，这里只管生成与缓冲。 */
@@ -1044,10 +1214,10 @@ function handoffFastAck(): void {
   if (!ack) return
   speechLog(`handoff ack->main spoken=${ack.spoken}`)
   cancelFastAck()
-  if (ack.spoken) narrator.interrupt('drop-queue')
+  if (ack.spoken) narrator.dropUtterance(ack.utteranceId)
 }
 
-function startFastAck(userText: string, bindingId: string): void {
+function startFastAck(userText: string, bindingId: string, assistantId?: string): void {
   const service = fastReply
   if (!service || !service.load().enabled) return
   cancelFastAck()
@@ -1059,7 +1229,7 @@ function startFastAck(userText: string, bindingId: string): void {
     if (bindingId !== sessionState?.bindingId || sessionState.status === 'disconnected') return
     if (spokenRound === null) return
     ack.spoken = true
-    narrator.speak({ utteranceId: ack.utteranceId, text, ephemeral: true })
+    narrator.speak({ utteranceId: ack.utteranceId, text, ephemeral: true, ...speakerRequestFields(await speakerForAssistant(assistantId)) })
     sendToRenderer('fast-ack', { text })
   })().catch(() => {
     // 快嘴是锦上添花：任何异常都不影响主轨。
@@ -1424,19 +1594,69 @@ function armIndependentDocumentDeadline(presentation: IndependentDocumentPresent
 }
 
 /** 等当前模型轮次和播报结束；录音状态不参与讲解准入。 */
+/**
+ * 交接表演：总助交棒 → 成员接棒。
+ *
+ * 为什么要在**派活那一刻**就演，而不是等讲解真的开讲：
+ * 开讲闸门要等会话空闲，忙的时候可能等很久甚至超时；一旦超时，用户从头到尾
+ * 既没听到小会开口、也没看到它登场，只看见总助说了句"我交给小会了"。
+ * 所以交接必须绑在"话已经说出口"这个时刻，和讲不讲得成解耦。
+ *
+ * `key` 用来去重：同一件事只演一次，讲解真正开始时不会再念一遍。
+ */
+/*
+  按"成员 + 时间"再去一次重：派工与开讲用的是两套 key（presentation.id / talk.sessionId），
+  只按 key 去重会把同一段交接台词念两遍——用户听到的就是"说了两次"。
+*/
+let lastHandoverMember = ''
+let lastHandoverAt = 0
+const HANDOVER_REPEAT_MS = 10 * 60_000
+const handoverPerformed = new Set<string>()
+
+function speakMemberHandover(assistantId: string | undefined, key: string): boolean {
+  if (loadSettings().memberHandover === false) return false
+  if (assistantId === undefined || assistantId === '') return false
+  if (lastHandoverMember === assistantId && Date.now() - lastHandoverAt < HANDOVER_REPEAT_MS) return false
+  if (handoverPerformed.has(key)) return false
+  lastHandoverMember = assistantId
+  lastHandoverAt = Date.now()
+  handoverPerformed.add(key)
+  const who = memberNamesCache?.names.get(assistantId) ?? ''
+  const lines = handoverLinesCache.get(assistantId) ?? fixedHandoverLines(who === '' ? '成员' : who)
+  // 总助交代 → 叫人 → 成员应声 → 成员开口；舞台换人由 doc-state 的 active/assistantId 驱动。
+  for (const step of handoverOpening(lines, { chiefPresent: true })) {
+    narrator.beginRound()
+    narrator.speak({
+      utteranceId: `handover-${step.speaker}-${randomUUID()}`,
+      text: step.text,
+      ephemeral: true,
+      ...speakerRequestFields(step.speaker === 'chief' ? chiefSpeakerVoice() : speakerForAssistantSync(assistantId)),
+    })
+  }
+  return true
+}
+
 async function maybeStartIndependentDocument(): Promise<void> {
   const presentation = independentDocument
   if (!presentation || !presentation.receiptConfirmed || (presentation.state !== 'waiting-to-present' && presentation.state !== 'waiting-to-resume')) return
+  /*
+    先演交接，再看闸门。
+    闸门要等会话空闲，忙的时候会一直等甚至超时；把交接绑在开讲上，
+    超时的时候用户只会听到总助说"交给小会了"，从头到尾没有小会登场。
+    所以这里先播交接台词，播完下一拍再判断能不能开讲。
+  */
+  if (!narrator.isSpeaking() && !spokenRound && submissionCount === 0
+    && speakMemberHandover(presentation.assistantId ?? undefined, presentation.id)) return
   if (Date.now() >= presentation.waitUntil || sessionState?.bindingId !== presentation.bindingId || sessionState.status === 'disconnected'
     || (presentation.autoApproved && loadSettings().meetingDocumentAutoApprove !== true)) {
     failIndependentDocument(presentation, '等待开讲超时或会话已变化，未继续。')
     return
   }
-  if (sessionState.status !== 'idle' || submissionCount > 0 || spokenRound || narrator.isSpeaking()) return
+    if (sessionState.status !== 'idle' || submissionCount > 0 || spokenRound || narrator.isSpeaking()) return
   const resuming = presentation.state === 'waiting-to-resume'
   presentation.state = 'starting'
   const allowed = () => independentDocument === presentation && presentation.state === 'starting'
-    && Date.now() < presentation.waitUntil && sessionState?.bindingId === presentation.bindingId && sessionState.status === 'idle'
+      && Date.now() < presentation.waitUntil && sessionState?.bindingId === presentation.bindingId && sessionState.status === 'idle'
     && submissionCount === 0 && !spokenRound && !narrator.isSpeaking()
     && (!presentation.autoApproved || loadSettings().meetingDocumentAutoApprove === true)
   try {
@@ -1824,6 +2044,12 @@ async function handleDesktopCommand(raw: unknown): Promise<void> {
           bargeIn: prefs.bargeIn === true,
           readReplies: settings.readReplies === true,
           docSpeechMode: settings.docSpeechMode === 'ai' ? 'ai' : 'source',
+        /* 音色（描述 / 克隆 ID / 复刻样本）也必须回读：缺了它设置页就永远显示空白。 */
+        agentVoiceDesign: settings.agentVoiceDesign ?? '',
+        agentVoiceId: settings.agentVoiceId ?? '',
+        agentVoiceSample: settings.agentVoiceSample ?? '',
+        agentVoiceSampleMime: settings.agentVoiceSampleMime ?? '',
+        agentVoiceStyle: settings.agentVoiceStyle ?? '',
           petScale: settings.petScale,
           petOpacity: settings.petOpacity,
         })
@@ -1921,20 +2147,26 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
     narrator.beginRound()
     narrator.generationStarted()
     // 快嘴必须在 interruptSpeech 之后起步，否则刚开口就被上面的静音掐掉。
-    if (ackUserText !== undefined && ackUserText.trim() !== '') startFastAck(ackUserText, bindingId)
+    if (ackUserText !== undefined && ackUserText.trim() !== '') startFastAck(ackUserText, bindingId, assistantId)
   }
   const current = () => bindingId === sessionState?.bindingId && sessionState.status !== 'disconnected'
     && (round === null || (spokenRound === round && !round.cancelled))
+  const speaker = await speakerForAssistant(assistantId)
   let fedChars = 0
+  const roundStartedAt = Date.now()
   /** 正文是否已交给语音（或确认没有正文）。决定 finally 能不能提前收尾这一轮。 */
   let bodyQueued = false
   try {
     const reply = await bridge.chat(outgoing, assistantId, round?.controller.signal, round ? delta => {
       if (!current()) return
-      if (fedChars === 0) handoffFastAck()
+      if (fedChars === 0) {
+        handoffFastAck()
+        speechLog(`first-delta +${Date.now() - roundStartedAt}ms（首句增量到达，随即逐句合成）`)
+      }
       fedChars += delta.length
-      narrator.feed(round.utteranceId, delta)
+      narrator.feed(round.utteranceId, delta, speaker)
     } : undefined, bindingId)
+    speechLog(`reply-resolved +${Date.now() - roundStartedAt}ms fedChars=${fedChars}`)
     if (!reply.ok) {
       failMeetingPresentationForReply(bindingId, '发起会话或插话回答失败，会议讲解不会自动推进；请在会议页核查录音。')
       failIndependentDocumentForReply(bindingId, '发起会话失败，文档讲解不会自动开始。')
@@ -1948,7 +2180,10 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
         if (fedChars > 0) narrator.feedEnd(round.utteranceId)
         else {
           handoffFastAck()
-          narrator.speak({ utteranceId: round.utteranceId, text: reply.reply })
+          narrator.speak({
+            utteranceId: round.utteranceId, text: reply.reply,
+            ...speakerRequestFields(speaker),
+          })
         }
       } else {
         interruptSpeech()
@@ -1977,7 +2212,8 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
       // 清空之后 startDocTalk 就看不到"这一轮还没播完"（它的判据正是 spokenRound 非空），
       // 于是直接 interruptSpeech 把正文顶掉 —— 真机表现就是"只听到开头那句快嘴，正文一个字没有"。
       // 已入队的正文交给 onSpeaking(false) 收尾；只有确定没有下文（异常/提前 return）才在这里收。
-      if (!bodyQueued) completeSpokenRound()
+      // 队列被失败/打断清空时（isSpeaking 已假）也要收，否则本轮挂死、后续委派全被挡。
+      if (!bodyQueued || !narrator.isSpeaking()) completeSpokenRound()
     }
   }
 }
@@ -2844,9 +3080,16 @@ function docUtteranceId(talk: DocTalk, index: number): string {
 function pushDocState(): void {
   const talk = docTalk
   if (talk === null) {
+    speechLog('doc-state idle')
     sendToRenderer('doc-state', { kind: 'idle' })
     return
   }
+  /*
+    舞台要不要换人，全看下面 active / assistantId 这两个值。
+    以前没有这行日志，用户说"形象没出来"时只能猜；现在能直接看出
+    是"根本没 active"，还是"active 了但渲染层没换"。
+  */
+  speechLog(`doc-state assistant=${talk.assistantId ?? 'none'} spoken=${talk.spoken} stopped=${talk.stopped} next=${talk.next}/${talk.outline.sections.length}`)
   sendToRenderer('doc-state', {
     kind: 'outline',
     path: talk.path,
@@ -2941,13 +3184,31 @@ function startDocTalk(talk: DocTalk, prelude?: { utteranceId: string; text: stri
   installDocTalk(talk)
   // 出声讲解开始时收起管理面板：用户要的是听讲解，不是被设置页挡着屏幕。
   if (talk.spoken) sendToRenderer('settings-close', null)
+  /*
+    点到成员来讲，就先演一段交接：总助交代 → 叫人 → 成员应声 → 成员开口，
+    然后才进开场白和正文。以前这段编排写在 handover-sequence.ts 里却没人调用，
+    于是总助嘴上说"交给小会"，舞台上什么都不会发生。
+  */
+  /*
+    交接编排（同步版）：点到成员来讲，先用**固定台词**演"总助交棒 → 成员接棒"。
+
+    为什么用固定台词而不是现问模型：这段必须卡在开场白之前，而讲解时序不能为了一个
+    网络请求而停住（试过 await 模型生成，两条讲解时序测试直接红）。台词是表演，
+    不进会话、不进记忆，和快答同一条红线。
+  */
+  speakMemberHandover(talk.assistantId, talk.sessionId)
   if (prelude !== undefined) {
     // 开场白单独算一轮：它被打断时该报的是"范围还没说完"，跟第一段讲了多少无关。
     narrator.beginRound()
-    narrator.speak(prelude)
+    /*
+      开场白也用**讲解人自己**的嗓子。
+      否则第一句是总助、后面几十段换成员，听感上就是中途换人说话。
+    */
+    narrator.speak({ ...prelude, ...speakerRequestFields(presentationSpeakerVoice(talk.assistantId)) })
   }
   void advanceDocTalk()
 }
+
 
 /** 讲解途中每次送模型或播放前都重新校验文档与授权。 */
 async function docTalkStillValid(talk: DocTalk): Promise<boolean> {
@@ -3049,6 +3310,8 @@ async function advanceDocTalk(verified?: DocTalk): Promise<void> {
         text: explanation,
         fromIndex: narrator.resumeFrom(utteranceId),
         origin: { docPath: talk.path, paragraph: index },
+      /* 点到谁讲，逐段就用谁的嗓子念下去；成员设了"总助代念"则用总助。 */
+      ...speakerRequestFields(presentationSpeakerVoice(talk.assistantId)),
       })
       // 跳过类段落：记一个"念完再停"的额度，由下一次推进入口开始计时。
       // 不能在这里直接算截止时间——这句跳过提示本身也要念几秒，算进去等于白少停几秒。
@@ -3084,6 +3347,7 @@ async function advanceDocTalk(verified?: DocTalk): Promise<void> {
       } else sendToRenderer('doc-notice', partial ? `《${talk.outline.title}》仅完成可提取文字的部分讲解。` : `《${talk.outline.title}》讲完了`)
       if (talk.sessionId === presentedSessionId) { presentedView?.stop('completed'); presentedSessionId = null }
       if (talk.sessionId === presentedOfficeSessionId) presentedOfficeSessionId = null
+      speakMemberClosing(talk.assistantId)
       stopDocTalk()
       pushDocState()
     }
@@ -3219,6 +3483,11 @@ async function explainDocByPath(
   const revision = docRevision
   // 点名成员就按点名的来；没点名时优先交给具备会议+文档能力的子助理（如"小会"）。
   const who = assistantId ?? (speak ? await presentationMember() : undefined)
+  if (who) {
+    // 先暖名字缓存：交接台词要点名"交给小会"，不能等异步预取回来才念对名字。
+    await memberDisplayName(who)
+    prefetchHandoverLines(who, `讲解《${path.basename(target)}》`)
+  }
   const opened = await documents.open(target)
   if (bindingId !== sessionState?.bindingId || revision !== docRevision) return { ok: false, error: '会话已改变或讲解已停止，未开始原文档讲解' }
   if (opened.kind !== 'opened') return { ok: false, error: `《${path.basename(target)}》讲不了：${unparseable(opened)}` }
@@ -3657,6 +3926,11 @@ const narrator = new Narrator(playbackTap.wrap(openTtsTransport), {
       spokenRound.cancelled = true
       spokenRound.controller.abort()
       narrator.dropFeed(spokenRound.utteranceId)
+      // 合成失败必须把这一轮收掉：否则 spokenRound 永远非空，
+      // 之后所有委派/讲解的"等本轮说完"闸门全被挡死，子助理再也出不来。
+      const round = spokenRound
+      spokenRound = null
+      if (round.voiceTurn) sendToRenderer('voice-turn-complete', { ...round.voiceTurn, outcome: 'stopped' })
     }
     // 失败不推进下一段，保留已生成的讲解和实际播放位置。
     pauseDocTalk()
@@ -3671,6 +3945,10 @@ const narrator = new Narrator(playbackTap.wrap(openTtsTransport), {
 }, {
   // 派发每一句时才取配置：用户中途换服务，下一句就走新的，不用重启播放器。
   ttsApi: (): ResolvedVoiceApi | null => voiceApiStore?.resolve('tts') ?? null,
+  // 没自带音色的句子（唤醒应答/快答/讲解）默认用总助理的嗓子，三条链路不再各用各的。
+  defaultVoice: () => chiefSpeakerVoice(),
+  // 成员级音色服务：编辑窗里选的某条 TTS 配置（MiMo 三模型等）。
+  resolveProfile: id => voiceApiStore?.resolveId(id) ?? null,
   // 固定话术（唤醒应答等）合成一次就落盘复用；换音色自动失效重合成。
   cache: ttsCache,
   // 默认合成（没配自定义服务）时的音色键：和 greetingVoiceKey(null) 必须一致，
@@ -3732,7 +4010,7 @@ const PET_OPTIONS: Array<{ id: PetId; label: string }> = [
  * 读-改-写要在主进程这一侧做完：渲染层手里的表可能是上一帧的，两个角色连着点的话
  * 后一次会把前一次冲掉。
  */
-function setCharacterSkin(target: MenuTarget, skin: PetId): void {
+function setCharacterSkin(target: MenuTarget, skin: string): void {
   const current = loadSettings().characters ?? {}
   const next = { ...current, [target.assistantId]: { ...current[target.assistantId], skin } }
   saveSettings({ characters: next })
@@ -3783,6 +4061,14 @@ function buildContextMenu(target: MenuTarget | null): Menu {
           type: 'radio' as const,
           checked: current === option.id,
           click: () => setCharacterSkin(target, option.id),
+        })),
+        // 本地登记的自定义皮肤（哪吒等生成形象）不进仓库，但右键要能选到：
+        // 菜单每次构建时读登记表，工作室新做的皮肤下次右键即出现。
+        ...listCustomSkins(app.getPath('userData')).map(skin => ({
+          label: skin.name,
+          type: 'radio' as const,
+          checked: current === skin.id,
+          click: () => setCharacterSkin(target, skin.id),
         })),
         { type: 'separator' as const },
         // 形象与音色工作室是高频功能，不埋进设置页：挂在"换个形象"里正好顺路。
@@ -4284,7 +4570,110 @@ function registerIpc(): void {
     },
   })
   const apis = voiceApiStore
-  const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
+  /** 试听用的固定例句：够长能听出音色和语气，又不至于每次白烧很多字。 */
+const VOICE_PREVIEW_TEXT = '你好，我是你的桌面助理。这句话用来试听音色——如果听着自然，就把这个音色留下；如果太生硬，换一个再听。'
+
+  /*
+   * 按性格生成音色描述：把助理的性格/人设交给插件侧的主助理模型，换回一段
+   * 可直接喂给 MiMo voicedesign 的描述。产出是**起点**，用户还能手改再试听。
+   */
+  ipcMain.handle('voice-design-assist', async (_event, input: unknown) => {
+    const raw = (input && typeof input === 'object' ? input : {}) as { name?: unknown; personality?: unknown; model?: unknown }
+    const personality = typeof raw.personality === 'string' ? raw.personality.trim() : ''
+    if (personality === '') return { ok: false, error: '先给这位助理写一点性格，才能按性格配色' }
+    if (personality.length > 4000) return { ok: false, error: '性格描述太长了，请精简一些' }
+    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 80) : undefined
+    const modelRaw = (raw.model && typeof raw.model === 'object' ? raw.model : null) as { provider?: unknown; model?: unknown } | null
+    const model = modelRaw && typeof modelRaw.provider === 'string' && typeof modelRaw.model === 'string'
+      && modelRaw.provider.trim() && modelRaw.model.trim()
+      ? { provider: modelRaw.provider.trim().slice(0, 128), model: modelRaw.model.trim().slice(0, 256) } : undefined
+    try {
+      const response = await bridge.companionRequest('POST', '/companion/v1/members/voice-design',
+        { personality, ...(name ? { name } : {}), ...(model ? { model } : {}) }, 'owner', 95_000)
+      if (response.status !== 200) {
+        const message = (response.body as { message?: string } | null)?.message
+        return { ok: false, error: message ?? '音色助手暂时不可用' }
+      }
+      const body = response.body as { description?: unknown; style?: unknown } | null
+      const description = body?.description
+      if (typeof description !== 'string' || description.trim() === '') return { ok: false, error: '没有生成出可用的描述，请补充一点性格再试' }
+      return { ok: true, description: description.trim(), style: typeof body?.style === 'string' ? body.style.trim().slice(0, 500) : '' }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : '音色助手暂时不可用' }
+    }
+  })
+
+  /*
+   * 交接台词：总助把活交给某成员时，四方各说一句（由模型按两人性格生成）。
+   * 台词只用于朗读与气泡，**不写进会话、不进记忆** —— 交接是表演，不是事实。
+   */
+  ipcMain.handle('handover-lines', async (_event, input: unknown) => {
+    const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
+    const text = (key: string, max: number): string => typeof raw[key] === 'string' ? (raw[key] as string).trim().slice(0, max) : ''
+    const task = text('task', 500)
+    if (task === '') return { ok: false, error: '先说要交接哪件事' }
+    try {
+      const response = await bridge.companionRequest('POST', '/companion/v1/members/handover', {
+        chiefName: text('chiefName', 80), chiefPersona: text('chiefPersona', 4000),
+        memberName: text('memberName', 80), memberPersona: text('memberPersona', 4000), task,
+      }, 'owner', 95_000)
+      if (response.status !== 200) {
+        const message = (response.body as { message?: string } | null)?.message
+        return { ok: false, error: message ?? '交接助手暂时不可用' }
+      }
+      const lines = (response.body as { lines?: unknown } | null)?.lines
+      if (!lines || typeof lines !== 'object') return { ok: false, error: '没有生成出可用的台词' }
+      return { ok: true, lines }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : '交接助手暂时不可用' }
+    }
+  })
+
+  /*
+   * 声纹环境自检：把"注册失败"背后那串**英文原始报错**原样带回来。
+   *
+   * 为什么需要它：注册失败可能来自四个完全不同的地方（模型文件、原生模块、
+   * 音频格式、系统密钥）。以前只有一句"注册失败：<英文>"，看不出是哪一层。
+   * 这里逐步试，每步都记下原始错误，用户点一下就能看到断在哪。
+   */
+  ipcMain.handle('voiceprint-diagnose', async () => {
+    const steps: Array<{ name: string; ok: boolean; detail: string }> = []
+    const userData = app.getPath('userData')
+    const modelPath = voiceprintModelPath(userData)
+    try {
+      const size = statSync(modelPath).size
+      steps.push({ name: '声纹模型文件', ok: true, detail: `${modelPath}（${Math.round(size / 1024 / 1024)} MB）` })
+    } catch (error) {
+      steps.push({ name: '声纹模型文件', ok: false, detail: `读不到：${error instanceof Error ? error.message : String(error)}` })
+      return { ok: false, steps }
+    }
+    try {
+      const sherpa = await import('sherpa-onnx-node')
+      const version = (sherpa as { default?: unknown }) !== undefined ? '已加载' : '已加载'
+      steps.push({ name: 'sherpa-onnx 原生模块', ok: true, detail: version })
+    } catch (error) {
+      steps.push({ name: 'sherpa-onnx 原生模块', ok: false, detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) })
+      return { ok: false, steps }
+    }
+    try {
+      const key = voiceprintKey()
+      steps.push({ name: '系统密钥', ok: true, detail: '可用' })
+      void key
+    } catch (error) {
+      steps.push({ name: '系统密钥', ok: false, detail: error instanceof Error ? error.message : String(error) })
+    }
+    try {
+      /* 静音一秒就够：这一步只验证"模型能不能跑起来"，不关心有没有人声。 */
+      const { extractEmbedding } = await import('./voiceprint.ts')
+      const vector = await extractEmbedding(new Float32Array(16000), modelPath)
+      steps.push({ name: '模型推理', ok: true, detail: `成功，维度 ${vector.length}` })
+    } catch (error) {
+      steps.push({ name: '模型推理', ok: false, detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) })
+    }
+    return { ok: steps.every(step => step.ok), steps }
+  })
+
+const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
     try {
       return { ok: true, state: fn() }
     } catch (error) {
@@ -4296,6 +4685,79 @@ function registerIpc(): void {
   ipcMain.handle('voice-api-save', (_event, input: unknown) => voiceApiCall(() => apis.save(input)))
   ipcMain.handle('voice-api-remove', (_event, id: unknown) => voiceApiCall(() => apis.remove(id)))
   ipcMain.handle('voice-api-select', (_event, kind: unknown, id: unknown) => voiceApiCall(() => apis.select(kind as VoiceApiKind, id)))
+  /*
+   * 试听：用**已保存**的那条配置合成一句样例，把音频直接回给渲染层播放。
+   *
+   * 只接受已保存的 profile id，不接受渲染层传端点/密钥进来 —— 否则等于给渲染层
+   * 开了一条"随便往哪儿发请求、带任何密钥"的通道。
+   * 每次试听都会真实调用一次语音服务，界面要事先说明这一点。
+   */
+  /*
+    总助理音色的读取口：单独一条通道，不再依赖 get-state 的形状。
+    之前踩过两次"存进去了但页面读不到"，都是回读路径和写入路径对不上。
+  */
+  ipcMain.handle('agent-voice-state', () => {
+    /* 组装规则在 agent-voice.ts 里，有测试钉着；这里只负责取设置。 */
+    return agentVoicePayload(loadSettings())
+  })
+
+  ipcMain.handle('voice-api-preview', async (_event, id: unknown, voiceDesign: unknown, voice: unknown, sample: unknown, style: unknown) => {
+    if (typeof id !== 'string' || id === '') return { ok: false, error: '缺少要试听的配置' }
+    const state = apis.snapshot()
+    const profile = state.profiles.find(item => item.id === id)
+    if (!profile) return { ok: false, error: '这条语音配置不存在，可能已被删除' }
+    if (profile.kind !== 'tts') return { ok: false, error: '只有语音合成配置能试听' }
+    const resolved = apis.resolve('tts')
+    if (!resolved || resolved.id !== id) return { ok: false, error: '这条配置还没被选为当前音色；请先选中再试听' }
+    try {
+      /* 试听可以带一段临时描述：用户还没保存或想对比时，不该逼他先存一遍。 */
+      const override = typeof voiceDesign === 'string' ? voiceDesign.trim().slice(0, 2000) : ''
+      const voiceId = typeof voice === 'string' ? voice.trim().slice(0, 200) : ''
+      const settingsNow = loadSettings()
+      /*
+        样本优先用**本次传进来的**（用户刚录完还没保存也该能试听），
+        没有才回落到已保存的那份。
+      */
+      const live = (sample && typeof sample === 'object' ? sample : {}) as { data?: unknown; mime?: unknown }
+      let sampleData = typeof live.data === 'string' && live.data.trim() !== '' ? live.data : (settingsNow.agentVoiceSample ?? '')
+      if (sampleData === '' && settingsNow.agentVoiceSampleFile) {
+        try { sampleData = readFileSync(settingsNow.agentVoiceSampleFile).toString('base64') } catch { sampleData = '' }
+      }
+      const sampleMime = typeof live.mime === 'string' && live.mime !== '' ? live.mime : (settingsNow.agentVoiceSampleMime || 'audio/wav')
+      const styleHint = typeof style === 'string' ? style.trim().slice(0, 500) : (settingsNow.agentVoiceStyle ?? '')
+      /*
+        模型必须跟意图对上：复刻样本要 voiceclone，音色描述要 voicedesign。
+        用户是分别建了几条配置的（预置 / 设计 / 复刻），一律拿"当前选中"那条去发，
+        等于用预置音色模型去发音频样本，服务端直接 4xx。
+      */
+      const pickByModel = (needle: string): typeof resolved | null => {
+        if (resolved.model.includes(needle)) return resolved
+        const candidates = state.profiles.filter(item => item.kind === 'tts' && item.model.includes(needle))
+        if (candidates.length === 0) return null
+        const chosen = candidates.find(item => item.hasKey) ?? candidates[0]
+        return { ...resolved, id: chosen.id, name: chosen.name, endpoint: chosen.endpoint,
+          model: chosen.model, voice: chosen.voice, voiceDesign: chosen.voiceDesign }
+      }
+      if (sampleData !== '') {
+        const clone = pickByModel('voiceclone')
+        if (clone === null) {
+          return { ok: false, error: '复刻需要一条模型名为 mimo-v2.5-tts-voiceclone 的语音配置；当前没有，请先在语音设置里加一条' }
+        }
+        const audio = await synthesizeApi({ ...clone, voiceSample: sampleData, voiceSampleMime: sampleMime, voiceDesign: '', voiceStyle: styleHint }, VOICE_PREVIEW_TEXT)
+        return { ok: true, audio: audio.toString('base64'), mime: 'audio/wav' }
+      }
+      if (voiceId !== '') {
+        const audio = await synthesizeApi({ ...resolved, voice: voiceId, voiceDesign: '' }, VOICE_PREVIEW_TEXT)
+        return { ok: true, audio: audio.toString('base64'), mime: 'audio/wav' }
+      }
+      const designTarget = override !== '' ? (pickByModel('voicedesign') ?? resolved) : resolved
+      const target = override !== '' ? { ...designTarget, voiceDesign: override, voiceStyle: styleHint } : { ...designTarget, voiceStyle: styleHint }
+      const audio = await synthesizeApi(target, VOICE_PREVIEW_TEXT)
+      return { ok: true, audio: audio.toString('base64'), mime: 'audio/wav' }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
 
   // ===== 形象与音色工作室（底座 4.8/4.9）=====
   // provider 全部用户自配；密钥走系统密钥库；生成/克隆/删除前原生确认。
@@ -4524,7 +4986,7 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'save-settings',
-    (event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; meetingDocumentAutoApprove?: boolean; meetingSpeakerCounts?: { mic: number; loopback: number }; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number }; stepDownMembers?: string[]; docSpeechMode?: 'source' | 'ai'; petScale?: number; petOpacity?: number; petDock?: boolean; dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null }) => {
+    (event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; meetingDocumentAutoApprove?: boolean; memberHandover?: boolean; meetingSpeakerCounts?: { mic: number; loopback: number }; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number }; stepDownMembers?: string[]; characters?: Record<string, { skin?: string }>; agentVoiceDesign?: string; agentVoiceId?: string; agentVoiceSample?: string; agentVoiceSampleMime?: string; agentVoiceStyle?: string; docSpeechMode?: 'source' | 'ai'; petScale?: number; petOpacity?: number; petDock?: boolean; dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null }) => {
       if (!patch || typeof patch !== 'object') return { ok: false }
       if ('stepDownMembers' in patch && (!stageSender(event) || !Array.isArray(patch.stepDownMembers) || patch.stepDownMembers.some(id => typeof id !== 'string'))) return { ok: false }
       if ('meetingDocumentAutoApprove' in patch && (!stageSender(event) || typeof patch.meetingDocumentAutoApprove !== 'boolean')) return { ok: false }
@@ -4543,6 +5005,39 @@ function registerIpc(): void {
       if (chatSize !== undefined && (!chatSize || !Number.isFinite(chatSize.width) || !Number.isFinite(chatSize.height))) {
         return { ok: false }
       }
+      /*
+       * 形象覆盖：与已存的合并，只改传进来的那个角色。
+       *
+       * 必须先合并再写：`saveSettings` 的 characters 是**整份替换**的，
+       * 直接把 patch 写进去会把其它角色（包括它的 randomActions）一起清掉。
+       * skin 合法性交给 settings.normalize 判（内置三项 + 已登记自定义皮肤），这里不重复白名单。
+       */
+      let charactersPatch: Record<string, { skin: string; randomActions?: string[] }> | null = null
+      if (patch.characters !== undefined) {
+        if (!stageSender(event) || !patch.characters || typeof patch.characters !== 'object' || Array.isArray(patch.characters)) return { ok: false }
+        const merged: Record<string, { skin: string; randomActions?: string[] }> = { ...(loadSettings().characters ?? {}) }
+        for (const [assistantId, value] of Object.entries(patch.characters)) {
+          const skin = (value as { skin?: unknown } | undefined)?.skin
+          if (!assistantId || assistantId.length > 128) return { ok: false }
+          if (typeof skin !== 'string' || skin === '' || skin.length > 128) return { ok: false }
+          merged[assistantId] = { ...(merged[assistantId] ?? { skin }), skin }
+        }
+        charactersPatch = merged
+      }
+      /*
+        样本落盘：把 base64 写成 wav 文件，配置里只留路径。
+        设置文件不会涨到几百 KB，TTS 合成也不必把整段 base64 穿过内部管道。
+      */
+      let agentVoiceFile: string | null = null
+      if (typeof patch.agentVoiceSample === 'string' && patch.agentVoiceSample.trim() !== '') {
+        try {
+          const target = path.join(app.getPath('userData'), 'voice-sample.wav')
+          writeFileSync(target, Buffer.from(patch.agentVoiceSample, 'base64'))
+          agentVoiceFile = target
+        } catch (error) {
+          console.warn(`[dsh-pet] 音色样本落盘失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
       saveSettings({
         ...(patch.bounds ? { bounds: patch.bounds } : {}),
         ...(patch.positions ? { positions: patch.positions } : {}),
@@ -4550,6 +5045,7 @@ function registerIpc(): void {
         ...(typeof patch.continuousVoice === 'boolean' ? { continuousVoice: patch.continuousVoice } : {}),
         ...(typeof patch.readReplies === 'boolean' ? { readReplies: patch.readReplies } : {}),
         ...(typeof patch.meetingDocumentAutoApprove === 'boolean' ? { meetingDocumentAutoApprove: patch.meetingDocumentAutoApprove } : {}),
+        ...(typeof patch.memberHandover === 'boolean' ? { memberHandover: patch.memberHandover } : {}),
         ...(counts ? { meetingSpeakerCounts: { mic: counts.mic, loopback: counts.loopback } } : {}),
         ...(patch.idleSleepMinutes !== undefined ? { idleSleepMinutes: patch.idleSleepMinutes } : {}),
         ...(patch.sleepMinutes !== undefined ? { sleepMinutes: patch.sleepMinutes } : {}),
@@ -4575,6 +5071,21 @@ function registerIpc(): void {
           ? { dockedAt: patch.dockedAt }
           : {}),
         ...(Array.isArray(patch.stepDownMembers) ? { stepDownMembers: patch.stepDownMembers } : {}),
+        /*
+         * 形象覆盖：只接受舞台窗口发来的、形状是 { [assistantId]: { skin } } 的对象。
+         * skin 的合法性交给 settings.normalize 判（内置三项 + 已登记的自定义皮肤），
+         * 这里不重复那份白名单 —— 两处各写一份迟早会不一致。
+         */
+        ...(charactersPatch ? { characters: charactersPatch } : {}),
+        ...(typeof patch.agentVoiceDesign === 'string' ? { agentVoiceDesign: patch.agentVoiceDesign.slice(0, 2000) } : {}),
+        ...(typeof patch.agentVoiceId === 'string' ? { agentVoiceId: patch.agentVoiceId.slice(0, 200) } : {}),
+        /*
+          样本落盘，配置里只留路径。
+          640KB 的 base64 塞进设置、再塞进 TTS 内部管道，会拖慢并撑爆一次性写入；
+          落成文件后，合成时按需读一次即可。
+        */
+        ...(agentVoiceFile !== null ? { agentVoiceSample: '', agentVoiceSampleFile: agentVoiceFile } : {}),
+        ...(typeof patch.agentVoiceSampleMime === 'string' ? { agentVoiceSampleMime: patch.agentVoiceSampleMime.slice(0, 100) } : {}),        ...(typeof patch.agentVoiceStyle === 'string' ? { agentVoiceStyle: patch.agentVoiceStyle.slice(0, 500) } : {}),
       })
       if (patch.meetingDocumentAutoApprove === false) {
         if (pendingMeetingStart?.autoApproved) cancelDesktopCommand({ id: pendingMeetingStart.id })
@@ -4674,6 +5185,7 @@ function registerIpc(): void {
   })
 
   ipcMain.on('speech-stop', (_event, preserveAutoResume?: unknown) => {
+    speechLog(`speech-stop received preserve=${preserveAutoResume === true}`)
     // 用户主动停播（按钮或“停一下”口令）：默认不再用自动续讲把讲解接回去。
     // 口令后面直接带问题的情形由渲染层传 preserveAutoResume=true：先停这一句，等回答播完再续讲。
     // 口令后面直接带问题的情形由渲染层传 preserveAutoResume=true：先停这一句，等回答播完再续讲。
@@ -4803,6 +5315,68 @@ function registerIpc(): void {
   })
   const memberEditor = new MemberEditorWindow()
   memberEditor.registerIpc()
+  // 成员音色（壳侧）：语气与克隆样本存设置，编号/描述仍归插件目录；只认编辑窗来源。
+  ipcMain.handle('member-voice-get', (event, id: unknown) => {
+    if (!memberEditor.allowed(event) || typeof id !== 'string') return null
+    return loadSettings().memberVoices?.[id] ?? null
+  })
+  ipcMain.handle('member-voice-save', (event, id: unknown, voice: unknown) => {
+    if (!memberEditor.allowed(event) || typeof id !== 'string' || id.trim() === '') return { ok: false }
+    const v = (voice ?? {}) as Record<string, unknown>
+    const str = (x: unknown, max: number): string => (typeof x === 'string' ? x.slice(0, max) : '')
+    const current = loadSettings().memberVoices ?? {}
+    saveSettings({
+      memberVoices: {
+        ...current,
+        [id]: { ...current[id], style: str(v.style, 500), sampleFile: str(v.sampleFile, 500), sampleMime: str(v.sampleMime, 100), profileId: str(v.profileId, 64) },
+      },
+    })
+    return { ok: true }
+  })
+  // 成员编辑窗的"已配置模型"下拉：与总助理会话模型下拉同源（session mirror 的 models）。
+  ipcMain.handle('member-model-options', (event) => {
+    if (!memberEditor.allowed(event)) return []
+    return sessionState?.models ?? []
+  })
+  // 成员编辑窗的"音色服务"下拉：语音设置里配好的全部 TTS 配置（MiMo 三模型等）。
+  ipcMain.handle('member-tts-profiles', (event) => {
+    if (!memberEditor.allowed(event)) return []
+    return (voiceApiStore?.snapshot().profiles ?? [])
+      .filter(p => p.kind === 'tts')
+      .map(p => ({ id: p.id, name: p.name, model: p.model, provider: p.provider }))
+  })
+  // 成员音色试听：与总助理试听同一条合成链路，按编辑窗里当前未保存的音色配置合成一句。
+  ipcMain.handle('member-voice-preview', async (event, input: unknown) => {
+    if (!memberEditor.allowed(event)) return { ok: false, error: '请求不是来自成员编辑窗口' }
+    const v = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
+    const str = (x: unknown, max: number): string => (typeof x === 'string' ? x.trim().slice(0, max) : '')
+    const speaker: SpeakerVoice = {
+      voiceId: str(v.voiceId, 200), design: str(v.design, 2000), style: str(v.style, 500),
+      sampleFile: str(v.sampleFile, 500), sampleMime: str(v.sampleMime, 100), profileId: str(v.profileId, 64),
+    }
+    const baseApi = (speaker.profileId ? voiceApiStore?.resolveId(speaker.profileId) : null)
+      ?? voiceApiStore?.resolve('tts') ?? null
+    if (baseApi === null) return { ok: false, error: '还没接入语音服务：先在语音设置里配一条 TTS' }
+    const api = { ...baseApi, ...speakerOverlay(baseApi.provider, baseApi.model, speaker) }
+    try {
+      const audio = await synthesizeApi(api, VOICE_PREVIEW_TEXT)
+      return { ok: true, audio: audio.toString('base64'), mime: sniffAudioMime(audio) }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+  ipcMain.handle('member-voice-pick-sample', async (event) => {
+    if (!memberEditor.allowed(event)) return { ok: false }
+    const picked = await dialog.showOpenDialog({
+      title: '选择音色克隆样本', properties: ['openFile'],
+      filters: [{ name: '音频', extensions: ['wav', 'mp3', 'm4a', 'ogg', 'flac'] }],
+    })
+    if (picked.canceled || picked.filePaths.length === 0) return { ok: false }
+    const file = picked.filePaths[0]
+    const ext = path.extname(file).toLowerCase()
+    const mime = ext === '.mp3' ? 'audio/mpeg' : ext === '.m4a' ? 'audio/mp4' : ext === '.ogg' ? 'audio/ogg' : 'audio/wav'
+    return { ok: true, file, mime }
+  })
   registerMemberManagement({
     getStageWindow: () => win,
     pagePath: path.join(here, '../renderer/index.html'),
@@ -4814,11 +5388,81 @@ function registerIpc(): void {
       memberEditor.notifyChanged()
     },
   })
+  // 成员独立会话查看：DSH 侧栏里成员会话埋在折叠分组里、标题又是任务原文，用户找不到。
+  // 这里直接读宿主持久化的会话文件（zstd），开一个只读窗口展示，入口在团队成员行。
+  ipcMain.handle('member-session-view', async (event, id: unknown) => {
+    if (!stageSender(event) || typeof id !== 'string' || id.trim() === '') return { ok: false, error: '请求来源或成员标识无效' }
+    const result = await bridge.companionRequest('GET', '/companion/v1/members', undefined, 'owner', 5000)
+    const body = result.status === 200
+      ? result.body as { members?: Array<{ profile?: { assistantId?: string; displayName?: string; sessionId?: string | null } }> } | null
+      : null
+    const profile = body?.members?.find(item => item.profile?.assistantId === id)?.profile
+    const sessionId = profile?.sessionId
+    if (!sessionId) return { ok: false, error: '这位成员还没有独立会话；首次派活时会自动新建。' }
+    const sessionsRoot = path.join(dshHome(), 'sessions')
+    let file: string | null = null
+    try {
+      for (const group of readdirSync(sessionsRoot)) {
+        const candidate = path.join(sessionsRoot, group, sessionId, 'session.v4.jsonl.zstd')
+        if (existsSync(candidate)) { file = candidate; break }
+      }
+    } catch { /* 目录不存在按找不到处理 */ }
+    if (!file) return { ok: false, error: '会话文件还没落盘，稍后再试。' }
+    let raw: string
+    try {
+      // 会话文件是多个 zstd frame 追加写的，Node 一次只解第一帧；按魔数逐帧解。
+      const buf = readFileSync(file)
+      const starts: number[] = []
+      for (let i = 0; i < buf.length - 3; i++) {
+        if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i)
+      }
+      if (starts.length === 0) starts.push(0)
+      const parts: string[] = []
+      for (let i = 0; i < starts.length; i++) {
+        const end = i + 1 < starts.length ? starts[i + 1] : buf.length
+        parts.push(zstdDecompressSync(buf.subarray(starts[i], end)).toString('utf8'))
+      }
+      raw = parts.join('')
+    } catch (error) {
+      return { ok: false, error: `会话读不出来：${error instanceof Error ? error.message : String(error)}` }
+    }
+    const messages: Array<{ role: 'user' | 'assistant'; text: string }> = []
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const ev = JSON.parse(line) as { type?: string; data?: { content?: unknown } }
+        if (ev.type !== 'user/message' && ev.type !== 'assistant/message') continue
+        const blocks = Array.isArray(ev.data?.content) ? ev.data.content as Array<{ type?: string; text?: string }> : []
+        const text = blocks.filter(b => b.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n').trim()
+        if (text) messages.push({ role: ev.type === 'user/message' ? 'user' : 'assistant', text })
+      } catch { /* 坏行跳过 */ }
+    }
+    const escape = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escape(profile?.displayName ?? id)} · 独立会话</title>
+<style>body{font:14px/1.7 system-ui,"Microsoft YaHei",sans-serif;margin:0;background:#f6f9fb;color:#22303c}
+header{position:sticky;top:0;background:#fff;border-bottom:1px solid #dfe7ee;padding:12px 20px;font-weight:600}
+main{max-width:860px;margin:0 auto;padding:20px}.m{margin:0 0 14px;padding:10px 14px;border-radius:10px;white-space:pre-wrap;word-break:break-word}
+.u{background:#e8f1fb;border:1px solid #cfe957}.a{background:#fff;border:1px solid #dfe7ee}
+.r{font-size:12px;color:#68788a;margin-bottom:4px}</style></head><body>
+<header>${escape(profile?.displayName ?? id)} 的独立会话（只读）</header><main>
+${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messages.map(m => `<div class="m ${m.role === 'user' ? 'u' : 'a'}"><div class="r">${m.role === 'user' ? '用户 / 总助派活' : escape(profile?.displayName ?? id)}</div>${escape(m.text)}</div>`).join('')}
+</main></body></html>`
+    const win = new BrowserWindow({
+      width: 780, height: 880, title: `${profile?.displayName ?? id} · 独立会话`, autoHideMenuBar: true,
+      webPreferences: { sandbox: true, nodeIntegration: false, contextIsolation: true },
+    })
+    win.setMenuBarVisibility(false)
+    void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+    return { ok: true }
+  })
+
   ipcMain.handle('member-editor-open', (event, id: unknown) => {
     const stagePage = pathToFileURL(path.join(here, '../renderer/index.html')).href
     if (!stageSender(event) || event.senderFrame?.url !== stagePage) return { ok: false }
     if (id !== null && (typeof id !== 'string' || !id.trim() || id.length > 256)) return { ok: false }
-    memberEditor.open({ memberId: id as string | null })
+    memberEditor.open({ memberId: id as string | null,
+      // 把自定义皮肤带进编辑窗口：用户自己在工作室做出来的形象，必须能在成员配置里选到。
+      skins: listCustomSkins(app.getPath('userData')).map(item => ({ id: item.id, name: item.name })) })
     return { ok: true }
   })
   ipcMain.handle('report-workbench-open', event => {
@@ -5035,7 +5679,10 @@ function registerIpc(): void {
     return transcribeDictation(
       buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
       (text) => sendToRenderer('asr-delta', { text }),
-    ).finally(() => {
+    ).then(result => {
+      speechLog(`asr-transcribe ok=${result.ok} text=${(result.text ?? '').slice(0, 40)}`)
+      return result
+    }).finally(() => {
       // 超时与正常结束都可能走到这里，仲裁器对重复收尾是幂等的。
       disarmDictationSafety()
       applyAudio({ type: 'dictation-finished' })
@@ -5156,6 +5803,7 @@ function registerAudioIpc(): void {
   })
 
   ipcMain.on('barge-in-detected', (event) => {
+    speechLog('barge-in-detected received')
     // 只核对来源。不再要求 audioState 此刻仍持有插话：设备交接与授权更新有先后，
     // 后到的一帧不该被丢掉；状态机自己会对“已经不是 barge-in”的事件做幂等处理。
     if (!fromStage(event)) return
@@ -5333,6 +5981,8 @@ if (!gotLock) {
   })
 
   void app.whenReady().then(() => {
+  /* 分句策略取自设置：打开后相邻短句并段合成，减少"两三个字一次请求"的卡顿。 */
+  configureSpeech({ mergeShortSentences: loadSettings().mergeShortSentences === true })
     // Windows 的通知必须挂在稳定的应用标识上；开发态不设会让提醒静默不显示。
     if (process.platform === 'win32') app.setAppUserModelId('com.dsh.pet')
     applyPlatformWindowTweaks()

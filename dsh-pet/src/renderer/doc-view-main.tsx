@@ -89,10 +89,14 @@ function App() {
   const descriptorRef = useRef<DocViewDescriptor | null>(null)
   /** 每次渲染请求的序号：后来的请求作废先前未完成的，避免页面闪回旧页。 */
   const renderSeq = useRef(0)
+  /** 正占用主画布的渲染任务：新页进来先取消旧的，否则 pdf.js 报同画布并发 render。 */
+  const renderTaskRef = useRef<{ cancel(): void } | null>(null)
   const loadSeq = useRef(0)
 
   const drop = useCallback((problem: DocViewProblem) => {
     renderSeq.current += 1
+    renderTaskRef.current?.cancel()
+    renderTaskRef.current = null
     const pdf = pdfRef.current
     pdfRef.current = null
     void pdf?.loadingTask.destroy()
@@ -152,7 +156,7 @@ function App() {
   }, [])
 
   /** 新页已经画好：平滑滚到它，滚完再收掉旧页。`scrollend` 不触发时用 520ms 兜底。 */
-  const scrollToNewPage = useCallback((height: number): void => {
+  const scrollToNewPage = useCallback((height: number, focus: (() => number | null) | null = null): void => {
     const stage = stageRef.current
     const sheet = sheetRef.current
     if (stage === null || sheet === null) { finishTransition(); return }
@@ -171,6 +175,11 @@ function App() {
         outgoing.setAttribute('aria-hidden', 'true')
       }
       stage.scrollTop = Math.max(0, stage.scrollTop - height)
+      // 旧页移除、补偿之后才算居中目标：过渡期间旧页还占着布局，现在算会偏一整页。
+      const target = focus ? focus() : null
+      if (target !== null) {
+        try { stage.scrollTo({ top: target, behavior: 'smooth' }) } catch { /* 保持原位 */ }
+      }
     }
     const timer = window.setTimeout(end, 520)
     stage.addEventListener('scrollend', end, { once: true })
@@ -178,6 +187,26 @@ function App() {
     try { stage.scrollTo({ top: Math.max(0, offset), behavior: 'smooth' }) }
     catch { end() }
   }, [finishTransition])
+
+  /** 高亮段居中目标（滚动无关量）；没有高亮返回 null。整块居中，不是只居中首行。 */
+  const highlightTarget = useCallback((rects: readonly Rect[]): number | null => {
+    const stage = stageRef.current
+    const sheet = sheetRef.current
+    if (!stage || !sheet || rects.length === 0) return null
+    const sheetTop = sheet.getBoundingClientRect().top - stage.getBoundingClientRect().top + stage.scrollTop
+    const top = rects[0].top
+    const last = rects[rects.length - 1]
+    const blockHeight = Math.max(last.top + last.height - top, rects[0].height)
+    return Math.max(0, sheetTop + top - Math.max(0, (stage.clientHeight - blockHeight) / 2))
+  }, [])
+
+  /** 把高亮段滚到屏幕中间：讲解位置与屏幕必须始终对齐，不能停在页顶。 */
+  const centerHighlight = useCallback((rects: readonly Rect[]): void => {
+    const stage = stageRef.current
+    const target = highlightTarget(rects)
+    if (!stage || target === null) return
+    try { stage.scrollTo({ top: target, behavior: 'smooth' }) } catch { /* 保持原位 */ }
+  }, [highlightTarget])
 
   const showPage = useCallback(async (page: number, target: { anchor: DocAnchor; highlight: boolean } | null) => {
     // 连续推进：先把上一次过渡收干净（它会补偿滚动位置），再开始这一次。
@@ -207,12 +236,22 @@ function App() {
       canvas.style.height = `${Math.floor(viewport.height)}px`
       const context = canvas.getContext('2d')
       if (!context) throw new Error('无法创建画布')
-      await pdfPage.render({
+      // 连续推进时上一帧可能还在画：先取消旧任务，pdf.js 才允许同一画布接新 render。
+      renderTaskRef.current?.cancel()
+      const renderTask = pdfPage.render({
         canvas,
         canvasContext: context,
         viewport,
         transform: ratio === 1 ? undefined : [ratio, 0, 0, ratio, 0, 0],
-      }).promise
+      })
+      renderTaskRef.current = renderTask
+      try {
+        await renderTask.promise
+      } catch (renderError) {
+        // 被新页取消不算失败：静默退出，报错会把阅读视图整个停掉。
+        if (renderError instanceof Error && renderError.name === 'RenderingCancelledException') return
+        throw renderError
+      }
       if (seq !== renderSeq.current) return
 
       // 文字层：与解析线程同一套拼接规则，摘要一致才承认偏移可用。
@@ -239,20 +278,22 @@ function App() {
           if (rects.length > 0) highlight = 'text'
         }
       }
-      const pageChanged = shown?.page !== page
       setShown({ page, numPages: pdf.numPages, textMatch, highlight, rects, anchor })
       setPageInput(String(page))
       setFailure(null)
       api.report(desc.token, { kind: 'rendered', page, numPages: pdf.numPages, textMatch })
 
       if (outgoing !== null) {
-        // 翻页：平滑滚到新页，滚完再收旧页（观感是"往下滑一页"，不是瞬切）。
-        scrollToNewPage(outgoing.height)
-      } else if (!pageChanged && rects.length > 0 && stage !== null) {
-        // 同一页内的下一段：文字层已经给出这一段的矩形，按它在页内的位置滚过去。
-        // 没有矩形（扫描件 / 文字层对不上）就什么都不做 —— 宁可不动，也不要按猜测的位置跳。
-        const top = stage.scrollTop + rects[0].top - 48
-        try { stage.scrollTo({ top: Math.max(0, top), behavior: 'smooth' }) } catch { /* 保持原位 */ }
+        // 翻页：平滑滚到新页，滚完收旧页，再把高亮段送到屏幕中间。
+        scrollToNewPage(outgoing.height, () => highlightTarget(rects))
+      } else if (rects.length > 0 && stage !== null) {
+        // 同页内下一段 / 首次加载：高亮段居中，讲解位置和屏幕始终对齐。
+        centerHighlight(rects)
+      }
+      // 翻页补偿/平滑滚动可能把居中 scroll 顶掉：落定后两次复居中兜底。
+      if (rects.length > 0) {
+        window.setTimeout(() => centerHighlight(rects), 700)
+        window.setTimeout(() => centerHighlight(rects), 1200)
       }
     } catch (error) {
       // 出错的这一帧绝不能留下"旧页还在上面"的中间态：立刻收掉，退回当前页。
@@ -264,12 +305,14 @@ function App() {
     } finally {
       pdfPage.cleanup()
     }
-  }, [beginTransition, drop, finishTransition, scrollToNewPage, shown?.page])
+  }, [beginTransition, centerHighlight, drop, finishTransition, highlightTarget, scrollToNewPage, shown?.page])
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current
     setLoading(true)
     renderSeq.current += 1
+    renderTaskRef.current?.cancel()
+    renderTaskRef.current = null
     const old = pdfRef.current
     pdfRef.current = null
     void old?.loadingTask.destroy()
@@ -282,11 +325,21 @@ function App() {
     if (desc === null) { setLoading(false); setFailure(null); return }
     if (desc.problem) { setLoading(false); setFailure(desc.problem); return }
     if (!desc.token) { setLoading(false); setFailure({ code: 'invalid-token', message: '阅读会话已失效' }); return }
-    const bytes = await api.bytes(desc.token, desc.fingerprint)
-    if (seq !== loadSeq.current) return
-    if (!bytes.ok) { setLoading(false); drop(bytes.problem); return }
-    try {
-      const task = getDocument({
+      /*
+        读文档字节加超时：IPC 不回、主进程卡住时以前会永远停在"正在加载…"，
+        用户既看不到内容也不知道出了什么事。现在超时就明确报错。
+      */
+      const bytes = await Promise.race([
+        api.bytes(desc.token, desc.fingerprint),
+        new Promise<{ ok: false; problem: DocViewProblem }>(resolve => setTimeout(
+          () => resolve({ ok: false, problem: { code: 'timeout', message: '文档内容读取超时（20 秒没响应）' } }),
+          20_000,
+        )),
+      ])
+      if (seq !== loadSeq.current) return
+      if (!bytes.ok) { setLoading(false); drop(bytes.problem); return }
+      try {
+        const task = getDocument({
         data: bytes.bytes,
         BinaryDataFactory: binaryFactory(desc.token),
         useWorkerFetch: false,
@@ -298,7 +351,16 @@ function App() {
         disableAutoFetch: true,
         verbosity: 0,
       })
-      const pdf = await task.promise
+      const pdf = await (async () => {
+        // 解析阶段也要有超时：getDocument 卡死时不能让用户对着"正在加载"干等。
+        const deadline = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('PDF 解析超时（20 秒）')), 20_000))
+        try {
+          return await Promise.race([task.promise, deadline])
+        } catch (error) {
+          void task.destroy()
+          throw error
+        }
+      })()
       if (seq !== loadSeq.current) { void task.destroy(); return }
       pdfRef.current = pdf
       setLoading(false)
@@ -312,17 +374,6 @@ function App() {
       api.report(desc.token, { kind: 'error', message: 'PDF 在阅读视图中无法加载' })
     }
   }, [drop, showPage])
-
-  useEffect(() => {
-    api.onSessionChanged(() => { void load() })
-    api.onCommand((command: DocViewCommand) => {
-      if (command.type === 'status') setStatus(command.status)
-      else if (command.type === 'goto') void showPage(command.anchor.page, { anchor: command.anchor, highlight: command.highlight })
-      // 令牌作废：已加载的文档整份丢掉，显示主进程给出的具体原因（文件变化 / 授权撤销）。
-      else if (command.type === 'invalidated') drop({ ...command.problem, message: `${command.problem.message}；已丢弃页面数据` })
-    })
-    void load()
-  }, [drop, load, showPage])
 
   /** 用户自己翻页：先如实回报（主进程据此判定"已脱离"），再按许可显示。 */
   const flip = useCallback((page: number) => {
@@ -343,6 +394,24 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [flip, shown])
+
+  // 订阅只装一次：load/showPage 的标识会随翻页变化，若把它们放进依赖，
+  // 每次翻页都会重跑 effect → 整份文档重新加载 → 永远"正在加载"，还会并发渲染撞画布。
+  const loadRef = useRef(load)
+  loadRef.current = load
+  const showPageRef = useRef(showPage)
+  showPageRef.current = showPage
+  useEffect(() => {
+    const offSession = api.onSessionChanged(() => { void loadRef.current() })
+    const offCommand = api.onCommand((command: DocViewCommand) => {
+      if (command.type === 'status') setStatus(command.status)
+      else if (command.type === 'goto') void showPageRef.current(command.anchor.page, { anchor: command.anchor, highlight: command.highlight })
+      // 令牌作废：已加载的文档整份丢掉，显示主进程给出的具体原因（文件变化 / 授权撤销）。
+      else if (command.type === 'invalidated') drop({ ...command.problem, message: `${command.problem.message}；已丢弃页面数据` })
+    })
+    void loadRef.current()
+    return () => { offSession(); offCommand() }
+  }, [drop])
 
   const token = descriptor?.token ?? null
   const detached = status?.mode === 'detached'

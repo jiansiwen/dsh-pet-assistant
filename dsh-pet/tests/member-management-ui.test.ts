@@ -23,8 +23,8 @@ function text(node: ReactNode): string {
   return typeof node === 'string' || typeof node === 'number' ? String(node) : ''
 }
 function snapshot(): MemberSnapshot {
-  return { enabled: false, defaultModel: { provider: '主服务商', model: '主模型' }, members: [{ profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', description: '通用研究', persona: '按证据回答',
-    roleId: 'wukong', skinId: 'wukong', voiceProfile: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision: 3, sessionId: '独立会话甲', provider: '', model: '',
+  return { enabled: false, defaultModel: { provider: '主服务商', model: '主模型' }, members: [{ profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', description: '通用研究', persona: '按证据回答',
+    roleId: 'wukong', skinId: 'wukong', voiceProfile: '', voiceDesign: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision: 3, sessionId: '独立会话甲', provider: '', model: '',
     maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 60, totalReserved: 60, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
     requests: [{ requestId: '申请甲', assistantId: '成员甲', reason: '达到阈值', state: 'pending', createdAt: 1, quotaRevision: 9 }] }
@@ -75,7 +75,7 @@ function mount(feedOnly = false) {
     membersState: async () => { reads++; return readResult },
     memberMemories: async () => ({ ok: true, data: { records: [memory] } }),
     memberCommand: async (action: string, input: Record<string, unknown>) => { writes.push({ action, input: structuredClone(input) }); return reply(action) },
-    memberAssist: async () => ({ ok: true, data: { draft: { displayName: 'AI 草稿', description: '', personality: '', permissionMode: 'ask', persona: '', skinId: 'panda', enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai' }, notes: '已填好' } }),
+    memberAssist: async () => ({ ok: true, data: { draft: { displayName: 'AI 草稿', description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', persona: '', skinId: 'panda', enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai' }, notes: '已填好' } }),
     openMemberEditor: async (id: string | null) => { opened.push(id); return { ok: true } },
   } } })
   let feed: Feed

@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS, READ_ONLY_DENY_CANDIDATES } from './gate.ts'
-import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, type MemberDraft, type MemberProfile, type MemberQuotaRequest, type MemberQuotaView } from './member-contract.ts'
+import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberProfile, type MemberQuotaRequest, type MemberQuotaView } from './member-contract.ts'
 import type { MemberConfig, RoleId, ToolPolicy } from './team-domain.ts'
 
 export type { MemberDraft, MemberProfile, MemberQuotaRequest, MemberQuotaView } from './member-contract.ts'
@@ -14,7 +14,7 @@ const MAX = Number.MAX_SAFE_INTEGER
 const SKINS = ['panda', 'girl-glasses', 'boy-glasses']
 
 function defaults(): Extension {
-  return { description: '', personality: '', permissionMode: 'ask', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
+  return { description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceDesign: '', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
     dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai', sessionId: null }
 }
 
@@ -103,7 +103,7 @@ function sameSet(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every(value => b.includes(value))
 }
 function extension(profile: MemberProfile): Extension {
-  return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
+  return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, reportMode: profile.reportMode, speechBy: profile.speechBy, voiceDesign: profile.voiceDesign, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
     capabilities: profile.capabilities, allowedTools: profile.allowedTools, dailyTokenLimit: profile.dailyTokenLimit,
     totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId }
 }
@@ -124,9 +124,15 @@ function normalize(draft: MemberDraft): MemberDraft {
   if (!!text(draft.provider, '模型提供方', 200) !== !!text(draft.model, '模型名称', 200)) throw new Error('模型提供方和模型必须同时填写，或同时留空使用默认模型')
   const permissionMode = draft.permissionMode ?? 'ask'
   if (!MEMBER_PERMISSION_MODES.includes(permissionMode)) throw new Error('权限只能是每次询问、自动审批或完全访问')
+  const reportMode = draft.reportMode ?? 'chief'
+  if (!MEMBER_REPORT_MODES.includes(reportMode)) throw new Error('汇报方式只能由总助理汇报，或由该成员自己汇报')
+  const speechBy = draft.speechBy ?? 'self'
+  if (!MEMBER_SPEECH_BY.includes(speechBy)) throw new Error('语音朗读只能是成员自己读，或由总助理代读')
   return { displayName: text(draft.displayName, '成员名称', 80, true), description: text(draft.description, '职责说明', 4000),
-    personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode,
+    personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode, reportMode, speechBy,
     persona: text(draft.persona, '人设', 16000), skinId, enabled: draft.enabled,
+    voiceProfile: text(draft.voiceProfile ?? '', '音色', 200),
+    voiceDesign: text(draft.voiceDesign ?? '', '音色设计描述', 2000),
     provider: text(draft.provider, '模型提供方', 200), model: text(draft.model, '模型名称', 200),
     maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 131072), capabilities: [...new Set(draft.capabilities)],
     allowedTools: [...new Set(draft.allowedTools)], dailyTokenLimit: integer(draft.dailyTokenLimit, '日额度'),
@@ -204,7 +210,7 @@ export class MemberDirectory {
     const normalized = normalize(draft)
     return this.transaction(() => {
       this.validateUnique(normalized)
-      const profile: MemberProfile = { ...normalized, assistantId: `member-${randomUUID()}`, roleId: 'custom', voiceProfile: '',
+      const profile: MemberProfile = { ...normalized, assistantId: `member-${randomUUID()}`, roleId: 'custom',
         toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 1, sessionId: null }
       this.db.prepare(`INSERT INTO assistants(assistant_id, role_id, display_name, skin_id, persona, voice_profile, tool_policy, enabled, revision)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(profile.assistantId, profile.roleId, profile.displayName, profile.skinId,
@@ -227,8 +233,8 @@ export class MemberDirectory {
         || current.toolPolicy.mode !== 'read-only'
       const next: MemberProfile = { ...current, ...normalized, revision: current.revision + 1,
         toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: permissionsChanged ? null : current.sessionId }
-      const changed = this.db.prepare(`UPDATE assistants SET display_name = ?, skin_id = ?, persona = ?, enabled = ?, tool_policy = ?, revision = ?
-        WHERE assistant_id = ? AND revision = ?`).run(next.displayName, next.skinId, next.persona, Number(next.enabled),
+      const changed = this.db.prepare(`UPDATE assistants SET display_name = ?, skin_id = ?, persona = ?, voice_profile = ?, enabled = ?, tool_policy = ?, revision = ?
+        WHERE assistant_id = ? AND revision = ?`).run(next.displayName, next.skinId, next.persona, next.voiceProfile, Number(next.enabled),
         JSON.stringify(next.toolPolicy), next.revision, id, expectedRevision)
       if (Number(changed.changes) !== 1) throw new Error('成员修订冲突，请刷新后重试')
       this.saveExtra(next)

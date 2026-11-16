@@ -275,6 +275,13 @@ export class BargeInSession {
   }
 
   private onFrame(frame: CaptureFrame): void {
+    /*
+      宠物自己正在朗读时的帧不参与插话判定。
+      以前靠"播报期间不监听"来避，但那有个缝隙：朗读刚结束、扬声器回声还在，
+      这几百毫秒会把残响当成用户开口，于是"叫不停"或者误触发打断。
+      用帧上的实时标记比切状态更准。
+    */
+    if (frame.assistantSpeaking) return
     const handover = this.handover
     if (handover !== null) {
       if (handover.ms < HANDOVER_MAX_MS) {

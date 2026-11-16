@@ -31,7 +31,11 @@ class FakeWorker implements KwsWorkerLike {
   posted: unknown[] = []
   terminated = 0
   private handlers = new Map<string, Array<(value: never) => void>>()
-  postMessage(message: unknown): void { this.posted.push(message) }
+  postMessage(message: unknown): void {
+    this.posted.push(message)
+    // 模拟真 worker：收到 shutdown 后自己退出（优雅退出契约）。
+    if ((message as { type?: string } | null)?.type === 'shutdown') queueMicrotask(() => this.emit('exit', 0))
+  }
   on(event: string, listener: (value: never) => void): unknown {
     this.handlers.set(event, [...(this.handlers.get(event) ?? []), listener])
     return this
@@ -115,7 +119,9 @@ describe('KWS 会话生命周期（假 worker）', () => {
       worker.emit('message', { type: 'wake', keyword: '小潘同学', atMs: 1200 })
       assert.deepEqual(wakes, ['小潘同学'])
       session.stop()
-      assert.equal(worker.terminated, 1)
+      assert.ok(worker.posted.some(m => (m as { type?: string } | null)?.type === 'shutdown'), 'stop 先请 worker 自己退，不强杀原生线程')
+      await tick()
+      assert.equal(worker.terminated, 0, '优雅退出路径不 terminate')
       worker.emit('exit', 1)
       worker.emit('message', { type: 'wake', keyword: '小潘同学', atMs: 1500 })
       assert.deepEqual(lost, [], '自己停的不算丢失')
@@ -174,7 +180,8 @@ describe('KWS 会话生命周期（假 worker）', () => {
       assert.equal(lost.length, 1)
       assert.match(lost[0], /加载失败.*bad model/)
       assert.equal(session.running, false)
-      assert.equal(worker.terminated, 1)
+      assert.ok(worker.posted.some(m => (m as { type?: string } | null)?.type === 'shutdown'))
+      assert.equal(worker.terminated, 0)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 

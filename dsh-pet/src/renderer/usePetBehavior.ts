@@ -217,12 +217,8 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
         const currentLines = linesRef.current
         if (!interactionProtected(interactionRef.current) && !optionsRef.current.sceneBound && !inActivity && !walking && !oneShotPlaying) {
           if (optionsRef.current.working) {
-            const act = pick(['write', 'read'] as PetAction[])
-            if (act === 'read') startActivity('read', 6400, 6400)
-            else {
-              const writeMs = Math.random() < 0.5 ? 3000 : 4500
-              startActivity('write', writeMs, writeMs)
-            }
+            // 工作期间只循环 write：read 是休闲动作，混进来就成了"一边干活一边摸鱼"。
+            startActivity('write', 6000, 9000)
             if (Math.random() < 0.3) chatter(pick(currentLines.work))
           } else if (optionsRef.current.randomActions) {
             // 用户勾选了随机动作：只从勾选集合里挑；没勾选任何动作就安静站着。

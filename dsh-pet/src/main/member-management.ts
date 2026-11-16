@@ -60,11 +60,11 @@ function uuid(value: unknown): string {
 export function memberPathIdentifier(value: unknown): string {
   return encodeURIComponent(identifier(value)).replace(/[!'()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
 }
-const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'persona', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone']
+const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'reportMode', 'speechBy', 'persona', 'voiceProfile', 'voiceDesign', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone']
 function draft(value: RecordValue, writing = false): MemberDraft {
   const next: MemberDraft = {
     displayName: text(value.displayName, 80), description: text(value.description, 2000), personality: text(value.personality, 2000),
-    permissionMode: choice(value.permissionMode, ['ask', 'auto', 'full']), persona: text(value.persona, 8000),
+    permissionMode: choice(value.permissionMode, ['ask', 'auto', 'full']), reportMode: choice(value.reportMode ?? 'chief', ['chief', 'self']), speechBy: choice(value.speechBy ?? 'self', ['self', 'chief']), persona: text(value.persona, 8000), voiceProfile: text(value.voiceProfile, 200), voiceDesign: text(value.voiceDesign, 2000),
     skinId: text(value.skinId, 128), enabled: bool(value.enabled), provider: text(value.provider, 128), model: text(value.model, 256),
     maxTokens: integer(value.maxTokens, 1, 131072), capabilities: list(value.capabilities, item => choice(item, MEMBER_CAPABILITIES)),
     allowedTools: list(value.allowedTools, item => text(item, 128)), dailyTokenLimit: integer(value.dailyTokenLimit),
@@ -142,7 +142,7 @@ export function projectMemberState(value: unknown): MemberSnapshot {
       const view = record(item), p = record(view.profile), q = record(view.quota), policy = record(p.toolPolicy)
       const profile: MemberProfile = {
         ...draft(p), assistantId: identifier(p.assistantId), roleId: choice(p.roleId, ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma', 'custom']),
-        voiceProfile: text(p.voiceProfile), toolPolicy: { mode: choice(policy.mode, ['read-only', 'side-effect']), denyTools: list(policy.denyTools, item => text(item)) },
+        voiceProfile: text(p.voiceProfile), voiceDesign: text(p.voiceDesign), toolPolicy: { mode: choice(policy.mode, ['read-only', 'side-effect']), denyTools: list(policy.denyTools, item => text(item)) },
         revision: integer(p.revision), sessionId: p.sessionId === null ? null : text(p.sessionId),
       }
       return { profile, busy: bool(view.busy), quota: {
@@ -193,8 +193,18 @@ function publicImpact(value: unknown, depth = 0): unknown {
 }
 interface Parsed { action: MemberAction; path: string; body: RecordValue; id?: string; memoryId?: string; requestId?: string; analysisId?: string; intentId?: string; channelId?: string }
 function parseCommand(action: unknown, raw: unknown): Parsed {
-  const a = choice(action, ['create', 'update', 'mode', 'delete', 'reset-quota', 'decide-request', 'ack-mail-notice', 'ack-mail-send', 'ack-channel-inbound', 'memory-create', 'memory-update', 'memory-confirm', 'memory-delete-preview', 'memory-delete'] as const)
+  const a = choice(action, ['create', 'update', 'mode', 'delete', 'reset-quota', 'decide-request', 'ack-mail-notice', 'ack-mail-send', 'ack-channel-inbound', 'memory-create', 'memory-update', 'memory-confirm', 'memory-delete-preview', 'memory-delete', 'share-memory'] as const)
   const input = record(raw)
+  /*
+   * 记忆共享开关：它不属于任何成员，所以必须在下面那句 `identifier(input.id)` 之前拦掉
+   * （那一句要求每个动作都带成员 id）。共享是"总助理 → 所有子助理"的全局投影，
+   * 不是对某一个成员的写入。
+   */
+  if (a === 'share-memory') {
+    keys(input, ['memoryId', 'shared'])
+    return { action: a, path: '/companion/v1/memories/shared',
+      body: { memoryId: identifier(input.memoryId), shared: bool(input.shared) } }
+  }
   if (a === 'ack-channel-inbound') {
     keys(input, ['id', 'expectedRevision'])
     const channelId = uuid(input.id)
@@ -239,8 +249,12 @@ function parseCommand(action: unknown, raw: unknown): Parsed {
   }
   const id = identifier(input.id), base = `${ROOT}/${memberPathIdentifier(id)}`
   if (a === 'delete') {
-    keys(input, ['id', 'expectedRevision'])
-    return { action: a, id, path: `${base}/delete`, body: { expectedRevision: integer(input.expectedRevision, 1) } }
+    keys(input, ['id', 'expectedRevision', 'purgeMemory'])
+    return { action: a, id, path: `${base}/delete`, body: {
+      expectedRevision: integer(input.expectedRevision, 1),
+      // 可选：连它的独立记忆一起删。不传 = 只删成员，记忆留着。
+      ...(input.purgeMemory === undefined ? {} : { purgeMemory: input.purgeMemory === true }),
+    } }
   }
   if (a === 'reset-quota') {
     keys(input, ['id', 'expectedQuotaRevision', 'scope'])
@@ -273,12 +287,19 @@ const messages: Record<string, string> = {
   invalid_response: '服务回包不完整，请刷新核对，不会自动重发。', preview_required: '请重新预览删除影响，再确认删除。',
   assist_failed: '这次没有生成可用配置，请换一种说法再试，或直接在下面填写。',
 }
-function parseAssist(raw: unknown): { request: string; current?: MemberDraft } {
+function parseAssist(raw: unknown): { request: string; current?: MemberDraft; model?: { provider: string; model: string } } {
   const input = record(raw)
-  keys(input, ['request', 'current'])
+  keys(input, ['request', 'current', 'model'])
   const request = text(input.request, 4000).trim()
   if (!request) throw new Error('invalid_input')
-  return { request, ...(input.current === undefined ? {} : { current: draft(record(input.current)) }) }
+  let model: { provider: string; model: string } | undefined
+  if (input.model !== undefined) {
+    const m = record(input.model)
+    const provider = text(m.provider, 128).trim()
+    const name = text(m.model, 256).trim()
+    if (provider && name) model = { provider, model: name }
+  }
+  return { request, ...(input.current === undefined ? {} : { current: draft(record(input.current)) }), ...(model ? { model } : {}) }
 }
 function failure(code: string): MemberResult { return { ok: false, error: { code, message: messages[code] ?? messages.unavailable! } } }
 /**
@@ -396,7 +417,8 @@ export function registerMemberManagement(options: Options): () => void {
         previews.delete(String(command.body.previewId))
       }
       const labels: Record<MemberAction, string> = { create: '创建成员', update: '修改成员', mode: '切换团队模式', delete: '删除成员', 'reset-quota': '重置额度用量', 'decide-request': '决定额度申请', 'ack-mail-notice': '核对邮件通知', 'ack-mail-send': '核对邮件发送', 'ack-channel-inbound': '核查渠道消息',
-        'memory-create': '本人确认新增记忆', 'memory-update': '修改记忆', 'memory-confirm': '本人确认记忆', 'memory-delete-preview': '预览删除', 'memory-delete': '删除记忆' }
+        'memory-create': '本人确认新增记忆', 'memory-update': '修改记忆', 'memory-confirm': '本人确认记忆', 'memory-delete-preview': '预览删除', 'memory-delete': '删除记忆',
+  'share-memory': '把这条记忆共享给所有子助理' }
       const target = channelIssue ? `渠道消息（${channelIssue.msgid}）` : mailNotice ? `邮件通知（${mailNotice.analysisId}）` : mailSend ? `邮件发送（${mailSend.intentId}）` : member ? `${member.profile.displayName}（${member.profile.assistantId}）` : command.action === 'create' ? `${command.body.displayName}（新成员）` : '整个团队'
       // 正文包含完整精确字段；输入来自严格白名单，无凭据字段。确认期间使用冻结副本，不读取渲染器的新值。
       const processingLabel = { 'not-started': '未开始', running: '处理中', done: '处理流程已返回', unknown: '结果未知' }

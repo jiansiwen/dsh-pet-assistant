@@ -341,10 +341,12 @@ export class PdfViewWindow implements DocViewTarget {
     if (this.ipcRegistered) return
     this.ipcRegistered = true
     ipcMain.handle(DOC_VIEW_CHANNELS.session, (event): DocViewDescriptor | null => {
+      console.log('[dsh-pet] doc-view session request, allowed=', this.allowed(event))
       if (!this.allowed(event)) return null
       return this.descriptor()
     })
     ipcMain.handle(DOC_VIEW_CHANNELS.bytes, async (event, token: unknown, fingerprint: unknown): Promise<DocViewBytes> => {
+      console.log('[dsh-pet] doc-view bytes request')
       if (!this.allowed(event)) return { ok: false, problem: problem('invalid-token') }
       const check = await this.grants.check(token, fingerprint)
       if (!check.ok) {
@@ -427,6 +429,11 @@ export class PdfViewWindow implements DocViewTarget {
       height: this.height,
       title: '阅读视图',
       show: false,
+      /*
+        讲解是要"看着讲"的：窗口自己置顶并在显示时最大化。
+        以前它按普通窗口弹出来，被别的窗口压住、也没铺开，用户得手动点一次才能看见。
+      */
+      alwaysOnTop: true,
       autoHideMenuBar: true,
       webPreferences: {
         preload: this.preloadPath,
@@ -462,7 +469,10 @@ export class PdfViewWindow implements DocViewTarget {
     })
     win.once('ready-to-show', () => {
       win.webContents.send(DOC_VIEW_CHANNELS.sessionChanged)
-      win.show()
+      /* 讲解一开始就铺满屏幕并抢到最前面，不再让用户手动点一下。 */
+    win.maximize()
+    win.show()
+    win.focus()
     })
     void win.loadFile(this.pagePath).catch(error => {
       console.log('[dsh-pet] 阅读视图页面加载失败:', error instanceof Error ? error.message : String(error))

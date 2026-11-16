@@ -31,17 +31,46 @@
  * section 模板——那是跨模块改动，本期刻意不做。**这是已知项，不是遗漏。**
  */
 
-/** 最多注入几条：再多就变成"把今天的时间线整个贴进提示词"，反而淹没当前任务。 */
-export const WORK_CONTEXT_LIMIT = 3
+/** 最多注入几条：再多就变成"把这一周的时间线整个贴进提示词"，反而淹没当前任务。 */
+export const WORK_CONTEXT_LIMIT = 5
 
-/** 时间窗：24 小时。跨天问"昨天下午那个"够用，又不至于把上周的事当"最近"。 */
-export const WORK_CONTEXT_WINDOW_MS = 24 * 60 * 60 * 1000
+/**
+ * 时间窗：7 天。
+ *
+ * 原来是 24 小时 —— 周一早上问"上周五那个"就已经落在窗外了，而这恰恰是最常被问的一句。
+ * 放到 7 天覆盖一个完整工作周；再长会把上个月的事当成"刚才那个"，
+ * 而 5 条上限会让旧事把新事挤出去。长期项目该走项目记忆，不该靠这个滚动窗口硬撑。
+ */
+export const WORK_CONTEXT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 
 /**
  * 段落抬头。明说"只是背景，不是本轮任务"：否则模型容易把这几条当成用户当前指令，
  * 自作主张去"继续"一件用户根本没提的事，或者把背景当成果汇报出来。
  */
-export const WORK_CONTEXT_HEADER = '以下是最近 24 小时的工作事项（只是背景，不是本轮任务）：'
+export const WORK_CONTEXT_HEADER = '以下是最近 7 天的工作事项（只是背景，不是本轮任务）：'
+
+/** 最近产物的抬头。与工作事项分开，是因为它回答的是"东西在哪"，不是"做了什么"。 */
+export const ARTIFACT_CONTEXT_HEADER = '以下是最近产出过的文件（只是位置索引，不代表内容还对；用到了就照实引用路径）：'
+
+/** 注入需要的最小产物形状；只要路径与标签，不把摘要和状态塞进提示词。 */
+export interface ArtifactContextItem {
+  path: string
+  label: string
+}
+
+/**
+ * 渲染"最近产物"段落。
+ *
+ * 上限 5 条、只给路径 + 标签：这是**指针**，不是正文。
+ * 把它压成一行一条，是为了让"上次那个文件在哪"能被一眼答出来，
+ * 同时不给上下文塞进五份文件内容。
+ */
+export function buildArtifactContext(items: readonly ArtifactContextItem[], limit = 5): string {
+  const picked = items.filter(item => item && typeof item.path === 'string' && item.path.trim() !== '').slice(0, Math.max(0, limit))
+  if (picked.length === 0) return ''
+  const lines = picked.map(item => `- ${collapse(item.label) || '产物'}：${collapse(item.path)}`)
+  return `${ARTIFACT_CONTEXT_HEADER}\n${lines.join('\n')}`
+}
 
 export interface WorkContextOptions {
   /** 当前时刻（毫秒）。由调用方传入，函数内不读时钟，保证可复现。 */

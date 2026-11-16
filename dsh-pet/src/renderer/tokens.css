@@ -1,0 +1,123 @@
+/*
+ * 设计令牌（唯一真源）。
+ *
+ * 存在的理由：改版之前，渲染层 15 个 CSS 文件里有 279 种不同的十六进制颜色、495 处使用；
+ * 圆角出现 6/8/9/10/12/14px 六种（9px 这种值只可能是手调的）；字号 207 处声明里 169 处 ≤13px。
+ * 那不是"风格不统一"，是**根本没有系统**——每个窗口各写各的。
+ *
+ * 这一层只定义值，不定义用法。用法在 settings-surface.css 及各面板里，必须引用这里的变量，
+ * 不允许再写字面量颜色。新增颜色前先问：能不能用现有的某一档。
+ *
+ * 取向「纸与靛」：纸白发丝线是底，墨是字，靛是唯一的强调色。只有一件事配用强调色——
+ * 「需要你点头」。产品全部的重量都在这个动作上（不擅自动手），所以颜色也只花在这里。
+ */
+
+:root {
+  /* —— 纸面：三层，靠明度区分层级，不靠描边 —— */
+  --paper: #fbfaf7;
+  --paper-raised: #ffffff;
+  --paper-sunken: #f3f1eb;
+  --paper-hover: #f0eee7;
+
+  /* —— 墨：四级，按信息重要性分配 —— */
+  --ink: #16161a;
+  --ink-2: #3c3c43;
+  --ink-3: #6a6a72;
+  --ink-4: #9b9ba2;
+
+  /* —— 线与边界 —— */
+  --rule: #e6e4dd;
+  --rule-strong: #d3d0c7;
+
+  /* —— 唯一强调色：靛。选中、链接、确认。不用于装饰 —— */
+  --indigo: #2c4470;
+  --indigo-hover: #23375c;
+  --indigo-wash: #eef1f7;
+  /* 深色面上的同族亮色：靛在近黑底子上会糊没，导航选中态要用提亮的一档。 */
+  --indigo-lift: #8ea8d8;
+
+  /*
+   * 深色导航栏。
+   *
+   * 为什么不跟内容区同色：一列浅灰按钮压在浅灰底上，层次只能靠描边，而描边越细越像"没画完"。
+   * 深色栏一次给出三件事——**分界**（不用画线）、**纵深**（内容像浮在上面）、**品牌**（黑与白正是熊猫）。
+   */
+  --rail: #17171b;
+  --rail-line: rgba(255, 255, 255, .07);
+  --rail-text: rgba(255, 255, 255, .70);
+  --rail-text-dim: rgba(255, 255, 255, .34);
+  --rail-hover: rgba(255, 255, 255, .07);
+  --rail-active: rgba(255, 255, 255, .13);
+
+  /* —— 危险：只在"确认删除"这类不可撤销动作上出现，且要 hover 才显色 —— */
+  --danger: #9b3b33;
+  --danger-wash: #faf1ef;
+
+  /*
+   * 状态色：只表达事实（能用/要处理/用不了），不做装饰。
+   * 用低饱和的绿与琥珀——纯红绿在高饱和下会把整页读成告警面板。
+   */
+  --win-green: #3f7a5c;
+  --win-green-ink: #2f6a4d;
+  --win-green-wash: #eaf2ed;
+  --win-amber: #b07a25;
+  --win-amber-ink: #8a5f1c;
+  --win-amber-wash: #f8f1e4;
+
+  /* —— 字体：Win11 的 Segoe UI Variable 比微软雅黑 UI 细一档，也更中性 —— */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei UI",
+    "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --font-num: "Segoe UI Variable Text", "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
+
+  /* —— 字号阶梯：六档，够用且不再加 —— */
+  --t-xs: 11px;      /* 角标、极次要 */
+  --t-sm: 12.5px;    /* 分节标题、说明 */
+  --t-base: 13.5px;  /* 正文与控件 */
+  --t-md: 15px;      /* 卡片标题 */
+  --t-lg: 17px;      /* 页面组标题 */
+  --t-xl: 21px;      /* 页面标题 */
+
+  /* —— 行高：中文正文需要比拉丁文更松 —— */
+  --lh-tight: 1.35;
+  --lh-base: 1.75;
+  --lh-loose: 1.9;
+
+  /* —— 间距：4 的倍数，八档 —— */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 40px;
+
+  /* —— 圆角：按层级分，不是"全部 12px" —— */
+  --r-control: 8px;  /* 按钮、输入、行内小件 */
+  --r-surface: 12px; /* 凹陷区块 */
+  --r-panel: 16px;   /* 浮层本身 */
+  --r-pill: 999px;
+
+  /* —— 阴影：分层的、带墨色倾向的；不是一层 rgba(0,0,0,.1) —— */
+  --e-1: 0 1px 2px rgba(22, 22, 26, .05), 0 0 0 1px rgba(22, 22, 26, .04);
+  --e-2: 0 2px 6px rgba(22, 22, 26, .06), 0 8px 24px -12px rgba(22, 22, 26, .18);
+  --e-3: 0 2px 8px rgba(22, 22, 26, .06), 0 16px 48px -16px rgba(22, 22, 26, .28);
+
+  /* —— 动效：只用来解释"发生了什么"，不做装饰 —— */
+  --ease: cubic-bezier(.22, .61, .36, 1);
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --dur-3: 320ms;
+}
+
+/*
+ * 减弱动效：整层关闭。
+ * 不是"把时长调成 1ms"——某些系统设置下 1ms 仍会触发重排。直接 none。
+ */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+    --dur-3: 0ms;
+  }
+}

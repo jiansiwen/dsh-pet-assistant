@@ -35,6 +35,13 @@ export interface CaptureFrame {
   readonly durationMs: number
   /** 这一帧之前有缺口：中间那段是真没采到，不是静音。 */
   readonly gapBefore: boolean
+  /**
+   * 这一帧是不是落在"宠物自己在说话"的区间里。
+   *
+   * 扬声器放出来的朗读会被麦克风收回去；录音要保留它（现场的一部分），
+   * 但 ASR 与唤醒不能把它当成用户在说话。实时标记比事后按时间区间猜更准。
+   */
+  readonly assistantSpeaking: boolean
   /** 线性 RMS，给各个检测器用，免得每个消费者各算一遍。 */
   readonly rms: number
 }
@@ -71,6 +78,14 @@ export interface SubscribeRequest {
   /** 需要预滚动缓冲（插话检测：检出点之前的话头要交给听写）。 */
   readonly preroll?: boolean
 }
+
+/**
+ * 偏差超过这个值才算"真的丢了音频"。
+ *
+ * 主线程被模型请求、合成、GC 占住时，回调会晚到几十到几百毫秒，但样本一个不少，
+ * 那是时序抖动。只有偏离到这个量级，才可能是设备暂停或休眠真的丢了内容。
+ */
+const GAP_HARD_MS = 600
 
 export class CaptureError extends Error {
   readonly code: 'not-authorized' | 'unavailable' | 'denied' | 'not-found' | 'failed'
@@ -214,6 +229,14 @@ export class AudioCaptureService {
   private readonly lingerMs: number
   private readonly frameSize: number
   private readonly prerollMaxMs: number
+  /** 宠物此刻是否在朗读（由 speech-state 实时驱动）。 */
+  private assistantSpeaking = false
+
+  /** 主进程播报开始/结束时调用；只影响帧标记，不关设备、不影响录音。 */
+  setAssistantSpeaking(speaking: boolean): void {
+    this.assistantSpeaking = speaking
+  }
+
   private readonly gapToleranceMs: number
 
   private readonly grants = new Map<CaptureConsumerKind, string | true>()
@@ -487,11 +510,21 @@ export class AudioCaptureService {
       device.firstFrameAtMs = observedStart
     } else {
       const expected = device.anchorMs + (device.samplesSinceAnchor / rate) * 1000
-      if (Math.abs(observedStart - expected) > this.gapToleranceMs) {
-        // 主线程卡顿丢了回调、设备暂停、休眠：从现在重新起算，中间是缺口。
+      const drift = Math.abs(observedStart - expected)
+      if (drift > this.gapToleranceMs) {
+        /*
+          回调时刻偏离预期，分两种情况，**不能一律当缺口**：
+
+          - 主线程被占（模型请求、合成、GC）导致回调晚到：样本一个没少，
+            只是"什么时候交上来"晚了。这是时序抖动，不是丢音频。
+          - 真的丢了：偏离大到超出任何合理抖动。
+
+          以前只要偏离就记缺口，结果录音期间随便一次卡顿就把整段标成"不完整"，
+          还会弹窗刷屏。现在小抖动只重新起算，超过硬阈值才算缺口。
+        */
         device.anchorMs = observedStart
         device.samplesSinceAnchor = 0
-        gapBefore = true
+        if (drift > GAP_HARD_MS) gapBefore = true
       }
     }
     if (gapBefore) this.gaps++
@@ -500,6 +533,7 @@ export class AudioCaptureService {
     const samples = new Float32Array(data)
     const frame: CaptureFrame = {
       seq: this.nextSeq++, session: device.session, sampleRate: rate, samples, atMs, durationMs, gapBefore, rms: frameRms(samples),
+      assistantSpeaking: this.assistantSpeaking,
     }
     this.framesTotal++
     if ([...this.subs.values()].some(sub => sub.preroll)) this.pushRing(frame)
@@ -621,7 +655,15 @@ export function browserCaptureDeps(): CaptureDeps {
 }
 
 export function sharedCapture(): AudioCaptureService {
-  if (shared === null) shared = new AudioCaptureService(browserCaptureDeps())
+  if (shared === null) {
+    shared = new AudioCaptureService(browserCaptureDeps())
+    /*
+      把"宠物此刻在朗读"接进来：帧带上标记，ASR 与唤醒据此跳过这些区间。
+      订阅失败不影响采集本身 —— 老壳没有这条推送时，只是没有标记而已。
+    */
+    const api = (globalThis as { petApi?: { onSpeechState?: (cb: (status: { speaking: boolean }) => void) => () => void } }).petApi
+    try { api?.onSpeechState?.(status => shared?.setAssistantSpeaking(status.speaking === true)) } catch { /* 没有推送就不标记 */ }
+  }
   return shared
 }
 

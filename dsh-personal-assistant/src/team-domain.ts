@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import type { MailSuggestion } from './mail-suggestions.ts'
 import type { CompanionBlocker, CompanionCommand, CompanionHttpResult, CompanionInput, CompanionTaskKind, DesktopReminderDelivery, ReminderSchedule } from './companion-contract.ts'
 import { MemberDirectory, migrateMemberDirectory } from './member-directory.ts'
 
@@ -137,8 +138,10 @@ export interface CompanionContextRecord {
  * v11：邮件分析通知的桌面领取、回执与结果不明状态。
  * v12：邮件发送意图、服务回执及人工核对状态。
  * v13：渠道消息执行与回复的持久状态，不保存消息正文。
+ * v14：待办优先级与来源列（仅新建库走到）。
+ * v15：老库按列名补 tasks.priority/source——v14 的补列被版本闸门挡住，老库永远走不到。
  */
-export const TEAM_SCHEMA_VERSION = 14
+export const TEAM_SCHEMA_VERSION = 15
 
 export interface ChannelInboundRecord {
   id: string
@@ -198,6 +201,11 @@ export interface MailWatchAnalysis {
   memberId: string
   uids: number[]
   result: string
+  /**
+   * 结构化建议。空数组表示这次分析只给了文字摘要（模型没按格式回），
+   * 而不是"没有邮件需要处理" —— 后者会是一条 `kind: 'none'` 的建议。
+   */
+  suggestions: MailSuggestion[]
   createdAt: number
   notifiedAt: number | null
 }
@@ -635,6 +643,20 @@ function bool(value: boolean): number {
 
 function json(value: unknown): string {
   return JSON.stringify(value ?? null)
+}
+
+/**
+ * 读回存着的结构化建议。任何解析失败都退成空数组而不是抛错：
+ * 一条建议坏了不该让整条通知读不出来 —— 摘要仍然要能送到用户眼前。
+ */
+function parseStoredSuggestions(raw: unknown): MailSuggestion[] {
+  if (raw === null || raw === undefined || raw === '') return []
+  try {
+    const parsed = JSON.parse(String(raw)) as unknown
+    return Array.isArray(parsed) ? parsed as MailSuggestion[] : []
+  } catch {
+    return []
+  }
 }
 
 /** action_proposals 行 → ActionProposal。getProposal / listProposals / findGateProposal 共用一份映射。 */
@@ -1247,6 +1269,18 @@ export class TeamStore {
         PRIMARY KEY(principal_id, device_id, meeting_id, item_id)
       );
     `)
+    /*
+     * 邮件分析的结构化建议：老库没有这一列，用 PRAGMA + ALTER 幂等补上。
+     *
+     * **必须放在建表之后**：放在 migrateMemberDirectory 后面会先于 mail_watch_analyses 建表，
+     * 新库上 PRAGMA 查不到表、ALTER 直接报 "no such table"，整个插件起不来。
+     * 默认 '[]' 表示"这次分析只给了文字摘要"，与"给了一条空建议"不是一回事。
+     */
+    {
+      const columns = (this.db.prepare('PRAGMA table_info(mail_watch_analyses)').all() as Array<Record<string, unknown>>)
+        .map(row => String(row.name))
+      if (!columns.includes('suggestions')) this.db.exec("ALTER TABLE mail_watch_analyses ADD COLUMN suggestions TEXT NOT NULL DEFAULT '[]'")
+    }
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
       .prepare('INSERT OR IGNORE INTO migrations (version, applied_at) VALUES (?, ?)')
@@ -2432,13 +2466,15 @@ export class TeamStore {
 
   /** 分析成功与待通知一起落库；通知失败或重启不能让已完成分析再次花费额度。 */
   completeMailWatchAnalysis(scopeId: string, memberId: string,
-    messages: readonly { uid: number; sourceDigest: string; truncated: boolean }[], result: string, at: number): MailWatchAnalysis {
+    messages: readonly { uid: number; sourceDigest: string; truncated: boolean }[], result: string, at: number,
+    suggestions: readonly MailSuggestion[] = []): MailWatchAnalysis {
     if (!result.trim() || messages.length === 0) throw new Error('不能保存空邮件分析')
     return this.transaction(() => {
       const analysis: MailWatchAnalysis = { analysisId: randomUUID(), scopeId, memberId,
-        uids: messages.map(message => message.uid), result, createdAt: at, notifiedAt: null }
-      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)`).run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result, at)
+        uids: messages.map(message => message.uid), result, suggestions: [...suggestions], createdAt: at, notifiedAt: null }
+      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, suggestions, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result,
+        json(analysis.suggestions), at)
       const update = this.db.prepare(`UPDATE mail_watch_messages SET state = 'analyzed', analysis_id = ?,
         source_digest = ?, truncated = ?, detail = NULL WHERE scope_id = ? AND uid = ? AND state = 'pending'`)
       for (const message of messages) {
@@ -2457,7 +2493,8 @@ export class TeamStore {
         WHERE d.analysis_id = mail_watch_analyses.analysis_id AND d.state != 'pending'))
       ORDER BY created_at, rowid LIMIT ?`).all(scopeId, deliverableOnly ? 1 : 0, limit) as Row[]
     return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), createdAt: Number(row.created_at), notifiedAt: null }))
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at), notifiedAt: null }))
   }
 
   markMailWatchNotified(analysisId: string, at: number): void {
@@ -2474,7 +2511,8 @@ export class TeamStore {
       WHERE s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL AND (d.analysis_id IS NULL OR d.state = 'pending')
       ORDER BY a.created_at, a.rowid LIMIT ?`).all(accountKey, memberId, limit) as Row[]
     return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), createdAt: Number(row.created_at), notifiedAt: null }))
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at), notifiedAt: null }))
   }
 
   mailNoticeAttention(accountKey: string, memberId: string | null, limit = 20): MailNoticeAttention[] {

@@ -691,6 +691,7 @@ parentPort.once('message', (msg) => {
     parentPort.postMessage({ ok: false, stage: 'process', error: String((error && error.message) || error) })
   }
 })
+parentPort.on('message', (m) => { if (m && m.type === 'shutdown') parentPort.close() })
 `
 
 /**
@@ -713,7 +714,12 @@ function runInWorker(samples: Float32Array, config: OfflineSpeakerDiarizationCon
       if (settled) return
       settled = true
       clearTimeout(timer)
-      void worker.terminate().catch(() => undefined)
+      // 超时路径上 worker 可能还在原生分人里：先请它自己退，兜底 terminate 延后，
+      // 避免强杀原生线程崩掉整个进程。
+      try { worker.postMessage({ type: 'shutdown' }) } catch { /* 已退出 */ }
+      const fallback = setTimeout(() => { void worker.terminate().catch(() => undefined) }, 3000)
+      fallback.unref?.()
+      worker.on('exit', () => clearTimeout(fallback))
       resolve(outcome)
     }
     const timer = setTimeout(() => done({ ok: false, stage: 'timeout', error: `分人超过 ${Math.round(timeoutMs / 1000)} 秒没有完成` }), timeoutMs)
