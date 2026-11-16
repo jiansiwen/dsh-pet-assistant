@@ -10,6 +10,8 @@ import { digestOf, type ApprovalService, type ApprovalWaitOutcome, type GateCall
 export const DELEGATION_TOOL_CANDIDATES = [
   'subagent', 'subagent_fork', 'workflow', 'ralph', 'send_message', 'interrupt_agent',
   'task', 'agent', 'delegate', 'desktop_team_assign', 'desktop_team_start',
+  // 子助理分派工具（AI 智能体接入，设计 4.4.5 防环第 1 层）：子代理自身层不可再委派。
+  'personal_assistant_dispatch_subassistant',
 ]
 export const SIDE_EFFECT_TOOL_CANDIDATES = [
   'bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'skill', 'job_kill',

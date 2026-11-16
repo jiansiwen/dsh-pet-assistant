@@ -7,6 +7,13 @@ import type { CompanionHttpResult } from './companion-contract.ts'
 
 const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
 const limit = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+/** 子助理绑定（桥上白名单形状；https/回环等深度校验在 member-directory.normalizeBinding）。 */
+const binding = z.union([
+  z.object({ kind: z.literal('platform'), endpoint: z.string().trim().min(1).max(2048),
+    model: z.string().trim().min(1).max(256), secretId: z.string().max(100).default('') }).strict(),
+  z.object({ kind: z.literal('local-cli'), command: z.string().trim().min(1).max(2048),
+    args: z.array(z.string().min(1).max(1024)).max(32).default([]) }).strict(),
+])
 const draft = z.object({
   displayName: z.string().trim().min(1).max(80), description: z.string().trim().max(2000),
   personality: z.string().max(2000).default(''), permissionMode: z.enum(MEMBER_PERMISSION_MODES).default('ask'),
@@ -15,6 +22,11 @@ const draft = z.object({
   maxTokens: z.number().int().min(1).max(32768), capabilities: z.array(z.enum(MEMBER_CAPABILITIES)).max(MEMBER_CAPABILITIES.length),
   allowedTools: z.array(z.string().min(1).max(100)).max(100), dailyTokenLimit: limit, totalTokenLimit: limit,
   thresholdPercent: z.number().min(1).max(100), timezone: z.string().min(1).max(100),
+  kind: z.enum(['expert', 'platform', 'local-cli']).default('expert'),
+  reportMode: z.enum(['chief', 'self']).default('chief'),
+  binding: binding.nullish(),
+  /** 平台密钥只在桥上一程（编辑器→插件），随即入加密存储，绝不回显、不入快照。 */
+  apiKey: z.string().min(1).max(4096).optional(),
 }).strict()
 const reset = z.enum(['daily', 'total', 'both'])
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject']), expectedQuotaRevision: revision,
@@ -38,6 +50,8 @@ export class MemberManagement {
     channelInboundAttention?(): NonNullable<MemberSnapshot['channelInboundAttention']>
     acknowledgeChannelInbound?(id: string, expectedRevision: number): boolean
     assistant?: { draft(input: { request: string; current?: MemberDraft }): Promise<{ draft: MemberDraft; notes: string }> }
+    /** 子助理密钥存储（AI 智能体接入）：apiKey 在桥上换 secretId 后即销毁；删除成员时尽力清理密钥条目。 */
+    secrets?: { save(input: { id?: string; apiKey: string }): { id: string }; remove?(id: string): void }
   }
   constructor(options: MemberManagement['options']) { this.options = options }
   snapshot(): MemberSnapshot {
@@ -69,6 +83,18 @@ export class MemberManagement {
   private idle(id: string): void {
     if (!this.options.directory.get(id)) throw new Error('智能体不存在')
     if (this.options.runtime.busy(id)) throw new Error('该智能体正在工作，请任务结束后修改')
+  }
+  /** 密钥只在桥上一程：apiKey 随即入加密存储换成 secretId，此后草稿与快照只携带标识。 */
+  private settle(input: z.infer<typeof draft>): MemberDraft {
+    const { apiKey, binding: bound, ...rest } = input
+    if (apiKey !== undefined && input.kind !== 'platform') throw new Error('只有平台子助理需要配置 API 密钥')
+    if (input.kind === 'expert') return { ...rest, binding: null }
+    if (!bound) throw new Error('子助理必须配置外部绑定（平台端点或本地工具命令）')
+    if (bound.kind === 'platform' && apiKey !== undefined) {
+      if (!this.options.secrets) throw new Error('子助理密钥存储未装配，无法保存 API 密钥')
+      bound.secretId = this.options.secrets.save({ id: bound.secretId !== '' ? bound.secretId : undefined, apiKey }).id
+    }
+    return { ...rest, binding: bound }
   }
   async request(method: string, pathname: string, raw: unknown): Promise<CompanionHttpResult> {
     const { directory, memories } = this.options
@@ -121,7 +147,7 @@ export class MemberManagement {
         return { status: 200, body: result }
       }
       if (method !== 'POST') return { status: 404, body: { code: 'NOT_FOUND', message: '成员接口不存在' } }
-      if (pathname === '/companion/v1/members') directory.create(draft.parse(raw) as MemberDraft)
+      if (pathname === '/companion/v1/members') directory.create(this.settle(draft.parse(raw)))
       else if (pathname === '/companion/v1/members/mode') {
         const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(raw)
         if (this.options.runtime.busy()) throw new Error('还有成员正在工作，不能切换团队模式')
@@ -149,12 +175,17 @@ export class MemberManagement {
             if (input.purgeMemory) throw new Error('独立记忆已清除，但成员未能删除；请刷新后重试删除')
             throw error
           }
+          // 密钥条目尽力清理：失败不阻塞删除（孤儿条目占上限但不影响正确性）。
+          const bound = profile.binding
+          if (this.options.secrets?.remove && bound && bound.kind === 'platform' && bound.secretId !== '') {
+            try { this.options.secrets.remove(bound.secretId) } catch { /* 密钥条目清理失败不影响成员删除 */ }
+          }
         } else if (update) {
           const id = update[1]
           this.idle(id)
           if (update[2] === 'update') {
             const { expectedRevision, ...input } = draft.extend({ expectedRevision: revision }).strict().parse(raw)
-            directory.update(id, expectedRevision, input as MemberDraft)
+            directory.update(id, expectedRevision, this.settle(input))
           } else {
             const input = z.object({ expectedQuotaRevision: revision, scope: reset }).strict().parse(raw)
             directory.resetQuota(id, input.expectedQuotaRevision, input.scope)

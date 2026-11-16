@@ -131,8 +131,9 @@ export interface CompanionContextRecord {
  * v11：邮件分析通知的桌面领取、回执与结果不明状态。
  * v12：邮件发送意图、服务回执及人工核对状态。
  * v13：渠道消息执行与回复的持久状态，不保存消息正文。
+ * v15：子助理分派账本（subassistant_runs）——先落账再执行，回执驱动状态推进；不保存任务正文，仅存摘要。
  */
-export const TEAM_SCHEMA_VERSION = 14
+export const TEAM_SCHEMA_VERSION = 15
 
 export interface ChannelInboundRecord {
   id: string
@@ -219,6 +220,20 @@ export interface MailSendIntent {
   accepted: string[]
   rejected: string[]
   resolutionOf: 'partial' | 'unknown' | null
+}
+
+/** 子助理分派账本行（subassistant_runs，v15 建表）：状态机 dispatched→completed/escalated/failed/refused。 */
+export interface SubAssistantRun {
+  runId: string
+  assistantId: string
+  dispatchId: string
+  taskDigest: string
+  depth: number
+  status: 'dispatched' | 'completed' | 'escalated' | 'failed' | 'refused'
+  resultKind: string | null
+  resultText: string | null
+  createdAt: number
+  completedAt: number | null
 }
 
 /** 已批准的会议邮件后续提醒范围，不保存会议正文。 */
@@ -1206,6 +1221,20 @@ export class TeamStore {
         task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id),
         PRIMARY KEY(principal_id, device_id, meeting_id, item_id)
       );
+      CREATE TABLE IF NOT EXISTS subassistant_runs (
+        run_id TEXT PRIMARY KEY,
+        assistant_id TEXT NOT NULL REFERENCES assistants(assistant_id),
+        dispatch_id TEXT NOT NULL UNIQUE,
+        task_digest TEXT NOT NULL,
+        depth INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0),
+        status TEXT NOT NULL CHECK(status IN ('dispatched', 'completed', 'escalated', 'failed', 'refused')),
+        result_kind TEXT,
+        result_text TEXT,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        CHECK((status = 'dispatched') = (completed_at IS NULL))
+      );
+      CREATE INDEX IF NOT EXISTS idx_subassistant_runs_assistant ON subassistant_runs(assistant_id, created_at);
     `)
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
@@ -2531,6 +2560,50 @@ export class TeamStore {
     const updated = this.db.prepare(`UPDATE mail_send_intents SET state = 'acknowledged', resolution_of = ?, updated_at = ?
       WHERE intent_id = ? AND account_key = ? AND state = ?`).run(expectedState, at, intentId, accountKey, expectedState)
     return Number(updated.changes) === 1
+  }
+
+  /** 子助理分派账本：dispatch_id 唯一——同一次工具调用重放命中已有 run，直接返回既有结果（幂等）。 */
+  getSubAssistantRunByDispatchId(dispatchId: string): SubAssistantRun | null {
+    const row = this.db.prepare('SELECT * FROM subassistant_runs WHERE dispatch_id = ?').get(dispatchId) as Row | undefined
+    return row ? this.subAssistantRunRow(row) : null
+  }
+
+  beginSubAssistantRun(input: { runId: string; assistantId: string; dispatchId: string; taskDigest: string; depth: number }, at: number): SubAssistantRun | null {
+    return this.transaction(() => {
+      const existing = this.getSubAssistantRunByDispatchId(input.dispatchId)
+      if (existing) return existing
+      this.db.prepare(`INSERT INTO subassistant_runs (run_id, assistant_id, dispatch_id, task_digest, depth, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'dispatched', ?)`)
+        .run(input.runId, input.assistantId, input.dispatchId, input.taskDigest, input.depth, at)
+      return this.getSubAssistantRunByDispatchId(input.dispatchId)
+    })
+  }
+
+  finishSubAssistantRun(runId: string, status: 'completed' | 'escalated' | 'failed' | 'refused', resultKind: string, resultText: string, at: number): boolean {
+    const updated = this.db.prepare(`UPDATE subassistant_runs SET status = ?, result_kind = ?, result_text = ?, completed_at = ?
+      WHERE run_id = ? AND status = 'dispatched'`).run(status, resultKind, resultText, at, runId)
+    return Number(updated.changes) === 1
+  }
+
+  /** 防环第 2 层的数据来源：同成员同任务摘要最近一次越权回退的深度，供再分派深度递增。 */
+  latestEscalatedSubAssistantRun(assistantId: string, taskDigest: string): { depth: number } | null {
+    const row = this.db.prepare(`SELECT depth FROM subassistant_runs WHERE assistant_id = ? AND task_digest = ? AND status = 'escalated'
+      ORDER BY created_at DESC LIMIT 1`).get(assistantId, taskDigest) as Row | undefined
+    return row ? { depth: Number(row.depth) } : null
+  }
+
+  /** 启动对账（先例 recoverMailSends）：插件重启后仍处于 dispatched 的行标记中断失败。 */
+  failInterruptedSubAssistantRuns(at: number): number {
+    const updated = this.db.prepare(`UPDATE subassistant_runs SET status = 'failed', result_kind = 'interrupted',
+      result_text = '插件进程重启，分派中断', completed_at = ? WHERE status = 'dispatched'`).run(at)
+    return Number(updated.changes)
+  }
+
+  private subAssistantRunRow(row: Row): SubAssistantRun {
+    return { runId: String(row.run_id), assistantId: String(row.assistant_id), dispatchId: String(row.dispatch_id),
+      taskDigest: String(row.task_digest), depth: Number(row.depth), status: String(row.status) as SubAssistantRun['status'],
+      resultKind: row.result_kind === null ? null : String(row.result_kind), resultText: row.result_text === null ? null : String(row.result_text),
+      createdAt: Number(row.created_at), completedAt: row.completed_at === null ? null : Number(row.completed_at) }
   }
 
   getMeetingTodoSource(principalId: string, deviceId: string, meetingId: string, itemId: string): MeetingTodoSource | null {

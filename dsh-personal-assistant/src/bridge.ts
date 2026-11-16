@@ -147,6 +147,8 @@ export type BridgeEventType =
   | 'desktop/command'
   | 'desktop/cancel'
   | 'notice'
+  /** 子助理自行汇报（reportMode=self）：载荷自带身份四件套与结果文本，桌宠以其形象+音色播报。 */
+  | 'subassistant-report'
   | TeamEventType
 
 /**
@@ -192,6 +194,12 @@ export interface BridgeEvent {
   message?: string
   /** 定向取消产生的 reply 附带回执，宠物据此如实展示状态，不把失败当成「已停止」。 */
   cancel?: CancelReceipt
+  /** subassistant-report：本次运行的账本行标识；桌宠按它去重（重连重放不重播）。 */
+  runId?: number | string
+  /** subassistant-report：本次播报的音色档案名（voice profile），未传走全局默认音色。 */
+  voiceProfile?: string
+  /** subassistant-report：汇报模式（self=子助理直接播报）。 */
+  reportMode?: 'chief' | 'self'
 }
 
 interface PendingRequest {
@@ -978,6 +986,15 @@ export class SessionBridge {
 
   notifyApprovalSnapshot(): void {
     this.push({ type: 'team/snapshot', payload: { epoch: this.epoch, team: this.teamEnabled, ...this.teamSnapshot() } })
+  }
+
+  /** 子助理自行汇报（§4.6 ★①）：载荷自带身份四件套与结果文本，桌宠无需回查。 */
+  notifySubAssistantReport(report: {
+    assistantId: string; displayName: string; skinId: string; voiceProfile: string
+    text: string; runId: number | string; reportMode: 'chief' | 'self'
+  }): void {
+    const { assistantId, displayName, skinId, voiceProfile, text, runId, reportMode } = report
+    this.push({ type: 'subassistant-report', assistantId, displayName, skinId, voiceProfile, text: text.slice(0, 8000), runId: String(runId), reportMode })
   }
 
   private teamSnapshot(): {

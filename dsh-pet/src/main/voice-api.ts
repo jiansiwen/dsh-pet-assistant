@@ -164,6 +164,18 @@ export class VoiceApiStore {
     return { ...data, apiKey: this.decrypt(profile) }
   }
 
+  /**
+   * 按档案名解析语音服务（§4.6 ★④ 子助理按成员音色播报）。
+   * 名字唯一命中同种类的档案才用；重名或未命中返回 null（调用方回退全局默认音色）。
+   */
+  resolveByName(kind: VoiceApiKind, name: string): ResolvedVoiceApi | null {
+    const validKind = kindOf(kind)
+    const matches = this.state.profiles.filter(item => item.kind === validKind && item.name === name)
+    if (matches.length !== 1) return null
+    const { encryptedKey: _encryptedKey, ...data } = matches[0]!
+    return { ...data, apiKey: this.decrypt(matches[0]) }
+  }
+
   private decrypt(profile: StoredProfile): string {
     try { return profile.encryptedKey ? keyField(this.codec.decrypt(Buffer.from(profile.encryptedKey, 'base64'))) : '' }
     catch { fail('语音密钥无法解密，原配置未修改') }

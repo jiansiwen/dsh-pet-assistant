@@ -189,6 +189,9 @@ contextBridge.exposeInMainWorld('petApi', {
   },
   onMemberNotice: (callback: (notice: { kind: 'mail' | 'member'; text: string; memberId?: string }) => void) =>
     listen('member-notice', callback),
+  /** 子助理自行汇报（self 模式）：主进程已按成员音色播报，这里只出角色气泡。 */
+  onSubassistantReport: (callback: (report: { assistantId: string; displayName: string; skinId: string; text: string }) => void) =>
+    listen('subassistant-report', callback),
   onCompanionState: (callback: (state: CompanionState) => void) => {
     subscribe('companion-state', state => callback(state as CompanionState))
   },

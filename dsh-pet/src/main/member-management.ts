@@ -1,9 +1,9 @@
 import { dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron'
 import { pathToFileURL } from 'node:url'
 import {
-  MEMBER_CAPABILITIES, MEMBER_READ_TOOLS, MEMORY_KINDS,
+  MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_READ_TOOLS, MEMORY_KINDS, SUB_ASSISTANT_REPORT_MODES,
   type MemberDraft, type MemberProfile, type MemberSnapshot, type MemoryRecord,
-  type MemberResult, type MemberAction, type MemoryDeletePreview,
+  type MemberResult, type MemberAction, type MemoryDeletePreview, type SubAssistantBinding,
 } from '../member-types.ts'
 
 export const MEMBER_CHANNELS = { state: 'members-state', memories: 'member-memories', command: 'member-command', assist: 'member-assist' } as const
@@ -60,7 +60,25 @@ function uuid(value: unknown): string {
 export function memberPathIdentifier(value: unknown): string {
   return encodeURIComponent(identifier(value)).replace(/[!'()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
 }
-const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'persona', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone']
+/** 原生确认弹窗展示副本：apiKey 只提示已输入，绝不回显明文（密钥只在桥上一程）。 */
+function displayBody(body: RecordValue): RecordValue {
+  if (typeof body.apiKey !== 'string' || !body.apiKey) return body
+  return { ...body, apiKey: '（已输入新密钥；确认后保存到本机加密存储，此处不回显）' }
+}
+const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'persona', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone', 'kind', 'reportMode', 'binding', 'apiKey']
+/** 子助理绑定（桥上白名单形状；https/回环等深度校验在插件 member-directory）。 */
+function subAssistantBinding(value: unknown): SubAssistantBinding {
+  const bound = record(value)
+  if (bound.kind === 'platform') {
+    keys(bound, ['kind', 'endpoint', 'model', 'secretId'])
+    return { kind: 'platform', endpoint: text(bound.endpoint, 2048), model: text(bound.model, 256), secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100) }
+  }
+  if (bound.kind === 'local-cli') {
+    keys(bound, ['kind', 'command', 'args'])
+    return { kind: 'local-cli', command: text(bound.command, 2048), args: list(bound.args ?? [], item => text(item, 1024)) }
+  }
+  throw new Error('invalid_input')
+}
 function draft(value: RecordValue, writing = false): MemberDraft {
   const next: MemberDraft = {
     displayName: text(value.displayName, 80), description: text(value.description, 2000), personality: text(value.personality, 2000),
@@ -69,11 +87,18 @@ function draft(value: RecordValue, writing = false): MemberDraft {
     maxTokens: integer(value.maxTokens, 1, 32768), capabilities: list(value.capabilities, item => choice(item, MEMBER_CAPABILITIES)),
     allowedTools: list(value.allowedTools, item => text(item, 128)), dailyTokenLimit: integer(value.dailyTokenLimit),
     totalTokenLimit: integer(value.totalTokenLimit), thresholdPercent: integer(value.thresholdPercent, 1, 100), timezone: text(value.timezone, 128),
+    kind: value.kind === undefined ? undefined : choice(value.kind, MEMBER_KINDS),
+    reportMode: value.reportMode === undefined ? undefined : choice(value.reportMode, SUB_ASSISTANT_REPORT_MODES),
+    binding: value.binding === undefined || value.binding === null ? (value.binding === null ? null : undefined) : subAssistantBinding(value.binding),
+    apiKey: value.apiKey === undefined ? undefined : text(value.apiKey, 4096),
   }
   if (writing) {
     if (!next.displayName.trim() || !!next.provider.trim() !== !!next.model.trim() || next.allowedTools.length > 0) throw new Error('invalid_input')
+    if (next.apiKey !== undefined && (!next.apiKey || next.kind !== 'platform')) throw new Error('invalid_input')
     new Intl.DateTimeFormat('zh-CN', { timeZone: next.timezone }).format()
   }
+  // 可选字段未提供时不留空键：快照投影、确认弹窗与候选草稿的逐字段比对都按实际字段走。
+  for (const key of ['apiKey', 'kind', 'reportMode', 'binding'] as const) if (next[key] === undefined) delete next[key]
   return next
 }
 /** 所有已知回包逐字段投影，绝不将服务凭据或附带调试字段交给渲染器。 */
@@ -144,6 +169,10 @@ export function projectMemberState(value: unknown): MemberSnapshot {
         ...draft(p), assistantId: identifier(p.assistantId), roleId: choice(p.roleId, ['tangseng', 'wukong', 'bajie', 'shaseng', 'bailongma', 'custom']),
         voiceProfile: text(p.voiceProfile), toolPolicy: { mode: choice(policy.mode, ['read-only', 'side-effect']), denyTools: list(policy.denyTools, item => text(item)) },
         revision: integer(p.revision), sessionId: p.sessionId === null ? null : text(p.sessionId),
+        // 旧宿主回包（升级前）缺子助理字段时按 expert/chief/null 兜底，界面仍能打开。
+        kind: p.kind === undefined || p.kind === null ? 'expert' : choice(p.kind, ['expert', 'platform', 'local-cli']),
+        reportMode: p.reportMode === undefined || p.reportMode === null ? 'chief' : choice(p.reportMode, ['chief', 'self']),
+        binding: p.binding === undefined || p.binding === null ? null : subAssistantBinding(p.binding),
       }
       return { profile, busy: bool(view.busy), quota: {
         day: text(q.day), dailyUsed: integer(q.dailyUsed), totalUsed: integer(q.totalUsed),
@@ -402,7 +431,7 @@ export function registerMemberManagement(options: Options): () => void {
         + `${command.action === 'mode' ? `当前模式：${state.enabled ? '开启' : '关闭'}\n涉及成员：${state.members.map(item => `${item.profile.displayName}（${item.profile.assistantId}）`).join('、')}\n关闭后仍可管理，但不运行子代理。\n` : ''}`
         + `${command.action === 'update' ? `原配置：\n${JSON.stringify(draft(record(member!.profile)), null, 2)}\n` : ''}`
         + `${member && 'expectedQuotaRevision' in command.body ? `当前额度与用量：\n${JSON.stringify(member.quota, null, 2)}\n` : ''}`
-        + `将提交的精确改动：\n${JSON.stringify(command.body, null, 2)}\n0 额度表示不限；daily 为日用量，total 为总用量，both 为两者。${deletion}`
+        + `将提交的精确改动：\n${JSON.stringify(displayBody(command.body), null, 2)}\n0 额度表示不限；daily 为日用量，total 为总用量，both 为两者。${deletion}`
       if (!allowed(event)) return failure('denied')
       const parent = options.parentOf?.(event) ?? options.getStageWindow()
       if (!parent || parent.isDestroyed()) return failure('denied')

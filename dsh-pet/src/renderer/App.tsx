@@ -404,6 +404,20 @@ export default function App() {
   useEffect(() => window.petApi.onMemberNotice(notice => {
     showToast(`${notice.kind === 'mail' ? '邮件值守' : '成员通知'}：${notice.text.slice(0, 300)}`)
   }), [showToast])
+  /**
+   * 子助理自行汇报（self 模式，§4.6 ★②）：主进程已按成员音色播报，
+   * 这里让该成员的角色上台出气泡——语音说 A、气泡显示 A。
+   * 角色不在 cast（未启用/旧宿主）时只播语音不出气泡；气泡文本截到 300 字，与通知一致。
+   */
+  useEffect(() => window.petApi.onSubassistantReport(report => {
+    const text = report.text.slice(0, 300)
+    if (!text) return
+    // 先把角色留在台上（上台的成员才会在 cast 里），再出气泡。
+    lingerUntil.current[report.assistantId] = Date.now() + 15_000
+    setStageTick(Date.now())
+    stageRef.current?.sayTo(report.assistantId, text, Math.min(4000 + text.length * 60, 12_000))
+    showToast(`子助理汇报（${report.displayName || report.assistantId}）：${text}`)
+  }), [])
   const memberFeed = useMemberFeed(showToast)
   const quotaPending = memberFeed.state?.requests.filter(item => item.state === 'pending').length ?? 0
   useLayoutEffect(() => {

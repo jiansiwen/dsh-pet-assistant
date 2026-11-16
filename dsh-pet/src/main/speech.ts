@@ -31,6 +31,12 @@ export interface SpeechRequest {
    * 「#0」，续讲按序号定位时落在哪一句就说不准了。单次请求（文档整段、整条回复）不用传。
    */
   readonly indexBase?: number
+  /**
+   * 本次讲话的音色档案名（§4.6 ★④）：edge-tts 音色名（如 zh-CN-XiaoxiaoNeural）或
+   * 语音设置里的自定义 TTS 档案名。未传走全局默认音色（向后兼容）。
+   * 子助理自行汇报（self 模式）按成员音色播报。
+   */
+  readonly voiceProfile?: string
 }
 
 /** 切好的一句，是播放与打断的最小单位。 */
@@ -39,6 +45,8 @@ export interface Segment {
   readonly index: number
   readonly text: string
   readonly origin?: SpeechOrigin
+  /** 本句的音色档案名；随请求透传，未传走全局默认音色。 */
+  readonly voiceProfile?: string
 }
 
 /** 一句的播出结果。complete=false 表示播到一半被打断。 */
@@ -88,6 +96,7 @@ export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
       index: base + segments.length,
       text: trimmed,
       ...(request.origin ? { origin: request.origin } : {}),
+      ...(request.voiceProfile ? { voiceProfile: request.voiceProfile } : {}),
     })
   }
   return segments
