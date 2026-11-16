@@ -39,6 +39,7 @@ import type { FirstRunReport, FirstRunStep } from '../main/first-run.js'
 import type { SessionCommand, SessionResult, SessionUpdate } from '../session-types.js'
 import type { Box } from './stage-layout.js'
 import type { AssistantSettingsPage, AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
+import type { AssistantMailAnalysesResult, AssistantMailInput, AssistantMailResult } from '../main/assistant-mail.js'
 import type { MemberAction, MemberApi, MemberCommandInputs, MemberDraft, MemberEditorContext, MemberResult } from '../member-types.js'
 
 export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?: string }
@@ -566,6 +567,12 @@ export interface PetApi extends MemberApi {
   overlayState(open: boolean, boxes: Box[], settingsOpen: boolean): void
   saveSettings(patch: PetSettingsPatch): Promise<{ ok: boolean }>
   assistantSettingsState(): Promise<AssistantSettingsResult>
+  /** 邮件页：读取邮箱配置（授权码只回 hasPassword，永不回显明文）。 */
+  assistantMailState(): Promise<AssistantMailResult>
+  /** 邮件页：保存邮箱配置；password 留空＝沿用已保存的授权码。 */
+  assistantMailSave(input: AssistantMailInput): Promise<AssistantMailResult>
+  /** 邮件页：最近的值守分析结果（只读，含已通知的）。 */
+  assistantMailAnalyses(limit?: number): Promise<AssistantMailAnalysesResult>
   /** 技能证据：本人确认（verify）或撤回（retract）；只作用于还没形成技能的样本。 */
   skillsEvidence(action: 'verify' | 'retract', assistantId: string, shape: string): Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; pending?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; unverified?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; verified?: number; removed?: number; message?: string }>
   /** 工作时间线：缺省查今天；只含解释过的工作事项。 */

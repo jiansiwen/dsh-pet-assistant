@@ -14,6 +14,15 @@ export type VoicePhase = 'stopped' | 'waiting' | 'recording' | 'generating' | 'p
 export const isVoiceStop = (text: string): boolean => /^(先这样|结束对话|停止对话)[。！!，,\s]*$/u.test(text.trim())
 
 /**
+ * 讲解中直接提问的"像话"判据：去掉空白、标点与符号后至少两个字。
+ *
+ * 讲解里不要求先说"停一下"（主进程返回 direct），但回声、咳嗽、键盘声偶尔会被识别成
+ * 一两个字或一串标点；这类结果既不该停讲解，也不该变成一条用户消息。
+ */
+export const plausibleDirectQuestion = (text: string): boolean =>
+  text.replace(/[\s\p{P}\p{S}]/gu, '').length >= 2
+
+/**
  * 口令式打断：只有明确说了「停一下 / 等等 / 等一下 / 打断一下」这类词才打断朗读。
  *
  * 为什么需要它：外放时麦克风会收到助理自己的声音（回声消除之后仍可能残留），若把任何声音

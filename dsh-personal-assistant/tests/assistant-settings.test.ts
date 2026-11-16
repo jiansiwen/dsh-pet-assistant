@@ -474,3 +474,56 @@ test('Windows 加密使用固定 PowerShell 命令，秘密只走标准输入且
     assert.match(JSON.stringify(commands), /CurrentUser/)
   } finally { spawn.mock.restore(); syncBuiltinESMExports() }
 })
+
+test('邮箱配置：未配置读回 null，保存后回读视图且不回显授权码', async t => {
+  const f = fixture(t)
+  const before = await f.service.request('GET', `${root}/mail`, undefined)
+  assert.equal(before.status, 200)
+  assert.equal((before.body as { mail: unknown }).mail, null)
+
+  const pw = '授权码-只在密文里-测试'
+  const saved = await f.service.request('POST', `${root}/mail`, { address: 'me@example.com', smtpHost: 'smtp.example.com',
+    smtpPort: 465, imapHost: 'imap.example.com', imapPort: 993, password: pw })
+  assert.equal(saved.status, 200)
+  const mail = (saved.body as { mail: Record<string, unknown> }).mail
+  assert.equal(mail.address, 'me@example.com')
+  assert.equal(mail.smtpHost, 'smtp.example.com')
+  assert.equal(mail.imapPort, 993)
+  assert.equal(mail.hasPassword, true)
+  assert.equal(mail.watchEnabled, true, '新配置默认开启值守')
+  assert.equal(JSON.stringify(saved).includes(pw), false)
+  assert.equal(f.read('mail.secret').includes(newCipher), true, '授权码以注入的密文写入')
+  assert.equal(f.state.encryptions, 1)
+
+  // 不带密码再保存：沿用已存授权码，不重新加密。
+  const again = await f.service.request('POST', `${root}/mail`, { address: 'me@example.com', smtpHost: 'smtp.example.com',
+    smtpPort: 587, imapHost: 'imap.example.com', imapPort: 993 })
+  assert.equal(again.status, 200)
+  assert.equal((again.body as { mail: Record<string, unknown> }).mail.hasPassword, true)
+  assert.equal((again.body as { mail: Record<string, unknown> }).mail.smtpPort, 587)
+  assert.equal(f.state.encryptions, 1)
+
+  const read = await f.service.request('GET', `${root}/mail`, null)
+  assert.equal(read.status, 200)
+  assert.equal((read.body as { mail: { address: string } }).mail.address, 'me@example.com')
+})
+
+test('邮箱配置：首配缺授权码与非法字段都被拒绝，并给出具体原因', async t => {
+  const f = fixture(t)
+  const noSecret = await f.service.request('POST', `${root}/mail`, { address: 'me@example.com', smtpHost: 'smtp.example.com',
+    smtpPort: 465, imapHost: 'imap.example.com', imapPort: 993 })
+  assert.equal(noSecret.status, 422)
+  assert.match((noSecret.body as { message: string }).message, /授权码/u)
+
+  const badMail = await f.service.request('POST', `${root}/mail`, { address: 'not-an-email', smtpHost: 'smtp.example.com',
+    smtpPort: 465, imapHost: 'imap.example.com', imapPort: 993, password: 'x' })
+  assert.equal(badMail.status, 422)
+  assert.match((badMail.body as { message: string }).message, /邮箱地址/u)
+
+  const badPort = await f.service.request('POST', `${root}/mail`, { address: 'me@example.com', smtpHost: 'smtp.example.com',
+    smtpPort: 70_000, imapHost: 'imap.example.com', imapPort: 993, password: 'x' })
+  assert.equal(badPort.status, 400)
+
+  const unknown = await f.service.request('POST', `${root}/mail`, { address: 'me@example.com', extra: 1 })
+  assert.equal(unknown.status, 400)
+})

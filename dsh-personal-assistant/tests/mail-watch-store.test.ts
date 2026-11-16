@@ -148,3 +148,20 @@ test('迁移已归属的 seen 不推进游标，重复初始化不覆盖持久�
   assert.equal(again.bootstrapUpperUid, 50)
   assert.equal(again.legacy?.seen.length, 2)
 })
+
+test('最近分析列表：按时间倒序投影，已通知的也保留可回看', t => {
+  const f = fixture(t)
+  const scope = f.store.commitMailWatchPage(init(f.store), 25, [1, 2])
+  const older = f.store.completeMailWatchAnalysis(scope.scopeId, 'member', [{ uid: 1, sourceDigest: 'd1', truncated: false }],
+    '第一条分析', 100, [{ uid: 1, kind: 'reply-mail', title: '回复客户', payload: '正文草稿', risk: 'low', rationale: '客户在等回复' }])
+  f.store.markMailWatchNotified(older.analysisId, 150)
+  const newer = f.store.completeMailWatchAnalysis(scope.scopeId, 'member', [{ uid: 2, sourceDigest: 'd2', truncated: false }], '第二条分析', 200)
+  const listed = f.store.listMailWatchAnalyses()
+  assert.deepEqual(listed.map(item => item.analysisId), [newer.analysisId, older.analysisId])
+  assert.equal(listed[1]!.notifiedAt, 150)
+  assert.equal(listed[0]!.notifiedAt, null)
+  assert.equal(listed[1]!.suggestions[0]?.title, '回复客户')
+  assert.equal(listed[0]!.suggestions.length, 0)
+  assert.equal(f.store.listMailWatchAnalyses(1).length, 1)
+  assert.equal(f.store.listMailWatchAnalyses(0).length, 1, '数量至少为 1')
+})

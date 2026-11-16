@@ -18,6 +18,7 @@ import { ApprovalWindow } from './approval-window.ts'
 import { registerReportWorkbench, type ReportWorkbenchHandle } from './report-workbench-window.ts'
 import { registerCompanionTasks, type CompanionTasksHandle } from './companion-task-window.ts'
 import { registerAssistantSettings } from './assistant-settings.ts'
+import { registerAssistantMail } from './assistant-mail.ts'
 import { FastReplyService, type FastReplyInput } from './fast-reply.ts'
 import { registerMemberManagement } from './member-management.ts'
 import { MemberEditorWindow } from './member-editor-window.ts'
@@ -5353,6 +5354,11 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
     pagePath: path.join(here, '../renderer/index.html'),
     request: (method, pathname, body) => bridge.companionRequest(method, pathname, body, 'owner'),
   })
+  registerAssistantMail({
+    getStageWindow: () => win,
+    pagePath: path.join(here, '../renderer/index.html'),
+    request: (method, pathname, body) => bridge.companionRequest(method, pathname, body, 'owner'),
+  })
   const memberEditor = new MemberEditorWindow()
   memberEditor.registerIpc()
   // 成员音色（壳侧）：语气与克隆样本存设置，编号/描述仍归插件目录；只认编辑窗来源。
@@ -5645,9 +5651,10 @@ ${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messag
     const bargeIn = options !== null && typeof options === 'object' && (options as { bargeIn?: unknown }).bargeIn === true
     const granted = applyAudio({ type: 'dictation-requested', ...(bargeIn ? { source: 'barge-in' as const } : {}) })
     if (granted.denied) return { ok: false, error: granted.denied }
-    // 讲解与会议里同样只认明确口令（停一下 / 暂停一下 / 等一下 / 打断一下 / 等等）：
-    // 把任何声音都当成提问会让回声、咳嗽和旁人闲聊反复打断朗读。口令后的提问由渲染层接着听。
-    const direct = false
+    // 讲解进行中：用户开口就是要提问，不再要求"停一下"口令（功能设计：随时插话）。
+    // 回声、咳嗽与旁人闲聊由渲染层的自回声过滤和最短文本判定兜住，见 App.tsx 的 direct 分支。
+    const presenting = docTalk !== null && docTalk.spoken && !docTalk.stopped
+    const direct = presenting
     armDictationSafety()
     // 用户挑的自定义服务是"整段上传"的接口，没有实时部分文本：这时不开本地流式会话。
     let apiAsr: ResolvedVoiceApi | null = null

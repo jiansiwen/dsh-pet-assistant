@@ -41,7 +41,7 @@ export function settingsNavGroups(): readonly SettingsNavGroup[] {
       items: [
         { id: 'chat', title: '对话', summary: '接着和总助理说话，设置面板会收起。' },
         { id: 'todo', title: '待办提醒', summary: '查看任务与催办提醒；完整的待办页在独立窗口里。' },
-        { id: 'mail', title: '邮件', summary: '审批发信与邮箱配置；完整的邮件页还在建设中。' },
+        { id: 'mail', title: '邮件', summary: '查看值守结果与建议；配置收发邮箱。发信在对话里走审批。' },
         { id: 'wecom', title: '企业微信', summary: '配置企业微信连接与已配对会话。' },
         { id: 'report', title: '日报周报', summary: '把今天做的事整理成日报；工作台在独立窗口里。' },
         { id: 'meeting', title: '会议助手', summary: '查看录音状态，整理并核对会议纪要。' },

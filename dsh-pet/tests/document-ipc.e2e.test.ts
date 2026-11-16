@@ -1249,8 +1249,8 @@ test('独立讲解的插话可交接听写、识别并发送，回答播完后�
     assert.equal(wiring.handovers.length, 1)
     const granted = await invoke<{ ok: boolean; direct?: boolean }>('asr-begin', { bargeIn: true })
     assert.equal(granted.ok, true)
-    // 讲解中也要先听到明确口令才打断；任何声音都不再直接当成提问。
-    assert.equal(granted.direct, false)
+    // 讲解中直接开口就是提问：主进程不再要求"停一下"口令（功能设计：随时插话打断）。
+    assert.equal(granted.direct, true)
     assert.ok((wiring.handovers[0]()?.frames.length ?? 0) > 0)
     // 检出人声本身不停讲解；识别出“停一下”后才停这一句。
     assert.equal(narrator.isSpeaking(), true, '还没听到口令时讲解应继续')

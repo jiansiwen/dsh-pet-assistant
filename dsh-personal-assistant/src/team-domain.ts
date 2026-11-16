@@ -2516,6 +2516,21 @@ export class TeamStore {
     })
   }
 
+  /**
+   * 最近的分析结果（倒序、只读投影）：页面展示值守成果与结构化建议。
+   *
+   * 与 pendingMailWatchNotifications 的区别：这个按"最近"取，不限是否已通知 ——
+   * 已确认送达的分析仍然要能在页面里回看，否则用户点掉通知就再也找不到建议了。
+   */
+  listMailWatchAnalyses(limit = 20): MailWatchAnalysis[] {
+    const capped = Math.max(1, Math.min(50, Math.trunc(limit)))
+    const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(capped) as Row[]
+    return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at),
+      notifiedAt: row.notified_at === null ? null : Number(row.notified_at) }))
+  }
+
   /** 尚未确认送达的分析；结果未知或本人已核对的不一定允许重发。 */
   pendingMailWatchNotifications(scopeId: string, limit = 5, deliverableOnly = false): MailWatchAnalysis[] {
     const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses WHERE scope_id = ? AND notified_at IS NULL

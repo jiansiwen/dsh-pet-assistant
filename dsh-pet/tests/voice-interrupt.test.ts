@@ -6,13 +6,21 @@
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseInterruptPhrase, planInterruptInput } from '../src/voice-conversation.ts'
+import { parseInterruptPhrase, planInterruptInput, plausibleDirectQuestion } from '../src/voice-conversation.ts'
 
 test('讲解插话的停一下进入后续听写，口令后直接带问题时只发送问题', () => {
   assert.deepEqual(planInterruptInput('停一下', true), { action: 'listen' })
   assert.deepEqual(planInterruptInput('停一下，这段什么意思？', true), { action: 'send', text: '这段什么意思？' })
   assert.deepEqual(planInterruptInput('这里是什么意思？', true), { action: 'direct' })
   assert.deepEqual(planInterruptInput('普通环境声', false), { action: 'ignore' })
+})
+
+test('直接提问的门槛：咳嗽、单字回声与纯标点不打断讲解', () => {
+  assert.equal(plausibleDirectQuestion('第三段再讲一遍'), true)
+  assert.equal(plausibleDirectQuestion('嗯'), false)
+  assert.equal(plausibleDirectQuestion('啊？'), false)
+  assert.equal(plausibleDirectQuestion('。。。'), false)
+  assert.equal(plausibleDirectQuestion('   '), false)
 })
 
 describe('parseInterruptPhrase', () => {

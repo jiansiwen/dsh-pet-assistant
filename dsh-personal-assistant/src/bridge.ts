@@ -406,6 +406,13 @@ const UNCERTAIN_ERROR =
  */
 const NON_USER_SOURCE_KINDS = new Set(['plugin', 'model', 'tool', 'runtime-context', 'time-context', 'system-prompt'])
 
+/**
+ * DSH 0.1.7+（会话格式 v4）把插件来源改成带命名的 `plugin:<name>`（例如
+ * `plugin:dsh-better-sidebar` 的侧边栏上下文注入），旧的裸 `plugin` 会被格式拒绝。
+ * 它们和旧值语义相同：可证明的非用户注入，既不是用户气泡，也不该让回复归属变成"来源不明"。
+ */
+const NAMED_PLUGIN_SOURCE = /^plugin:[a-z0-9-]+$/u
+
 /** turn/end 的 reason.kind 非 completed 时，按具体原因如实描述失败，不含糊成「超时」。 */
 function reasonFailure(kind: unknown): string {
   switch (kind) {
@@ -507,6 +514,12 @@ export function settleFromEvents(
     const sourceKind = data.source?.kind
     if (sourceKind === 'user') return { kind: 'failed', attribution: 'mixed', error: MIXED_ERROR }
     if (typeof sourceKind === 'string' && NON_USER_SOURCE_KINDS.has(sourceKind)) continue
+    if (typeof sourceKind === 'string' && NAMED_PLUGIN_SOURCE.test(sourceKind)) continue
+    // 真正无法自证清白的来源：如实拒绝，但把种类记下来（不含正文），下次诊断不用再猜。
+    try {
+      console.warn('[dsh-personal-assistant] 会话里出现无法归类的 user/message 来源，拒绝归属本轮回复',
+        JSON.stringify({ id: data.id ?? null, sourceKind: typeof sourceKind === 'string' ? sourceKind : null }))
+    } catch { /* 日志失败不影响判定 */ }
     return { kind: 'failed', error: UNCERTAIN_ERROR }
   }
 

@@ -4,6 +4,7 @@ import type { SettingsPage } from '../renderer/types.js'
 import type { Box } from '../renderer/stage-layout.js'
 import type { VoiceApiInput, VoiceApiKind, VoiceApiResult } from '../voice-api-types.js'
 import type { AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
+import type { AssistantMailAnalysesResult, AssistantMailInput, AssistantMailResult } from '../main/assistant-mail.js'
 import type { MemberAction, MemberCommandInputs, MemberDraft, MemberResult, MemoryRecord } from '../member-types.js'
 import type { FirstRunDownloadResult, FirstRunReportResult } from '../main/first-run-service.js'
 import type { DownloadConfirmation } from '../main/model-resources.js'
@@ -72,6 +73,10 @@ contextBridge.exposeInMainWorld('petApi', {
   overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
   saveSettings: (patch: PetSettingsPatch) => ipcRenderer.invoke('save-settings', patch) as Promise<{ ok: boolean }>,
   assistantSettingsState: () => ipcRenderer.invoke('assistant-settings-state') as Promise<AssistantSettingsResult>,
+  /* 邮件页：配置读取 / 保存 / 值守分析列表。授权码只写不读，回包只有 hasPassword。 */
+  assistantMailState: () => ipcRenderer.invoke('assistant-mail-state') as Promise<AssistantMailResult>,
+  assistantMailSave: (input: AssistantMailInput) => ipcRenderer.invoke('assistant-mail-save', input) as Promise<AssistantMailResult>,
+  assistantMailAnalyses: (limit?: number) => ipcRenderer.invoke('assistant-mail-analyses', limit) as Promise<AssistantMailAnalysesResult>,
   /* 专属词库：列表 / 新增 / 删除。写操作会经主进程的发送方校验，页面拿不到桥接凭据。 */
   /* 技能证据：本人确认 / 撤回（作用于还没形成技能的样本）。 */
   skillsEvidence: (action: 'verify' | 'retract', assistantId: string, shape: string) =>

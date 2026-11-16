@@ -7,6 +7,7 @@ import MeetingPanel from './meeting-panel.js'
 import { installMeetingSession } from './meeting-capture-session.ts'
 import VoiceApiSettings from './VoiceApiSettings.js'
 import AssistantSettings from './AssistantSettings.js'
+import MailSettings from './MailSettings.js'
 import ChatOverlay from './ChatOverlay.js'
 import PetSettingsPanel, { FastReplySettings, PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
 import { EnvironmentCheck } from './FirstRunSettings.js'
@@ -18,7 +19,7 @@ import { dockEdge, dockPosition, dockStatusTone, type DockEdge } from './pet-doc
 import DockedPet from './DockedPet.js'
 import { PET_WIDTH } from './pet-metrics.js'
 import { HOVER_CLOSE_MS, HOVER_OPEN_MS, hoverActions, initialHover, reduceHover, type HoverEventKind } from './hover-toolbar.js'
-import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, planInterruptInput } from '../voice-conversation.ts'
+import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, planInterruptInput, plausibleDirectQuestion } from '../voice-conversation.ts'
 import type { VoiceTurn } from '../session-types.js'
 import {
   clearStageHitboxes,
@@ -1623,7 +1624,7 @@ export default function App() {
     if (!gateInterrupt) window.petApi.stopSpeech()
     setListening(true)
     asrDeltaText.current = ''
-    // 讲解与会议里也要先听到明确口令才停下；直接说话不会打断朗读。
+    // 讲解与会议里直接说话就是提问（主进程返回 direct）；日常外放仍只认明确口令，防自回声。
     let directMode = false
     const accept = async (text: string): Promise<void> => {
       if (cancelled()) return
@@ -1632,7 +1633,7 @@ export default function App() {
         if (plan.action === 'ignore') return
         if (plan.action === 'send' || plan.action === 'listen') {
           // 口令后直接带问题时，回答播完仍要自动回到原讲解；只说“停一下”则保持暂停。
-          if (!directMode) window.petApi.stopSpeech(plan.action === 'send')
+          window.petApi.stopSpeech(plan.action === 'send')
           if (conversation.active) {
             stopContinuous(false)
             // 这是主动从连续对话转入插话，不是用户取消下一次听写。
@@ -1656,6 +1657,26 @@ export default function App() {
               void startListen(true, false, undefined, true, true)
             }
           }, 150)
+          return
+        }
+        if (plan.action === 'direct') {
+          // 讲解中直接开口提问：先过滤回声与噪声，再停播并把这句话当问题发出去。
+          // 停播带 preserveAutoResume=true —— 回答播完后主进程会把讲解接回原处。
+          if (isSelfSpeech(text)) {
+            showToast('刚才是我的回声，已忽略；请再说一次')
+            return
+          }
+          if (!plausibleDirectQuestion(text)) return
+          window.petApi.stopSpeech(true)
+          if (conversation.active) {
+            stopContinuous(false)
+            // 这是主动从连续对话转入插话，不是用户取消下一次听写。
+            dictationCancelled.current = false
+          }
+          voiceRoundRef.current = true
+          setInput(text)
+          if (!busyRef.current) void send(text)
+          else showToast('上一条消息尚未提交完成，语音已保留在输入框')
           return
         }
       }
@@ -2642,12 +2663,7 @@ export default function App() {
               <AssistantSettings key="reminders" section="reminders" />
             </>
           ) : settingsPage === 'mail' ? (
-            <SettingsEntryCard
-              title="邮件"
-              description="审批时的发信与邮箱配置；完整收发页还在建设中。"
-              action="打开企业微信设置"
-              onAction={() => setSettingsPage('wecom')}
-            />
+            <MailSettings />
           ) : settingsPage === 'report' ? (
             <SettingsEntryCard
               title="日报周报"

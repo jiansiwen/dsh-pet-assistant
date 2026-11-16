@@ -804,6 +804,12 @@ export class CompanionTaskRuntime {
         if (pathname === '/companion/v1/reminder-defaults') {
           return { status: 200, body: { repeatEverySeconds: this.settings?.getReminderInterval() ?? 300 } }
         }
+        if (pathname === '/companion/v1/mail/analyses') {
+          // 邮件值守的最近分析：只读投影，页面据此展示摘要与建议；正文与授权码都不在库里。
+          const raw = query?.get('limit') ?? '20'
+          if (!/^\d+$/u.test(raw)) throw new CompanionError('INVALID_INPUT', '数量必须是正整数', 422)
+          return { status: 200, body: { ok: true, analyses: this.store.listMailWatchAnalyses(Number(raw)) } }
+        }
         if (pathname === '/companion/v1/tasks') {
           const snapshot = this.snapshot()
           const status = query?.get('status')

@@ -445,8 +445,9 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'meeting-take-command',
     'office-open', 'office-view-session', 'office-view-bytes', 'office-view-image', 'office-view-check',
     'office-view-fullscreen', 'office-view-close',
-    // 助理设置页（渠道与邮箱）。
+    // 助理设置页（渠道与邮箱）+ 邮件页：配置读写与值守结果列表，都走舞台发送方校验。
     'assistant-settings-state', 'assistant-settings-save',
+    'assistant-mail-state', 'assistant-mail-save', 'assistant-mail-analyses',
     // 形象与音色工作室（底座 4.8/4.9）：工作室窗口专用通道，发送方校验只认该窗口。
     'custom-skins-list', 'asset-studio-open',
     'asset-studio-state', 'asset-studio-save-providers', 'asset-studio-test-provider',

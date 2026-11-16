@@ -2805,6 +2805,26 @@ var TeamStore = class {
       return analysis;
     });
   }
+  /**
+   * 最近的分析结果（倒序、只读投影）：页面展示值守成果与结构化建议。
+   *
+   * 与 pendingMailWatchNotifications 的区别：这个按"最近"取，不限是否已通知 ——
+   * 已确认送达的分析仍然要能在页面里回看，否则用户点掉通知就再也找不到建议了。
+   */
+  listMailWatchAnalyses(limit2 = 20) {
+    const capped = Math.max(1, Math.min(50, Math.trunc(limit2)));
+    const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(capped);
+    return rows.map((row) => ({
+      analysisId: String(row.analysis_id),
+      scopeId: String(row.scope_id),
+      memberId: String(row.member_id),
+      uids: JSON.parse(String(row.uids)),
+      result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions),
+      createdAt: Number(row.created_at),
+      notifiedAt: row.notified_at === null ? null : Number(row.notified_at)
+    }));
+  }
   /** 尚未确认送达的分析；结果未知或本人已核对的不一定允许重发。 */
   pendingMailWatchNotifications(scopeId, limit2 = 5, deliverableOnly = false) {
     const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses WHERE scope_id = ? AND notified_at IS NULL
@@ -4622,6 +4642,7 @@ function asNumber(value) {
 var MIXED_ERROR = "\u5171\u4EAB\u4F1A\u8BDD\u91CC\u8FD9\u4E00\u8F6E\u6DF7\u5165\u4E86\u5176\u4ED6\u7528\u6237\u8F93\u5165\uFF0C\u65E0\u6CD5\u5206\u8FA8\u54EA\u53E5\u662F\u56DE\u7ED9\u4F60\u7684\uFF1B\u8BF7\u628A\u7F51\u9875\u4E0E\u5BA0\u7269\u5206\u5F00\u6210\u4E0D\u540C\u4F1A\u8BDD\uFF0C\u6211\u4E0D\u4F1A\u731C";
 var UNCERTAIN_ERROR = "\u5171\u4EAB\u4F1A\u8BDD\u91CC\u8FD9\u4E00\u8F6E\u6DF7\u5165\u4E86\u6765\u6E90\u4E0D\u660E\u7684\u8F93\u5165\uFF0C\u65E0\u6CD5\u786E\u8BA4\u662F\u4E0D\u662F\u522B\u7684\u7528\u6237\u63D2\u8FDB\u6765\u7684\uFF1B\u8BF7\u628A\u7F51\u9875\u4E0E\u5BA0\u7269\u5206\u5F00\u6210\u4E0D\u540C\u4F1A\u8BDD\uFF0C\u6211\u4E0D\u4F1A\u731C";
 var NON_USER_SOURCE_KINDS = /* @__PURE__ */ new Set(["plugin", "model", "tool", "runtime-context", "time-context", "system-prompt"]);
+var NAMED_PLUGIN_SOURCE = /^plugin:[a-z0-9-]+$/u;
 function reasonFailure(kind) {
   switch (kind) {
     case "aborted":
@@ -4686,6 +4707,14 @@ function settleFromEvents(events, pending) {
     const sourceKind = data.source?.kind;
     if (sourceKind === "user") return { kind: "failed", attribution: "mixed", error: MIXED_ERROR };
     if (typeof sourceKind === "string" && NON_USER_SOURCE_KINDS.has(sourceKind)) continue;
+    if (typeof sourceKind === "string" && NAMED_PLUGIN_SOURCE.test(sourceKind)) continue;
+    try {
+      console.warn(
+        "[dsh-personal-assistant] \u4F1A\u8BDD\u91CC\u51FA\u73B0\u65E0\u6CD5\u5F52\u7C7B\u7684 user/message \u6765\u6E90\uFF0C\u62D2\u7EDD\u5F52\u5C5E\u672C\u8F6E\u56DE\u590D",
+        JSON.stringify({ id: data.id ?? null, sourceKind: typeof sourceKind === "string" ? sourceKind : null })
+      );
+    } catch {
+    }
     return { kind: "failed", error: UNCERTAIN_ERROR };
   }
   if (turnEndIndex < 0) return { kind: "pending" };
@@ -15721,6 +15750,11 @@ ${candidate.text}`);
         if (pathname === "/companion/v1/reminder-defaults") {
           return { status: 200, body: { repeatEverySeconds: this.settings?.getReminderInterval() ?? 300 } };
         }
+        if (pathname === "/companion/v1/mail/analyses") {
+          const raw = query?.get("limit") ?? "20";
+          if (!/^\d+$/u.test(raw)) throw new CompanionError("INVALID_INPUT", "\u6570\u91CF\u5FC5\u987B\u662F\u6B63\u6574\u6570", 422);
+          return { status: 200, body: { ok: true, analyses: this.store.listMailWatchAnalyses(Number(raw)) } };
+        }
         if (pathname === "/companion/v1/tasks") {
           const snapshot = this.snapshot();
           const status = query?.get("status");
@@ -17089,7 +17123,9 @@ function readMailConfigView(home) {
     smtpPort: base.port,
     imapHost: imap?.imapHost ?? "",
     imapPort: imap?.imapPort ?? 0,
-    hasPassword: existsSync3(path17.join(mailDir(home), SECRET_FILE2))
+    hasPassword: existsSync3(path17.join(mailDir(home), SECRET_FILE2)),
+    watchEnabled: imap?.watchEnabled ?? false,
+    watchIntervalSeconds: imap?.watchIntervalSeconds ?? 600
   };
 }
 function formatMailConfigView(view) {
@@ -18110,12 +18146,22 @@ var wecomRequestSchema = z5.object({
 var reminderRequestSchema = reminderSchema.extend({ expectedRevision: revisionSchema }).strict();
 var agentRequestSchema = z5.object({ expectedRevision: revisionSchema, ...agentShape }).strict().refine(pairedModel);
 var reconnectSchema = z5.object({ expectedRevision: revisionSchema }).strict();
+var MAIL_ROUTE = "/companion/v1/settings/mail";
+var mailRequestSchema = z5.object({
+  address: z5.string().max(320).trim(),
+  smtpHost: z5.string().max(255).trim(),
+  smtpPort: z5.number().int().min(1).max(65535),
+  imapHost: z5.string().max(255).trim(),
+  imapPort: z5.number().int().min(1).max(65535),
+  password: z5.string().max(4096).optional()
+}).strict();
 var routes = [
   "/companion/v1/settings",
   "/companion/v1/settings/wecom",
   "/companion/v1/settings/reminders",
   "/companion/v1/settings/agent",
-  "/companion/v1/settings/wecom/reconnect"
+  "/companion/v1/settings/wecom/reconnect",
+  MAIL_ROUTE
 ];
 var envelopeSchema = z5.object({ method: z5.enum(["GET", "POST"]), pathname: z5.enum(routes) }).strict();
 var cipherSchema = z5.string().min(4).max(65536).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/);
@@ -18403,8 +18449,38 @@ var AssistantSettings = class {
       this.check();
       if (!envelopeSchema.safeParse({ method, pathname }).success) throw invalid();
       if (method === "GET") {
-        if (pathname !== routes[0] || !z5.union([z5.undefined(), z5.null(), z5.object({}).strict()]).safeParse(body).success) throw invalid();
+        if (!z5.union([z5.undefined(), z5.null(), z5.object({}).strict()]).safeParse(body).success) throw invalid();
+        if (pathname === MAIL_ROUTE) return { status: 200, body: { ok: true, mail: readMailConfigView(this.options.home) } };
+        if (pathname !== routes[0]) throw invalid();
         return { status: 200, body: this.snapshot() };
+      }
+      if (pathname === MAIL_ROUTE) {
+        const parsed2 = mailRequestSchema.safeParse(body);
+        if (!parsed2.success) throw invalid();
+        if (process.platform !== "win32" && !this.options.encrypt && (parsed2.data.password ?? "") !== "") {
+          throw new SettingsError(503, "CREDENTIALS_UNSUPPORTED", "\u5F53\u524D\u7CFB\u7EDF\u4E0D\u652F\u6301\u4FEE\u6539\u6388\u6743\u7801\uFF0C\u8BF7\u5728 Windows \u4E0A\u914D\u7F6E\u3002");
+        }
+        if (this.busy) throw new SettingsError(409, "SETTINGS_BUSY", "\u8BBE\u7F6E\u6B63\u5728\u4FDD\u5B58\u6216\u91CD\u8FDE\uFF0C\u8BF7\u7A0D\u540E\u5237\u65B0\u91CD\u8BD5\u3002");
+        this.busy = true;
+        try {
+          const checked = checkMailConfig({
+            address: parsed2.data.address,
+            smtphost: parsed2.data.smtpHost,
+            smtpport: String(parsed2.data.smtpPort),
+            imaphost: parsed2.data.imapHost,
+            imapport: String(parsed2.data.imapPort),
+            password: parsed2.data.password ?? ""
+          });
+          if (!checked.ok) throw new SettingsError(422, "INVALID_INPUT", checked.reason);
+          const saved = await saveMailConfig({
+            home: this.options.home,
+            ...this.options.encrypt ? { encrypt: this.options.encrypt } : {}
+          }, checked.value);
+          if (!saved.ok) throw new SettingsError(422, "SAVE_FAILED", saved.reason);
+          return { status: 200, body: { ok: true, mail: readMailConfigView(this.options.home) } };
+        } finally {
+          this.busy = false;
+        }
       }
       if (pathname === routes[0]) throw invalid();
       const schema = pathname === routes[1] ? wecomRequestSchema : pathname === routes[2] ? reminderRequestSchema : pathname === routes[3] ? agentRequestSchema : reconnectSchema;

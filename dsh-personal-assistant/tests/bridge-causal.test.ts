@@ -163,6 +163,19 @@ describe('settleFromEvents：因果折叠的纯逻辑', () => {
     }
   })
 
+  test('v4 命名插件来源（plugin:dsh-better-sidebar）也是非用户注入，不算来源不明', () => {
+    const events: Ev[] = [
+      turnStart(1),
+      userMsg('m1'),
+      userMsg('side-injection', 'plugin:dsh-better-sidebar'),
+      assistantMsg(1, 1, '回答'),
+      turnEnd(1, 'completed'),
+    ]
+    const outcome = settleFromEvents(events, { messageId: 'm1' })
+    assert.equal(outcome.kind, 'settled', '插件上下文注入不该让宠物回复被判来源不明')
+    if (outcome.kind === 'settled') assert.equal(outcome.reply, '回答')
+  })
+
   test('消息没进入模型（无匹配 user/message）→ failed 且不重试', () => {
     const events: Ev[] = [turnStart(1), userMsg('someone-else'), assistantMsg(1, 1, '回答'), turnEnd(1, 'completed')]
     const outcome = settleFromEvents(events, { messageId: 'm1' })

@@ -39,20 +39,20 @@ body {
 }
 .dv-failure { margin: 12px; padding: 12px; border-radius: 8px; background: #fdecec; color: #9b1c1c; }
 .dv-loading { margin: 12px; color: #52606d; }
-.dv-stage { flex: 1; overflow: auto; padding: 12px; display: flex; justify-content: center; align-items: flex-start; }
-.dv-sheet { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2); }
+.dv-stage { flex: 1; overflow: auto; padding: 12px 12px 28px; }
+/*
+ * 连续滚动：所有页按顺序纵向排开，页与页之间只留一点缝（像 WPS 的 PDF 阅读）。
+ * 每一页的高度在加载时已按真实页面尺寸量好，渲染前后不会跳。
+ */
+.dv-pages { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.dv-sheet { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2); overflow: hidden; }
 .dv-sheet canvas { display: block; }
+/* 还没轮到渲染的页先占住位置，滚动条长度因此从一开始就是准的。 */
+.dv-sheet-placeholder {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: #b6bec8; font-size: 13px;
+}
 /* 页级高亮：只说明"讲解在这一页"，不在正文上画任何东西。 */
 .dv-sheet-current { outline: 3px solid rgba(37, 99, 235, 0.55); outline-offset: 2px; }
 /* 文字层片段高亮：画在整个文字项上，而不是按字切，避免暗示逐字精度。 */
 .dv-mark { position: absolute; background: rgba(250, 204, 21, 0.38); border-radius: 2px; pointer-events: none; mix-blend-mode: multiply; }
-
-/*
- * 翻页过渡的两页容器。
- *
- * 平时只有一页；翻页的那几百毫秒里上面多出一层"上一页"的位图，滚动结束后立刻撤掉。
- * 纵向排列而不是绝对定位：绝对定位需要手工算高度，而两页高度未必相同（不同纸张尺寸），
- * 算错就会在收尾时跳一下。用文档流排，移除上面那层时只需补偿相等的 scrollTop。
- */
-.dv-pages { display: flex; flex-direction: column; align-items: center; }
-.dv-sheet-outgoing { pointer-events: none; }

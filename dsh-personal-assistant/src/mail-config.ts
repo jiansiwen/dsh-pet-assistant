@@ -48,6 +48,9 @@ export interface MailConfigView {
   readonly imapPort: number
   /** 只表示"有没有存过授权码"，永远不表示值本身。 */
   readonly hasPassword: boolean
+  /** 值守开关与间隔（mail.json）；页面据此显示"值守中/未开启"。 */
+  readonly watchEnabled: boolean
+  readonly watchIntervalSeconds: number
 }
 
 /** 读当前配置。返回 `null` = 还没配过（`mail.json` 缺失或不可用）。 */
@@ -62,6 +65,8 @@ export function readMailConfigView(home: string): MailConfigView | null {
     imapHost: imap?.imapHost ?? '',
     imapPort: imap?.imapPort ?? 0,
     hasPassword: existsSync(path.join(mailDir(home), SECRET_FILE)),
+    watchEnabled: imap?.watchEnabled ?? false,
+    watchIntervalSeconds: imap?.watchIntervalSeconds ?? 600,
   }
 }
 
