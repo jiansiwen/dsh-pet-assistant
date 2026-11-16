@@ -40,6 +40,12 @@
 .pose-layer[data-pose-action='grab'] .pet-video {
   transform: translate(-11px, -4px) scale(1.08);
 }
+/* 念诗成片画幅留白比静图多，角色显小：渲染层等比放大对齐静图角色高度/水平中心，
+   不改素材（不压扁、诗字保留）。origin 取角色头顶附近，放大后脚底与静图接近。 */
+.pose-layer[data-pose-action='recite-poem'] .pet-video {
+  transform: translateX(-8px) scale(1.38);
+  transform-origin: 50% 40%;
+}
 .pose-layer[data-pose-action='drop'] .pet-video {
   transform: translate(-8px, -6.5px) scale(1.22);
 }
