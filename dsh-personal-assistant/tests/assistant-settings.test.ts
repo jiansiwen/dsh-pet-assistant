@@ -13,7 +13,7 @@ const root = '/companion/v1/settings'
 const oldCipher = Buffer.from('旧模拟密文，不是真实凭据').toString('base64')
 const newCipher = Buffer.from('新模拟密文，不是真实凭据').toString('base64')
 const secret = '仅测试-绝不能回显-密钥-123'
-const defaultAgent = { name: '小潘', persona: '', provider: '', model: '', maxTokens: 4096, tokenBudget: 0 }
+const defaultAgent = { name: '小潘', persona: '', provider: '', model: '', maxTokens: 16384, tokenBudget: 0 }
 
 function fixture(t: TestContext, configured = false) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-assistant-settings-'))
@@ -272,7 +272,7 @@ test('所有端点严格拒绝未知字段、错误类型、越界数值、非�
   for (const repeatEverySeconds of [undefined, null, '60', 59, 604801, 60.5, NaN, Infinity]) {
     invalidRequests.push(['reminders', { expectedRevision: 0, repeatEverySeconds }])
   }
-  for (const maxTokens of [0, 32769, 1.5, '4096', NaN]) invalidRequests.push(['agent', { expectedRevision: 0, ...defaultAgent, maxTokens }])
+  for (const maxTokens of [0, 131073, 1.5, '4096', NaN]) invalidRequests.push(['agent', { expectedRevision: 0, ...defaultAgent, maxTokens }])
   for (const tokenBudget of [-1, 0.5, 10_000_001, '0', Infinity]) invalidRequests.push(['agent', { expectedRevision: 0, ...defaultAgent, tokenBudget }])
   for (const [endpoint, body] of invalidRequests) errorCode(await f.post(endpoint, body), 400, 'INVALID_INPUT')
   for (const [method, pathname, body] of [

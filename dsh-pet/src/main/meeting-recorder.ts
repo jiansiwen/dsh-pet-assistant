@@ -171,6 +171,11 @@ export interface MeetingRecorderDeps {
   /** 说话人分离实现。默认 diarize.ts（本地模型、Worker 里跑）；测试注入替身。 */
   readonly diarize?: DiarizeFn
   /**
+   * 每条音轨的发言人数（0 = 自动）。停录精修时读取，用来固定聚类数。
+   * 按轨而不是按全场：线上会议常常本机 1 人、对方多人。
+   */
+  readonly speakerCounts?: () => { mic: number; loopback: number }
+  /**
    * 录音中逐块做临时转写（临时字幕）。createMeetingRecorder（生产接线）默认开；
    * 直接 new 时默认关，免得测试里转写调用次数不确定。
    */
@@ -567,7 +572,8 @@ export class MeetingRecorder {
   getState(): MeetingRuntimeState {
     const active = this.active
     const last = active !== null ? active : this.last
-    const recent = this.store.listMeetings(10)
+    // 保留更多历史：会议页的删除入口需要覆盖较早的录音，而不只是最近十场。
+    const recent = this.store.listMeetings(50)
     const lastMeetingId = this.last?.meetingId ?? recent[0]?.id ?? null
     const captions = this.liveMeetingId === null
       ? null
@@ -1136,9 +1142,12 @@ export class MeetingRecorder {
     const { timelines, corrupted } = this.loadTimelines(meetingId, last.startedAt)
     const diarize = this.deps.diarize ?? diarizeTimelineSamples
     const tracks = TRACK_ORDER.filter(track => (timelines.get(track)?.placements.length ?? 0) > 0)
+    const counts = this.deps.speakerCounts?.() ?? { mic: 0, loopback: 0 }
     const outcomes = await Promise.all(tracks.map(async (track): Promise<{ result?: DiarizeResult; error?: string }> => {
       try {
-        return { result: await diarize((timelines.get(track) as TrackTimeline).samples, this.deps.userDataDir) }
+        const count = track === 'mic' ? counts.mic : counts.loopback
+        return { result: await diarize((timelines.get(track) as TrackTimeline).samples, this.deps.userDataDir,
+          count >= 1 ? { numClusters: count } : undefined) }
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) }
       }
@@ -1465,6 +1474,24 @@ export class MeetingRecorder {
    */
   meetingName(meetingId: string): string | null {
     return this.store.getMeeting(meetingId)?.name ?? null
+  }
+
+  /** 删除整场会议；录音或转写进行中的那场拒绝删除，避免与后台写入交错。 */
+  deleteMeeting(meetingId: string): { ok: true } | { ok: false; error: string } {
+    const state = this.getState()
+    if (state.recording || state.stopping) return { ok: false, error: '会议还在录制，停止后才能删除' }
+    if (state.transcribe === 'transcribing'
+      && (state.meetingId === meetingId || state.lastMeetingId === meetingId)) {
+      return { ok: false, error: '这场会议正在转写，结束后才能删除' }
+    }
+    const result = this.store.deleteMeeting(meetingId)
+    if (result.ok) {
+      // 内存里的"最近一场"不能继续指向已删除的会议；状态推送后界面会回退到上一场。
+      if (this.last?.meetingId === meetingId) this.last = null
+      if (this.lastIntegrity?.meetingId === meetingId) this.lastIntegrity = null
+      this.deps.notifyRenderer('meeting-state-changed', this.getState())
+    }
+    return result
   }
 
   exportMinutes(meetingId: string): { ok: true; content: string; digest: string; confirmedAt: number; kind: 'local' | 'model' } | { ok: false; error: string } {
@@ -1870,6 +1897,7 @@ export function createMeetingRecorder(deps: {
   notifyRenderer: (channel: string, payload: unknown) => void
   storeDeps?: MeetingStoreDeps
   transcribe?: (wav: ArrayBuffer, userDataDir: string) => Promise<MeetingAsrResult>
+  speakerCounts?: () => { mic: number; loopback: number }
   now?: () => number
   flushTimeoutMs?: number
   summarize?: MeetingSummarizeFn
@@ -1885,6 +1913,7 @@ export function createMeetingRecorder(deps: {
     // 生产接线默认出临时字幕：录音中就能看到大致内容，停录精修后被替换。
     liveCaptions: true,
     ...(deps.transcribe !== undefined ? { transcribe: deps.transcribe } : {}),
+    ...(deps.speakerCounts !== undefined ? { speakerCounts: deps.speakerCounts } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...(deps.flushTimeoutMs !== undefined ? { flushTimeoutMs: deps.flushTimeoutMs } : {}),
     ...(deps.summarize !== undefined ? { summarize: deps.summarize } : {}),
@@ -1912,6 +1941,8 @@ export interface MeetingIpcDeps {
   readonly authorizeStart?: (event: unknown, consent: unknown, requestId?: string) => string | null
   /** 由主进程弹出原生目录选择；不能采用 IPC 传入的路径。 */
   readonly chooseExportDirectory?: (event: unknown) => Promise<string | null>
+  /** 删除整场会议前的原生确认；返回 false 表示用户取消。 */
+  readonly confirmDelete?: (event: unknown, meetingName: string) => Promise<boolean>
 }
 
 function asString(value: unknown): string | null {
@@ -1973,6 +2004,19 @@ export function registerMeetingIpc(deps: MeetingIpcDeps): void {
   })
 
   ipc.handle('meeting-state', () => recorder.getState())
+
+  // 删除整场会议（录音、转写与纪要）：必须先在主进程原生对话框里确认，渲染层不能自行决定。
+  ipc.handle('meeting-delete', async (event, meetingId: unknown) => {
+    const id = asString(meetingId)
+    if (id === null) return { ok: false, error: '参数不对' }
+    const name = recorder.meetingName(id)
+    if (name === null) return { ok: false, error: '没有这场会议' }
+    if (!deps.confirmDelete) return { ok: false, error: '删除确认不可用' }
+    let confirmed = false
+    try { confirmed = await deps.confirmDelete(event, name) } catch { confirmed = false }
+    if (!confirmed) return { ok: false, error: '已取消删除' }
+    return recorder.deleteMeeting(id)
+  })
 
   // 第二个参数 mode：'failed-only' = 只重试失败片段（缺口占位段）；不传 = 重转（有人工修订时
   // 自动降为只重试失败片段）。复用这一条通道而不是另开一条：舞台侧的 IPC 面保持不变。

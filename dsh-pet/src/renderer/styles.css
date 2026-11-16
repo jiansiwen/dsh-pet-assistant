@@ -658,6 +658,31 @@ body,
   font-size: 11px;
 }
 
+.meeting-recent-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.meeting-recent-delete {
+  border: 1px solid rgba(170, 55, 55, 0.28);
+  border-radius: 6px;
+  background: transparent;
+  color: #a33;
+  padding: 3px 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.meeting-recent-delete:hover:not(:disabled) {
+  background: rgba(170, 55, 55, 0.08);
+}
+
+.meeting-recent-delete:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .meeting-transcribe-state {
   margin: 0;
   display: flex;

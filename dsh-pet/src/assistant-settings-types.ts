@@ -4,7 +4,7 @@ export type AssistantSettingsPage = Exclude<AssistantSettingsSection, 'wecom/rec
 /** 与配置服务的写入上限保持一致，界面与 IPC 共用。 */
 export const ASSISTANT_SETTINGS_LIMITS = {
   botId: 200, secret: 4096, name: 80, persona: 8000, provider: 128, model: 256,
-  maxTokens: 32768, tokenBudget: 10_000_000,
+  maxTokens: 131072, tokenBudget: 10_000_000,
 } as const
 
 export interface AssistantAgentSettings {

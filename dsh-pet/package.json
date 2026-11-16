@@ -24,6 +24,7 @@
     "docx-preview": "^0.4.1",
     "jszip": "^3.10.2",
     "pdfjs-dist": "6.3.289",
+    "pinyin-pro": "^3.29.5",
     "pptx-preview": "^1.0.7",
     "sherpa-onnx-node": "^1.13.7",
     "ws": "^8.21.3"

@@ -110,7 +110,7 @@ export interface CompanionHostCallbacks {
   onRetryWake: () => void
   /** 退出桌面壳：走完退场动画再退出。 */
   onExit: () => void
-  readSettings: () => { trayResident?: boolean; runtimeProfile?: string }
+  readSettings: () => { trayResident?: boolean; runtimeProfile?: string; wakeName?: string }
   saveSettings: (patch: { trayResident?: boolean; runtimeProfile?: string }) => void
 }
 
@@ -565,7 +565,7 @@ export class CompanionHost {
         {
           // 唤醒监听初始化失败后会粘住、不自动重试（否则每三秒刷一条错误日志，用户看到的
           // 是一只一直在报错的宠物）。所以修好麦克风、装好中文语音包之后得有地方能把它叫回来。
-          label: '重新监听唤醒词（"小潘同学"）',
+          label: `重新监听唤醒词（"${this.callbacks.readSettings().wakeName ?? '小潘同学'}"）`,
           click: () => this.callbacks.onRetryWake(),
         },
         {

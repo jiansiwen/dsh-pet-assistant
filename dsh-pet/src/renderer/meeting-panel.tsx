@@ -424,6 +424,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
   const [runtime, setRuntime] = useState<MeetingRuntimeState | null>(null)
   const [name, setName] = useState('')
   const [sources, setSources] = useState<'mic' | 'mic+loopback'>('mic')
+  const [speakerCounts, setSpeakerCounts] = useState<{ mic: number; loopback: number }>({ mic: 0, loopback: 0 })
   const [consented, setConsented] = useState(false)
   const [retentionDays, setRetentionDays] = useState(30)
   const [formError, setFormError] = useState<string | null>(null)
@@ -444,6 +445,8 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
   const [mergeInto, setMergeInto] = useState('')
   const [renameFor, setRenameFor] = useState<{ speaker: string; label: string } | null>(null)
   const [elapsed, setElapsed] = useState('')
+  /** 正在请求删除的会议 id：防止重复点击，也用来禁用按钮。 */
+  const [deleting, setDeleting] = useState<string | null>(null)
   const handledCommands = useRef(new Set<string>())
 
   const selectedId = selected ?? runtime?.lastMeetingId ?? null
@@ -487,6 +490,14 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
         .then(showFlush).catch(() => setNotice('录音冲刷回执异常，停止结果未知'))
     }
     void api.meetingState().then(setRuntime).catch(() => undefined)
+    // 人数是按音轨存的全局设置：会议页重新打开时把上次的选择带回来。
+    // 面板在部分隔离测试里用最小 api 替身，没有 getState 时跳过即可。
+    if (typeof api.getState === 'function') {
+      void api.getState().then(state => {
+        const counts = state.meetingSpeakerCounts
+        if (counts) setSpeakerCounts({ mic: counts.mic, loopback: counts.loopback })
+      }).catch(() => undefined)
+    }
     api.onMeetingState((state) => setRuntime(state))
     api.onMeetingStarted((payload) => {
       startingFor = payload.meetingId
@@ -557,6 +568,16 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
     return () => clearInterval(timer)
   }, [recording, runtime?.startedAt])
 
+  const updateSpeakerCount = useCallback((track: 'mic' | 'loopback', value: number) => {
+    setSpeakerCounts(previous => {
+      const next = { ...previous, [track]: value }
+      void api?.saveSettings({ meetingSpeakerCounts: next }).then(result => {
+        if (!result.ok) setFormError('分人人数未保存')
+      }).catch(() => setFormError('分人人数未保存'))
+      return next
+    })
+  }, [api])
+
   const start = useCallback(async () => {
     if (api === undefined) return
     setFormError(null)
@@ -623,6 +644,25 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
     const result = await api.meetingRetryFailed(selectedId).catch(() => ({ ok: false, error: '主进程没有响应' }))
     setNotice(result.ok ? '正在重试失败的片段（其余段与你的修订不动）' : result.error ?? '无法重试')
   }, [api, selectedId])
+
+  /** 删除整场会议；主进程会先弹原生确认，取消时不报错。 */
+  const removeMeeting = useCallback(async (meetingId: string) => {
+    if (api === undefined || deleting !== null) return
+    setDeleting(meetingId)
+    try {
+      const result = await api.meetingDelete(meetingId).catch(() => ({ ok: false, error: '主进程没有响应' }))
+      if (result.ok) {
+        setNotice('会议已删除（录音、转写与纪要一并清除）')
+        if (selectedId === meetingId) setSelected(null)
+        const next = await api.meetingState().catch(() => null)
+        if (next !== null) setRuntime(next)
+      } else if (result.error !== '已取消删除') {
+        setNotice(result.error ?? '删除失败')
+      }
+    } finally {
+      setDeleting(null)
+    }
+  }, [api, deleting, selectedId])
 
   /** 纪要条目的来源被点：滚到转写里那一段并高亮，定位回原片段。 */
   const locateSegment = useCallback((idx: number) => {
@@ -763,6 +803,33 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
               麦克风 + 系统回环声（线上会议对方的声音，分两条音轨录）
             </label>
           </fieldset>
+          <fieldset className="meeting-field">
+            <legend>每条音轨的发言人数（停录后分人用）</legend>
+            <label className="meeting-radio">
+              本机麦克风
+              <select
+                value={speakerCounts.mic}
+                onChange={event => updateSpeakerCount('mic', Number.parseInt(event.target.value, 10))}
+              >
+                <option value={0}>自动</option>
+                {[1, 2, 3, 4, 5, 6].map(count => <option key={count} value={count}>{count} 人</option>)}
+              </select>
+            </label>
+            <label className="meeting-radio">
+              对方（系统回环）
+              <select
+                value={speakerCounts.loopback}
+                disabled={sources === 'mic'}
+                onChange={event => updateSpeakerCount('loopback', Number.parseInt(event.target.value, 10))}
+              >
+                <option value={0}>自动</option>
+                {[1, 2, 3, 4, 5, 6].map(count => <option key={count} value={count}>{count} 人</option>)}
+              </select>
+            </label>
+            <p className="meeting-hint">
+              线上会议通常本机 1 人、对方多人；线下会议按麦克风实际人数选。填错会把同一个人拆开或把两个人并成一组。
+            </p>
+          </fieldset>
           <label className="meeting-field">
             <span>保留天数（到期自动删除录音分块）</span>
             <input
@@ -801,7 +868,7 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
           <h3 className="meeting-title">最近的会议</h3>
           <ul className="meeting-recent">
             {runtime.recent.map(item => (
-              <li key={item.id}>
+              <li key={item.id} className="meeting-recent-item">
                 <button
                   type="button"
                   className={'meeting-recent-btn' + (item.id === selectedId ? ' active' : '')}
@@ -809,6 +876,16 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
                 >
                   {item.name}
                   <span className="meeting-recent-state">{item.state}</span>
+                </button>
+                <button
+                  type="button"
+                  className="meeting-recent-delete"
+                  aria-label={`删除会议 ${item.name}`}
+                  title="删除这场会议的录音、转写与纪要"
+                  disabled={deleting !== null}
+                  onClick={() => void removeMeeting(item.id)}
+                >
+                  {deleting === item.id ? '删除中…' : '删除'}
                 </button>
               </li>
             ))}

@@ -140,6 +140,15 @@ interface LlmLike {
   listProviders?: () => readonly { id: string; name?: string }[]
   listModels?: (provider: string) => Promise<readonly { provider?: string; id?: string; name?: string }[]>
 }
+/**
+ * 宿主 API 会话控制器：`session/selectModel` 的 Host 服务入口。
+ *
+ * 0.2.x 不再给插件提供 `apiProxy` 会话 RPC，但这个服务仍由宿主注册；
+ * 取不到或没有 `selectModel` 时，宠物端如实保持"不能切换"，不伪造能力。
+ */
+interface SessionControllerLike {
+  selectModel?: (request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }) => Promise<unknown>
+}
 
 const MODEL_CACHE_MS = 5_000
 const PAGE_MESSAGES = 50
@@ -149,7 +158,8 @@ const stale = (): SessionResult => ({ ok: false, error: '会话绑定已变化�
  * 只适配已安装宿主的服务；最小测试 agent 没有服务时不伪造原生能力或运行态。
  *
  * 0.2.x 起宿主不再给插件提供 `apiProxy` 会话 RPC：历史分页直接读会话事件日志，
- * 输入与停止直接走 live agent 的 followup / cancel，模型目录走 `ctx.llm`。
+ * 输入与停止直接走 live agent 的 followup / cancel，模型目录走 `ctx.llm`；
+ * 模型切换走宿主注册的 `sessionController.selectModel`，取不到时保持只读。
  */
 export class SessionMirror {
   readonly bindingId = randomUUID()
@@ -159,6 +169,8 @@ export class SessionMirror {
   private status: SessionSnapshot['status'] = 'disconnected'
   private title = ''
   private model: SessionModel | null = null
+  /** 宠物侧刚选中的模型；宿主还没有把新值写回 agent.options 时先用它显示。 */
+  private modelSelected: SessionModel | null = null
   private models: SessionModel[] = []
   private modelError: string | undefined
   private modelsAt = -Infinity
@@ -190,7 +202,11 @@ export class SessionMirror {
   observe(event: MirrorEvent, index: number): void {
     this.projection.apply(event, index)
     if (event.type === 'session/title') this.title = text(event.data.title)
-    if (event.type === 'request/header') this.modelsAt = -Infinity
+    if (event.type === 'request/header') {
+      this.modelsAt = -Infinity
+      // 宿主已经带着新选择发出请求：以宿主写回的值/目录为准，不再用本地临时覆盖。
+      this.modelSelected = null
+    }
   }
 
   private metadata(): Omit<SessionSnapshot, 'entries'> {
@@ -203,6 +219,7 @@ export class SessionMirror {
     const permission = text(projected.currentValue) || (this.agent && presets?.current(events ?? [])) || null
     const available = this.active && this.sessionId() !== null
     const agent = this.agent as { followup?: unknown; cancel?: unknown } | null
+    const controller = this.service<SessionControllerLike>('sessionController')
     return {
       sessionId: this.sessionId(), bindingId: this.bindingId, cursor: this.cursor, title: this.title,
       status: this.active ? this.status : 'disconnected', hasMore: this.hasMore, beforeSeq: this.beforeSeq,
@@ -211,8 +228,8 @@ export class SessionMirror {
         prompt: available && typeof agent?.followup === 'function',
         cancel: available && typeof agent?.cancel === 'function',
         history: available,
-        // 当前宿主只提供模型目录，不提供这里的会话模型切换接口。
-        models: false,
+        // 宿主注册了 sessionController.selectModel 才能切；没有就保持只读，不伪造成可选。
+        models: available && typeof controller?.selectModel === 'function',
         permissions: available && !!presets && !!commands?.find(this.agent!, 'permission'),
       },
       ...(this.modelError ? { error: this.modelError } : {}),
@@ -250,8 +267,11 @@ export class SessionMirror {
     const llm = this.service<LlmLike>('llm')
     this.modelsPending = (async () => {
       const readCurrent = () => {
+        // 请求头是宿主实际发出的路由；没有请求头时才回落到创建时的 agent.options。
+        const header = (this.agent as { session?: { requestHeader?: () => { config?: RecordValue } | undefined } } | null)
+          ?.session?.requestHeader?.()?.config
         const options = (this.agent as { options?: RecordValue } | null)?.options
-        this.model = options ? this.asModel(options) : null
+        this.model = this.modelSelected ?? (header ? this.asModel(header) : options ? this.asModel(options) : null)
       }
       // 当前模型独立于目录查询；目录失败也不能把已知模型弄丢。
       readCurrent()
@@ -341,8 +361,31 @@ export class SessionMirror {
           break
         }
         case 'model': {
-          // 0.2.x 宿主没有面向插件的运行时模型切换接口：如实拒绝，让用户去应用设置里换。
-          throw new Error('当前宿主不支持从宠物侧切换模型，请在应用的模型设置里切换')
+          const controller = this.service<SessionControllerLike>('sessionController')
+          if (!controller?.selectModel) throw new Error('当前宿主不支持从宠物侧切换模型，请在应用的模型设置里切换')
+          if (typeof value.provider !== 'string' || typeof value.model !== 'string'
+            || !value.provider.trim() || !value.model.trim()
+            || value.provider.length > 128 || value.model.length > 256) throw new Error('模型参数无效')
+          const sessionId = this.sessionId()
+          if (sessionId === null) throw new Error('会话还未就绪，不能切换模型')
+          const reasoningEffort = typeof value.reasoningEffort === 'string' && value.reasoningEffort.length <= 64
+            ? value.reasoningEffort : undefined
+          await controller.selectModel({
+            sessionId,
+            provider: value.provider.trim(),
+            model: value.model.trim(),
+            ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          })
+          const provider = value.provider.trim()
+          const model = value.model.trim()
+          this.modelSelected = {
+            provider,
+            model,
+            label: this.models.find(item => item.provider === provider && item.model === model)?.label ?? model,
+            ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          }
+          this.model = this.modelSelected
+          break
         }
         case 'permission': {
           if (!capabilities.permissions) throw new Error('宿主权限切换不可用')

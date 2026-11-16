@@ -16,7 +16,7 @@ const MAX = Number.MAX_SAFE_INTEGER
 const SKINS = ['panda', 'girl-glasses', 'boy-glasses']
 
 function defaults(): Extension {
-  return { description: '', personality: '', permissionMode: 'ask', provider: '', model: '', maxTokens: 4096, capabilities: [], allowedTools: [],
+  return { description: '', personality: '', permissionMode: 'ask', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
     dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai', sessionId: null,
     kind: 'expert', binding: null, reportMode: 'chief' }
 }
@@ -174,7 +174,7 @@ function normalize(draft: MemberDraft): NormalizedMemberDraft {
     personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode,
     persona: text(draft.persona, '人设', 16000), skinId, enabled: draft.enabled,
     provider: text(draft.provider, '模型提供方', 200), model: text(draft.model, '模型名称', 200),
-    maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 32768), capabilities: [...new Set(draft.capabilities)],
+    maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 131072), capabilities: [...new Set(draft.capabilities)],
     allowedTools: [...new Set(draft.allowedTools)], dailyTokenLimit: integer(draft.dailyTokenLimit, '日额度'),
     totalTokenLimit: integer(draft.totalTokenLimit, '总额度'), thresholdPercent: integer(draft.thresholdPercent ?? 80, '申请阈值', 1, 100), timezone,
     kind, binding, reportMode }

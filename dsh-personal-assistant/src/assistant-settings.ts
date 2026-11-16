@@ -30,7 +30,7 @@ const agentShape = {
   persona: z.string().max(8000),
   provider: z.string().max(128).trim(),
   model: z.string().max(256).trim(),
-  maxTokens: z.number().int().min(1).max(32768),
+  maxTokens: z.number().int().min(1).max(131072),
   tokenBudget: z.number().int().min(0).max(10_000_000),
 }
 const pairedModel = (value: { provider: string; model: string }) => !!value.provider === !!value.model
@@ -57,7 +57,7 @@ type Response = { status: number; body: unknown }
 
 function defaults(): Settings {
   return { revision: 0, reminder: { repeatEverySeconds: 300 },
-    agent: { name: '小潘', persona: '', provider: '', model: '', maxTokens: 4096, tokenBudget: 0 } }
+    agent: { name: '小潘', persona: '', provider: '', model: '', maxTokens: 16384, tokenBudget: 0 } }
 }
 
 class SettingsError extends Error {

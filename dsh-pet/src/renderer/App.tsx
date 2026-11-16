@@ -713,7 +713,7 @@ export default function App() {
     if (!gateInterrupt) window.petApi.stopSpeech()
     setListening(true)
     asrDeltaText.current = ''
-    // 主进程按场景判定：会议演讲 / 文档讲解中，评委的话直接当问题，不要求“停一下”这类口令。
+    // 讲解与会议里也要先听到明确口令才停下；直接说话不会打断朗读。
     let directMode = false
     const accept = async (text: string): Promise<void> => {
       if (cancelled()) return
@@ -721,7 +721,8 @@ export default function App() {
         const plan = planInterruptInput(text, directMode)
         if (plan.action === 'ignore') return
         if (plan.action === 'send' || plan.action === 'listen') {
-          if (!directMode) window.petApi.stopSpeech()
+          // 口令后直接带问题时，回答播完仍要自动回到原讲解；只说“停一下”则保持暂停。
+          if (!directMode) window.petApi.stopSpeech(plan.action === 'send')
           if (conversation.active) {
             stopContinuous(false)
             // 这是主动从连续对话转入插话，不是用户取消下一次听写。
@@ -1215,6 +1216,11 @@ export default function App() {
     },
     [docState, runDoc],
   )
+  /** 面板上的恢复入口：与说“继续讲解”走同一条主进程路径。 */
+  const docResume = useCallback(
+    () => void runDoc(() => window.petApi.chat('继续讲解', undefined, true)),
+    [runDoc],
+  )
   /** 加目录要弹原生选择框，用户点了取消也算一次正常收场，不该报错。 */
   const docAddRoot = useCallback(async () => {
     setDocBusy(true)
@@ -1545,6 +1551,7 @@ export default function App() {
                 onExplain={docExplain}
                 onAsk={docAsk}
                 onStop={() => window.petApi.stopSpeech()}
+                onResume={docResume}
                 onAddRoot={() => void docAddRoot()}
                 onRemoveRoot={dir => void docRemoveRoot(dir)}
                 onForgetDir={dir => void docForgetDir(dir)}

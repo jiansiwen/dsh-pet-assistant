@@ -114,6 +114,30 @@ test('宿主不能从宠物侧切换模型时不能宣称选择能力可用', as
   } finally { mirror.close() }
 })
 
+test('宿主提供 sessionController.selectModel 时，宠物端可以切换模型', async () => {
+  const calls: unknown[] = []
+  const agent = { id: 'isolated-agent', status: 'idle', session: { id: 'isolated-agent', events: [] }, followup() {},
+    options: { provider: '测试提供方', model: '模型甲' }, ctx: { get: (name: string) => {
+      if (name === 'llm') {
+        return { listProviders: () => [{ id: '测试提供方' }], listModels: async () => [{ id: '模型甲', name: '模型甲' }, { id: '模型乙', name: '模型乙' }] }
+      }
+      if (name === 'sessionController') {
+        return { selectModel: async (request: unknown) => { calls.push(request); return { selected: request } } }
+      }
+      return undefined
+    } } } as BridgeAgent
+  const mirror = new SessionMirror(agent, () => {})
+  try {
+    const state = (await mirror.snapshot(undefined, undefined, () => {})).state!
+    assert.equal(state.capabilities.models, true, '宿主有 selectModel 才宣称可切换')
+    const result = await mirror.command({ kind: 'model', bindingId: mirror.bindingId, provider: '测试提供方', model: '模型乙' }, () => {})
+    assert.equal(result.ok, true, result.error)
+    assert.deepEqual(calls, [{ sessionId: 'isolated-agent', provider: '测试提供方', model: '模型乙' }])
+    const after = (await mirror.snapshot(undefined, undefined, () => {})).state!
+    assert.deepEqual([after.model?.provider, after.model?.model], ['测试提供方', '模型乙'])
+  } finally { mirror.close() }
+})
+
 test('模型目录异常明确提示，不能丢失已知当前模型或泄露异常细节', async () => {
   const agent = { id: 'isolated-agent', status: 'idle', session: { id: 'isolated-agent', events: [] }, followup() {},
     options: { provider: '测试提供方', model: '模型甲' }, ctx: { get: (name: string) => name === 'llm'

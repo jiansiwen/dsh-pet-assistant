@@ -81,6 +81,8 @@ export interface PetState {
   continuousVoice?: boolean
   readReplies?: boolean
   meetingDocumentAutoApprove?: boolean
+  /** 本场会议人数；0 = 自动。 */
+  meetingSpeakerCounts?: { mic: number; loopback: number }
   idleSleepMinutes?: number
   sleepMinutes?: number
   chatDock?: 'top' | 'auto'
@@ -99,6 +101,7 @@ export interface PetSettingsPatch {
   continuousVoice?: boolean
   readReplies?: boolean
   meetingDocumentAutoApprove?: boolean
+  meetingSpeakerCounts?: { mic: number; loopback: number }
   idleSleepMinutes?: number
   sleepMinutes?: number
   bounds?: PetPosition
@@ -360,6 +363,17 @@ export interface ResidencyState {
   readonly wake: {
     readonly enabled: boolean
     readonly engine: 'system' | 'kws' | null
+    /** 用户自定义的唤醒词。 */
+    readonly name: string
+    /** 只认本人声纹的开关与注册状态。 */
+    readonly voiceprint: {
+      readonly enabled: boolean
+      readonly threshold: number
+      readonly registered: boolean
+      readonly count: number
+      readonly createdAt: number | null
+      readonly problem: string | null
+    }
     readonly engines: ReadonlyArray<'system' | 'kws'>
     /** 仲裁器当前是否把麦克风交给了唤醒。 */
     readonly listening: boolean
@@ -378,6 +392,12 @@ export interface ResidencyPatch {
   readonly trayResident?: boolean
   readonly wakeEnabled?: boolean
   readonly wakeEngine?: 'system' | 'kws'
+  /** 自定义唤醒词（2–5 个汉字）；只对 KWS 引擎生效。 */
+  readonly wakeName?: string
+  /** 只认已注册声纹；开启前必须先录制。 */
+  readonly wakeVoiceprint?: boolean
+  /** 声纹相似度阈值（0.5–0.9）。 */
+  readonly wakeVoiceprintThreshold?: number
   readonly launchAtLogin?: boolean
   readonly bargeIn?: boolean
   /** 唤醒失败后用户手动重试。 */
@@ -483,8 +503,8 @@ export interface PetApi extends MemberApi {
    * 打字问的话突然出声，是用户没要求过的行为。
    */
   chat(text: string, assistantId?: string, spoken?: boolean): Promise<{ ok: boolean; reply?: string; error?: string }>
-  /** 让角色闭嘴：掐掉当前这句并丢掉排队的那些。 */
-  stopSpeech(): void
+  /** 让角色闭嘴：掐掉当前这句并丢掉排队的那些。preserveAutoResume 用于“停一下，问题”后回答完续讲。 */
+  stopSpeech(preserveAutoResume?: boolean): void
   /** 只在本机念一句（不进会话、不调模型）。 */
   speakLocal(text: string): void
   /** 拉一次团队快照。未连接或未开启团队模式时返回 null。 */
@@ -514,6 +534,11 @@ export interface PetApi extends MemberApi {
   bargeInMetrics(metrics: import('./barge-in.ts').BargeInMetrics): void
   residencyState(): Promise<ResidencyState>
   residencySet(patch: ResidencyPatch): Promise<ResidencyResult>
+  /** 声纹注册状态（不返回 embedding 本身）。 */
+  voiceprintStatus(): Promise<{ registered: boolean; count: number; createdAt: number | null; problem: string | null }>
+  /** 用 2–5 段 16k 单声道 WAV（base64）注册声纹；只存 embedding，不存原始录音。 */
+  voiceprintEnroll(wavs: string[]): Promise<{ ok: boolean; count?: number; error?: string }>
+  voiceprintClear(): Promise<{ ok: boolean; removed?: boolean; error?: string }>
   /** 流式喂数：一帧 16kHz Int16 PCM（base64），返回当前累积的识别文本（实时回显）。 */
   asrStreamFeed(chunkBase64: string): Promise<{ text: string }>
   /** 流式收尾：取最终全文并归还麦克风给唤醒监听。 */
@@ -630,6 +655,8 @@ export interface PetApi extends MemberApi {
   meetingFlushDone(meetingId: string, report?: MeetingFlushReport): Promise<SimpleOkResult>
   /** 拉一次会议运行时状态（录音中/停止中/转写进度/最近会议）。 */
   meetingState(): Promise<MeetingRuntimeState>
+  /** 删除整场会议（录音、转写与纪要）；主进程会先弹原生确认。 */
+  meetingDelete(meetingId: string): Promise<SimpleOkResult>
   /** 手动重跑转写（转写失败后的重试入口）。录音始终保留；已有人工修订时只重试失败片段。 */
   meetingTranscribe(meetingId: string): Promise<SimpleOkResult>
   /** 只重试转写失败的片段：成功的替换占位段，其余段（含用户改过的名字）不动。 */

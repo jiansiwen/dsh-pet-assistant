@@ -534,3 +534,25 @@ describe('双轨就绪：没收到音频不算开始成功', () => {
     h.store.close()
   })
 })
+
+describe('删除整场会议', () => {
+  test('删除后不再把已删会议当最近一场，并推送新状态', async () => {
+    const h = setup({ transcribe: async () => ({ ok: false, error: '测试不转写' }) })
+    const started = h.recorder.startMeeting(CONSENT)
+    if (!started.ok) throw new Error(started.error)
+    const meetingId = started.meetingId
+    h.recorder.requestStop(meetingId)
+    await h.recorder.flushDone(meetingId)
+    await h.recorder.whenSettled()
+    assert.equal(h.recorder.getState().lastMeetingId, meetingId)
+
+    const eventsBefore = h.events.length
+    const deleted = h.recorder.deleteMeeting(meetingId)
+    assert.equal(deleted.ok, true, deleted.ok ? '' : deleted.error)
+    assert.equal(h.recorder.getState().lastMeetingId, null)
+    assert.ok(h.events.slice(eventsBefore).some(event => event.channel === 'meeting-state-changed'),
+      '删除后要推送会议状态，界面才会刷新列表')
+    assert.equal(h.recorder.deleteMeeting(meetingId).ok, false, '重复删除要明确失败')
+    h.store.close()
+  })
+})

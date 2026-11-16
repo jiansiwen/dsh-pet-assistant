@@ -16,16 +16,26 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { defaultWakeEnabled, defaultWakeEngine, wakeEngines, type SupportedPlatform, type WakeEngine } from './platform.ts'
+import { DEFAULT_WAKE_NAME, normalizeWakeName } from './wake-name.ts'
 
 export interface AudioPrefs {
   readonly wakeEnabled: boolean
   /** null = 这个平台没有可用引擎。 */
   readonly wakeEngine: WakeEngine | null
+  /** 用户给助理起的唤醒词；默认「小潘同学」。 */
+  readonly wakeName: string
+  /** 只认已注册的声纹；默认关（关闭时谁喊都应，保持旧行为）。 */
+  readonly wakeVoiceprint: boolean
+  /** 声纹相似度阈值；0.5–0.9，默认 0.65。 */
+  readonly wakeVoiceprintThreshold: number
   readonly launchAtLogin: boolean
   readonly bargeIn: boolean
 }
 
-export type AudioPrefsPatch = Partial<Pick<AudioPrefs, 'wakeEnabled' | 'launchAtLogin' | 'bargeIn'>> & { wakeEngine?: WakeEngine }
+export type AudioPrefsPatch = Partial<Pick<AudioPrefs, 'wakeEnabled' | 'wakeVoiceprint' | 'wakeVoiceprintThreshold' | 'launchAtLogin' | 'bargeIn'>> & {
+  wakeEngine?: WakeEngine
+  wakeName?: string
+}
 
 export function normalizeAudioPrefs(raw: unknown, platform: SupportedPlatform): AudioPrefs {
   const record = raw !== null && typeof raw === 'object' ? raw as Record<string, unknown> : {}
@@ -36,6 +46,12 @@ export function normalizeAudioPrefs(raw: unknown, platform: SupportedPlatform): 
     // 没有任何引擎的平台上，开关存了 true 也没有意义：如实是 false。
     wakeEnabled: engine === null ? false : typeof record.wakeEnabled === 'boolean' ? record.wakeEnabled : defaultWakeEnabled(platform),
     wakeEngine: engine,
+    wakeName: normalizeWakeName(record.wakeName),
+    wakeVoiceprint: record.wakeVoiceprint === true,
+    wakeVoiceprintThreshold: typeof record.wakeVoiceprintThreshold === 'number'
+      && Number.isFinite(record.wakeVoiceprintThreshold)
+      && record.wakeVoiceprintThreshold >= 0.5 && record.wakeVoiceprintThreshold <= 0.9
+      ? record.wakeVoiceprintThreshold : 0.65,
     launchAtLogin: record.launchAtLogin === true,
     bargeIn: record.bargeIn === true,
   }
@@ -51,6 +67,11 @@ export function sanitizePatch(raw: unknown, platform: SupportedPlatform): AudioP
   }
   if (typeof record.wakeEngine === 'string' && (wakeEngines(platform) as readonly string[]).includes(record.wakeEngine)) {
     patch.wakeEngine = record.wakeEngine as WakeEngine
+  }
+  if (typeof record.wakeName === 'string') patch.wakeName = record.wakeName
+  if (typeof record.wakeVoiceprint === 'boolean') patch.wakeVoiceprint = record.wakeVoiceprint
+  if (typeof record.wakeVoiceprintThreshold === 'number' && Number.isFinite(record.wakeVoiceprintThreshold)) {
+    patch.wakeVoiceprintThreshold = record.wakeVoiceprintThreshold
   }
   return patch
 }

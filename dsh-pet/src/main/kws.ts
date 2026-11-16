@@ -14,11 +14,13 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
+import { pinyin } from 'pinyin-pro'
 import type { KeywordSpotterConfig } from 'sherpa-onnx-node'
 import { toUnpackedPath } from './runtime-launch.ts'
+import { DEFAULT_WAKE_NAME } from './wake-name.ts'
 
-/** 唤醒词。与 wake.ps1（System.Speech grammar）是同一个词。 */
-export const WAKE_KEYWORD = '小潘同学'
+/** 兼容旧调用：默认唤醒词。System.Speech 仍只认这个词；KWS 可以改名。 */
+export const WAKE_KEYWORD = DEFAULT_WAKE_NAME
 
 /**
  * keywords 文件的行：`<token 序列> [:boost] [#threshold] @<显示文本>`。
@@ -29,6 +31,34 @@ export const WAKE_KEYWORD = '小潘同学'
  * 会把"小盘子"一类日常说法也收进来。
  */
 export const KWS_KEYWORD_LINES: readonly string[] = ['x iǎo p ān t óng x ué @小潘同学']
+
+/**
+ * 模型 tokens.txt 里的声母顺序：zh/ch/sh 必须排在 z/c/s 前面，
+ * 否则 "zhāng" 会被拆成 z + hāng。
+ */
+const PINYIN_INITIALS = ['zh', 'ch', 'sh', 'b', 'p', 'm', 'f', 'd', 't', 'n', 'l', 'g', 'k', 'h',
+  'j', 'q', 'x', 'r', 'z', 'c', 's', 'y', 'w'] as const
+
+/** 把中文唤醒词拆成模型要求的「声母 + 带调韵母」token。 */
+export function wakeKeywordTokens(name: string): string[] {
+  const syllables = pinyin(name, { toneType: 'symbol', type: 'array', multiple: false })
+  const tokens: string[] = []
+  for (const syllable of syllables) {
+    const initial = PINYIN_INITIALS.find(item => syllable.startsWith(item))
+    if (initial !== undefined && syllable.length > initial.length) {
+      tokens.push(initial, syllable.slice(initial.length))
+    } else {
+      // 零声母（安 ān、儿 ér 等）：模型若没有这个 token，missingKeywordTokens 会如实报出来。
+      tokens.push(syllable)
+    }
+  }
+  return tokens
+}
+
+/** keywords 文件的一行：token 序列 + 显示文本。 */
+export function wakeKeywordLines(name: string = DEFAULT_WAKE_NAME): readonly string[] {
+  return [`${wakeKeywordTokens(name).join(' ')} @${name}`]
+}
 
 /** 检出阈值与加分。按 `petsBak/dsh-pet/m1-kws-bench` 的离线数据选定；改动要重跑那份数据。 */
 export const KWS_THRESHOLD = 0.2
@@ -73,15 +103,17 @@ export function missingKeywordTokens(tokensText: string, lines: readonly string[
 }
 
 /** 模型不可用的原因；可用返回 null。给用户看的话，不是错误码。 */
-export function kwsModelProblem(userDataDir: string): string | null {
+export function kwsModelProblem(userDataDir: string, name: string = DEFAULT_WAKE_NAME): string | null {
   const paths = kwsModelPaths(userDataDir)
   const absent = [paths.encoder, paths.decoder, paths.joiner, paths.tokens].filter(file => !existsSync(file))
   if (absent.length > 0) {
     return `本地唤醒模型没装（缺 ${absent.map(file => path.basename(file)).join('、')}）：运行 scripts/setup-local-asr 安装后在设置里重试`
   }
   try {
-    const missing = missingKeywordTokens(readFileSync(paths.tokens, 'utf8'))
-    if (missing.length > 0) return `唤醒模型与唤醒词不匹配（模型里没有 ${missing.join(' ')}），请重新安装唤醒模型`
+    const missing = missingKeywordTokens(readFileSync(paths.tokens, 'utf8'), wakeKeywordLines(name))
+    if (missing.length > 0) {
+      return `唤醒词「${name}」里有模型不支持的读音（${missing.join(' ')}），请换一个名字；模型本身不用重装`
+    }
   } catch (error) {
     return `读不了唤醒模型：${error instanceof Error ? error.message : String(error)}`
   }
@@ -106,9 +138,9 @@ export function kwsSpotterConfig(paths: KwsModelPaths): KeywordSpotterConfig {
   }
 }
 
-/** 写 keywords 文件（内容由常量生成；没变就不写）。这是配置，不是音频。 */
-export function ensureKeywordsFile(paths: KwsModelPaths): void {
-  const content = KWS_KEYWORD_LINES.join('\n') + '\n'
+/** 写 keywords 文件（内容由唤醒词生成；没变就不写）。这是配置，不是音频。 */
+export function ensureKeywordsFile(paths: KwsModelPaths, name: string = DEFAULT_WAKE_NAME): void {
+  const content = wakeKeywordLines(name).join('\n') + '\n'
   try {
     if (existsSync(paths.keywords) && readFileSync(paths.keywords, 'utf8') === content) return
   } catch { /* 读不了就重写 */ }
@@ -124,20 +156,77 @@ const WORKER_SOURCE = `
 const { parentPort, workerData } = require('node:worker_threads')
 let spotter = null
 let stream = null
+let extractor = null
+let voiceprintError = null
 let lastHit = -Infinity
 let fedSamples = 0
+const RING = 16000 * 3
+const ring = new Float32Array(RING)
+let ringLen = 0
+
+function push(samples) {
+  if (samples.length >= RING) {
+    ring.set(samples.subarray(samples.length - RING))
+    ringLen = RING
+    return
+  }
+  const overflow = ringLen + samples.length - RING
+  if (overflow > 0) {
+    ring.copyWithin(0, overflow, ringLen)
+    ringLen -= overflow
+  }
+  ring.set(samples, ringLen)
+  ringLen += samples.length
+}
+
+function similarity(candidate, reference) {
+  if (candidate.length !== reference.length || candidate.length === 0) return -1
+  let dot = 0, normA = 0, normB = 0
+  for (let i = 0; i < candidate.length; i++) {
+    dot += candidate[i] * reference[i]
+    normA += candidate[i] * candidate[i]
+    normB += reference[i] * reference[i]
+  }
+  return normA > 0 && normB > 0 ? dot / Math.sqrt(normA * normB) : -1
+}
+
+function verify(samples) {
+  if (extractor === null) return -1
+  const input = extractor.createStream()
+  input.acceptWaveform({ sampleRate: 16000, samples })
+  input.inputFinished()
+  if (!extractor.isReady(input)) return -1
+  const embedding = extractor.compute(input)
+  let best = -1
+  for (const reference of workerData.voiceprint.embeddings) {
+    best = Math.max(best, similarity(embedding, reference))
+  }
+  return best
+}
+
 try {
   const sherpa = require('node:module').createRequire(workerData.base)('sherpa-onnx-node')
   const started = Date.now()
   spotter = new sherpa.KeywordSpotter(workerData.config)
   stream = spotter.createStream()
-  parentPort.postMessage({ type: 'ready', loadMs: Date.now() - started })
+  if (workerData.voiceprint) {
+    try {
+      // 2 线程：实测 1.2–2.0 秒唤醒片段比单线程快约 30%，唤醒只在命中时跑一次。
+      extractor = new sherpa.SpeakerEmbeddingExtractor({
+        model: workerData.voiceprint.model, numThreads: 2, provider: 'cpu', debug: 0,
+      })
+    } catch (error) {
+      voiceprintError = String((error && error.message) || error)
+    }
+  }
+  parentPort.postMessage({ type: 'ready', loadMs: Date.now() - started, voiceprint: extractor !== null, voiceprintError })
 } catch (error) {
   parentPort.postMessage({ type: 'error', stage: 'load', error: String((error && error.message) || error) })
 }
 parentPort.on('message', (msg) => {
   if (spotter === null || !msg || msg.type !== 'pcm') return
   try {
+    push(msg.samples)
     stream.acceptWaveform({ sampleRate: 16000, samples: msg.samples })
     fedSamples += msg.samples.length
     while (spotter.isReady(stream)) {
@@ -148,7 +237,23 @@ parentPort.on('message', (msg) => {
         const atMs = (fedSamples / 16000) * 1000
         if (atMs - lastHit >= workerData.cooldownMs) {
           lastHit = atMs
-          parentPort.postMessage({ type: 'wake', keyword: result.keyword, atMs })
+          if (!workerData.voiceprint) {
+            parentPort.postMessage({ type: 'wake', keyword: result.keyword, atMs })
+            continue
+          }
+          if (extractor === null) {
+            parentPort.postMessage({ type: 'rejected', keyword: result.keyword, score: -1,
+              reason: voiceprintError || '声纹模型加载失败' })
+            continue
+          }
+          // 2.2 秒足够覆盖约 1 秒唤醒词 + KWS 的解码延迟；再长只是多算静音。
+          const take = Math.min(ringLen, 16000 * 2.2)
+          const score = verify(ring.slice(ringLen - take, ringLen))
+          if (score >= workerData.voiceprint.threshold) {
+            parentPort.postMessage({ type: 'wake', keyword: result.keyword, atMs, score })
+          } else {
+            parentPort.postMessage({ type: 'rejected', keyword: result.keyword, score })
+          }
         }
       }
     }
@@ -176,8 +281,9 @@ export interface KwsWorkerLike {
 }
 
 export type KwsWorkerMessage =
-  | { type: 'ready'; loadMs: number }
-  | { type: 'wake'; keyword: string; atMs: number }
+  | { type: 'ready'; loadMs: number; voiceprint?: boolean; voiceprintError?: string | null }
+  | { type: 'wake'; keyword: string; atMs: number; score?: number }
+  | { type: 'rejected'; keyword: string; score: number; reason?: string }
   | { type: 'error'; stage: string; error: string }
 
 export interface KwsSession {
@@ -189,7 +295,16 @@ export interface KwsSession {
 
 export interface KwsOptions {
   readonly userDataDir: string
+  /** 用户自定义的唤醒词；省略用默认「小潘同学」。 */
+  readonly keywordName?: string
+  /**
+   * 声纹验证。给出后，命中关键词还要和注册声纹比对；不通过只报 onRejected，不唤醒。
+   * 模型与会议分人共用同一份本地 embedding 模型。
+   */
+  readonly voiceprint?: { readonly model: string; readonly embeddings: readonly (readonly number[])[]; readonly threshold: number }
   readonly onWake: (keyword: string) => void
+  /** 关键词命中但声纹不通过。score 为 -1 表示没提取出有效声纹。 */
+  readonly onRejected?: (score: number, reason?: string) => void
   /** 只报一次。之后会话自己停掉，不重试。 */
   readonly onLost: (reason: string) => void
   readonly onReady?: (loadMs: number) => void
@@ -223,11 +338,12 @@ export function startKws(options: KwsOptions): KwsSession {
   }
 
   try {
-    ensureKeywordsFile(paths)
+    ensureKeywordsFile(paths, options.keywordName ?? DEFAULT_WAKE_NAME)
     const config = kwsSpotterConfig(paths)
     worker = options.createWorker
       ? options.createWorker(config)
-      : new Worker(WORKER_SOURCE, { eval: true, workerData: { base: MODULE_BASE, config, cooldownMs: KWS_COOLDOWN_MS } }) as unknown as KwsWorkerLike
+      : new Worker(WORKER_SOURCE, { eval: true, workerData: { base: MODULE_BASE, config, cooldownMs: KWS_COOLDOWN_MS,
+        voiceprint: options.voiceprint ?? null } }) as unknown as KwsWorkerLike
   } catch (error) {
     // 同步失败也走回调：调用方（index.ts）在 start-wake 分派之前已经同步检查过模型文件，
     // 走到这里是罕见的写盘/建线程失败，延后一拍报，避免在 applyAudio 里同步重入。
@@ -239,6 +355,8 @@ export function startKws(options: KwsOptions): KwsSession {
   worker.on('message', (message: KwsWorkerMessage) => {
     if (!running) return
     if (message.type === 'ready') {
+      // 开了声纹但模型加载不起来：宁可报不可用，也不能悄悄退回"谁喊都应"。
+      if (message.voiceprintError) { lose(`声纹模型加载失败：${message.voiceprintError}`); return }
       ready = true
       options.onReady?.(message.loadMs)
       const queued = pending
@@ -247,6 +365,8 @@ export function startKws(options: KwsOptions): KwsSession {
       for (const chunk of queued) worker?.postMessage({ type: 'pcm', samples: chunk }, [chunk.buffer as ArrayBuffer])
     } else if (message.type === 'wake') {
       options.onWake(message.keyword)
+    } else if (message.type === 'rejected') {
+      options.onRejected?.(message.score, message.reason)
     } else if (message.type === 'error') {
       lose(message.stage === 'load' ? `本地唤醒模型加载失败：${message.error}` : `本地唤醒解码失败：${message.error}`)
     }

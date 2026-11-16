@@ -560,12 +560,12 @@ describe('模型纪要的内容、版本与确认', () => {
 })
 
 describe('IPC：纪要动作复用 meeting-minutes 通道', () => {
-  test('通道清单不变；generate / revoke-egress / edit / export / use-local 与 confirm(digest) 都走得通', async () => {
+  test('纪要动作复用 meeting-minutes 通道；删除会议是独立通道', async () => {
     const h = setup()
     const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
     registerMeetingIpc({ ipc: { handle: (channel, listener) => { handlers.set(channel, listener) } }, recorder: h.recorder })
     assert.deepEqual([...handlers.keys()].sort(), [
-      'meeting-chunk', 'meeting-flush-done', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-speaker-merge',
+      'meeting-chunk', 'meeting-delete', 'meeting-flush-done', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-speaker-merge',
       'meeting-speaker-rename', 'meeting-speaker-split', 'meeting-speakers', 'meeting-start', 'meeting-state',
       'meeting-stop', 'meeting-track-missing', 'meeting-transcribe',
     ])

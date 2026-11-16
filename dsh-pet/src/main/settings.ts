@@ -28,6 +28,13 @@ export interface PetSettings {
   readReplies?: boolean
   /** 本人请求的会议录音与文档讲解是否跳过逐次原生确认。 */
   meetingDocumentAutoApprove?: boolean
+  /**
+   * 每条音轨的发言人数，0 = 自动。分人模型停录后按这个数聚类。
+   *
+   * 不能用一个"全场人数"套两条轨：线上会议常常是本机 1 人、对方多人，
+   * 给麦克风轨固定 4 人会把一个人硬拆成四个。
+   */
+  meetingSpeakerCounts?: { mic: number; loopback: number }
   /** 分钟，范围 1–120；缺省分别为 2 和 20。 */
   idleSleepMinutes?: number
   sleepMinutes?: number
@@ -93,6 +100,10 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.continuousVoice = merged.continuousVoice === true
   merged.readReplies = merged.readReplies === true
   merged.meetingDocumentAutoApprove = typeof raw.meetingDocumentAutoApprove === 'boolean' ? raw.meetingDocumentAutoApprove : true
+  const speakerCounts = (merged.meetingSpeakerCounts ?? {}) as { mic?: unknown; loopback?: unknown }
+  const validCount = (value: unknown): number => (typeof value === 'number' && Number.isInteger(value)
+    && value >= 0 && value <= 6 ? value : 0)
+  merged.meetingSpeakerCounts = { mic: validCount(speakerCounts.mic), loopback: validCount(speakerCounts.loopback) }
   for (const [key, fallback] of [['idleSleepMinutes', 2], ['sleepMinutes', 20]] as const) {
     const value = merged[key]
     if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 120) merged[key] = fallback

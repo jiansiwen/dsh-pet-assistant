@@ -30,6 +30,8 @@ interface DocPanelProps {
   readonly onExplain: (path: string, from: number) => void
   readonly onAsk: (index: number, question: string) => void
   readonly onStop: () => void
+  /** 讲解被 WPS 弹窗/失焦/视图暂停后，用户不用记口令也能从这里接着讲。 */
+  readonly onResume: () => void
   readonly onAddRoot: () => void
   readonly onRemoveRoot: (path: string) => void
   readonly onForgetDir: (path: string) => void
@@ -45,6 +47,7 @@ export default function DocPanel({
   onExplain,
   onAsk,
   onStop,
+  onResume,
   onAddRoot,
   onRemoveRoot,
   onForgetDir,
@@ -169,10 +172,14 @@ export default function DocPanel({
             {OFFICE_EXTENSIONS.some(extension => outline.path.toLowerCase().endsWith(extension)) && (
               <button type="button" className="doc-btn" disabled={busy} onClick={() => onRead(outline.path)}>逐页阅读 / 演示</button>
             )}
-            {/* 没在出声的时候不摆一个按了也没反应的停止键。 */}
-            {speaking && (
+            {/* 没在出声的时候不摆一个按了也没反应的停止键；改成明确的继续入口。 */}
+            {speaking ? (
               <button type="button" className="doc-btn danger" onClick={onStop}>
                 停止讲解
+              </button>
+            ) : (
+              <button type="button" className="doc-btn" disabled={busy} onClick={onResume}>
+                继续讲解
               </button>
             )}
           </div>

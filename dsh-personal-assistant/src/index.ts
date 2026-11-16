@@ -226,21 +226,23 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
         const agent = invocation.agent
         if (!agent) {
           // 没有会话也能先把宠物叫出来；绑定留到用户打开会话后的下一次点击。
-          const launched = bridge.teamEnabled ? false : bridge.launchPet()
+          // 团队模式同样兜底启动：桌面壳没有拉起桌宠时，用户点“召唤”不能什么都不发生。
+          // 已有实例由 Electron 单实例锁挡住并显示原窗口，不会出现两支队伍。
+          const launched = bridge.launchPet()
           return launched
             ? { kind: 'success', text: '桌面宠物已启动；打开一个会话后再点一次即可绑定' }
             : { kind: 'error', text: '没有可绑定的会话，也没能启动桌宠；请在 dsh-pet 目录运行 pnpm start' }
         }
         try {
           const { port } = await bridge.bind(agent as Parameters<SessionBridge['bind']>[0])
-          const launched = bridge.teamEnabled ? false : bridge.launchPet()
+          const launched = bridge.launchPet()
           return {
-            kind: 'success',
-            text: bridge.teamEnabled
-              ? `会话已绑定（桥接端口 ${port}）；团队模式的桌面角色由桌面壳负责`
-              : launched
-                ? '桌面宠物已召唤并绑定到当前会话'
-                : `会话已绑定（桥接端口 ${port}），但没能拉起桌宠；请在 dsh-pet 目录运行 pnpm install && pnpm start（日志：~/.dsh/dsh-pet/launch.log）`,
+            kind: launched ? 'success' : 'error',
+            text: launched
+              ? bridge.teamEnabled
+                ? `会话已绑定（桥接端口 ${port}）；团队模式下桌面角色由桌面壳附着，本次也已请求启动桌宠`
+                : '桌面宠物已召唤并绑定到当前会话'
+              : `会话已绑定（桥接端口 ${port}），但没能拉起桌宠；请在 dsh-pet 目录运行 pnpm install && pnpm start（日志：~/.dsh/dsh-pet/launch.log）`,
           }
         } catch (error) {
           return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
@@ -634,7 +636,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
           'personal_assistant_remember_preference', 'personal_assistant_edit_preference'])
         const create = agents.create as unknown as (this: unknown, options: Record<string, unknown>) => Promise<{ agent: never; dispose(): Promise<void> }>
         const chiefChannelSettings = () => ({ name: '总助理', persona: '团队关闭时，由你直接处理用户交办的工作。',
-          provider: '', model: '', maxTokens: 4096, tokenBudget: 0 })
+          provider: '', model: '', maxTokens: 16384, tokenBudget: 0 })
         const channelModel = resolveDefaultModel(home)
         const handle = await create.call(agents, {
           // 会话 id 带上渠道会话标识，任务工具据此把提醒默认发回当前会话。

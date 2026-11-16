@@ -183,7 +183,7 @@ test('输入严格校验，工具仅取真实安全只读白名单，不可借�
   }
   const invalid: Partial<MemberDraft>[] = [
     { displayName: '  ' }, { description: '长'.repeat(4001) }, { skinId: '../任意文件' }, { enabled: 1 as never },
-    { maxTokens: 0 }, { maxTokens: 32769 }, { maxTokens: 1.1 }, { dailyTokenLimit: -1 }, { totalTokenLimit: Infinity },
+    { maxTokens: 0 }, { maxTokens: 131073 }, { maxTokens: 1.1 }, { dailyTokenLimit: -1 }, { totalTokenLimit: Infinity },
     { dailyTokenLimit: NaN }, { totalTokenLimit: Number.MAX_SAFE_INTEGER + 1 }, { thresholdPercent: 0 }, { thresholdPercent: 101 },
     { timezone: '无效/时区' }, { capabilities: ['任意能力'] as never }, { allowedTools: null as never },
   ]

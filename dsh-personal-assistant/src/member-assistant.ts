@@ -107,7 +107,7 @@ export class MemberAssistant {
 export function defaultDraft(): MemberDraft {
   return {
     displayName: '新成员', description: '', personality: '', permissionMode: 'ask', persona: '', skinId: 'panda',
-    enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [],
+    enabled: true, provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
     dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
   }

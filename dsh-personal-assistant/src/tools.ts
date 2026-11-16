@@ -373,11 +373,12 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
         return json({ ok: false, error: '当前执行上下文没有可绑定的会话 agent，无法召唤宠物' })
       }
       const { port } = await options.bridge.bind(agent as Parameters<SessionBridge['bind']>[0])
-      // 团队模式下启动所有权归桌面壳（companion-host）：插件再 spawn 一个 `pnpm start`，
-      // 桌面上就会出现两支互相不知道对方存在的角色队伍，还会抢同一份 bridge.json。
+      // 团队模式下桌面壳通常负责启动桌宠；但用户点“召唤”时必须真的发生点什么，
+      // 所以这里仍兜底拉起一次。已有实例会被 Electron 单实例锁挡住并显示原窗口，
+      // 不会出现两支互相抢 bridge.json 的队伍。
       const teamMode = options.bridge.teamEnabled
       const petDir = options.bridge.petDir
-      const launched = teamMode ? false : options.bridge.launchPet()
+      const launched = options.bridge.launchPet()
       return json({
         ok: true,
         bridgePort: port,
@@ -385,7 +386,9 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
         petDir: petDir ?? null,
         teamMode,
         message: teamMode
-          ? '会话已绑定到桥接，团队模式已开启；桌面角色由桌面壳负责启动与附着，本插件不会反向拉起它'
+          ? launched
+            ? '会话已绑定到桥接，团队模式已开启；已请求启动桌宠，桌面角色会附着到当前会话'
+            : '会话已绑定到桥接，团队模式已开启；但没能拉起桌宠，请在 dsh-pet 目录运行 pnpm start'
           : launched
             ? '桌面宠物已召唤并绑定到本会话'
             : petDir

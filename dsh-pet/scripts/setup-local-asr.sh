@@ -33,7 +33,9 @@ MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sh
 STREAM_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.tar.bz2"
 # 会议按音色分人：pyannote 分段（MIT）+ 3D-Speaker 声纹嵌入（上游 Apache-2.0），本地推理，不上传音频。
 SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
-EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx"
+# 升级声纹模型时改这个标记：旧模型会被重新下载，会议分人与唤醒声纹共用同一份。
+EMB_TAG="eres2netv2_zh-cn_16k-common"
 # 本地唤醒（M1-02，macOS 唯一的本地唤醒方案）：sherpa-onnx 官方 kws-models 发布里的 WenetSpeech 中文 KWS 小模型
 #（zipformer，约 3.3M 参数，建模单元为拼音声母 + 带调韵母），许可证 Apache-2.0（见模型 README）。
 # 包大小 15,292,881 字节；sha256 取自该发布的 checksum.txt，解压前校验。
@@ -59,7 +61,9 @@ echo "安装位置：$DEST"
 if [ -f "$MODEL_DIR/model.int8.onnx" ] && [ -f "$MODEL_DIR/tokens.txt" ] \
    && [ -f "$STREAM_DIR/encoder.int8.onnx" ] && [ -f "$STREAM_DIR/decoder.int8.onnx" ] \
    && [ -f "$STREAM_DIR/joiner.int8.onnx" ] && [ -f "$STREAM_DIR/tokens.txt" ] \
-   && [ -f "$DIAR_DIR/segmentation.onnx" ] && [ -f "$DIAR_DIR/embedding.onnx" ]    && [ -f "$KWS_DIR/encoder.int8.onnx" ] && [ -f "$KWS_DIR/decoder.onnx" ]    && [ -f "$KWS_DIR/joiner.int8.onnx" ] && [ -f "$KWS_DIR/tokens.txt" ]; then
+   && [ -f "$DIAR_DIR/segmentation.onnx" ] && [ -f "$DIAR_DIR/embedding.onnx" ] \
+   && [ "$(cat "$DIAR_DIR/embedding.version.txt" 2>/dev/null)" = "$EMB_TAG" ] \
+   && [ -f "$KWS_DIR/encoder.int8.onnx" ] && [ -f "$KWS_DIR/decoder.onnx" ]    && [ -f "$KWS_DIR/joiner.int8.onnx" ] && [ -f "$KWS_DIR/tokens.txt" ]; then
   echo "已经装好了，无需重复下载。"
   exit 0
 fi
@@ -133,10 +137,11 @@ if [ ! -f "$DIAR_DIR/segmentation.onnx" ]; then
   [ -z "$LICENSE_FILE" ] || cp "$LICENSE_FILE" "$DIAR_DIR/LICENSE.segmentation.txt"
   cp "$SEG" "$DIAR_DIR/segmentation.onnx"
 fi
-if [ ! -f "$DIAR_DIR/embedding.onnx" ]; then
+if [ ! -f "$DIAR_DIR/embedding.onnx" ] || [ "$(cat "$DIAR_DIR/embedding.version.txt" 2>/dev/null)" != "$EMB_TAG" ]; then
   fetch "$EMB_URL" "$TMP/embedding.onnx"
   [ "$(wc -c < "$TMP/embedding.onnx")" -gt 1048576 ] || { echo "声纹嵌入模型大小异常，可能下载不完整" >&2; exit 1; }
   cp "$TMP/embedding.onnx" "$DIAR_DIR/embedding.onnx"
+  printf '%s\n' "$EMB_TAG" > "$DIAR_DIR/embedding.version.txt"
 fi
 
 # ── 本地唤醒词模型（KWS）：只装模型文件，keywords 文件由应用按唤醒词常量生成 ──
