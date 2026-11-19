@@ -1,6 +1,6 @@
 // src/index.ts
 import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync6, readFileSync as readFileSync16, statSync as statSync9, writeFileSync as writeFileSync6 } from "node:fs";
-import { randomUUID as randomUUID27 } from "node:crypto";
+import { randomUUID as randomUUID28 } from "node:crypto";
 import os2 from "node:os";
 import path28 from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1003,7 +1003,7 @@ var MemberDirectory = class {
 };
 
 // src/team-domain.ts
-var TEAM_SCHEMA_VERSION = 16;
+var TEAM_SCHEMA_VERSION = 17;
 var TASK_STATUSES = [
   "created",
   "queued",
@@ -1655,6 +1655,22 @@ var TeamStore = class {
         CHECK((status = 'dispatched') = (completed_at IS NULL))
       );
       CREATE INDEX IF NOT EXISTS idx_subassistant_runs_assistant ON subassistant_runs(assistant_id, created_at);
+      CREATE TABLE IF NOT EXISTS member_schedules (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
+      CREATE TABLE IF NOT EXISTS member_schedule_runs (
+        run_id TEXT PRIMARY KEY,
+        schedule_id TEXT NOT NULL,
+        assistant_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        trigger_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('running', 'succeeded', 'failed')),
+        text TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_member_schedule_runs ON member_schedule_runs(schedule_id, started_at);
     `);
     {
       const columns = this.db.prepare("PRAGMA table_info(mail_watch_analyses)").all().map((row2) => String(row2.name));
@@ -2609,6 +2625,39 @@ var TeamStore = class {
   }
   saveCompanionSchedule(schedule) {
     this.saveCompanionRecord("schedules", schedule.scheduleId, schedule);
+  }
+  getMemberSchedule(scheduleId) {
+    const row = this.db.prepare("SELECT data FROM member_schedules WHERE id = ?").get(scheduleId);
+    return row ? JSON.parse(String(row.data)) : null;
+  }
+  listMemberSchedules() {
+    return this.db.prepare("SELECT data FROM member_schedules ORDER BY rowid").all().map((row) => JSON.parse(String(row.data)));
+  }
+  saveMemberSchedule(schedule) {
+    this.db.prepare("INSERT INTO member_schedules(id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data").run(schedule.scheduleId, json(schedule));
+  }
+  deleteMemberSchedule(scheduleId) {
+    this.db.prepare("DELETE FROM member_schedules WHERE id = ?").run(scheduleId);
+  }
+  insertMemberScheduleRun(run) {
+    this.db.prepare(`INSERT INTO member_schedule_runs(run_id, schedule_id, assistant_id, generation, trigger_at, state, text, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(run.runId, run.scheduleId, run.assistantId, run.generation, run.triggerAt, run.state, run.text, run.startedAt, run.finishedAt);
+  }
+  finishMemberScheduleRun(runId, state, text7, at) {
+    this.db.prepare("UPDATE member_schedule_runs SET state = ?, text = ?, finished_at = ? WHERE run_id = ? AND state = ?").run(state, text7, at, runId, "running");
+  }
+  listMemberScheduleRuns(scheduleId, limit2 = 20) {
+    return this.db.prepare("SELECT * FROM member_schedule_runs WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?").all(scheduleId, limit2).map((row) => ({
+      runId: String(row.run_id),
+      scheduleId: String(row.schedule_id),
+      assistantId: String(row.assistant_id),
+      generation: Number(row.generation),
+      triggerAt: Number(row.trigger_at),
+      state: String(row.state),
+      text: row.text === null ? null : String(row.text),
+      startedAt: Number(row.started_at),
+      finishedAt: row.finished_at === null ? null : Number(row.finished_at)
+    }));
   }
   getReminderGrant(grantRef) {
     return this.companionRecord("reminder_grants", grantRef);
@@ -4013,6 +4062,50 @@ function hostLlm(ctx) {
   }
 }
 
+// src/member-web.ts
+function isBlockedWebHost(hostname) {
+  const host = hostname.toLowerCase();
+  return host === "localhost" || host === "[::1]" || host === "0.0.0.0" || host.endsWith(".local") || host.endsWith(".internal") || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+}
+var WEB_FETCH_DEFAULT_CHARS = 12e3;
+var WEB_FETCH_MAX_CHARS = 6e4;
+var WEB_FETCH_MAX_BYTES = 512 * 1024;
+function clampMaxChars(value) {
+  return typeof value === "number" && value > 0 ? Math.min(Math.floor(value), WEB_FETCH_MAX_CHARS) : WEB_FETCH_DEFAULT_CHARS;
+}
+function htmlToText(raw, contentType) {
+  if (!contentType.includes("html") && !/^\s*</.test(raw)) return raw;
+  return raw.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/[ \t\r\f\v]+/g, " ").replace(/\n\s*\n\s*\n+/g, "\n\n");
+}
+async function safeWebFetch(rawUrl, maxChars, signal, fetchImpl = fetch, timeoutMs = 25e3) {
+  const raw = typeof rawUrl === "string" ? rawUrl.trim() : "";
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return { ok: false, error: "URL \u65E0\u6548" };
+  }
+  if (parsed.protocol !== "https:") return { ok: false, error: "\u53EA\u5141\u8BB8 https \u516C\u5F00\u7F51\u9875" };
+  if (isBlockedWebHost(parsed.hostname)) return { ok: false, error: "\u4E0D\u5141\u8BB8\u6293\u53D6\u672C\u673A/\u5185\u7F51\u5730\u5740" };
+  const limit2 = clampMaxChars(maxChars);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(raw, {
+      signal: AbortSignal.any([controller.signal, signal]),
+      redirect: "follow",
+      headers: { "user-agent": "Mozilla/5.0 (compatible; DSHAssistant/1.0)", accept: "text/html,application/json;q=0.9,*/*;q=0.8" }
+    });
+    const bytes = Buffer.from(await res.arrayBuffer()).subarray(0, WEB_FETCH_MAX_BYTES);
+    const text7 = htmlToText(bytes.toString("utf8"), res.headers.get("content-type") ?? "");
+    return { ok: true, status: res.status, url: raw, text: text7.trim().slice(0, limit2) };
+  } catch (error) {
+    return { ok: false, error: `\u6293\u53D6\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // src/memory.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
 
@@ -5168,12 +5261,12 @@ var MemberRuntime = class {
     }
     return profile;
   }
-  async start(memberId, prompt2, signal, taskId, origin = "desktop", docScope) {
-    return this.open(memberId, prompt2, signal, taskId, void 0, origin, void 0, docScope);
+  async start(memberId, prompt2, signal, taskId, origin = "desktop", docScope, parentAgent) {
+    return this.open(memberId, prompt2, signal, taskId, void 0, origin, void 0, docScope, parentAgent);
   }
-  async chat(memberId, text7, signal = new AbortController().signal, channelKey, origin = "desktop", sessionScope, docScope) {
+  async chat(memberId, text7, signal = new AbortController().signal, channelKey, origin = "desktop", sessionScope, docScope, parentAgent) {
     if (!text7.trim()) throw new Error("\u6210\u5458\u6D88\u606F\u4E0D\u80FD\u4E3A\u7A7A");
-    const { activation } = await this.open(memberId, [{ type: "text", text: text7 }], signal, void 0, channelKey, origin, sessionScope, docScope);
+    const { activation } = await this.open(memberId, [{ type: "text", text: text7 }], signal, void 0, channelKey, origin, sessionScope, docScope, parentAgent);
     try {
       const result = await activation.result;
       if (result.stopReason !== "completed") throw new Error(result.diagnostic ?? "\u6210\u5458\u8BF7\u6C42\u672A\u5B8C\u6210");
@@ -5182,7 +5275,7 @@ var MemberRuntime = class {
       await activation.dispose();
     }
   }
-  async open(memberId, prompt2, signal, taskId, channelKey, origin = "desktop", channelScope, docScope) {
+  async open(memberId, prompt2, signal, taskId, channelKey, origin = "desktop", channelScope, docScope, parentAgent) {
     signal.throwIfAborted();
     const profile = this.available(memberId);
     const effectiveOrigin = channelKey ? "wecom" : origin;
@@ -5436,6 +5529,22 @@ ${skillsText}
           return JSON.stringify(result ?? null);
         }
       }));
+      if (allowed.has("web_fetch") && !ctx.tools.get("web_fetch", agent) && !ctx.tools.get("companion_web_fetch", agent)) {
+        ctx.tools.register(defineTool2({
+          name: "companion_web_fetch",
+          description: "\u6293\u53D6\u4E00\u4E2A\u516C\u5F00 https \u7F51\u9875\u6216 API \u5E76\u8FD4\u56DE\u6B63\u6587\u6587\u672C\uFF08GitHub \u8BF7\u7528\u5B98\u65B9 API\uFF0C\u5982 https://api.github.com/search/repositories?q=stars:%3E100&sort=stars&order=desc&per_page=10 \uFF1Bgithub.com \u7F51\u9875\u5728\u672C\u7F51\u7EDC\u53EF\u80FD\u4E0D\u53EF\u8FBE\uFF09\u3002\u53EA\u8BFB\uFF0C\u4E0D\u6267\u884C\u526F\u4F5C\u7528\uFF1B\u672C\u673A/\u5185\u7F51\u5730\u5740\u4F1A\u88AB\u62D2\u7EDD\u3002",
+          parameters: {
+            url: { type: "string", required: true, description: "\u8981\u6293\u53D6\u7684\u516C\u5F00 https URL" },
+            maxChars: { type: "number", description: "\u8FD4\u56DE\u6B63\u6587\u6700\u5927\u5B57\u7B26\u6570\uFF0C\u9ED8\u8BA4 12000\uFF0C\u4E0A\u9650 60000" }
+          },
+          output: toolOutput,
+          execute: async (args, exec) => {
+            if (!owns(exec.agent) || !admitted || ended !== void 0 || runSignal.aborted || exec.signal.aborted) throw new Error("\u6210\u5458\u8BF7\u6C42\u5DF2\u505C\u6B62");
+            return JSON.stringify(await safeWebFetch(args.url, args.maxChars, exec.signal));
+          }
+        }));
+        allowed.add("companion_web_fetch");
+      }
       const desktop = this.options.desktop;
       if (allowed.has(DOCUMENT_PRESENTATION_TOOL) && desktop && desktopBinding) {
         registerMeetingPresentationTools(ctx, {
@@ -5690,7 +5799,7 @@ ${skillsText}
       const agents = hostAgentRegistry(this.options.ctx);
       if (!agents) throw new Error("\u5BBF\u4E3B\u6CA1\u6709\u63D0\u4F9B\u6210\u5458\u4F1A\u8BDD\u670D\u52A1\uFF0C\u6210\u5458\u672A\u542F\u52A8");
       const memberCwd = this.options.cwd?.();
-      const meta = typeof memberCwd === "string" && memberCwd !== "" ? { cwd: memberCwd } : void 0;
+      const meta = { ...typeof memberCwd === "string" && memberCwd !== "" ? { cwd: memberCwd } : {}, agentPreset: "standard" };
       const ownedByWriter = (cause) => /already owned by an active write handle/iu.test(cause instanceof Error ? cause.message : String(cause));
       const resumeAgent = async () => {
         let last;
@@ -14045,7 +14154,8 @@ var TeamService = class {
       signal,
       task.taskId,
       task.originChannel === "wecom" ? "wecom" : "desktop",
-      docScope
+      docScope,
+      parentAgent
     );
     const activation = await this.ctx.subagents.startActivation({
       provider: this.options.provider,
@@ -16679,7 +16789,7 @@ ${candidate.text}`);
         if (!this.accepting || !this.memberManagement) throw new CompanionError("DEVICE_OFFLINE", "\u6210\u5458\u7BA1\u7406\u670D\u52A1\u5C1A\u672A\u5C31\u7EEA", 503);
         return await this.memberManagement.request(method, pathname, body);
       }
-      if (pathname === "/companion/v1/skills" || pathname === "/companion/v1/artifacts" || pathname === "/companion/v1/glossary" || pathname.startsWith("/companion/v1/timeline") || pathname === "/companion/v1/memories/shared") {
+      if (pathname === "/companion/v1/skills" || pathname === "/companion/v1/artifacts" || pathname === "/companion/v1/glossary" || pathname.startsWith("/companion/v1/timeline") || pathname === "/companion/v1/memories/shared" || pathname === "/companion/v1/member-schedules" || pathname.startsWith("/companion/v1/member-schedules/")) {
         if (subject !== "owner") throw new CompanionError("FORBIDDEN", "\u6280\u80FD\u4E0E\u8D44\u6599\u7BA1\u7406\u53EA\u63A5\u53D7\u672C\u4EBA\u5728\u684C\u9762\u7684\u64CD\u4F5C", 403);
         if (!this.accepting || !this.memberManagement) throw new CompanionError("DEVICE_OFFLINE", "\u6210\u5458\u7BA1\u7406\u670D\u52A1\u5C1A\u672A\u5C31\u7EEA", 503);
         return await this.memberManagement.request(method, pathname, body);
@@ -20250,6 +20360,31 @@ var docPreloadSchema = z7.object({
   docKey: z7.string().trim().min(1).max(2048),
   text: z7.string().trim().min(1).max(6e4)
 }).strict();
+var scheduleRecipient = z7.string().trim().max(200).nullish();
+var scheduleCreate = z7.object({
+  action: z7.literal("create"),
+  assistantId: z7.string().trim().min(1).max(100),
+  title: z7.string().trim().min(1).max(120),
+  prompt: z7.string().trim().min(1).max(8e3),
+  spec: reminderScheduleSchema,
+  channel: z7.enum(["desktop", "wecom"]).default("desktop"),
+  recipientId: scheduleRecipient,
+  enabled: z7.boolean().default(true)
+}).strict();
+var scheduleUpdate = z7.object({
+  action: z7.literal("update"),
+  scheduleId: z7.string().trim().min(1).max(100),
+  expectedGeneration: revision,
+  title: z7.string().trim().min(1).max(120).optional(),
+  prompt: z7.string().trim().min(1).max(8e3).optional(),
+  spec: reminderScheduleSchema.optional(),
+  channel: z7.enum(["desktop", "wecom"]).optional(),
+  recipientId: scheduleRecipient,
+  enabled: z7.boolean().optional()
+}).strict();
+var scheduleDelete = z7.object({ action: z7.literal("delete"), scheduleId: z7.string().trim().min(1).max(100) }).strict();
+var scheduleEditSchema = z7.discriminatedUnion("action", [scheduleCreate, scheduleUpdate, scheduleDelete]);
+var scheduleRunSchema = z7.object({ scheduleId: z7.string().trim().min(1).max(100) }).strict();
 var MemberManagement = class {
   options;
   constructor(options) {
@@ -20328,6 +20463,18 @@ var MemberManagement = class {
     const { directory, memories } = this.options;
     try {
       if (method === "GET" && pathname === "/companion/v1/members") return { status: 200, body: this.snapshot() };
+      if (method === "GET" && pathname === "/companion/v1/member-schedules") {
+        return { status: 200, body: { schedules: this.options.schedules ? this.options.schedules() : [] } };
+      }
+      if (method === "POST" && pathname === "/companion/v1/member-schedules") {
+        if (!this.options.scheduleEdit) throw new Error("\u6210\u5458\u5B9A\u65F6\u4EFB\u52A1\u529F\u80FD\u672A\u88C5\u914D");
+        return { status: 200, body: { schedules: this.options.scheduleEdit(scheduleEditSchema.parse(raw)) } };
+      }
+      if (method === "POST" && pathname === "/companion/v1/member-schedules/run") {
+        if (!this.options.scheduleRunNow) throw new Error("\u6210\u5458\u5B9A\u65F6\u4EFB\u52A1\u529F\u80FD\u672A\u88C5\u914D");
+        const input = scheduleRunSchema.parse(raw);
+        return { status: 200, body: await this.options.scheduleRunNow(input.scheduleId) };
+      }
       if (method === "POST" && pathname === "/companion/v1/members/doc-preload") {
         const input = docPreloadSchema.parse(raw);
         try {
@@ -23207,6 +23354,63 @@ function registerAssistantTools(ctx, tracker, options) {
         elapsedMs: result.elapsedMs,
         summary
       });
+    }
+  }));
+  host.tools.register(defineTool9({
+    name: "personal_assistant_member_schedule",
+    description: '\u4E3A\u6210\u5458\u5B89\u6392/\u67E5\u8BE2/\u53D6\u6D88/\u7ACB\u5373\u6267\u884C"\u5B9A\u65F6\u81EA\u4E3B\u4EFB\u52A1"\uFF1A\u5230\u70B9\u8BA9\u8BE5\u6210\u5458\u7528\u81EA\u5DF1\u7684\u5DE5\u5177\u771F\u5E72\u6D3B\uFF08\u6293 GitHub \u70ED\u95E8\u3001\u6574\u7406\u65E5\u62A5\u7B49\uFF09\uFF0C\u518D\u628A\u7ED3\u679C\u63A8\u9001\u7ED9\u672C\u4EBA\uFF08\u684C\u9762\u64AD\u62A5\u6216\u4F01\u4E1A\u5FAE\u4FE1\uFF09\u3002\u4E0E\u56FA\u5B9A\u63D0\u9192\u4E0D\u540C\u2014\u2014\u8FD9\u91CC\u6210\u5458\u4F1A\u771F\u6B63\u6267\u884C\u4EFB\u52A1\u4EA7\u51FA\u7ED3\u679C\u3002\u7528\u6237\u8BF4"\u6BCF\u59299\u70B9\u8BA9\u63A2\u82B1\u6293GitHub\u63A8\u4F01\u5FAE""18\u70B9\u8BA9\u53F2\u5B98\u51FA\u65E5\u62A5""\u73B0\u5728\u5C31\u8BA9XX\u8DD1\u4E00\u6B21"\u65F6\u8C03\u7528\u3002\u6210\u5458\u9700\u5148\u5728\u56E2\u961F\u76EE\u5F55\u91CC\u5B58\u5728\u5E76\u542F\u7528\uFF1B\u4F01\u4E1A\u5FAE\u4FE1\u63A8\u9001\u9700 recipientId\uFF08\u5DF2\u7ED1\u5B9A\u7684\u4F01\u5FAE\u4F1A\u8BDD\u6807\u8BC6\uFF0C\u5F62\u5982 wecom:single:<id>\uFF09\u3002',
+    parameters: {
+      action: { type: "string", required: true, description: "create / list / delete / run" },
+      assistantId: { type: "string", description: "create \u5FC5\u586B\uFF1A\u6210\u5458 assistantId" },
+      title: { type: "string", description: "create \u5FC5\u586B\uFF1A\u4EFB\u52A1\u77ED\u6807\u9898" },
+      prompt: { type: "string", description: "create \u5FC5\u586B\uFF1A\u4EA4\u7ED9\u6210\u5458\u7684\u4EFB\u52A1\u76EE\u6807\uFF08\u8BF4\u6E05\u8981\u5E72\u4EC0\u4E48\u3001\u4EA7\u51FA\u4EC0\u4E48\uFF09" },
+      repeatKind: { type: "string", description: "create\uFF1Adaily / once / interval" },
+      localTime: { type: "string", description: "daily \u7684\u672C\u5730\u65F6\u523B HH:mm\uFF08\u5982 09:00\uFF09" },
+      runAt: { type: "string", description: "once/interval \u7684\u9996\u6B21\u65F6\u95F4 ISO8601" },
+      everySeconds: { type: "number", description: "interval \u7684\u95F4\u9694\u79D2\uFF08\u226560\uFF09" },
+      timezone: { type: "string", description: "\u65F6\u533A\uFF0C\u9ED8\u8BA4 Asia/Shanghai" },
+      channel: { type: "string", description: "desktop \u6216 wecom\uFF0C\u9ED8\u8BA4 desktop" },
+      recipientId: { type: "string", description: "wecom \u6536\u4EF6\u4F1A\u8BDD\u6807\u8BC6\uFF08wecom:single:<id>\uFF09" },
+      scheduleId: { type: "string", description: "delete/run \u5FC5\u586B\uFF1A\u5B9A\u65F6\u4EFB\u52A1 id" }
+    },
+    output: { schema: { type: "string" }, render: textRender },
+    async execute(args) {
+      if (!options.memberSchedules) return json4({ ok: false, error: "\u6210\u5458\u5B9A\u65F6\u4EFB\u52A1\u670D\u52A1\u672A\u88C5\u914D" });
+      const svc = options.memberSchedules;
+      const action = typeof args.action === "string" ? args.action : "";
+      if (action === "list") {
+        const res = await svc.request("GET", "/companion/v1/member-schedules", {});
+        return json4({ ok: res.status === 200, ...res.body });
+      }
+      if (action === "delete" || action === "run") {
+        const scheduleId = typeof args.scheduleId === "string" ? args.scheduleId : "";
+        if (!scheduleId) return json4({ ok: false, error: "scheduleId \u5FC5\u586B" });
+        const res = action === "delete" ? await svc.request("POST", "/companion/v1/member-schedules", { action: "delete", scheduleId }) : await svc.request("POST", "/companion/v1/member-schedules/run", { scheduleId });
+        return json4({ ok: res.status === 200, ...res.body });
+      }
+      if (action === "create") {
+        const assistantId = typeof args.assistantId === "string" ? args.assistantId.trim() : "";
+        const title = typeof args.title === "string" ? args.title.trim() : "";
+        const prompt2 = typeof args.prompt === "string" ? args.prompt.trim() : "";
+        const repeatKind = typeof args.repeatKind === "string" ? args.repeatKind : "";
+        const timezone2 = typeof args.timezone === "string" && args.timezone ? args.timezone : "Asia/Shanghai";
+        if (!assistantId || !title || !prompt2) return json4({ ok: false, error: "assistantId/title/prompt \u5FC5\u586B" });
+        let spec;
+        if (repeatKind === "daily") {
+          const localTime = typeof args.localTime === "string" ? args.localTime : "";
+          if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(localTime)) return json4({ ok: false, error: "daily \u9700\u8981 localTime\uFF08HH:mm\uFF09" });
+          spec = { kind: "daily", timezone: timezone2, localTime };
+        } else if (repeatKind === "once" || repeatKind === "interval") {
+          const runAt = typeof args.runAt === "string" ? args.runAt : "";
+          if (!runAt || Number.isNaN(Date.parse(runAt))) return json4({ ok: false, error: "once/interval \u9700\u8981\u53EF\u89E3\u6790\u7684 runAt\uFF08ISO8601\uFF09" });
+          spec = repeatKind === "once" ? { kind: "once", timezone: timezone2, runAt } : { kind: "interval", timezone: timezone2, runAt, everySeconds: typeof args.everySeconds === "number" ? args.everySeconds : 0 };
+        } else return json4({ ok: false, error: "repeatKind \u5FC5\u987B\u662F daily/once/interval" });
+        const channel = args.channel === "wecom" ? "wecom" : "desktop";
+        const recipientId = typeof args.recipientId === "string" ? args.recipientId : null;
+        const res = await svc.request("POST", "/companion/v1/member-schedules", { action: "create", assistantId, title, prompt: prompt2, spec, channel, recipientId, enabled: true });
+        return json4({ ok: res.status === 200, ...res.body });
+      }
+      return json4({ ok: false, error: "action \u5FC5\u987B\u662F create/list/delete/run" });
     }
   }));
   host.tools.register(defineTool9({
@@ -26879,6 +27083,117 @@ var SubAssistantDispatch = class {
   }
 };
 
+// src/member-scheduler.ts
+import { randomUUID as randomUUID27 } from "node:crypto";
+var MAX_LAST_TEXT = 2e3;
+var MemberScheduler = class {
+  options;
+  timer = null;
+  running = /* @__PURE__ */ new Set();
+  constructor(options) {
+    this.options = options;
+  }
+  start() {
+    if (this.timer) return;
+    const interval = Math.max(5e3, this.options.tickIntervalMs ?? 3e4);
+    this.timer = setInterval(() => {
+      try {
+        this.tick();
+      } catch (error) {
+        this.options.log(`\u6210\u5458\u5B9A\u65F6\u8C03\u5EA6\u62CD\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+      }
+    }, interval);
+    this.timer.unref?.();
+  }
+  stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+  now() {
+    return this.options.now?.() ?? Date.now();
+  }
+  /**
+   * 扫一拍：认领所有到期且启用的计划（同步推进 nextRunAt 防重触），异步触发执行。
+   * 返回本拍认领了几条，供测试与诊断。
+   */
+  tick() {
+    if (!this.options.enabled()) return { fired: 0 };
+    const now = this.now();
+    let fired = 0;
+    for (const schedule of this.options.store.listMemberSchedules()) {
+      if (!schedule.enabled || schedule.nextRunAt === null || schedule.nextRunAt > now) continue;
+      if (this.running.has(schedule.scheduleId)) continue;
+      this.claimAndFire(schedule, now);
+      fired += 1;
+    }
+    return { fired };
+  }
+  /** 手动立即跑一次（测试/总助理"现在就去办"）；仍尊重启用状态与并发闸，不改 nextRunAt。 */
+  async runNow(scheduleId) {
+    const schedule = this.options.store.getMemberSchedule(scheduleId);
+    if (!schedule) return { state: "skipped", text: "\u5B9A\u65F6\u4EFB\u52A1\u4E0D\u5B58\u5728" };
+    if (!schedule.enabled) return { state: "skipped", text: "\u5B9A\u65F6\u4EFB\u52A1\u5DF2\u505C\u7528" };
+    if (!this.options.enabled()) return { state: "skipped", text: "\u56E2\u961F\u6A21\u5F0F\u672A\u5F00\u542F\uFF0C\u6210\u5458\u4E0D\u80FD\u8FD0\u884C" };
+    if (this.running.has(scheduleId)) return { state: "skipped", text: "\u8BE5\u5B9A\u65F6\u4EFB\u52A1\u6B63\u5728\u6267\u884C" };
+    return await this.fire(schedule, this.now());
+  }
+  /** 认领：先把 nextRunAt 推进/停用落库，再异步执行——下一拍绝不会重复触发同一条。 */
+  claimAndFire(schedule, now) {
+    const once = schedule.spec.kind === "once";
+    const next = once ? null : nextScheduleAt(schedule.spec, now);
+    const claimed = {
+      ...schedule,
+      nextRunAt: next,
+      enabled: once ? false : schedule.enabled,
+      generation: schedule.generation + 1,
+      lastRunAt: now
+    };
+    this.options.store.saveMemberSchedule(claimed);
+    this.running.add(schedule.scheduleId);
+    void this.fire(claimed, now).catch((error) => this.options.log(`\u6210\u5458\u5B9A\u65F6\u4EFB\u52A1\u6267\u884C\u5F02\u5E38\uFF1A${error instanceof Error ? error.message : String(error)}`)).finally(() => this.running.delete(schedule.scheduleId));
+  }
+  async fire(schedule, triggerAt) {
+    const runId = randomUUID27();
+    this.options.store.insertMemberScheduleRun({
+      runId,
+      scheduleId: schedule.scheduleId,
+      assistantId: schedule.assistantId,
+      generation: schedule.generation,
+      triggerAt,
+      state: "running",
+      text: null,
+      startedAt: triggerAt,
+      finishedAt: null
+    });
+    let state = "failed";
+    let text7 = "";
+    try {
+      const reply = await this.options.run(schedule.assistantId, schedule.prompt);
+      text7 = (reply ?? "").trim();
+      if (text7 === "") {
+        text7 = "\u6210\u5458\u6CA1\u6709\u4EA7\u51FA\u53EF\u63A8\u9001\u7684\u5185\u5BB9";
+        state = "failed";
+      } else {
+        const delivered = await this.options.deliver({ assistantId: schedule.assistantId, text: text7, channel: schedule.channel, recipientId: schedule.recipientId });
+        state = delivered ? "succeeded" : "failed";
+        if (!delivered) text7 = `${text7}
+[\u6295\u9012\u5931\u8D25\uFF1A\u6E20\u9053\u4E0D\u53EF\u8FBE\u6216\u672A\u7ED1\u5B9A\u6536\u4EF6\u4F1A\u8BDD]`;
+      }
+    } catch (error) {
+      state = "failed";
+      text7 = `\u6210\u5458\u8FD0\u884C\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`;
+    }
+    const finishedAt = this.now();
+    this.options.store.finishMemberScheduleRun(runId, state, text7.slice(0, MAX_LAST_TEXT), finishedAt);
+    const latest = this.options.store.getMemberSchedule(schedule.scheduleId) ?? schedule;
+    this.options.store.saveMemberSchedule({ ...latest, lastStatus: state, lastText: text7.slice(0, MAX_LAST_TEXT) });
+    this.options.log(`\u6210\u5458\u5B9A\u65F6\u4EFB\u52A1\u300C${schedule.title}\u300D${state === "succeeded" ? "\u5DF2\u63A8\u9001" : "\u5931\u8D25"}\uFF1A${text7.slice(0, 120)}`);
+    return { state, text: text7 };
+  }
+};
+
 // src/injection.ts
 var InjectionGate = class {
   entries = [];
@@ -27217,7 +27532,7 @@ function mountUserCommands(ctx, deps) {
           }
           const result = await tasks.request("POST", `${path29}/${action}`, {
             protocolVersion: 1,
-            commandId: randomUUID27(),
+            commandId: randomUUID28(),
             expiresAt: new Date(Date.now() + 6e4).toISOString(),
             payload,
             taskId: request.taskId,
@@ -27448,7 +27763,7 @@ function mountUserCommands(ctx, deps) {
           }
           const result = await tasks.request("POST", `${path29}/set-priority`, {
             protocolVersion: 1,
-            commandId: randomUUID27(),
+            commandId: randomUUID28(),
             expiresAt: new Date(Date.now() + 6e4).toISOString(),
             payload: { priority: parsed.priority },
             taskId: parsed.taskId,
@@ -27802,6 +28117,33 @@ async function apply(ctx, config) {
     enabled: () => teamRuntime !== null,
     member: mailMember,
     analyze: (id, prompt2) => memberRuntime.chat(id, prompt2, void 0, void 0, "mail"),
+    /*
+     * 有新邮件分析结果时主动提醒本人：桌面以信使形象播报，企微推给已绑定 deliverHere 的会话。
+     * channelManager 在下方装配，闭包在值守拍（启动 60 秒后）才调用，届时早已初始化。
+     * 返回 true 才记已送达；桌面播报恒成功，企微不可达时仍算桌面已提醒。
+     */
+    notify: async (text7, memberId) => {
+      const member = teamStore.directory.get(memberId);
+      if (!member) return false;
+      bridge.notifySubAssistantReport({
+        assistantId: memberId,
+        displayName: member.displayName,
+        skinId: member.skinId,
+        voiceProfile: member.voiceProfile,
+        text: text7,
+        runId: randomUUID28(),
+        reportMode: "self"
+      });
+      for (const key of channelManager.settingsSnapshot().deliverHere) {
+        if (!channelManager.canDeliver(key)) continue;
+        try {
+          await channelManager.deliver(key, text7);
+        } catch (error) {
+          log(`\u90AE\u4EF6\u4F01\u5FAE\u63D0\u9192\u6295\u9012\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return true;
+    },
     log
   });
   mailWatcher.start();
@@ -27978,7 +28320,7 @@ ${material}
         const channelModel = resolveDefaultModel(home);
         const handle = await create.call(agents, {
           // 会话 id 带上渠道会话标识，任务工具据此把提醒默认发回当前会话。
-          sessionId: `channel-${Buffer.from(key, "utf8").toString("hex")}-${randomUUID27()}`,
+          sessionId: `channel-${Buffer.from(key, "utf8").toString("hex")}-${randomUUID28()}`,
           meta: { cwd: process.cwd() },
           ...channelModel ? { agentOptions: channelModel } : {},
           // 远程渠道只允许读与已登记的普通任务工具；shell、写文件、安装、再委派一律拒绝。
@@ -28019,6 +28361,31 @@ ${material}
     return config2 && current && connectionMatchesSettings && wecomAdapter?.connected() === true && current === connectedWecomAccountKey ? { accountKey: current, botId: config2.botId } : null;
   };
   companionRuntime.setChannelAccountKey(() => activeWecomBinding()?.accountKey ?? null);
+  const memberScheduler = new MemberScheduler({
+    store: teamStore,
+    enabled: () => teamRuntime !== null,
+    run: (id, prompt2) => memberRuntime.chat(id, prompt2, void 0, void 0, "desktop"),
+    deliver: async ({ assistantId, text: text7, channel, recipientId }) => {
+      const member = teamStore.directory.get(assistantId);
+      if (!member) return false;
+      if (channel === "wecom") {
+        if (!recipientId) return false;
+        return await channelManager.deliver(recipientId, text7);
+      }
+      bridge.notifySubAssistantReport({
+        assistantId,
+        displayName: member.displayName,
+        skinId: member.skinId,
+        voiceProfile: member.voiceProfile,
+        text: text7,
+        runId: randomUUID28(),
+        reportMode: "self"
+      });
+      return true;
+    },
+    log
+  });
+  memberScheduler.start();
   surface.add("meeting-mail-tools", () => registerMeetingMailTools(ctx, {
     home,
     bridge,
@@ -28036,6 +28403,7 @@ ${material}
   }));
   ctx.effect(() => () => {
     mailWatcher.stop();
+    memberScheduler.stop();
     void (async () => {
       await memberRuntime.dispose();
       await companionRuntime.dispose();
@@ -28264,6 +28632,63 @@ ${material}
       else glossary.add(input.term, input.expansion ?? "");
       return glossary.list().map((item) => ({ term: item.term, expansion: item.expansion, createdAt: item.createdAt }));
     },
+    schedules: () => teamStore.listMemberSchedules().map((item) => ({
+      ...item,
+      assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId
+    })),
+    scheduleEdit: (input) => {
+      const views = () => teamStore.listMemberSchedules().map((item) => ({
+        ...item,
+        assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId
+      }));
+      const now = Date.now();
+      if (input.action === "create") {
+        if (!teamStore.directory.get(input.assistantId)) throw new Error("\u6210\u5458\u4E0D\u5B58\u5728\uFF0C\u4E0D\u80FD\u4E3A\u5176\u521B\u5EFA\u5B9A\u65F6\u4EFB\u52A1");
+        if (input.channel === "wecom" && !input.recipientId) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u63A8\u9001\u9700\u8981\u6307\u5B9A\u6536\u4EF6\u4F1A\u8BDD\uFF08recipientId\uFF09");
+        teamStore.saveMemberSchedule({
+          scheduleId: randomUUID28(),
+          assistantId: input.assistantId,
+          title: input.title,
+          prompt: input.prompt,
+          spec: input.spec,
+          channel: input.channel,
+          recipientId: input.recipientId ?? null,
+          enabled: input.enabled,
+          nextRunAt: input.enabled ? firstScheduleAt(input.spec, now) : null,
+          generation: 1,
+          createdAt: now,
+          lastRunAt: null,
+          lastStatus: null,
+          lastText: null
+        });
+      } else if (input.action === "update") {
+        const current = teamStore.getMemberSchedule(input.scheduleId);
+        if (!current) throw new Error("\u5B9A\u65F6\u4EFB\u52A1\u4E0D\u5B58\u5728");
+        if (current.generation !== input.expectedGeneration) throw new Error("\u5B9A\u65F6\u4EFB\u52A1\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5");
+        const spec = input.spec ?? current.spec;
+        const enabled = input.enabled ?? current.enabled;
+        const channel = input.channel ?? current.channel;
+        const recipientId = input.recipientId === void 0 ? current.recipientId : input.recipientId ?? null;
+        if (channel === "wecom" && !recipientId) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u63A8\u9001\u9700\u8981\u6307\u5B9A\u6536\u4EF6\u4F1A\u8BDD\uFF08recipientId\uFF09");
+        const specChanged = JSON.stringify(spec) !== JSON.stringify(current.spec);
+        teamStore.saveMemberSchedule({
+          ...current,
+          title: input.title ?? current.title,
+          prompt: input.prompt ?? current.prompt,
+          spec,
+          channel,
+          recipientId,
+          enabled,
+          generation: current.generation + 1,
+          nextRunAt: enabled ? specChanged || current.nextRunAt === null ? firstScheduleAt(spec, now) : current.nextRunAt : null
+        });
+      } else {
+        teamStore.deleteMemberSchedule(input.scheduleId);
+      }
+      bridge.notifyApprovalSnapshot();
+      return views();
+    },
+    scheduleRunNow: (id) => memberScheduler.runNow(id),
     enabled: () => teamRuntime !== null,
     // 子助理平台密钥：桥上 apiKey → 加密存储 secretId；删除成员时尽力清理条目。
     secrets: {
@@ -28427,7 +28852,8 @@ ${material}
     approvalMode: () => config.approvalMode,
     subAssistantDispatch: {
       dispatch: (assistantId, task, dispatchId) => subAssistantDispatch.dispatch(assistantId, task, dispatchId)
-    }
+    },
+    memberSchedules: { request: (method, pathname, body) => memberManagement.request(method, pathname, body) }
   }));
   const workbenchSummary = () => {
     let openTodos = null;

@@ -109,6 +109,8 @@ import { mountReportWorkbench } from './workbench.ts'
 import { fileKeyCodec, SubAssistantSecrets } from './sub-assistant-secrets.ts'
 import { SubAssistantRegistry } from './sub-assistant-registry.ts'
 import { SubAssistantDispatch } from './sub-assistant-dispatch.ts'
+import { MemberScheduler } from './member-scheduler.ts'
+import { firstScheduleAt } from './scheduler.ts'
 import {
   formatAssistantState,
   InjectionGate,
@@ -1212,6 +1214,22 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     enabled: () => teamRuntime !== null,
     member: mailMember,
     analyze: (id, prompt) => memberRuntime.chat(id, prompt, undefined, undefined, 'mail'),
+    /*
+     * 有新邮件分析结果时主动提醒本人：桌面以信使形象播报，企微推给已绑定 deliverHere 的会话。
+     * channelManager 在下方装配，闭包在值守拍（启动 60 秒后）才调用，届时早已初始化。
+     * 返回 true 才记已送达；桌面播报恒成功，企微不可达时仍算桌面已提醒。
+     */
+    notify: async (text, memberId) => {
+      const member = teamStore.directory.get(memberId)
+      if (!member) return false
+      bridge.notifySubAssistantReport({ assistantId: memberId, displayName: member.displayName, skinId: member.skinId,
+        voiceProfile: member.voiceProfile, text, runId: randomUUID(), reportMode: 'self' })
+      for (const key of channelManager.settingsSnapshot().deliverHere) {
+        if (!channelManager.canDeliver(key)) continue
+        try { await channelManager.deliver(key, text) } catch (error) { log(`邮件企微提醒投递失败：${error instanceof Error ? error.message : String(error)}`) }
+      }
+      return true
+    },
     log,
   })
   mailWatcher.start()
@@ -1411,6 +1429,31 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       ? { accountKey: current, botId: config.botId } : null
   }
   companionRuntime.setChannelAccountKey(() => activeWecomBinding()?.accountKey ?? null)
+  /*
+   * 成员定时调度：到点自主跑成员真干活（抓 GitHub / 整理日报），再把结果推给本人。
+   * run 走 memberRuntime.chat 的成员桌面持久会话——与渠道入站同一条自主路径，
+   * 多次定时运行会在同一会话里累积上下文，记忆/经验/技能由此沉淀。
+   * deliver：企微经 channelManager.deliver（仅 deliverHere 已绑定会话）；桌面以成员形象+音色播报。
+   * enabled 与成员运行同闸（团队模式开着），团队没开时定时拍直接跳过，不会空跑模型。
+   */
+  const memberScheduler = new MemberScheduler({
+    store: teamStore,
+    enabled: () => teamRuntime !== null,
+    run: (id, prompt) => memberRuntime.chat(id, prompt, undefined, undefined, 'desktop'),
+    deliver: async ({ assistantId, text, channel, recipientId }) => {
+      const member = teamStore.directory.get(assistantId)
+      if (!member) return false
+      if (channel === 'wecom') {
+        if (!recipientId) return false
+        return await channelManager.deliver(recipientId, text)
+      }
+      bridge.notifySubAssistantReport({ assistantId, displayName: member.displayName, skinId: member.skinId,
+        voiceProfile: member.voiceProfile, text, runId: randomUUID(), reportMode: 'self' })
+      return true
+    },
+    log,
+  })
+  memberScheduler.start()
   surface.add('meeting-mail-tools', () => registerMeetingMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log,
     wecomBinding: recipient => channelManager.canDeliver(recipient) ? activeWecomBinding() : null,
     wecomRecipients: () => channelManager.settingsSnapshot().deliverHere.filter(recipient => channelManager.canDeliver(recipient)),
@@ -1422,6 +1465,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }))
   ctx.effect(() => () => {
     mailWatcher.stop()
+    memberScheduler.stop()
     void (async () => {
       await memberRuntime.dispose()
       await companionRuntime.dispose()
@@ -1652,6 +1696,39 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       else glossary.add(input.term, input.expansion ?? '')
       return glossary.list().map(item => ({ term: item.term, expansion: item.expansion, createdAt: item.createdAt }))
     },
+    schedules: () => teamStore.listMemberSchedules().map(item => ({ ...item,
+      assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId })),
+    scheduleEdit: input => {
+      const views = () => teamStore.listMemberSchedules().map(item => ({ ...item,
+        assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId }))
+      const now = Date.now()
+      if (input.action === 'create') {
+        if (!teamStore.directory.get(input.assistantId)) throw new Error('成员不存在，不能为其创建定时任务')
+        if (input.channel === 'wecom' && !input.recipientId) throw new Error('企业微信推送需要指定收件会话（recipientId）')
+        teamStore.saveMemberSchedule({ scheduleId: randomUUID(), assistantId: input.assistantId, title: input.title,
+          prompt: input.prompt, spec: input.spec, channel: input.channel, recipientId: input.recipientId ?? null,
+          enabled: input.enabled, nextRunAt: input.enabled ? firstScheduleAt(input.spec, now) : null, generation: 1,
+          createdAt: now, lastRunAt: null, lastStatus: null, lastText: null })
+      } else if (input.action === 'update') {
+        const current = teamStore.getMemberSchedule(input.scheduleId)
+        if (!current) throw new Error('定时任务不存在')
+        if (current.generation !== input.expectedGeneration) throw new Error('定时任务已变化，请刷新后重试')
+        const spec = input.spec ?? current.spec
+        const enabled = input.enabled ?? current.enabled
+        const channel = input.channel ?? current.channel
+        const recipientId = input.recipientId === undefined ? current.recipientId : (input.recipientId ?? null)
+        if (channel === 'wecom' && !recipientId) throw new Error('企业微信推送需要指定收件会话（recipientId）')
+        const specChanged = JSON.stringify(spec) !== JSON.stringify(current.spec)
+        teamStore.saveMemberSchedule({ ...current, title: input.title ?? current.title, prompt: input.prompt ?? current.prompt,
+          spec, channel, recipientId, enabled, generation: current.generation + 1,
+          nextRunAt: enabled ? (specChanged || current.nextRunAt === null ? firstScheduleAt(spec, now) : current.nextRunAt) : null })
+      } else {
+        teamStore.deleteMemberSchedule(input.scheduleId)
+      }
+      bridge.notifyApprovalSnapshot()
+      return views()
+    },
+    scheduleRunNow: id => memberScheduler.runNow(id),
     enabled: () => teamRuntime !== null,
     // 子助理平台密钥：桥上 apiKey → 加密存储 secretId；删除成员时尽力清理条目。
     secrets: {
@@ -1840,6 +1917,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     subAssistantDispatch: {
       dispatch: (assistantId, task, dispatchId) => subAssistantDispatch.dispatch(assistantId, task, dispatchId),
     },
+    memberSchedules: { request: (method, pathname, body) => memberManagement.request(method, pathname, body) },
   }))
   // 一键入口：输入框「+ → 指令」里的召唤与开关，不经过模型、不产生消息。
   // 工作台概览的数据源：全部只读，且都复用既有存储（team.sqlite 的任务表 / work_items 表）。

@@ -796,9 +796,10 @@ export class CompanionTaskRuntime {
         if (!this.accepting || !this.memberManagement) throw new CompanionError('DEVICE_OFFLINE', '成员管理服务尚未就绪', 503)
         return await this.memberManagement.request(method, pathname, body)
       }
-      // 技能/产物/时间线/词库/共享记忆同样归成员管理面；只接受本人桌面操作。
+      // 技能/产物/时间线/词库/共享记忆/成员定时任务同样归成员管理面；只接受本人桌面操作。
       if (pathname === '/companion/v1/skills' || pathname === '/companion/v1/artifacts' || pathname === '/companion/v1/glossary'
-        || pathname.startsWith('/companion/v1/timeline') || pathname === '/companion/v1/memories/shared') {
+        || pathname.startsWith('/companion/v1/timeline') || pathname === '/companion/v1/memories/shared'
+        || pathname === '/companion/v1/member-schedules' || pathname.startsWith('/companion/v1/member-schedules/')) {
         if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '技能与资料管理只接受本人在桌面的操作', 403)
         if (!this.accepting || !this.memberManagement) throw new CompanionError('DEVICE_OFFLINE', '成员管理服务尚未就绪', 503)
         return await this.memberManagement.request(method, pathname, body)

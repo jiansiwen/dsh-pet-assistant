@@ -492,7 +492,7 @@ test('迁移 v8 到当前版本保留身份，当前版本再次打开不重跑�
   raw.prepare('INSERT INTO assistants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(old.assistantId, old.roleId, old.displayName,
     old.skinId, old.persona, old.voiceProfile, JSON.stringify(old.toolPolicy), 1, old.revision)
   const store = fixture.open()
-  assert.equal(TEAM_SCHEMA_VERSION, 16)
+  assert.equal(TEAM_SCHEMA_VERSION, 17)
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, TEAM_SCHEMA_VERSION)
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_notice_deliveries'").get())
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_send_intents'").get())

@@ -63,6 +63,41 @@ export interface CompanionScheduleRecord {
   grantRef: string
 }
 
+/**
+ * 成员定时任务：到点**自主跑成员**（memberRuntime.chat）真干活，再把结果投递到桌面/企微。
+ * 与提醒（schedules）刻意分开：提醒到点只发一条固定通知；这里让成员抓数据/整理日报后推真实结果。
+ * spec 复用 ReminderSchedule（daily/once/interval），nextRunAt 由 scheduler.ts 计算。
+ */
+export interface MemberScheduleRecord {
+  scheduleId: string
+  assistantId: string
+  title: string
+  prompt: string
+  spec: ReminderSchedule
+  channel: 'desktop' | 'wecom'
+  /** wecom 收件会话标识（wecom:single:<id>）；desktop 为 null（以成员形象播报给本人）。 */
+  recipientId: string | null
+  enabled: boolean
+  nextRunAt: number | null
+  generation: number
+  createdAt: number
+  lastRunAt: number | null
+  lastStatus: 'succeeded' | 'failed' | null
+  lastText: string | null
+}
+
+export interface MemberScheduleRunRecord {
+  runId: string
+  scheduleId: string
+  assistantId: string
+  generation: number
+  triggerAt: number
+  state: 'running' | 'succeeded' | 'failed'
+  text: string | null
+  startedAt: number
+  finishedAt: number | null
+}
+
 export interface ReminderGrantRecord {
   grantRef: string
   taskId: string
@@ -143,7 +178,7 @@ export interface CompanionContextRecord {
  *     子助理分派账本（subassistant_runs）——先落账再执行，回执驱动状态推进；不保存任务正文，仅存摘要。
  * v16：合并两路 v15 后版本顺延，让旧库重跑一次幂等迁移——只看版本号会漏建另一分支的表/列。
  */
-export const TEAM_SCHEMA_VERSION = 16
+export const TEAM_SCHEMA_VERSION = 17
 
 export interface ChannelInboundRecord {
   id: string
@@ -1298,6 +1333,22 @@ export class TeamStore {
         CHECK((status = 'dispatched') = (completed_at IS NULL))
       );
       CREATE INDEX IF NOT EXISTS idx_subassistant_runs_assistant ON subassistant_runs(assistant_id, created_at);
+      CREATE TABLE IF NOT EXISTS member_schedules (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
+      CREATE TABLE IF NOT EXISTS member_schedule_runs (
+        run_id TEXT PRIMARY KEY,
+        schedule_id TEXT NOT NULL,
+        assistant_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        trigger_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('running', 'succeeded', 'failed')),
+        text TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_member_schedule_runs ON member_schedule_runs(schedule_id, started_at);
     `)
     /*
      * 邮件分析的结构化建议：老库没有这一列，用 PRAGMA + ALTER 幂等补上。
@@ -2337,6 +2388,35 @@ export class TeamStore {
   getCompanionSchedule(scheduleId: string): CompanionScheduleRecord | null { return this.companionRecord('schedules', scheduleId) }
   listCompanionSchedules(): CompanionScheduleRecord[] { return this.companionRecords('schedules') }
   saveCompanionSchedule(schedule: CompanionScheduleRecord): void { this.saveCompanionRecord('schedules', schedule.scheduleId, schedule) }
+  getMemberSchedule(scheduleId: string): MemberScheduleRecord | null {
+    const row = this.db.prepare('SELECT data FROM member_schedules WHERE id = ?').get(scheduleId) as Row | undefined
+    return row ? JSON.parse(String(row.data)) as MemberScheduleRecord : null
+  }
+  listMemberSchedules(): MemberScheduleRecord[] {
+    return (this.db.prepare('SELECT data FROM member_schedules ORDER BY rowid').all() as Row[])
+      .map(row => JSON.parse(String(row.data)) as MemberScheduleRecord)
+  }
+  saveMemberSchedule(schedule: MemberScheduleRecord): void {
+    this.db.prepare('INSERT INTO member_schedules(id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data')
+      .run(schedule.scheduleId, json(schedule))
+  }
+  deleteMemberSchedule(scheduleId: string): void { this.db.prepare('DELETE FROM member_schedules WHERE id = ?').run(scheduleId) }
+  insertMemberScheduleRun(run: MemberScheduleRunRecord): void {
+    this.db.prepare(`INSERT INTO member_schedule_runs(run_id, schedule_id, assistant_id, generation, trigger_at, state, text, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(run.runId, run.scheduleId, run.assistantId, run.generation, run.triggerAt, run.state, run.text, run.startedAt, run.finishedAt)
+  }
+  finishMemberScheduleRun(runId: string, state: 'succeeded' | 'failed', text: string | null, at: number): void {
+    this.db.prepare('UPDATE member_schedule_runs SET state = ?, text = ?, finished_at = ? WHERE run_id = ? AND state = ?')
+      .run(state, text, at, runId, 'running')
+  }
+  listMemberScheduleRuns(scheduleId: string, limit = 20): MemberScheduleRunRecord[] {
+    return (this.db.prepare('SELECT * FROM member_schedule_runs WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?').all(scheduleId, limit) as Row[])
+      .map(row => ({ runId: String(row.run_id), scheduleId: String(row.schedule_id), assistantId: String(row.assistant_id),
+        generation: Number(row.generation), triggerAt: Number(row.trigger_at), state: String(row.state) as MemberScheduleRunRecord['state'],
+        text: row.text === null ? null : String(row.text), startedAt: Number(row.started_at),
+        finishedAt: row.finished_at === null ? null : Number(row.finished_at) }))
+  }
   getReminderGrant(grantRef: string): ReminderGrantRecord | null { return this.companionRecord('reminder_grants', grantRef) }
   saveReminderGrant(grant: ReminderGrantRecord): void { this.saveCompanionRecord('reminder_grants', grant.grantRef, grant) }
   getReminderCycle(cycleId: string): ReminderCycleRecord | null { return this.companionRecord('reminder_cycles', cycleId) }

@@ -799,7 +799,7 @@ export class TeamService {
     docScope?: string,
   ): Promise<{ activation: SubagentActivation; child: Agent | undefined }> {
     if (this.options.members) return this.options.members.start(member.assistantId, this.buildPrompt(member, task, null), signal, task.taskId,
-      task.originChannel === 'wecom' ? 'wecom' : 'desktop', docScope)
+      task.originChannel === 'wecom' ? 'wecom' : 'desktop', docScope, parentAgent)
     const activation = await this.ctx.subagents.startActivation({
       provider: this.options.provider,
       label: runId,

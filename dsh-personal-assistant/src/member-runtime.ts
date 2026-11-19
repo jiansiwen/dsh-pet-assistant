@@ -7,6 +7,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { hostAgentRegistry } from './host-agents.ts'
+import { safeWebFetch } from './member-web.ts'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS } from './gate.ts'
 import type { MemberProfile, MemberQuotaView } from './member-contract.ts'
 import { MEMORY_KINDS, type MemoryKind } from './memory.ts'
@@ -264,13 +265,13 @@ export class MemberRuntime {
     return profile
   }
 
-  async start(memberId: string, prompt: ContentBlock[], signal: AbortSignal, taskId?: string, origin: MemberOrigin = 'desktop', docScope?: string): Promise<{ child: Agent; activation: MemberActivation }> {
-    return this.open(memberId, prompt, signal, taskId, undefined, origin, undefined, docScope)
+  async start(memberId: string, prompt: ContentBlock[], signal: AbortSignal, taskId?: string, origin: MemberOrigin = 'desktop', docScope?: string, parentAgent?: Agent): Promise<{ child: Agent; activation: MemberActivation }> {
+    return this.open(memberId, prompt, signal, taskId, undefined, origin, undefined, docScope, parentAgent)
   }
 
-  async chat(memberId: string, text: string, signal = new AbortController().signal, channelKey?: string, origin: MemberOrigin = 'desktop', sessionScope?: string, docScope?: string): Promise<string> {
+  async chat(memberId: string, text: string, signal = new AbortController().signal, channelKey?: string, origin: MemberOrigin = 'desktop', sessionScope?: string, docScope?: string, parentAgent?: Agent): Promise<string> {
     if (!text.trim()) throw new Error('成员消息不能为空')
-    const { activation } = await this.open(memberId, [{ type: 'text', text }], signal, undefined, channelKey, origin, sessionScope, docScope)
+    const { activation } = await this.open(memberId, [{ type: 'text', text }], signal, undefined, channelKey, origin, sessionScope, docScope, parentAgent)
     try {
       const result = await activation.result
       if (result.stopReason !== 'completed') throw new Error(result.diagnostic ?? '成员请求未完成')
@@ -279,7 +280,7 @@ export class MemberRuntime {
   }
 
   private async open(memberId: string, prompt: ContentBlock[], signal: AbortSignal, taskId?: string, channelKey?: string,
-    origin: MemberOrigin = 'desktop', channelScope?: string, docScope?: string): Promise<{ child: Agent; activation: MemberActivation }> {
+    origin: MemberOrigin = 'desktop', channelScope?: string, docScope?: string, parentAgent?: Agent): Promise<{ child: Agent; activation: MemberActivation }> {
     signal.throwIfAborted()
     const profile = this.available(memberId)
     const effectiveOrigin: MemberOrigin = channelKey ? 'wecom' : origin
@@ -418,7 +419,13 @@ export class MemberRuntime {
       const analysisOnly = effectiveOrigin === 'mail'
       if (analysisOnly) { allowed.clear(); sideEffect.clear() }
       for (const denied of profile.toolPolicy.denyTools) { allowed.delete(denied); sideEffect.delete(denied) }
-      // restrict 只过滤全局工具；局部工具另有执行 guard，其他插件新增工具也默认拒绝。
+      /*
+       * 沿用宿主工具：成员 agent 从插件 ctx 创建，作用域里只有插件工具；DSH 核心会话工具
+       * （read/web_fetch/bash/write…）注册在宿主会话（总助理）作用域。委派运行时把父会话
+       * （总助理，带宿主工具）已授权给本成员的工具定义复制进成员 ctx，成员即可沿用宿主工具，
+       * 而不必插件自造。无父会话（如纯定时触发）时复制不到，成员退回能力工具。
+       */
+      // restrict 只过滤全局工具；按存在性进入允许名单，未授权/不存在一律挡掉。局部工具另有 guard。
       ctx.tools.restrict({ allow: [...allowed, ...sideEffect].filter(name => !!ctx.tools.get(name, agent)) })
       for (const name of LOCAL_TOOLS) allowed.add(name)
       if (taskId) allowed.add('structured_output')
@@ -531,6 +538,22 @@ export class MemberRuntime {
           return JSON.stringify(result ?? null)
         },
       }))
+      // 定时自主运行没有核心创建的父会话可 spawn，拿不到宿主核心工具（DSH 装配机制决定）。
+      // 给获准 web_fetch 的成员注册一个最小只读抓取能力作桥；仅只读、防 SSRF，不替代宿主工具。
+      if (allowed.has('web_fetch') && !ctx.tools.get('web_fetch', agent) && !ctx.tools.get('companion_web_fetch', agent)) {
+        ctx.tools.register(defineTool({
+          name: 'companion_web_fetch',
+          description: '抓取一个公开 https 网页或 API 并返回正文文本（GitHub 请用官方 API，如 https://api.github.com/search/repositories?q=stars:%3E100&sort=stars&order=desc&per_page=10 ；github.com 网页在本网络可能不可达）。只读，不执行副作用；本机/内网地址会被拒绝。',
+          parameters: { url: { type: 'string', required: true, description: '要抓取的公开 https URL' },
+            maxChars: { type: 'number', description: '返回正文最大字符数，默认 12000，上限 60000' } },
+          output: toolOutput,
+          execute: async (args: { url?: unknown; maxChars?: unknown }, exec: { agent?: Agent; signal: AbortSignal }) => {
+            if (!owns(exec.agent) || !admitted || ended !== undefined || runSignal.aborted || exec.signal.aborted) throw new Error('成员请求已停止')
+            return JSON.stringify(await safeWebFetch(args.url, args.maxChars, exec.signal))
+          },
+        }))
+        allowed.add('companion_web_fetch')
+      }
       const desktop = this.options.desktop
       if (allowed.has(DOCUMENT_PRESENTATION_TOOL) && desktop && desktopBinding) {
         registerMeetingPresentationTools(ctx as never, {
@@ -755,7 +778,9 @@ export class MemberRuntime {
       if (!agents) throw new Error('宿主没有提供成员会话服务，成员未启动')
       /* 成员会话挂到总助理工作目录下，用户才能在同一个工作区里找到它。 */
       const memberCwd = this.options.cwd?.()
-      const meta = typeof memberCwd === 'string' && memberCwd !== '' ? { cwd: memberCwd } : undefined
+      // agentPreset:'standard' 与本人手动开的会话同款组合：装配 DSH 默认工具
+      // （read/web_fetch/bash/write…）。成员=程序化开的独立标准会话，而非裸会话。
+      const meta = { ...(typeof memberCwd === 'string' && memberCwd !== '' ? { cwd: memberCwd } : {}), agentPreset: 'standard' }
         /*
          * 恢复持久会话时，宿主可能还在释放上一轮的写句柄（讲解被口令打断、追问紧接着发出时
          * 最容易撞上："session ... is already owned by an active write handle"）。

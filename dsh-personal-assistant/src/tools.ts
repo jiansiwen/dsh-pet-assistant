@@ -147,6 +147,11 @@ export interface ToolOptions {
   /** 运行时卸载团队服务（团队模式开关的「关」）；有运行中任务时拒绝。 */
   disableTeamMode(): Promise<{ ok: true } | { ok: false; error: string }>
   /**
+   * 成员定时任务管理（到点自主跑成员真干活再推送）。复用成员管理面路由，单一真源。
+   * 未装配时工具明确拒绝，不降级成固定提醒。
+   */
+  memberSchedules?: { request(method: string, pathname: string, body: unknown): Promise<{ status: number; body: unknown }> }
+  /**
    * 当前写入方式（来自用户配置文件，模型改不了）。缺省按 manual：
    * 不知道这件事时只能更保守，不能更宽松。
    */
@@ -829,6 +834,67 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       return json({ ok: result.status === 'completed', runId: result.runId, assistantId: result.assistantId,
         displayName: result.displayName, status: result.status, text: result.text, depth: result.depth,
         elapsedMs: result.elapsedMs, summary })
+    },
+  }))
+
+  host.tools.register(defineTool({
+    name: 'personal_assistant_member_schedule',
+    description: '为成员安排/查询/取消/立即执行"定时自主任务"：到点让该成员用自己的工具真干活（抓 GitHub 热门、整理日报等），再把结果推送给本人（桌面播报或企业微信）。与固定提醒不同——这里成员会真正执行任务产出结果。用户说"每天9点让探花抓GitHub推企微""18点让史官出日报""现在就让XX跑一次"时调用。成员需先在团队目录里存在并启用；企业微信推送需 recipientId（已绑定的企微会话标识，形如 wecom:single:<id>）。',
+    parameters: {
+      action: { type: 'string', required: true, description: 'create / list / delete / run' },
+      assistantId: { type: 'string', description: 'create 必填：成员 assistantId' },
+      title: { type: 'string', description: 'create 必填：任务短标题' },
+      prompt: { type: 'string', description: 'create 必填：交给成员的任务目标（说清要干什么、产出什么）' },
+      repeatKind: { type: 'string', description: 'create：daily / once / interval' },
+      localTime: { type: 'string', description: 'daily 的本地时刻 HH:mm（如 09:00）' },
+      runAt: { type: 'string', description: 'once/interval 的首次时间 ISO8601' },
+      everySeconds: { type: 'number', description: 'interval 的间隔秒（≥60）' },
+      timezone: { type: 'string', description: '时区，默认 Asia/Shanghai' },
+      channel: { type: 'string', description: 'desktop 或 wecom，默认 desktop' },
+      recipientId: { type: 'string', description: 'wecom 收件会话标识（wecom:single:<id>）' },
+      scheduleId: { type: 'string', description: 'delete/run 必填：定时任务 id' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: Record<string, unknown>) {
+      if (!options.memberSchedules) return json({ ok: false, error: '成员定时任务服务未装配' })
+      const svc = options.memberSchedules
+      const action = typeof args.action === 'string' ? args.action : ''
+      if (action === 'list') {
+        const res = await svc.request('GET', '/companion/v1/member-schedules', {})
+        return json({ ok: res.status === 200, ...(res.body as object) })
+      }
+      if (action === 'delete' || action === 'run') {
+        const scheduleId = typeof args.scheduleId === 'string' ? args.scheduleId : ''
+        if (!scheduleId) return json({ ok: false, error: 'scheduleId 必填' })
+        const res = action === 'delete'
+          ? await svc.request('POST', '/companion/v1/member-schedules', { action: 'delete', scheduleId })
+          : await svc.request('POST', '/companion/v1/member-schedules/run', { scheduleId })
+        return json({ ok: res.status === 200, ...(res.body as object) })
+      }
+      if (action === 'create') {
+        const assistantId = typeof args.assistantId === 'string' ? args.assistantId.trim() : ''
+        const title = typeof args.title === 'string' ? args.title.trim() : ''
+        const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
+        const repeatKind = typeof args.repeatKind === 'string' ? args.repeatKind : ''
+        const timezone = typeof args.timezone === 'string' && args.timezone ? args.timezone : 'Asia/Shanghai'
+        if (!assistantId || !title || !prompt) return json({ ok: false, error: 'assistantId/title/prompt 必填' })
+        let spec: Record<string, unknown>
+        if (repeatKind === 'daily') {
+          const localTime = typeof args.localTime === 'string' ? args.localTime : ''
+          if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(localTime)) return json({ ok: false, error: 'daily 需要 localTime（HH:mm）' })
+          spec = { kind: 'daily', timezone, localTime }
+        } else if (repeatKind === 'once' || repeatKind === 'interval') {
+          const runAt = typeof args.runAt === 'string' ? args.runAt : ''
+          if (!runAt || Number.isNaN(Date.parse(runAt))) return json({ ok: false, error: 'once/interval 需要可解析的 runAt（ISO8601）' })
+          spec = repeatKind === 'once' ? { kind: 'once', timezone, runAt }
+            : { kind: 'interval', timezone, runAt, everySeconds: typeof args.everySeconds === 'number' ? args.everySeconds : 0 }
+        } else return json({ ok: false, error: 'repeatKind 必须是 daily/once/interval' })
+        const channel = args.channel === 'wecom' ? 'wecom' : 'desktop'
+        const recipientId = typeof args.recipientId === 'string' ? args.recipientId : null
+        const res = await svc.request('POST', '/companion/v1/member-schedules', { action: 'create', assistantId, title, prompt, spec, channel, recipientId, enabled: true })
+        return json({ ok: res.status === 200, ...(res.body as object) })
+      }
+      return json({ ok: false, error: 'action 必须是 create/list/delete/run' })
     },
   }))
 

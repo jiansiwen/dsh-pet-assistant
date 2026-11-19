@@ -4,7 +4,8 @@ import type { MemberRuntime } from './member-runtime.ts'
 import { documentSessionScope } from './member-runtime.ts'
 import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberSnapshot } from './member-contract.ts'
 import type { MemberMemory } from './member-memory.ts'
-import type { CompanionHttpResult } from './companion-contract.ts'
+import { reminderScheduleSchema, type CompanionHttpResult, type ReminderSchedule } from './companion-contract.ts'
+import type { MemberScheduleRecord } from './team-domain.ts'
 
 const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
 const limit = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
@@ -44,6 +45,21 @@ const channelAcknowledgement = z.object({ expectedRevision: revision }).strict()
 /** 文档讲解会话：预读（静默喂文档）。docKey 用文档路径，插件侧结合工作区算范围摘要。 */
 const docPreloadSchema = z.object({ assistantId: z.string().trim().min(1).max(100),
   docKey: z.string().trim().min(1).max(2048), text: z.string().trim().min(1).max(60_000) }).strict()
+
+/** 成员定时任务视图：计划本体 + 成员名（界面展示用）。 */
+export type MemberScheduleView = MemberScheduleRecord & { assistantName: string }
+const scheduleRecipient = z.string().trim().max(200).nullish()
+const scheduleCreate = z.object({ action: z.literal('create'), assistantId: z.string().trim().min(1).max(100),
+  title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(8000), spec: reminderScheduleSchema,
+  channel: z.enum(['desktop', 'wecom']).default('desktop'), recipientId: scheduleRecipient, enabled: z.boolean().default(true) }).strict()
+const scheduleUpdate = z.object({ action: z.literal('update'), scheduleId: z.string().trim().min(1).max(100),
+  expectedGeneration: revision, title: z.string().trim().min(1).max(120).optional(), prompt: z.string().trim().min(1).max(8000).optional(),
+  spec: reminderScheduleSchema.optional(), channel: z.enum(['desktop', 'wecom']).optional(), recipientId: scheduleRecipient,
+  enabled: z.boolean().optional() }).strict()
+const scheduleDelete = z.object({ action: z.literal('delete'), scheduleId: z.string().trim().min(1).max(100) }).strict()
+const scheduleEditSchema = z.discriminatedUnion('action', [scheduleCreate, scheduleUpdate, scheduleDelete])
+const scheduleRunSchema = z.object({ scheduleId: z.string().trim().min(1).max(100) }).strict()
+export type MemberScheduleEditInput = z.infer<typeof scheduleEditSchema>
 
 export class MemberManagement {
   private readonly options: {
@@ -99,6 +115,12 @@ export class MemberManagement {
      * 原始片段是**线索**，没有解释过就不该当成事实摆在时间线上。
      */
     timeline?(from: number, to: number): Array<{ id: string; start: number; end: number; action: string; outcome: string; project: string | null; status: string }>
+    /** 成员定时任务列表（到点自主跑成员真干活再推送）。 */
+    schedules?(): MemberScheduleView[]
+    /** 增/改/删定时任务；返回最新列表。nextRunAt 由装配侧按 spec 计算。 */
+    scheduleEdit?(input: MemberScheduleEditInput): MemberScheduleView[]
+    /** 立即跑一次（手动触发/测试）；返回执行结局与文本。 */
+    scheduleRunNow?(scheduleId: string): Promise<{ state: string; text: string }>
     assistant?: {
       draft(input: { request: string; current?: MemberDraft }): Promise<{ draft: MemberDraft; notes: string }>
       studio?(input: { request: string }): Promise<{ name: string; prompt: string; actions: string[]; notes: string }>
@@ -164,6 +186,18 @@ export class MemberManagement {
     const { directory, memories } = this.options
     try {
       if (method === 'GET' && pathname === '/companion/v1/members') return { status: 200, body: this.snapshot() }
+      if (method === 'GET' && pathname === '/companion/v1/member-schedules') {
+        return { status: 200, body: { schedules: this.options.schedules ? this.options.schedules() : [] } }
+      }
+      if (method === 'POST' && pathname === '/companion/v1/member-schedules') {
+        if (!this.options.scheduleEdit) throw new Error('成员定时任务功能未装配')
+        return { status: 200, body: { schedules: this.options.scheduleEdit(scheduleEditSchema.parse(raw)) } }
+      }
+      if (method === 'POST' && pathname === '/companion/v1/member-schedules/run') {
+        if (!this.options.scheduleRunNow) throw new Error('成员定时任务功能未装配')
+        const input = scheduleRunSchema.parse(raw)
+        return { status: 200, body: await this.options.scheduleRunNow(input.scheduleId) }
+      }
       if (method === 'POST' && pathname === '/companion/v1/members/doc-preload') {
         const input = docPreloadSchema.parse(raw)
         try {

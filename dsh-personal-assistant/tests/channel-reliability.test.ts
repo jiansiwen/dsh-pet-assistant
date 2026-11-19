@@ -366,7 +366,7 @@ test('旧版去重标记升级后仍保守防重，旧结果不能推断为已�
   await manager.handle(message('legacy-id', '旧消息正文不可知').value)
   assert.equal(calls, 0)
   assert.equal(f.store.channelInboundAttention().length, 0, '旧记录没有足够证据恢复或编造状态')
-  assert.equal(TEAM_SCHEMA_VERSION, 16)
+  assert.equal(TEAM_SCHEMA_VERSION, 17)
   assert.equal(f.store.getMailSendIntent('old-mail')?.state, 'sending', '渠道升级不得修改邮件账本')
   f.advance(31 * 24 * 60 * 60_000)
   await manager.handle(message('new-message', '新消息').value)
