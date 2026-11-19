@@ -125,6 +125,8 @@ export interface PetState {
    * 完全不同义，所以这一侧刻意叫 `docSpeechMode`。
    */
   docSpeechMode?: 'source' | 'ai'
+  /** 讲解快捷键回读（设置页靠它回显）：打断 / 休息 / 继续。 */
+  docHotkeys?: { interrupt: string; rest: string; resume: string }
   /** 总助理音色的三项回读（设置页靠它回显）。 */
   agentVoiceDesign?: string
   agentVoiceId?: string
@@ -166,6 +168,10 @@ export interface PetSettingsPatch {
   agentVoiceSampleMime?: string
   /** 讲解形态；写进 patch 是为了让设置页能改（主进程 `save-settings` 是白名单式的）。 */
   docSpeechMode?: 'source' | 'ai'
+  /** 讲解快捷键（Electron accelerator，如 Ctrl+Alt+D）；设置页可改，主进程注册时验占用。 */
+  docInterruptHotkey?: string
+  docRestHotkey?: string
+  docResumeHotkey?: string
   /** 总助理音色的三项回读（设置页靠它回显）。 */
   agentVoiceDesign?: string
   agentVoiceId?: string
@@ -567,6 +573,14 @@ export interface PetApi extends MemberApi {
   overlayState(open: boolean, boxes: Box[], settingsOpen: boolean): void
   saveSettings(patch: PetSettingsPatch): Promise<{ ok: boolean }>
   assistantSettingsState(): Promise<AssistantSettingsResult>
+  /** 讲解口令打断后的提问窗口超时：把被暂停的讲解接回去（没有待续讲时返回失败）。 */
+  docResume(reason?: 'timeout' | 'continue'): Promise<{ ok: boolean; error?: string }>
+  /** 口令打断后的即时应答：讲解人音色的预合成短句（"好的，你说"）。 */
+  docAck(kind: 'stop'): void
+  /** 讲解全局快捷键按下：interrupt 打断提问 / rest 休息 / resume 继续。 */
+  onDocHotkey(callback: (payload: { action: 'interrupt' | 'rest' | 'resume' }) => void): () => void
+  /** 讲解快捷键注册状态（false = 被占用或非法），设置页据此提示改键。 */
+  onDocHotkeyStatus(callback: (status: { interrupt: boolean; rest: boolean; resume: boolean }) => void): () => void
   /** 邮件页：读取邮箱配置（授权码只回 hasPassword，永不回显明文）。 */
   assistantMailState(): Promise<AssistantMailResult>
   /** 邮件页：保存邮箱配置；password 留空＝沿用已保存的授权码。 */

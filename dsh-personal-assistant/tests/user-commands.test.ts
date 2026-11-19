@@ -21,13 +21,20 @@ const EXPECTED_COMMANDS = [
   'assistant-mail-config',
   'assistant-meeting-history',
   'assistant-meeting-list',
+  'assistant-meeting-set',
   'assistant-meeting-today',
   'assistant-off',
   'assistant-on',
+  'assistant-pet-config',
+  'assistant-pet-set',
   'assistant-report-list',
   'assistant-set-option',
+  'assistant-skill-set',
+  'assistant-skills',
   'assistant-set-task-priority',
   'assistant-settings-summary',
+  'assistant-state',
+  'assistant-task-set',
   'assistant-today-summary',
   'assistant-todo-count',
   'assistant-todo-list',
@@ -54,6 +61,13 @@ interface Overrides {
   tasks?: { request(method: string, path: string, body: unknown, subject: string): Promise<{ status: number; body: unknown }> }
   /** `settings.set` 的回包：'ok' 表示 applied，'error:<原因>' 表示桌宠拒绝，'timeout' 表示超时。 */
   settingsSet?: 'ok' | `error:${string}` | 'timeout'
+  /** 会议改删 / 提醒间隔桌面命令的回包。 */
+  meetingSet?: 'ok' | `error:${string}` | 'timeout'
+  taskInterval?: 'ok' | `error:${string}` | 'timeout'
+  /** `pet.config.summary` 的回包；'timeout' 表示桌宠没在跑。 */
+  petConfig?: Record<string, unknown> | 'timeout'
+  /** `pet.config.set` 的回包：'ok' 表示 applied，'error:<原因>' 表示拒绝，'timeout' 表示超时。 */
+  petSet?: 'ok' | `error:${string}` | 'timeout'
   /** 三张本地列表的数据源；给 null 表示该源读不到。 */
   lists?: {
     todos?: () => Array<{ goal: string; status: string; deadlineAt: number | null }> | null
@@ -114,19 +128,56 @@ function harness(overrides: Overrides = {}) {
         if (overrides.settingsSummary === 'timeout') throw new Error('桌面命令超时')
         return overrides.settingsSummary ?? {}
       }
+      if (command === 'meeting.rename' || command === 'meeting.delete' || command === 'task.set-interval') {
+        const mode = command === 'task.set-interval' ? (overrides.taskInterval ?? 'ok') : (overrides.meetingSet ?? 'ok')
+        if (mode === 'timeout') throw new Error('桌面命令超时')
+        if (mode.startsWith('error:')) return { applied: false, error: mode.slice('error:'.length) }
+        return { applied: true }
+      }
+      if (command === 'pet.config.summary') {
+        if (overrides.petConfig === 'timeout') throw new Error('桌面命令超时')
+        return overrides.petConfig ?? { stageVisible: true, characters: [], skins: [] }
+      }
+      if (command === 'pet.config.set') {
+        const mode = overrides.petSet ?? 'ok'
+        if (mode === 'timeout') throw new Error('桌面命令超时')
+        if (mode.startsWith('error:')) return { applied: false, error: mode.slice('error:'.length) }
+        return { applied: true, note: '已生效' }
+      }
       return { ok: true }
     },
   }
-  const tracker = {
-    capturing: overrides.capturing ?? false,
-    start: overrides.start ?? (async () => { events.push('start') }),
-    stop: overrides.stop ?? (async () => { events.push('stop') }),
+  /**
+   * 总开关替身：命令层只该转调 enable/disable/state，不再直接动 tracker。
+   * 采集范围确认、平台闸门这类判定属于 power 实现（见插件装配测试），这里只验命令接线。
+   */
+  const powerEvents: string[] = []
+  const power = {
+    enabled: () => (overrides.injection ?? 'off') === 'on',
+    enable: async () => {
+      powerEvents.push('enable')
+      if (overrides.blocked) {
+        return { ok: true, changed: true, capture: 'blocked' as const, text: `个人助理已开启；活动记录未开启：${overrides.blocked}` }
+      }
+      if (overrides.scope === false) {
+        return { ok: true, changed: true, capture: 'pending' as const, text: '个人助理已开启：工具已注入当前会话；活动记录等你在桌面宠物里确认采集范围后开始' }
+      }
+      if (overrides.capturing) return { ok: true, changed: false, capture: 'recording' as const, text: '个人助理已经在运行' }
+      return { ok: true, changed: true, capture: 'recording' as const, text: '个人助理已开启：工具已注入，开始记录活动' }
+    },
+    disable: async () => {
+      powerEvents.push('disable')
+      return { ok: true, changed: true, capture: 'off' as const, text: '个人助理已关闭：工具已撤回，活动记录已停止；桌面宠物保留' }
+    },
+    state: () => ({
+      injection: (overrides.injection ?? 'off') as 'on' | 'off',
+      capture: (overrides.capturing ? 'recording' : 'off') as 'recording' | 'off',
+      blocked: overrides.blocked ?? null,
+    }),
   }
   registerUserCommands(ctx as never, {
     bridge: bridge as never,
-    tracker: tracker as never,
-    captureBlockedReason: () => overrides.blocked ?? null,
-    captureScopeAuthorized: () => overrides.scope ?? true,
+    power: power as never,
     ...(overrides.summary === undefined ? {} : { summary: overrides.summary }),
     ...(overrides.tasks === undefined ? {} : { tasks: overrides.tasks }),
     ...(overrides.lists === undefined ? {} : {
@@ -137,15 +188,13 @@ function harness(overrides: Overrides = {}) {
       },
     }),
   })
-  return { definitions, events, desktop, command: (name: string) => definitions.find(item => item.name === name)! }
+  return { definitions, events, powerEvents, desktop, command: (name: string) => definitions.find(item => item.name === name)! }
 }
 
 test('宿主没有 commands 服务时静默跳过，不影响插件加载', () => {
   assert.doesNotThrow(() => registerUserCommands({ effect: (run: () => () => void) => run() } as never, {
     bridge: {} as never,
-    tracker: {} as never,
-    captureBlockedReason: () => null,
-    captureScopeAuthorized: () => true,
+    power: {} as never,
   }))
 })
 
@@ -161,9 +210,7 @@ test('commands 服务晚于插件就绪时，等它出现再注册', () => {
   }
   registerUserCommands(ctx as never, {
     bridge: { teamEnabled: false, bind: async () => ({ port: 1 }), launchPet: () => true } as never,
-    tracker: { capturing: false } as never,
-    captureBlockedReason: () => null,
-    captureScopeAuthorized: () => true,
+    power: { enabled: () => false } as never,
   })
   assert.equal(definitions.length, 0)
   ready = true
@@ -244,34 +291,82 @@ test('没有可绑定会话时仍把宠物叫出来，只是暂不绑定', async
   assert.deepEqual(events, ['launch'])
 })
 
-test('开启命令在范围未确认时给出明确指引', async () => {
-  const { command, events } = harness({ scope: false })
-  const result = await command('assistant-on').handler({})
-  assert.equal(result.kind, 'error')
+test('开启命令在范围未确认时仍开工具，并把采集指引说清楚', async () => {
+  const h = harness({ scope: false })
+  const result = await h.command('assistant-on').handler({})
+  assert.equal(result.kind, 'success')
   assert.match(result.text, /采集范围/)
-  assert.deepEqual(events, [])
+  assert.deepEqual(h.powerEvents, ['enable'])
 })
 
-test('开启命令在采集被拦住时不启动', async () => {
-  const { command, events } = harness({ blocked: '平台不支持' })
-  const result = await command('assistant-on').handler({})
-  assert.equal(result.kind, 'error')
+test('开启命令在采集被拦住时仍开工具，如实说明采集没开', async () => {
+  const h = harness({ blocked: '平台不支持' })
+  const result = await h.command('assistant-on').handler({})
+  assert.equal(result.kind, 'success')
   assert.match(result.text, /平台不支持/)
-  assert.deepEqual(events, [])
+  assert.deepEqual(h.powerEvents, ['enable'])
 })
 
-test('开启与关闭命令直接驱动 tracker', async () => {
+test('开启与关闭命令转调总开关，不直接动 tracker', async () => {
   const on = harness()
   assert.equal((await on.command('assistant-on').handler({})).kind, 'success')
-  assert.deepEqual(on.events, ['start'])
+  assert.deepEqual(on.powerEvents, ['enable'])
+  assert.deepEqual(on.events, [])
 
   const running = harness({ capturing: true })
   assert.match((await running.command('assistant-on').handler({})).text, /已经在运行/)
-  assert.deepEqual(running.events, [])
+  assert.deepEqual(running.powerEvents, ['enable'])
 
   const off = harness()
   assert.equal((await off.command('assistant-off').handler({})).kind, 'success')
-  assert.deepEqual(off.events, ['stop'])
+  assert.deepEqual(off.powerEvents, ['disable'])
+  assert.deepEqual(off.events, [])
+})
+
+test('状态命令如实回 JSON：注入与采集分开', async () => {
+  const on = await harness({ injection: 'on', capturing: true }).command('assistant-state').handler({})
+  assert.deepEqual(JSON.parse(on.text), { injection: 'on', capture: 'recording' })
+  const blocked = await harness({ blocked: '平台不支持' }).command('assistant-state').handler({})
+  assert.deepEqual(JSON.parse(blocked.text), { injection: 'off', capture: 'off', blocked: '平台不支持' })
+})
+
+test('宠物配置读：桌宠在线时原样带出 JSON，超时时如实说读不到', async () => {
+  const view = {
+    stageVisible: false,
+    characters: [{ assistantId: 'member-tangseng', displayName: '总助理', roleId: 'tangseng', skin: 'nezha', randomActions: ['recite-poem'], steppedDown: false, chief: true }],
+    skins: [{ id: 'panda', label: '国宝熊猫', actions: [{ id: 'walk', label: '走路' }] }],
+  }
+  const online = await harness({ petConfig: view }).command('assistant-pet-config').handler({})
+  assert.equal(online.kind, 'success')
+  assert.deepEqual(JSON.parse(online.text), { ok: true, ...view })
+
+  const offline = await harness({ petConfig: 'timeout' }).command('assistant-pet-config').handler({})
+  assert.equal(offline.kind, 'success', '桌宠没跑不算命令失败：页面要显示"读不到"而不是一块红')
+  assert.equal(JSON.parse(offline.text).unavailable, true)
+  assert.match(JSON.parse(offline.text).message, /没在运行/)
+})
+
+test('宠物配置写：合法改动转成桌面命令，拒绝与超时都给出原因', async () => {
+  const ok = harness()
+  const changed = await ok.command('assistant-pet-set').handler({ rawInput: '/assistant-pet-set skin member-tangseng nezha' })
+  assert.equal(changed.kind, 'success')
+  assert.match(changed.text, /member-tangseng.*nezha/)
+  assert.deepEqual(ok.desktop.at(-1), {
+    command: 'pet.config.set',
+    payload: { kind: 'skin', assistantId: 'member-tangseng', value: 'nezha' },
+  })
+
+  const refused = await harness({ petSet: 'error:没有这个形象' }).command('assistant-pet-set').handler({ rawInput: '/assistant-pet-set skin member-tangseng nope' })
+  assert.equal(refused.kind, 'error')
+  assert.match(refused.text, /没有这个形象/)
+
+  const offline = await harness({ petSet: 'timeout' }).command('assistant-pet-set').handler({ rawInput: '/assistant-pet-set stage hide' })
+  assert.equal(offline.kind, 'error')
+  assert.match(offline.text, /没在运行/)
+
+  const usage = await harness().command('assistant-pet-set').handler({ rawInput: '/assistant-pet-set skin' })
+  assert.equal(usage.kind, 'success')
+  assert.match(usage.text, /用法/)
 })
 
 test('工作台概览：三条只读命令都有数据时各自返回一行短文本', async () => {
@@ -394,9 +489,9 @@ test('待办列表：有数据 / 空 / 读不到 三种形态', async () => {
 
 test('会议列表：有数据 / 空 / 桌宠超时 三种形态', async () => {
   const startedAt = new Date(2026, 0, 2, 9, 30).getTime()
-  const filled = harness({ meetingList: [{ startedAt, name: '周会', state: 'transcribed' }] })
+  const filled = harness({ meetingList: [{ startedAt, name: '周会', state: 'transcribed', id: 'm-1' }] })
   const text = (await filled.command('assistant-meeting-list').handler({})).text
-  assert.deepEqual(text.split('\n')[0].split(' | '), ['09:30', '周会', '已转写'])
+  assert.deepEqual(text.split('\n')[0].split(' | '), ['09:30', '周会', '已转写', 'm-1'])
 
   const empty = harness({ meetingList: [] })
   assert.equal((await empty.command('assistant-meeting-list').handler({})).text, '今天还没有会议')
@@ -414,7 +509,7 @@ test('日报列表：有数据 / 空 / 读不到 三种形态', async () => {
 
 test('成员列表：有数据 / 空 / 读不到 三种形态', async () => {
   const filled = harness({ lists: { members: () => [{ name: '小会', role: 'wukong', enabled: true, quota: '1200/8000' }] } })
-  assert.deepEqual((await filled.command('assistant-team-list').handler({})).text.split(' | '), ['小会', '悟空', '在岗', '1200/8000'])
+  assert.deepEqual((await filled.command('assistant-team-list').handler({})).text.split(' | '), ['小会', '助理1', '在岗', '1200/8000'])
   assert.equal((await harness({ lists: { members: () => [] } }).command('assistant-team-list').handler({})).text, '还没有成员')
   assert.equal((await harness({ lists: { members: () => null } }).command('assistant-team-list').handler({})).text, '暂时读不到成员')
 })
@@ -453,8 +548,8 @@ test('历史会议列表：5 列、来源三种组合、空与读不到分开', 
   ] })
   const rows = (await filled.command('assistant-meeting-history').handler({})).text.split('\n')
   assert.equal(rows.length, 2)
-  assert.deepEqual(rows[0].split(' | '), ['2026-11-12 14:30', '周会', '麦克风+系统声', '30 天', '已转写'])
-  assert.deepEqual(rows[1].split(' | '), ['2026-11-12 14:30', '双人评审', '仅麦克风', '7 天', '部分转写'])
+  assert.deepEqual(rows[0].split(' | '), ['2026-11-12 14:30', '周会', '麦克风+系统声', '30 天', '已转写', 'm1'])
+  assert.deepEqual(rows[1].split(' | '), ['2026-11-12 14:30', '双人评审', '仅麦克风', '7 天', '部分转写', 'm2'])
   // 只读：只发了一条 meeting.history 桌面命令。
   assert.deepEqual(filled.events, ['desktop:meeting.history'])
 
@@ -468,8 +563,8 @@ test('历史会议列表：5 列、来源三种组合、空与读不到分开', 
 test('历史会议列表：字段缺失时该格为 —，列数不变', async () => {
   const partial = harness({ meetingHistory: [{ startedAt: 0 }] })
   const columns = (await partial.command('assistant-meeting-history').handler({})).text.split(' | ')
-  assert.equal(columns.length, 5)
-  assert.deepEqual(columns, ['—', '—', '—', '—', '—'])
+  assert.equal(columns.length, 6)
+  assert.deepEqual(columns, ['—', '—', '—', '—', '—', '—'])
 })
 
 test('改设置：三种合法参数各自转发正确的 key/value', async () => {
@@ -589,4 +684,84 @@ test('待办列表：真实 taskId 会出现在第 6 格（前端点的就是它
   assert.equal(rows[0][0], '改讲解链路')
   assert.equal(rows[0][5], '9f2a41c7-3d5e-4b8a-9c1d-7e6f0a2b3c4d')
   assert.equal(rows[1][5], '1b7c9e02-8a4d-4f61-b3c5-2d9e8f7a6b10')
+})
+
+test('待办改标题/取消：提交待批提案（client），不直接落库', async () => {
+  const calls: Array<{ method: string; path: string; subject: string }> = []
+  const tasks = {
+    request: async (method: string, path: string, _body: unknown, subject: string) => {
+      calls.push({ method, path, subject })
+      if (method === 'GET') return { status: 200, body: { task: { revision: 3, title: '旧标题' } } }
+      return { status: 202, body: {} }
+    },
+  }
+  const h = harness({ tasks })
+  const titled = await h.command('assistant-task-set').handler({ rawInput: '/assistant-task-set title task-1 新标题' })
+  assert.equal(titled.kind, 'success')
+  assert.match(titled.text, /已提交.*新标题.*确认/)
+  assert.equal(calls.at(-1)!.path, '/companion/v1/tasks/task-1/set-title')
+  assert.equal(calls.at(-1)!.subject, 'client', '聊天/面板侧只能提案，不能直接写')
+
+  const cancelled = await h.command('assistant-task-set').handler({ rawInput: '/assistant-task-set cancel task-1' })
+  assert.match(cancelled.text, /取消/)
+  assert.equal(calls.at(-1)!.path, '/companion/v1/tasks/task-1/cancel')
+})
+
+test('待办改期：人工待办用 deadlineAt；提醒保留重复规则只换首次时间', async () => {
+  const posts: Array<{ path: string; payload: Record<string, unknown> }> = []
+  const make = (spec?: unknown) => ({
+    request: async (method: string, path: string, body: unknown) => {
+      if (method === 'GET') return { status: 200, body: { task: { revision: 1, title: 't', ...(spec ? { schedule: { spec } } : {}) } } }
+      posts.push({ path, payload: (body as { payload: Record<string, unknown> }).payload })
+      return { status: 202, body: {} }
+    },
+  })
+  const iso = '2026-11-17T15:00:00+08:00'
+  const manual = harness({ tasks: make() })
+  await manual.command('assistant-task-set').handler({ rawInput: `/assistant-task-set deadline task-1 ${iso}` })
+  assert.deepEqual(posts.at(-1)!.payload, { deadlineAt: iso })
+
+  const reminder = harness({ tasks: make({ kind: 'interval', timezone: 'UTC', runAt: '2026-11-17T09:00:00+08:00', everySeconds: 300 }) })
+  await reminder.command('assistant-task-set').handler({ rawInput: `/assistant-task-set deadline task-2 ${iso}` })
+  const payload = posts.at(-1)!.payload as { schedule: { runAt: string; everySeconds: number } }
+  assert.equal(payload.schedule.runAt, iso)
+  assert.equal(payload.schedule.everySeconds, 300, '重复规则不能被改期抹掉')
+})
+
+test('提醒间隔走桌宠本机确认；拒绝与超时如实报错', async () => {
+  const ok = harness()
+  const done = await ok.command('assistant-task-set').handler({ rawInput: '/assistant-task-set interval task-1 600' })
+  assert.equal(done.kind, 'success')
+  assert.match(done.text, /10 分钟/)
+  assert.deepEqual(ok.desktop.at(-1), { command: 'task.set-interval', payload: { taskId: 'task-1', repeatEverySeconds: 600 } })
+
+  const refused = await harness({ taskInterval: 'error:已取消修改' }).command('assistant-task-set').handler({ rawInput: '/assistant-task-set interval task-1 600' })
+  assert.equal(refused.kind, 'error')
+  assert.match(refused.text, /已取消修改/)
+})
+
+test('会议重命名/删除走桌宠；取消删除如实报错', async () => {
+  const h = harness()
+  const renamed = await h.command('assistant-meeting-set').handler({ rawInput: '/assistant-meeting-set rename m-1 新名字' })
+  assert.equal(renamed.kind, 'success')
+  assert.match(renamed.text, /新名字/)
+  assert.deepEqual(h.desktop.at(-1), { command: 'meeting.rename', payload: { meetingId: 'm-1', name: '新名字' } })
+
+  const deleted = await h.command('assistant-meeting-set').handler({ rawInput: '/assistant-meeting-set delete m-1' })
+  assert.match(deleted.text, /已删除整场/)
+  assert.deepEqual(h.desktop.at(-1), { command: 'meeting.delete', payload: { meetingId: 'm-1' } })
+
+  const cancelled = await harness({ meetingSet: 'error:已取消删除' }).command('assistant-meeting-set').handler({ rawInput: '/assistant-meeting-set delete m-1' })
+  assert.equal(cancelled.kind, 'error')
+  assert.match(cancelled.text, /已取消删除/)
+})
+
+test('改删命令非法参数回用法提示，不发任何写命令', async () => {
+  const h = harness()
+  for (const raw of ['/assistant-task-set', '/assistant-task-set title', '/assistant-task-set interval task-1 5', '/assistant-meeting-set rename', '/assistant-meeting-set wat m-1']) {
+    const result = await h.command(raw.startsWith('/assistant-task') ? 'assistant-task-set' : 'assistant-meeting-set').handler({ rawInput: raw })
+    assert.equal(result.kind, 'success')
+    assert.match(result.text, /用法/)
+  }
+  assert.deepEqual(h.desktop, [])
 })

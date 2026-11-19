@@ -73,6 +73,14 @@ contextBridge.exposeInMainWorld('petApi', {
   overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
   saveSettings: (patch: PetSettingsPatch) => ipcRenderer.invoke('save-settings', patch) as Promise<{ ok: boolean }>,
   assistantSettingsState: () => ipcRenderer.invoke('assistant-settings-state') as Promise<AssistantSettingsResult>,
+  /* 讲解口令打断后的提问窗口超时：把被暂停的讲解接回去。 */
+  docResume: (reason?: 'timeout' | 'continue') => ipcRenderer.invoke('doc-resume', reason) as Promise<{ ok: boolean; error?: string }>,
+  /** 口令打断后的即时应答（预合成短句，讲解人音色）。 */
+  docAck: (kind: 'stop') => ipcRenderer.send('doc-ack', kind),
+  /** 讲解全局快捷键按下：interrupt 打断提问 / rest 休息 / resume 继续。 */
+  onDocHotkey: (callback: (payload: { action: 'interrupt' | 'rest' | 'resume' }) => void) => listen('doc-hotkey', callback),
+  /** 讲解快捷键注册状态（false = 被占用或非法），设置页据此提示改键。 */
+  onDocHotkeyStatus: (callback: (status: { interrupt: boolean; rest: boolean; resume: boolean }) => void) => listen('doc-hotkey-status', callback),
   /* 邮件页：配置读取 / 保存 / 值守分析列表。授权码只写不读，回包只有 hasPassword。 */
   assistantMailState: () => ipcRenderer.invoke('assistant-mail-state') as Promise<AssistantMailResult>,
   assistantMailSave: (input: AssistantMailInput) => ipcRenderer.invoke('assistant-mail-save', input) as Promise<AssistantMailResult>,

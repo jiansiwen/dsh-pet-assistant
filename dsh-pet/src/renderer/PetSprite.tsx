@@ -319,14 +319,14 @@ export default function PetSprite({
   useEffect(() => {
     if (dragging || frameList?.length || videoSrc || !action || (!oneShot(action) && action !== 'write')) return
     const durations: Record<string, number> = { drop: 3900, lie: 5000, 'laptop-in': 3500, 'laptop-out': 2300, write: 1600,
-      'sleep-in': 1800, 'sleep-out': 2500, 'walk-stop': 300 }
+      'sleep-in': 1800, 'sleep-out': 2500, 'walk-stop': 300, 'swagger-stop': 1700 }
     const timer = window.setInterval(() => callback.current?.(action, animationVersion), durations[action])
     return () => window.clearInterval(timer)
   }, [action, animationVersion, dragging, frameList, videoSrc])
   const pose: Pose | null = videoSrc
     ? { id: `video:${skin}:${effective}:${animationVersion}:${videoSrc}`, kind: 'video', src: videoSrc, loop: !oneShot(effective) && !(effective !== undefined && ONE_CYCLE_ACTIONS.has(effective)) && !isCustomAction, action: effective }
     : frameList?.length
-    ? { id: `frames:${skin}:${effective}:${animationVersion}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS, once: oneShot(effective) || isCustomAction }
+    ? { id: `frames:${skin}:${effective}:${animationVersion}:${frameList.length}`, kind: 'frames', frames: frameList, fps: DEFAULT_FPS, once: (oneShot(effective) || isCustomAction) && effective !== 'swagger' }
     : effective === 'walk' && images.walk
       ? { id: `walk:${images.walk}`, kind: 'walk', src: images.walk }
       : (() => {
@@ -338,7 +338,7 @@ export default function PetSprite({
   if (pose) {
     return (
       <div className={grabFallback ? 'pet-flip pet-grab-fallback' : 'pet-flip'}>
-        <AnimatedPose pose={pose} onVideoFailure={onVideoFailure} onComplete={!dragging && action ? () => onComplete?.(action, animationVersion) : undefined} />
+        <AnimatedPose pose={pose} onVideoFailure={onVideoFailure} onComplete={!dragging && action && action !== 'swagger' ? () => onComplete?.(action, animationVersion) : undefined} />
       </div>
     )
   }

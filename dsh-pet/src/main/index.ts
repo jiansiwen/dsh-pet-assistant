@@ -32,7 +32,7 @@ import { clearVoiceprint, enrollVoiceprint, loadVoiceprint, voiceprintModelPath,
 import { getDataKey } from './dpapi.ts'
 import { RendererPlayback, createSwitchingTransport, type RendererReceipt } from './tts-renderer-transport.ts'
 import { TtsCache, voiceFingerprint } from './tts-cache.ts'
-import { WAKE_GREETINGS, fixedPhrases, pickPhrase } from './greetings.ts'
+import { DOC_CONTINUE_ACKS, DOC_RESUME_ACKS, DOC_STOP_ACKS, DOC_THINKING_ACKS, WAKE_GREETINGS, fixedPhrases, pickPhrase } from './greetings.ts'
 import { CompanionHost } from './companion-host.ts'
 import { createDocFileSystem } from './doc-fs.ts'
 import { chooseDocVia, createPlaybackTap } from './doc-presenter.ts'
@@ -43,8 +43,10 @@ import { cachedWpsProbe, createWpsController, nextWpsProbe, type WpsController, 
 import { WpsViewTarget } from './wps-view-target.ts'
 import {
   askPrompt,
+  askPromptLite,
   describeOutline,
   detectDocIntent,
+  docPreloadPrompt,
   docSpeechPlan,
   DocumentLibrary,
   extensionOf,
@@ -112,6 +114,13 @@ import { isSessionCommand, shouldDismissOverlay, validBoxes, type OverlayBox } f
 import type { CancelReceipt, SessionCommand, SessionSnapshot, SessionUpdate, SessionResult } from '../session-types.ts'
 import type { SettingsPage } from '../renderer/types.js'
 import { RANDOM_CANDIDATES, DEFAULT_RANDOM_ACTIONS } from '../renderer/character-manifest.ts'
+import {
+  ACTION_LABELS,
+  PET_SKIN_OPTIONS,
+  applyPetConfigChange,
+  buildPetConfigView,
+  type PetMemberProfile,
+} from './pet-config.ts'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 
@@ -751,12 +760,12 @@ function onWakeWord(): void {
   // 路径根本没进来（识别没命中）／被下面某个条件挡住／进来了但在合成/播放阶段失败。
   console.log('[dsh-pet] 唤醒命中：',
     JSON.stringify({ holder: audioState.holder, speaking: narrator.isSpeaking(), spokenRound: spokenRound !== null, focus: audioState.focus }))
-  // 会议中仍然不接唤醒：麦克风被会议采集占着，独立的 wake.ps1 这时候本来也拿不到音频
-  // （见 record-stop-command.ts 的注释），会议里的语音停止走 ASR 指令那条路。
-  if (audioState.holder === 'meeting') {
-    console.log('[dsh-pet] 唤醒被忽略：会议录音中（录音期间的语音指令走会议转写）')
-    return
-  }
+  /*
+   * 会议录音中现在允许唤醒：用户要在录音期间叫小潘办事（例如查资料、改设置），
+   * 这是明确的产品要求。代价是唤醒应答会被会议麦克风录进去、并进入转写时间线；
+   * 这属于"我叫了它"的现场声，不再当作异常。
+   * 参会者误触由 KWS 关键词 +（如已注册）声纹验证兜底。
+   */
   // 播报中默认不响应唤醒：用户没在等它，别人（或电视）说话不该把正在念的回答打断。
   // 讲解中是例外 —— 那本来就是"讲给听众听、随时被打断"的场合。
   // 判定在 wake-scene.ts（纯函数，能单测）；开关是 audio-prefs 的 wakeDuringSpeech。
@@ -916,6 +925,139 @@ async function synthesizeOneShot(text: string, api: ResolvedVoiceApi | null): Pr
   return synthesizeSpeech({ text, voice: DEFAULT_TTS_VOICE, rate: '+0%', pitch: '+0Hz' })
 }
 
+/**
+ * 把"停下/稍等/继续/没问了"这些短句按讲解人音色预合成进缓存。
+ *
+ * 缓存键与 Narrator 派发时完全一致（音色指纹 + 文本）：换音色自然失效、重开文档时重合成，
+ * 和唤醒应答同一套缓存，长期有效。同一音色只跑一次，失败只记日志、下次再补。
+ */
+function docSpeakerApi(assistantId?: string): ResolvedVoiceApi | null {
+  const speaker = presentationSpeakerVoice(assistantId)
+  const base = voiceApiStore?.resolve('tts') ?? null
+  const profile = speaker?.profileId ? voiceApiStore?.resolveId(speaker.profileId) ?? null : null
+  let api = profile ?? base
+  if (api !== null && speaker !== null && hasSpeakerVoice(speaker)) api = { ...api, ...speakerOverlay(api.provider, api.model, speaker) }
+  return api
+}
+
+function docPhraseVoiceKey(api: ResolvedVoiceApi | null): string {
+  return api === null ? greetingVoiceKey(null) : ttsVoiceKey(api)
+}
+
+const warmedDocVoices = new Set<string>()
+const docWarmTasks = new Map<string, Promise<void>>()
+function warmDocTalkCache(assistantId?: string): void {
+  const api = docSpeakerApi(assistantId)
+  const voiceKey = docPhraseVoiceKey(api)
+  if (warmedDocVoices.has(voiceKey) || docWarmTasks.has(voiceKey)) return
+  const phrases = [...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS]
+  const task = (async () => {
+    const pending = phrases.filter(text => !ttsCache.has({ voiceKey, text }))
+    let next = 0
+    const worker = async (): Promise<void> => {
+      while (next < pending.length) {
+        const text = pending[next++]
+        if (text === undefined) return
+        try {
+          const audio = api === null
+            ? await synthesizeSpeech({ text, voice: DEFAULT_TTS_VOICE, rate: '+0%', pitch: '+0Hz' })
+            : await synthesizeApi(api, text)
+          ttsCache.put({ voiceKey, text }, audio)
+        } catch { /* 单句失败不影响其余句子；下次开文档再补。 */ }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(3, pending.length) }, () => worker()))
+    warmedDocVoices.add(voiceKey)
+    console.log(`[dsh-pet] 讲解短句音频已预热（新合成 ${pending.length} 句）`)
+  })().finally(() => { docWarmTasks.delete(voiceKey) })
+  docWarmTasks.set(voiceKey, task)
+}
+
+/** 用讲解人音色说一句预合成的固定短句（不进会话、不进播出记录）。 */
+function speakDocAck(phrases: readonly string[], assistantId?: string): void {
+  const text = pickPhrase(phrases)
+  if (text === '') return
+  narrator.speak({
+    utteranceId: `doc-ack-${randomUUID()}`,
+    text,
+    ephemeral: true,
+    ...speakerRequestFields(presentationSpeakerVoice(assistantId)),
+  })
+}
+
+/** 文档讲解的静默预读状态：一份文档一条独立会话，打开时预读、提问时等它读完。 */
+let docPreload: { key: string; assistantId: string; done: Promise<boolean> } | null = null
+
+/**
+ * 打开文档（模式一、出声、点名成员）时后台预读：短文档整份、长文档提纲，喂进成员独立文档会话。
+ * 不念不显示；之后提问只发问题。失败只记日志，提问退回附原文的老办法。
+ */
+function triggerDocPreload(talk: DocTalk): void {
+  if (!talk.spoken || talk.assistantId === undefined) return
+  if ((loadSettings().docSpeechMode ?? 'source') !== 'source') return
+  const key = talk.path
+  const assistantId = talk.assistantId
+  if (docPreload !== null && docPreload.key === key && docPreload.assistantId === assistantId) return
+  const text = docPreloadPrompt(talk.name, talk.path)
+  const done = (async () => {
+    try {
+      const result = await bridge.companionRequest('POST', '/companion/v1/members/doc-preload',
+        { assistantId, docKey: key, text }, 'owner', 120_000)
+      const ok = result.status === 200 && (result.body as { ok?: boolean })?.ok === true
+      if (!ok) console.log(`[dsh-pet] 文档预读未成功，提问退回附原文：${JSON.stringify(result.body)}`)
+      return ok
+    } catch (error) {
+      console.log(`[dsh-pet] 文档预读异常：${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+  })()
+  docPreload = { key, assistantId, done }
+}
+
+/**
+ * 关闭文档讲解：只重置本地预读标记，**不再清会话绑定**。
+ *
+ * 文档会话由 (子代理, 工作区, 文档) 决定并持久复用：关掉再打开同一份文档仍是同一条会话，
+ * 用户事先培训的名词/口径留在会话历史里。换工作区或换文档才会新开（scope 含 cwd 与路径）。
+ */
+function closeDocPreload(_talk: DocTalk | null): void {
+  // 只重置"当前活动预读"标记；**不清会话绑定**（插件侧 scope 由 (成员,工作区,文档) 持久复用）。
+  // 重开同一份文档会再预读一次喂进同一条会话，用户培训留在会话历史里不丢。
+  docPreload = null
+}
+
+/** 已注册的讲解快捷键 accelerator，重注册前先逐个卸掉，避免残留旧键。 */
+let docHotkeyAccelerators: string[] = []
+
+/**
+ * 按设置注册讲解全局快捷键（打断/休息/继续），按下经 doc-hotkey 通知渲染层。
+ *
+ * 被占用或非法的键注册失败，如实把状态投影到设置页（doc-hotkey-status），用户据此改键。
+ * 设置变更与启动时各调一次；退出时 globalShortcut.unregisterAll 统一收尾。
+ */
+function registerDocHotkeys(): void {
+  for (const accelerator of docHotkeyAccelerators) globalShortcut.unregister(accelerator)
+  docHotkeyAccelerators = []
+  const settings = loadSettings()
+  const bindings: Array<{ action: 'interrupt' | 'rest' | 'resume'; accelerator: string | undefined }> = [
+    { action: 'interrupt', accelerator: settings.docInterruptHotkey },
+    { action: 'rest', accelerator: settings.docRestHotkey },
+    { action: 'resume', accelerator: settings.docResumeHotkey },
+  ]
+  const status: Record<string, boolean> = {}
+  for (const { action, accelerator } of bindings) {
+    if (typeof accelerator !== 'string' || accelerator.trim() === '') { status[action] = false; continue }
+    let ok = false
+    try {
+      ok = globalShortcut.register(accelerator, () => sendToRenderer('doc-hotkey', { action }))
+    } catch { ok = false }
+    status[action] = ok
+    if (ok) docHotkeyAccelerators.push(accelerator)
+    else console.log(`[dsh-pet] 讲解快捷键「${accelerator}」（${action}）注册失败，可能被其他程序占用`)
+  }
+  sendToRenderer('doc-hotkey-status', status)
+}
+
 /** 同一次预热不重复跑；换成同一音色且已完成时直接跳过。 */
 let warmGreetingTask: { voiceKey: string; promise: Promise<void> } | null = null
 let warmedGreetingVoice: string | null = null
@@ -1071,6 +1213,34 @@ async function chiefContext(): Promise<{ name: string; persona: string }> {
     return chiefContextCache
   } catch {
     return chiefContextCache ?? { name: '', persona: '' }
+  }
+}
+
+/**
+ * 取一次成员目录里与外观有关的最小投影。
+ *
+ * 工作台的宠物配置读/写都用它现取，不复用 `memberNamesCache`：那份缓存是给播报点名的，
+ * 60 秒内允许旧值；而"改形象"必须知道此刻真实存在的角色，拿着一分钟前的目录去校验，
+ * 刚加的成员会被判成"不认识这个角色"。
+ */
+async function fetchMemberProfiles(): Promise<PetMemberProfile[]> {
+  try {
+    const result = await bridge.companionRequest('GET', '/companion/v1/members', undefined, 'owner', 5000)
+    if (result.status !== 200) return []
+    const body = result.body as { members?: Array<{ profile?: Record<string, unknown> }> } | null
+    return (body?.members ?? []).flatMap(item => {
+      const profile = item?.profile
+      if (!profile || typeof profile.assistantId !== 'string' || profile.assistantId === '') return []
+      return [{
+        assistantId: profile.assistantId,
+        displayName: typeof profile.displayName === 'string' ? profile.displayName : profile.assistantId,
+        roleId: typeof profile.roleId === 'string' ? profile.roleId : '',
+        skinId: typeof profile.skinId === 'string' ? profile.skinId : '',
+        enabled: profile.enabled !== false,
+      }]
+    })
+  } catch {
+    return []
   }
 }
 
@@ -2034,7 +2204,7 @@ async function handleDesktopCommand(raw: unknown): Promise<void> {
         const meetings = meetingRecorder.listMeetings(50)
           .filter(meeting => meeting.startedAt >= from && meeting.startedAt < to)
           .slice(0, limit)
-          .map(meeting => ({ startedAt: meeting.startedAt, name: meeting.name, state: meeting.state }))
+          .map(meeting => ({ id: meeting.id, startedAt: meeting.startedAt, name: meeting.name, state: meeting.state }))
         await replyDesktopCommand(value.id, true, { meetings })
         return
       }
@@ -2129,6 +2299,132 @@ async function handleDesktopCommand(raw: unknown): Promise<void> {
         await refuse('不支持的设置项')
         return
       }
+      case 'pet.config.summary': {
+        // DSH 工作台「宠物」tab 的整份外观配置。纯读：只取当前设置、成员目录与皮肤登记，
+        // 不改窗口、不写文件。读不到成员目录时 buildPetConfigView 会退回内置编制，不整块报错。
+        const members = await fetchMemberProfiles()
+        await replyDesktopCommand(value.id, true, buildPetConfigView({
+          stageVisible: host?.getState().stageVisible ?? true,
+          members,
+          settings: loadSettings(),
+          customSkins: listCustomSkins(app.getPath('userData')),
+        }))
+        return
+      }
+      case 'pet.config.set': {
+        // 写入口：形象 / 随机动作 / 显示隐藏 / 上台退下。
+        // 合法性由 pet-config.ts 统一裁决（皮肤是否登记、动作是否属于当前形象），
+        // 落盘后立刻广播：舞台与右键菜单读的是同一份设置，不广播就会出现"改了没变化"。
+        const kind = typeof payload.kind === 'string' ? payload.kind : ''
+        const settings = loadSettings()
+        const customSkins = listCustomSkins(app.getPath('userData'))
+        const members = await fetchMemberProfiles()
+        const stageVisible = host?.getState().stageVisible ?? true
+        const view = buildPetConfigView({ stageVisible, members, settings, customSkins })
+        const outcome = applyPetConfigChange({
+          kind: kind as 'skin' | 'actions' | 'stage' | 'step',
+          ...(typeof payload.assistantId === 'string' ? { assistantId: payload.assistantId } : {}),
+          ...(typeof payload.value === 'string' ? { value: payload.value } : {}),
+        }, {
+          characters: settings.characters,
+          customSkins,
+          knownCharacters: view.characters.map(character => character.assistantId),
+          stepDownMembers: settings.stepDownMembers ?? [],
+          stageVisible,
+          // 只改动作时要保留成员目录里的形象，不能默认写成熊猫。
+          effectiveSkins: Object.fromEntries(view.characters.map(character => [character.assistantId, character.skin])),
+        })
+        if (!outcome.ok) {
+          await replyDesktopCommand(value.id, false, undefined, outcome.error)
+          return
+        }
+        if (outcome.characters !== undefined) {
+          saveSettings({ characters: outcome.characters })
+          sendToRenderer('characters-changed', outcome.characters)
+        }
+        if (outcome.stepDownMembers !== undefined) {
+          // 先落主进程设置，再通知渲染层：渲染层收到后会按同一份名单更新舞台并回写一次，
+          // 两条路径内容一致，谁先谁后都不会把对方覆盖成旧值。
+          saveSettings({ stepDownMembers: outcome.stepDownMembers })
+          const assistantId = typeof payload.assistantId === 'string' ? payload.assistantId : ''
+          sendToRenderer(payload.value === 'up' ? 'member-step-up' : 'member-step-down', assistantId)
+        }
+        if (outcome.stageVisible !== undefined) host?.setStageVisible(outcome.stageVisible)
+        await replyDesktopCommand(value.id, true, { applied: true, kind, note: outcome.note })
+        return
+      }
+      case 'meeting.rename': {
+        // 工作台「会议」行的重命名。只改密封名字，不碰录音/转写；校验在 store。
+        const meetingId = typeof payload.meetingId === 'string' ? payload.meetingId : ''
+        const name = typeof payload.name === 'string' ? payload.name : ''
+        if (!meetingRecorder) throw new Error('会议记录还没准备好')
+        const outcome = meetingRecorder.renameMeeting(meetingId, name)
+        if (!outcome.ok) throw new Error(outcome.error)
+        await replyDesktopCommand(value.id, true, { applied: true, meetingId })
+        return
+      }
+      case 'meeting.delete': {
+        // 删除整场会议：与舞台侧同一道原生确认，渲染层/远端都不能自行决定删。
+        const meetingId = typeof payload.meetingId === 'string' ? payload.meetingId : ''
+        if (!meetingRecorder) throw new Error('会议记录还没准备好')
+        const name = meetingRecorder.meetingName(meetingId)
+        if (name === null) throw new Error('没有这场会议')
+        const confirmed = win && !win.isDestroyed()
+          ? (await dialog.showMessageBox(win, {
+            type: 'warning',
+            buttons: ['删除', '取消'],
+            defaultId: 1,
+            cancelId: 1,
+            noLink: true,
+            message: `删除整场会议「${name}」？`,
+            detail: '录音、转写与纪要一并删除，不可恢复。',
+          })).response === 0
+          : false
+        if (!confirmed) throw new Error('已取消删除')
+        const outcome = meetingRecorder.deleteMeeting(meetingId)
+        if (!outcome.ok) throw new Error(outcome.error)
+        await replyDesktopCommand(value.id, true, { applied: true, meetingId })
+        return
+      }
+      case 'task.set-interval': {
+        // 提醒催办间隔只接受本机可信所有者（task-runtime 的策略），所以这里走
+        // 原生确认 + owner 调用，与桌宠待办窗口同一条路；DSH 工作台只是发起入口。
+        const taskId = typeof payload.taskId === 'string' ? payload.taskId : ''
+        const seconds = typeof payload.repeatEverySeconds === 'number' ? payload.repeatEverySeconds : NaN
+        if (!taskId || !Number.isInteger(seconds) || seconds < 60 || seconds > 604_800) {
+          throw new Error('间隔需为 60–604800 的整数秒')
+        }
+        const detail = await bridge.companionRequest('GET', `/companion/v1/tasks/${encodeURIComponent(taskId)}`, undefined, 'owner', 5000)
+        const task = (detail.body as { task?: { revision?: unknown; goal?: unknown } } | null)?.task
+        if (detail.status !== 200 || typeof task?.revision !== 'number') throw new Error('没找到这条提醒')
+        const title = typeof task.goal === 'string' ? task.goal : taskId
+        const confirmed = win && !win.isDestroyed()
+          ? (await dialog.showMessageBox(win, {
+            type: 'question',
+            buttons: ['修改', '取消'],
+            defaultId: 1,
+            cancelId: 1,
+            noLink: true,
+            message: `把「${title}」的催办间隔改为 ${Math.round(seconds / 60)} 分钟？`,
+            detail: '只修改这条计划及当前未回应周期，不更改首次时间与暂停状态。',
+          })).response === 0
+          : false
+        if (!confirmed) throw new Error('已取消修改')
+        const applied = await bridge.companionRequest('POST', `/companion/v1/tasks/${encodeURIComponent(taskId)}/set-interval`, {
+          protocolVersion: 1,
+          commandId: randomUUID(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          payload: { repeatEverySeconds: seconds },
+          taskId,
+          expectedRevision: task.revision,
+        }, 'owner', 8000)
+        if (applied.status !== 202 && applied.status !== 200) {
+          const message = (applied.body as { message?: unknown } | null)?.message
+          throw new Error(typeof message === 'string' ? message : '间隔修改未被接受')
+        }
+        await replyDesktopCommand(value.id, true, { applied: true, taskId })
+        return
+      }
       case 'meeting.status': {
         const status = meetingStatusView()
         if (!status) throw new Error('会议记录还没准备好')
@@ -2146,7 +2442,7 @@ async function handleDesktopCommand(raw: unknown): Promise<void> {
 
 async function sendChatReply(text: string, bindingId: string, spoken: boolean, assistantId?: string,
   voiceTurn?: import('../session-types.ts').VoiceTurn, preserveOriginal = false, withDocContext = true,
-  ackUserText?: string): Promise<ChatReply> {
+  ackUserText?: string, docKey?: string): Promise<ChatReply> {
   interruptSpeech()
   const contextual = withDocContext ? withPresentationContext(text) : withInterruptedSpeech(text)
   // 复合委托必须按原话交接；仍消费旧中断上下文，避免它污染下一条请求。
@@ -2158,8 +2454,10 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
   if (round) {
     narrator.beginRound()
     narrator.generationStarted()
-    // 快嘴必须在 interruptSpeech 之后起步，否则刚开口就被上面的静音掐掉。
-    if (ackUserText !== undefined && ackUserText.trim() !== '') startFastAck(ackUserText, bindingId, assistantId)
+    // 讲解中的提问不走快嘴：用户刚打断讲解，等的是讲解人的回答；快嘴再晚几秒冒出来只是噪音。
+    if (ackUserText !== undefined && ackUserText.trim() !== '' && docTalk === null) startFastAck(ackUserText, bindingId, assistantId)
+    // 讲解中的提问：先回一句预合成的"稍等，我想一下"（讲解人音色），再等模型正文。
+    else if (docTalk !== null && docTalk.spoken) speakDocAck(DOC_THINKING_ACKS, docTalk.assistantId)
   }
   const current = () => bindingId === sessionState?.bindingId && sessionState.status !== 'disconnected'
     && (round === null || (spokenRound === round && !round.cancelled))
@@ -2177,8 +2475,12 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
       }
       fedChars += delta.length
       narrator.feed(round.utteranceId, delta, speaker)
-    } : undefined, bindingId)
+    } : undefined, bindingId, { cancelOnAbort: docTalk !== null, ...(docKey === undefined ? {} : { docKey }) })
     speechLog(`reply-resolved +${Date.now() - roundStartedAt}ms fedChars=${fedChars}`)
+    if (reply.ok && reply.reply) {
+      // 只记语种与长度，不记正文：用于定位"怎么突然念了一大段英文"这类问题。
+      speechLog(`reply-kind lang=${/[\u4e00-\u9fff]/u.test(reply.reply) ? 'zh' : 'other'} len=${reply.reply.length}`)
+    }
     if (!reply.ok) {
       failMeetingPresentationForReply(bindingId, '发起会话或插话回答失败，会议讲解不会自动推进；请在会议页核查录音。')
       failIndependentDocumentForReply(bindingId, '发起会话失败，文档讲解不会自动开始。')
@@ -2195,6 +2497,8 @@ async function sendChatReply(text: string, bindingId: string, spoken: boolean, a
           narrator.speak({
             utteranceId: round.utteranceId, text: reply.reply,
             ...speakerRequestFields(speaker),
+            // 讲解中追问的回答：引用块（原文粘贴）不念，只念回答正文。
+            ...(docTalk !== null ? { stripQuotes: true } : {}),
           })
         }
       } else {
@@ -2843,7 +3147,13 @@ function pumpDocFollowup(): void {
   if (docFollowupPhase === 'to-ask') {
     docFollowupPhase = 'asking'
     // ephemeral：这句是过场话，不进会话 / 记忆 / 纪要（与快答旁路同一条红线）。
-    narrator.speak({ utteranceId: `followup-${randomUUID()}`, text: FOLLOWUP_QUESTION, ephemeral: true })
+    // 用讲解人的嗓子：这是"讲解子助理"在问，不是总助理。
+    narrator.speak({
+      utteranceId: `followup-${randomUUID()}`,
+      text: FOLLOWUP_QUESTION,
+      ephemeral: true,
+      ...speakerRequestFields(presentationSpeakerVoice(docFollowupTalk.assistantId)),
+    })
     // 念得出来就等它念完再开窗（用户听到问句之后才开始算 5 秒）；
     // 念不出来（TTS 不可用）也不能卡在 asking，直接开窗。
     if (narrator.isSpeaking()) return
@@ -2947,8 +3257,9 @@ function pauseDocTalk(): void {
   if (docTalk !== null && docTalk.sessionId === presentedSessionId) presentedView?.pause()
 }
 
-function stopDocTalk(): void {
+function stopDocTalk(preservePreload = false): void {
   const talk = docTalk
+  if (!preservePreload) closeDocPreload(talk)
   if (talk && independentDocument?.talkId === talk.sessionId) {
     independentDocument.next = talk.next
     independentDocument.completed = [...talk.completed].sort((a, b) => a - b)
@@ -3130,7 +3441,9 @@ function pushDocState(): void {
  * 打字要来的讲解走这条：提纲铺在面板上，用户点某一段或者点"开始朗读"再由 `startDocTalk` 接手。
  */
 function installDocTalk(talk: DocTalk): void {
-  stopDocTalk()
+  // 同一份文档换段重装（点提纲跳段）不扔预读会话：避免每点一段就重喂一次文档。
+  const sameDoc = docTalk !== null && docTalk.path === talk.path && docTalk.fingerprint === talk.fingerprint && docTalk.assistantId === talk.assistantId
+  stopDocTalk(sameDoc)
   interruptSpeech()
   docTalk = talk
   pushDocState()
@@ -3194,6 +3507,10 @@ function startDocTalk(talk: DocTalk, prelude?: { utteranceId: string; text: stri
     return
   }
   installDocTalk(talk)
+  // 打开文档就按讲解人音色预热"停下/稍等/继续"短句：口令一响就要立刻出声，不能等云端合成。
+  if (talk.spoken) warmDocTalkCache(talk.assistantId)
+  // 模式一+出声+点名成员：后台静默预读文档进独立会话，之后提问只发问题（不念不显示）。
+  triggerDocPreload(talk)
   // 出声讲解开始时收起管理面板：用户要的是听讲解，不是被设置页挡着屏幕。
   if (talk.spoken) sendToRenderer('settings-close', null)
   /*
@@ -3299,7 +3616,7 @@ async function advanceDocTalk(verified?: DocTalk): Promise<void> {
         const prompt = explainPrompt(talk.name, talk.outline, index)
         const request = new AbortController()
         docRequest = request
-        const reply = await bridge.chat(prompt, talk.assistantId, request.signal, undefined, talk.bindingId)
+        const reply = await bridge.chat(prompt, talk.assistantId, request.signal, undefined, talk.bindingId, { cancelOnAbort: true })
         if (docRequest === request) docRequest = null
         if (docTalk !== talk || talk.stopped || request.signal.aborted || talk.bindingId !== sessionState?.bindingId) return
         if (!reply.ok || !reply.reply) {
@@ -3599,7 +3916,7 @@ function clampSection(from: number, total: number): number {
  * 只接受界面上点出来的段号，不从消息里猜。把一段原文附上，比让模型凭标题瞎想要靠谱，
  * 也比把整份文档再塞一遍便宜。
  */
-async function resumeDocTalk(spoken: boolean): Promise<ChatReply> {
+async function resumeDocTalk(spoken: boolean, ack?: readonly string[]): Promise<ChatReply> {
   const talk = docTalk
   if (!talk) return { ok: false, error: '没有可继续的文档讲解，请先选择文档。' }
   if (meetingPresentation?.talkId === talk.sessionId && !['presenting', 'paused'].includes(meetingPresentation.state)) {
@@ -3620,6 +3937,9 @@ async function resumeDocTalk(spoken: boolean): Promise<ChatReply> {
   // 用户明确说"继续讲解"就是不想再等：跳过段的停留一并作废，否则他得再干等十来秒。
   clearDocSkipHold()
   talk.stopped = false
+  // 续讲前先回一句预合成的"好的，我这就继续 / 没其他问题那我就继续了"（讲解人音色）；
+  // 推进链会等它念完再开口（advanceDocTalk 盯着 narrator.isSpeaking）。
+  if (ack !== undefined) speakDocAck(ack, talk.assistantId)
   // 视图还开着就接着推进；用户关过视图则重新打开到当前段，不静默只出声。
   if (isOfficeDoc(talk.path)) {
     // 追问打断后页面保持原段；这里重新对齐到未讲完的段，再继续推进。
@@ -3705,11 +4025,20 @@ async function askAboutDoc(target: string, index: number, question: string, assi
   }
   const request = new AbortController()
   if (!spoken) docRequest = request
-  const prompt = askPrompt(opened.doc.name, opened.doc.parsed.outline, index, question)
+  // 预读成功就走"只发问题"的独立文档会话；没预读或失败退回附当前段原文的老办法。
+  const preload = docPreload !== null && docPreload.key === opened.doc.path && docPreload.assistantId === who ? docPreload : null
+  const preloaded = preload === null ? false : await preload.done
+  if (bindingId !== sessionState?.bindingId || docTalk !== talk || revision !== docRevision) {
+    return { ok: false, error: '会话或文档讲解已切换或停止。' }
+  }
+  const docKey = preload === null ? undefined : opened.doc.path
+  const prompt = preloaded
+    ? askPromptLite(opened.doc.name, opened.doc.parsed.outline, index, question, opened.doc.path)
+    : askPrompt(opened.doc.name, opened.doc.parsed.outline, index, question, opened.doc.path)
   try {
     const result = spoken && bindingId
-      ? await sendChatReply(prompt, bindingId, true, who, undefined, false, false)
-      : await bridge.chat(withInterruptedSpeech(prompt), who, request.signal, undefined, bindingId)
+      ? await sendChatReply(prompt, bindingId, true, who, undefined, false, false, undefined, docKey)
+      : await bridge.chat(withInterruptedSpeech(prompt), who, request.signal, undefined, bindingId, { cancelOnAbort: true, ...(docKey === undefined ? {} : { docKey }) })
     if (request.signal.aborted || bindingId !== sessionState?.bindingId || docTalk !== talk) {
       return { ok: false, error: '追问已停止或会话已切换，旧回答已丢弃。' }
     }
@@ -4026,12 +4355,6 @@ function menuTargetOf(raw: unknown): MenuTarget | null {
   }
 }
 
-const PET_OPTIONS: Array<{ id: PetId; label: string }> = [
-  { id: 'panda', label: '国宝熊猫' },
-  { id: 'girl-glasses', label: '眼镜女生（Q版）' },
-  { id: 'boy-glasses', label: '眼镜男生（Q版）' },
-]
-
 /**
  * 把某个角色的形象写进设置，并广播整张表。
  *
@@ -4087,7 +4410,7 @@ function buildContextMenu(target: MenuTarget | null): Menu {
     items.push({
       label: `换个形象：${target.displayName || '这个角色'}`,
       submenu: [
-        ...PET_OPTIONS.map(option => ({
+        ...PET_SKIN_OPTIONS.map(option => ({
           label: option.label,
           type: 'radio' as const,
           checked: current === option.id,
@@ -4111,12 +4434,6 @@ function buildContextMenu(target: MenuTarget | null): Menu {
     const skinNow = stored ?? target.skin ?? 'panda'
     const customActions = listCustomSkins(app.getPath('userData')).find(s => s.id === skinNow)?.actions ?? []
     const randomCandidates = [...new Set([...RANDOM_CANDIDATES, ...customActions])]
-    const ACTION_LABELS: Record<string, string> = {
-      walk: '走路', jump: '蹦跳', wave: '挥手', read: '看书', play: '玩耍', write: '敲电脑',
-      'laptop-in': '开电脑', 'laptop-out': '收电脑站起', think: '思考', sleep: '睡觉',
-      turnaround: '转身', breathe: '呼吸待机', swagger: '插兜swagger走',
-      'declare-fate': '我命由我不由天', 'recite-poem': '念诗', transform: '变身火焰',
-    }
     items.push({
       label: '随机动作（只随机勾选的）',
       submenu: randomCandidates.map(action => ({
@@ -4282,8 +4599,14 @@ async function dispatchPrompt(command: Extract<SessionCommand, { kind: 'prompt' 
   }
   // 朗读回复打开时，打字发出的消息也把回答念出来（原来只有语音发起的那一轮会念）。
   const readReplies = loadSettings().readReplies === true
+  /*
+    讲解进行中的追问跟讲解人走：讲是小会、答也应该是小会。
+    舞台当前选择的成员（assistantId）不能覆盖讲解人，否则问题会送进总助理的会话、
+    用总助理的音色快答，而讲解人自己的会话根本收不到这句话。
+  */
+  const docSpeaker = docTalk !== null && docTalk.spoken ? docTalk.assistantId : undefined
   if (command.spoken || assistantId || readReplies) {
-    return sendChatReply(command.text, command.bindingId, command.spoken === true || readReplies, assistantId, voiceTurn, compound, true,
+    return sendChatReply(command.text, command.bindingId, command.spoken === true || readReplies, docSpeaker ?? assistantId, voiceTurn, compound, true,
       command.spoken === true ? command.text : undefined)
   }
   interruptSpeech()
@@ -5018,6 +5341,11 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
       // 讲解形态与外观档位也要回读：设置页靠 get-state 回显，缺一项就会永远显示默认值。
       // （`docSpeechMode` 此前没在这里出现，等于"存得进去、读不回来"，这次一并补上。）
       docSpeechMode: settings.docSpeechMode === 'ai' ? 'ai' : 'source',
+      docHotkeys: {
+        interrupt: settings.docInterruptHotkey ?? 'Ctrl+Alt+D',
+        rest: settings.docRestHotkey ?? 'Ctrl+Alt+R',
+        resume: settings.docResumeHotkey ?? 'Ctrl+Alt+C',
+      },
       petScale: settings.petScale,
       petOpacity: settings.petOpacity,
       petDock: settings.petDock !== false,
@@ -5027,7 +5355,7 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
 
   ipcMain.handle(
     'save-settings',
-    (event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; meetingDocumentAutoApprove?: boolean; memberHandover?: boolean; meetingSpeakerCounts?: { mic: number; loopback: number }; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number }; stepDownMembers?: string[]; characters?: Record<string, { skin?: string }>; agentVoiceDesign?: string; agentVoiceId?: string; agentVoiceSample?: string; agentVoiceSampleMime?: string; agentVoiceStyle?: string; docSpeechMode?: 'source' | 'ai'; petScale?: number; petOpacity?: number; petDock?: boolean; dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null }) => {
+    (event, patch: { bounds?: { x: number; y: number }; positions?: Record<string, { x: number; y: number }>; voiceConversation?: boolean; continuousVoice?: boolean; readReplies?: boolean; meetingDocumentAutoApprove?: boolean; memberHandover?: boolean; meetingSpeakerCounts?: { mic: number; loopback: number }; idleSleepMinutes?: number; sleepMinutes?: number; chatDock?: 'top' | 'auto'; chatSize?: { width: number; height: number }; stepDownMembers?: string[]; characters?: Record<string, { skin?: string }>; agentVoiceDesign?: string; agentVoiceId?: string; agentVoiceSample?: string; agentVoiceSampleMime?: string; agentVoiceStyle?: string; docSpeechMode?: 'source' | 'ai'; docInterruptHotkey?: string; docRestHotkey?: string; docResumeHotkey?: string; petScale?: number; petOpacity?: number; petDock?: boolean; dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null }) => {
       if (!patch || typeof patch !== 'object') return { ok: false }
       if ('stepDownMembers' in patch && (!stageSender(event) || !Array.isArray(patch.stepDownMembers) || patch.stepDownMembers.some(id => typeof id !== 'string'))) return { ok: false }
       if ('meetingDocumentAutoApprove' in patch && (!stageSender(event) || typeof patch.meetingDocumentAutoApprove !== 'boolean')) return { ok: false }
@@ -5097,6 +5425,10 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
         ...(patch.docSpeechMode === 'source' || patch.docSpeechMode === 'ai'
           ? { docSpeechMode: patch.docSpeechMode }
           : {}),
+        // 讲解快捷键：字符串即可，合法性与占用交给 settings.normalize 与注册那一步。
+        ...(typeof patch.docInterruptHotkey === 'string' ? { docInterruptHotkey: patch.docInterruptHotkey } : {}),
+        ...(typeof patch.docRestHotkey === 'string' ? { docRestHotkey: patch.docRestHotkey } : {}),
+        ...(typeof patch.docResumeHotkey === 'string' ? { docResumeHotkey: patch.docResumeHotkey } : {}),
         // 大小与透明度：档位制白名单。只认这三档，别的一律不写 —— 让"手改文件写 1.5"
         // 与"界面传错值"都落回归一化那一步，而不是把角色撑大。
         ...(patch.petScale === 0.8 || patch.petScale === 1 || patch.petScale === 1.2
@@ -5128,6 +5460,7 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
         ...(agentVoiceFile !== null ? { agentVoiceSample: '', agentVoiceSampleFile: agentVoiceFile } : {}),
         ...(typeof patch.agentVoiceSampleMime === 'string' ? { agentVoiceSampleMime: patch.agentVoiceSampleMime.slice(0, 100) } : {}),        ...(typeof patch.agentVoiceStyle === 'string' ? { agentVoiceStyle: patch.agentVoiceStyle.slice(0, 500) } : {}),
       })
+      if ('docInterruptHotkey' in patch || 'docRestHotkey' in patch || 'docResumeHotkey' in patch) registerDocHotkeys()
       if (patch.meetingDocumentAutoApprove === false) {
         if (pendingMeetingStart?.autoApproved) cancelDesktopCommand({ id: pendingMeetingStart.id })
         if (independentDocument?.autoApproved && ['authorizing', 'waiting-to-present', 'waiting-to-resume', 'starting'].includes(independentDocument.state)) {
@@ -5225,8 +5558,7 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
     }
   })
 
-  ipcMain.on('speech-stop', (_event, preserveAutoResume?: unknown) => {
-    speechLog(`speech-stop received preserve=${preserveAutoResume === true}`)
+  ipcMain.on('speech-stop', (_event, preserveAutoResume?: unknown) => {    speechLog(`speech-stop received preserve=${preserveAutoResume === true}`)
     // 用户主动停播（按钮或“停一下”口令）：默认不再用自动续讲把讲解接回去。
     // 口令后面直接带问题的情形由渲染层传 preserveAutoResume=true：先停这一句，等回答播完再续讲。
     // 口令后面直接带问题的情形由渲染层传 preserveAutoResume=true：先停这一句，等回答播完再续讲。
@@ -5243,6 +5575,12 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
    * 用于"用户又只喊了一句名字"这种本地应答 —— 它只是确认"我听见了"，
    * 没有任何需要模型参与的内容；塞进会话就等于凭空多出一条用户消息。
    */
+  /** 口令打断后的即时应答：用讲解人音色的预合成短句（"好的，你说"），不调模型。 */
+  ipcMain.on('doc-ack', (event, kind: unknown) => {
+    if (!stageSender(event) || kind !== 'stop') return
+    if (docTalk !== null && docTalk.spoken) speakDocAck(DOC_STOP_ACKS, docTalk.assistantId)
+  })
+
   ipcMain.on('speech-local', (_event, text: unknown) => {
     if (typeof text !== 'string' || text.trim().length === 0 || text.length > 200) return
     void speakWakeGreeting(text.trim())
@@ -5302,6 +5640,19 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
   ipcMain.handle('doc-open', async (_event, target: unknown) => {
     if (typeof target !== 'string' || target === '') return { ok: false, error: '没有指定文档' }
     return openDocByPath(target)
+  })
+
+  /**
+   * 提问窗口超时（渲染层 10 秒内没听到问题）：把被口令暂停的讲解接回去。
+   * 只接受舞台来源；没有待续讲的讲解时如实返回失败，不凭空开讲。
+   */
+  ipcMain.handle('doc-resume', async (event, reason?: unknown) => {
+    if (!stageSender(event)) return { ok: false, error: '请求来源无效' }
+    if (docTalk === null || !docTalk.stopped) return { ok: false, error: '没有待续讲的文档讲解' }
+    // 10 秒没等到问题 / 用户说"继续"：回一句预合成短句再接着讲。
+    const ack = reason === 'continue' ? DOC_CONTINUE_ACKS : DOC_RESUME_ACKS
+    const result = await resumeDocTalk(true, ack)
+    return { ok: result.ok, error: result.error }
   })
 
   ipcMain.handle('office-open', async (event, target: unknown) => {
@@ -5651,10 +6002,12 @@ ${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messag
     const bargeIn = options !== null && typeof options === 'object' && (options as { bargeIn?: unknown }).bargeIn === true
     const granted = applyAudio({ type: 'dictation-requested', ...(bargeIn ? { source: 'barge-in' as const } : {}) })
     if (granted.denied) return { ok: false, error: granted.denied }
-    // 讲解进行中：用户开口就是要提问，不再要求"停一下"口令（功能设计：随时插话）。
-    // 回声、咳嗽与旁人闲聊由渲染层的自回声过滤和最短文本判定兜住，见 App.tsx 的 direct 分支。
-    const presenting = docTalk !== null && docTalk.spoken && !docTalk.stopped
-    const direct = presenting
+    /*
+      插话采用"口令门禁"：先说 停一下/等一下/暂停一下 这类口令，才停下并进入提问窗口。
+      讲解/会议里也一样 —— 旁人低声讨论不会被当成提问（产品要求：一边播报一边提问
+      不符合人的交互习惯）。口令命中后的提问由渲染层在同一次听写窗口里收下。
+    */
+    const direct = false
     armDictationSafety()
     // 用户挑的自定义服务是"整段上传"的接口，没有实时部分文本：这时不开本地流式会话。
     let apiAsr: ResolvedVoiceApi | null = null
@@ -6100,6 +6453,8 @@ if (!gotLock) {
         sendToRenderer('pet-summon', null)
       })) break
     }
+    // 讲解快捷键（打断/休息/继续）：按设置注册，被占用如实提示，设置页可改键。
+    registerDocHotkeys()
 
     // 常驻语音唤醒：听到"小潘同学"就回应并弹出输入框。起不起由仲裁器按当前设置决定，
     // 之后每一次起停也都从它那里出 —— 设备只有一个主人。

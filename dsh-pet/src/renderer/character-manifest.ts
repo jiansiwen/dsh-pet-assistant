@@ -70,7 +70,7 @@ export const DEFAULT_RANDOM_ACTIONS = ['walk', 'jump', 'wave', 'read', 'play'] a
  * 助理2幽默生活化、助理3细致踏实、助理4简洁及时。
  * 助理2那几组沿用改造前单宠物的原词 —— 它本来就是那个皮肤的性格，换了编制不该换脾气。
  */
-const ROSTER: readonly CharacterManifest[] = [
+export const ROSTER: readonly CharacterManifest[] = [
   {
     assistantId: 'member-tangseng',
     displayName: '总助理',
@@ -95,7 +95,7 @@ const ROSTER: readonly CharacterManifest[] = [
       idle: ['有活儿吱一声', '我先扫一眼', '这有什么难的'],
       work: ['查到了，看结论', '我去翻一遍', '马上给你答案'],
       poke: ['别闹，正忙着', '哈，手挺快', '有事说事'],
-      greet: ['来了来了', '俺老孙在此'],
+      greet: ['来了来了', '我到了'],
       activity: ['我再去核实一遍', '这处有点可疑，我看看'],
     },
   },

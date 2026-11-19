@@ -1,0 +1,22 @@
+{
+  "lastWarmupOk": true,
+  "lastWarmupAt": "2026-11-16T08:55:35.432Z",
+  "warmupPackageSpec": "code-review-graph==2.3.7",
+  "warmupToolName": "code-review-graph",
+  "warmupStatus": 0,
+  "lastBuildOk": false,
+  "lastBuildAt": "2026-11-16T09:10:35.495Z",
+  "lastBuildReason": "state-missing-or-incomplete",
+  "status": null,
+  "graphDbPath": "D:\\java\\openCode2026\\dsh-github\\.code-review-graph\\graph.db",
+  "graphDbExists": true,
+  "usableGraphExists": true,
+  "graphDbSize": 135163904,
+  "graphDbMtime": "2026-11-16T09:09:56.919Z",
+  "lastAttemptedPackageSpec": "code-review-graph==2.3.7",
+  "lastAttemptedToolName": "code-review-graph",
+  "lastAttemptedGitSignature": "{\"kind\":\"git\",\"head\":\"6efada09dc16413cd2d354bdd9a65abe69027942\",\"status\":\"\"}",
+  "lastBuildError": "spawnSync C:\\Users\\lakala\\.config\\opencode\\cache\\code-review-graph\\uv\\tools\\code-review-graph\\Scripts\\code-review-graph.exe ETIMEDOUT",
+  "graphStale": true,
+  "lastUsableGraphAt": "2026-11-16T09:09:56.919Z"
+}

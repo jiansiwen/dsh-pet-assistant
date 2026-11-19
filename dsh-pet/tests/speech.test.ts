@@ -319,6 +319,14 @@ describe('朗读清洗', () => {
     assert.equal(cleanForSpeech('从第 3 段开始讲，共 6 段。'), '从第 3 段开始讲，共 6 段。')
   })
 
+  test('追问回答的引用块整行不念，正文照常；文档原文朗读不受影响', () => {
+    const cleaned = cleanForSpeech('结论是提醒做成周期。\n> 原文：到点提醒你。\n继续说明。', { stripQuotes: true })
+    assert.equal(cleaned, '结论是提醒做成周期。 继续说明。')
+    assert.equal(cleanForSpeech('> 引用一句原文。'), '引用一句原文。', '没有开关时保持原样（文档朗读）')
+    const segments = splitIntoSegments({ utteranceId: 'u9', text: '> 原文引用。\n正文回答。', stripQuotes: true })
+    assert.deepEqual(segments.map(segment => segment.text), ['正文回答。'])
+  })
+
   test('切句入口统一清洗：纯编号句子整句丢掉', () => {
     const segments = splitIntoSegments(request('0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3。第二句正文。'))
     assert.deepEqual(segments.map(segment => segment.text), ['第二句正文。'])

@@ -13,7 +13,7 @@ import {
   LIST_TABS, LIST_SEPARATOR, MEETING_HISTORY, MEETING_HISTORY_COMMAND, NARROW_HIDDEN_COLUMNS, SETTINGS_SUMMARY,
   SETTINGS_SUMMARY_COMMAND, TABS,
   PRIORITY_CHOICES, columnClassName, columnTone, narrowTableCss, parseList, parseSettingsSummary,
-  priorityCommand, priorityLabel, priorityOutcome, priorityTone, reconcilePending, rowTaskId, statusTone, tableView,
+  priorityCommand, priorityLabel, priorityOutcome, priorityTone, reconcilePending, rowMeetingId, rowTaskId, statusTone, tableView,
 } from '../src/client/tabs.ts'
 
 /**
@@ -28,8 +28,8 @@ const cells = (parsed: { rows: readonly { cells: readonly string[] }[] }): (read
 
 describe('七个 tab', () => {
   it('顺序与标题固定', () => {
-    assert.deepEqual(TABS.map(tab => tab.id), ['todo', 'mail', 'wecom', 'report', 'meeting', 'team', 'settings'])
-    assert.deepEqual(TABS.map(tab => tab.label), ['待办', '邮件', '企业微信', '日报周报', '会议', '助理团', '设置'])
+    assert.deepEqual(TABS.map(tab => tab.id), ['todo', 'mail', 'wecom', 'report', 'meeting', 'team', 'skills', 'pet', 'settings'])
+    assert.deepEqual(TABS.map(tab => tab.label), ['待办', '邮件', '企业微信', '日报周报', '会议', '助理团', '技能', '宠物', '设置'])
   })
 
   it('每个 tab 都能对应到桌面宠物里的一页（用于「在桌面宠物里打开」）', () => {
@@ -131,12 +131,12 @@ describe('parseList：分行、分列、空态与降级态', () => {
   const team = LIST_TABS.team
 
   it('正常表格：按固定分隔符切，列数与表头一致', () => {
-    const parsed = parseList('小会 | 悟空 | 在岗 | 1200/8000\n阿七 | 八戒 | 休息 | —', team)
+    const parsed = parseList('小会 | 助理1 | 在岗 | 1200/8000\n阿七 | 助理2 | 休息 | —', team)
     assert.equal(parsed.state, 'rows')
     assert.equal(parsed.message, null)
     assert.deepEqual(cells(parsed), [
-      ['小会', '悟空', '在岗', '1200/8000'],
-      ['阿七', '八戒', '休息', '—'],
+      ['小会', '助理1', '在岗', '1200/8000'],
+      ['阿七', '助理2', '休息', '—'],
     ])
   })
 
@@ -149,7 +149,7 @@ describe('parseList：分行、分列、空态与降级态', () => {
   })
 
   it('少列时补 `—`，不让整行左移；空单元格也补 `—`', () => {
-    assert.deepEqual(cells(parseList('小会 | 悟空', team)), [['小会', '悟空', '—', '—']])
+    assert.deepEqual(cells(parseList('小会 | 助理1', team)), [['小会', '助理1', '—', '—']])
     assert.deepEqual(cells(parseList('小会 |  | 在岗 | 1', team)), [['小会', '—', '在岗', '1']])
   })
 
@@ -179,7 +179,7 @@ describe('parseList：分行、分列、空态与降级态', () => {
   })
 
   it('每行都是 `—` 的成员表也算表格（额度为空是常态）', () => {
-    const parsed = parseList('小会 | 悟空 | 在岗 | 1200/8000\n阿七 | — | 休息 | —', team)
+    const parsed = parseList('小会 | 助理1 | 在岗 | 1200/8000\n阿七 | — | 休息 | —', team)
     assert.equal(parsed.state, 'rows')
     assert.equal(parsed.rows.length, 2)
     assert.equal(parsed.rows[1].cells[3], '—')
@@ -249,7 +249,7 @@ describe('待办：5 列与旧 3 列兼容', () => {
       assert.equal(LIST_TABS[id].legacy, undefined, id)
     }
     // 助理团四列，给三格就按原序补一格，不重排
-    assert.deepEqual(cells(parseList('小会 | 悟空 | 在岗', LIST_TABS.team)), [['小会', '悟空', '在岗', '—']])
+    assert.deepEqual(cells(parseList('小会 | 助理1 | 在岗', LIST_TABS.team)), [['小会', '助理1', '在岗', '—']])
   })
 })
 
@@ -399,12 +399,13 @@ describe('隐藏尾列 trailing', () => {
     assert.equal(parsed.rows[0].cells.length, 5)
   })
 
-  it('只有待办声明了 trailing；其它表把多余格也照收（不是丢弃）', () => {
+  it('待办/会议/历史会议声明了 trailing（id 尾列）；其它表把多余格也照收（不是丢弃）', () => {
     assert.equal(LIST_TABS.todo.trailing, 1)
-    for (const id of ['report', 'meeting', 'team'] as const) assert.equal(LIST_TABS[id].trailing, undefined, id)
-    assert.deepEqual(MEETING_HISTORY.trailing, undefined)
+    assert.equal(LIST_TABS.meeting.trailing, 1, '会议行要按 id 改名/删除')
+    assert.equal(MEETING_HISTORY.trailing, 1)
+    for (const id of ['report', 'team'] as const) assert.equal(LIST_TABS[id].trailing, undefined, id)
     // 没声明 trailing 的表，多出来的一格同样进 trailing —— 解析规则统一，不按表分叉
-    const parsed = parseList('小会 | 悟空 | 在岗 | 1200/8000 | 多出来', LIST_TABS.team)
+    const parsed = parseList('小会 | 助理1 | 在岗 | 1200/8000 | 多出来', LIST_TABS.team)
     assert.equal(parsed.rows[0].cells.length, 4)
     assert.deepEqual(parsed.rows[0].trailing, ['多出来'])
   })
@@ -515,5 +516,18 @@ describe('待确认标记的收口', () => {
       '乙 | 中 | 手动 | 待办中 | — | task-2',
     )
     assert.deepEqual(reconcilePending(mixed, rows), { 'task-2': 'low' })
+  })
+})
+
+describe('会议行 id（rowMeetingId）', () => {
+  it('尾列有 id 才给交互；缺 id / 占位 — / 带空格都只读', () => {
+    const withId = parseList('09:30 | 周会 | 已转写 | m-1', LIST_TABS.meeting)
+    assert.equal(rowMeetingId(withId.rows[0]), 'm-1')
+    const noId = parseList('09:30 | 周会 | 已转写', LIST_TABS.meeting)
+    assert.equal(rowMeetingId(noId.rows[0]), null)
+    const placeholder = parseList('09:30 | 周会 | 已转写 | —', LIST_TABS.meeting)
+    assert.equal(rowMeetingId(placeholder.rows[0]), null)
+    const dirty = parseList('09:30 | 周会 | 已转写 | m 1', LIST_TABS.meeting)
+    assert.equal(rowMeetingId(dirty.rows[0]), null)
   })
 })

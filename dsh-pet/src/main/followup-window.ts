@@ -145,3 +145,19 @@ export function isExplicitContinue(text: string): boolean {
   if (QUESTION_MARK.test(said) || QUESTION_WORDS.test(said)) return false
   return CONTINUE_WORDS.test(said)
 }
+
+/**
+ * 休息模式的恢复指令：比 {@link isExplicitContinue} 更严，必须**整句就是"继续"**。
+ *
+ * 休息时参会人在互相讨论，"我们继续讨论这个问题"里也带"继续"，但那是讨论不是恢复指令。
+ * 所以剥掉客套前缀（你/我们/请…）与语气尾缀（吧/啊/了…）后，剩下的必须恰好是
+ * "继续/接着/往下 [+ 讲/演讲/说/念/讲解]"本身，多一个字（讨论、这个问题）都不算。
+ */
+export function isRestResume(text: string): boolean {
+  if (!isExplicitContinue(text)) return false
+  const said = text.trim().replace(/[。！!，,、\s]+$/u, '')
+  const core = said
+    .replace(/^(?:请|麻烦|你们|我们|你|我|那就|那|好|行|嗯|哎)+/u, '')
+    .replace(/(?:吧|啊|呀|了|喔|哦)+$/u, '')
+  return /^(?:继续|接着|往下)(?:讲|演讲|说|念|讲解)?$/u.test(core)
+}

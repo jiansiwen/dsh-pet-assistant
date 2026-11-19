@@ -66,13 +66,19 @@ export function describeTaskStatus(status: string): string {
   return TASK_STATUS_TEXT[status] ?? status
 }
 
-/** 角色 id 说成人话。 */
+/**
+ * 角色 id 说成人话。
+ *
+ * 这些 id 只是内部席位标识；西游记称谓曾是首版种子占位（用户口述的比喻），
+ * v10 迁移已把未改过的显示名换成通用名称（见 team-domain.ts）。这张表必须与那次
+ * 迁移同一套名字，否则列表里又会冒出早已删掉的比喻称谓。
+ */
 const ROLE_TEXT: Readonly<Record<string, string>> = {
-  tangseng: '唐僧',
-  wukong: '悟空',
-  bajie: '八戒',
-  shaseng: '沙僧',
-  bailongma: '白龙马',
+  tangseng: '总助理',
+  wukong: '助理1',
+  bajie: '助理2',
+  shaseng: '助理3',
+  bailongma: '助理4',
   custom: '自定义',
 }
 
@@ -171,12 +177,14 @@ export interface MeetingListRow {
   readonly startedAt: number
   readonly name: string
   readonly state: string
+  /** 会议 id：尾列，不渲染；工作台的改名/删除按它定位，不能按行号或名字。 */
+  readonly id?: string
 }
 
 export function formatMeetingList(rows: readonly MeetingListRow[] | null): string {
   if (rows === null) return '暂时读不到今天的会议'
   if (rows.length === 0) return '今天还没有会议'
-  return joinRows(rows.slice(0, 10).map(row => [clockOf(row.startedAt), row.name, describeMeetingState(row.state)]))
+  return joinRows(rows.slice(0, 10).map(row => [clockOf(row.startedAt), row.name, describeMeetingState(row.state), row.id ?? '']))
 }
 
 /** 一份日报的展示形状：日期 | 状态 | 摘要。 */
@@ -255,6 +263,8 @@ export interface MeetingHistoryRaw {
   readonly retentionDays?: unknown
   readonly transcriptStatus?: unknown
   readonly integrityStatus?: unknown
+  /** 会议 id：尾列，不渲染；改名/删除按它定位。 */
+  readonly id?: unknown
 }
 
 /**
@@ -281,5 +291,6 @@ export function formatMeetingHistory(rows: readonly MeetingHistoryRaw[] | null):
     describeMeetingSources(row.sources),
     typeof row.retentionDays === 'number' && Number.isFinite(row.retentionDays) ? `${row.retentionDays} 天` : '',
     typeof row.transcriptStatus === 'string' ? row.transcriptStatus : '',
+    typeof row.id === 'string' ? row.id : '',
   ]))
 }

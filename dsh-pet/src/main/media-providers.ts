@@ -35,6 +35,8 @@ export interface VideoProviderConfig {
   baseUrl: string
   model: string
   auth?: ProviderAuth
+  /** 提交/轮询都要带的静态请求头，如百炼的 X-DashScope-Async: enable */
+  extraHeaders?: Record<string, string>
   submitPath?: string
   bodyTemplate?: Record<string, unknown>
   taskIdPath?: string
@@ -214,25 +216,44 @@ export class MediaProviderStore {
     return this.secrets[ref] ?? ''
   }
 
-  private headers(auth: ProviderAuth | undefined): Record<string, string> {
-    const headers: Record<string, string> = { 'content-type': 'application/json' }
+  private headers(auth: ProviderAuth | undefined, extra?: Record<string, string>): Record<string, string> {
+    const headers: Record<string, string> = { 'content-type': 'application/json', ...extra }
     const secret = this.secretOf(auth?.apiKeyRef)
     if (secret) headers[auth?.headerName ?? 'authorization'] = `${auth?.scheme ?? 'Bearer '}${secret}`.trimEnd()
     return headers
   }
 
-  async requestJson(baseUrl: string, auth: ProviderAuth | undefined, submitPath: string | undefined, body: unknown, timeoutMs = DEFAULT_TIMEOUT): Promise<unknown> {
+  async requestJson(baseUrl: string, auth: ProviderAuth | undefined, submitPath: string | undefined, body: unknown, timeoutMs = DEFAULT_TIMEOUT, extra?: Record<string, string>): Promise<unknown> {
     const url = joinUrl(baseUrl, submitPath)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const response = await this.fetch(url, {
-        method: 'POST', headers: this.headers(auth), body: JSON.stringify(body), signal: controller.signal,
+        method: 'POST', headers: this.headers(auth, extra), body: JSON.stringify(body), signal: controller.signal,
       })
       const payload = await response.json().catch(() => null)
       if (!response.ok) {
         throw new MediaError(`provider 返回 HTTP ${response.status}`, 'PROVIDER_HTTP')
       }
+      return payload
+    } catch (error) {
+      if (error instanceof MediaError) throw error
+      if (controller.signal.aborted) throw new MediaError('provider 请求超时', 'PROVIDER_TIMEOUT')
+      throw new MediaError(`provider 连接失败：${error instanceof Error ? error.message : String(error)}`, 'PROVIDER_NETWORK')
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** GET 查询（异步任务轮询等）：不带请求体。 */
+  async getJson(baseUrl: string, auth: ProviderAuth | undefined, getPathname: string | undefined, timeoutMs = DEFAULT_TIMEOUT, extra?: Record<string, string>): Promise<unknown> {
+    const url = joinUrl(baseUrl, getPathname)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const response = await this.fetch(url, { method: 'GET', headers: this.headers(auth, extra), signal: controller.signal })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new MediaError(`provider 返回 HTTP ${response.status}`, 'PROVIDER_HTTP')
       return payload
     } catch (error) {
       if (error instanceof MediaError) throw error
@@ -310,9 +331,9 @@ export interface VideoSubmission {
 
 export async function submitVideo(store: MediaProviderStore, provider: VideoProviderConfig, vars: { prompt: string; imageUrl: string }): Promise<VideoSubmission> {
   const body = renderTemplate(provider.bodyTemplate ?? { prompt: '{{prompt}}', image_url: '{{image_url}}', model: '{{model}}' }, {
-    ...vars, model: provider.model,
+    ...vars, image_url: vars.imageUrl, model: provider.model,
   })
-  const payload = await store.requestJson(provider.baseUrl, provider.auth, provider.submitPath, body)
+  const payload = await store.requestJson(provider.baseUrl, provider.auth, provider.submitPath, body, DEFAULT_TIMEOUT, provider.extraHeaders)
   if (provider.type === 'sync-url') {
     const url = getPath(payload, provider.videoUrlPath ?? 'data[0].url')
     if (typeof url !== 'string') throw new MediaError('视频响应缺少配置的结果字段', 'PROVIDER_SHAPE')
@@ -330,7 +351,8 @@ export interface VideoPoll {
 
 export async function pollVideo(store: MediaProviderStore, provider: VideoProviderConfig, taskId: string): Promise<VideoPoll> {
   const pollPath = (provider.pollPath ?? '/v1/tasks/{{task_id}}').replace('{{task_id}}', encodeURIComponent(taskId))
-  const payload = await store.requestJson(provider.baseUrl, provider.auth, pollPath, {})
+  // 异步开关头（如 X-DashScope-Async）只属于提交请求；带上它查询会被百炼拒 403。
+  const payload = await store.getJson(provider.baseUrl, provider.auth, pollPath)
   const status = String(getPath(payload, provider.statusPath ?? 'output.task_status') ?? '')
   const succeeded = provider.succeededValues ?? ['succeeded', 'SUCCEEDED', 'completed', 'COMPLETED', 'success']
   const failed = provider.failedValues ?? ['failed', 'FAILED', 'error', 'ERROR', 'canceled', 'CANCELED']

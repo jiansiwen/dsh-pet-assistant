@@ -1537,7 +1537,7 @@ export class TeamStore {
   updateTask(
     taskId: string,
     expectedRevision: number,
-    patch: Partial<Pick<Task, 'status' | 'ownerId' | 'artifacts' | 'budgetTokens' | 'deadlineAt'>>,
+    patch: Partial<Pick<Task, 'status' | 'ownerId' | 'artifacts' | 'budgetTokens' | 'deadlineAt' | 'goal'>>,
   ): Task | null {
     const current = this.getTask(taskId)
     if (!current || current.revision !== expectedRevision) return null
@@ -1548,12 +1548,13 @@ export class TeamStore {
       artifacts: patch.artifacts ?? current.artifacts,
       budgetTokens: patch.budgetTokens ?? current.budgetTokens,
       deadlineAt: patch.deadlineAt === undefined ? current.deadlineAt : patch.deadlineAt,
+      goal: patch.goal === undefined ? current.goal : patch.goal,
       revision: current.revision + 1,
       updatedAt: Date.now(),
     }
     const result = this.db
       .prepare(
-        `UPDATE tasks SET owner_id = ?, status = ?, revision = ?, artifacts = ?, budget_tokens = ?, deadline_at = ?, updated_at = ?
+        `UPDATE tasks SET owner_id = ?, status = ?, revision = ?, artifacts = ?, budget_tokens = ?, deadline_at = ?, goal = ?, updated_at = ?
          WHERE task_id = ? AND revision = ?`,
       )
       .run(
@@ -1563,6 +1564,7 @@ export class TeamStore {
         json(next.artifacts),
         next.budgetTokens,
         num(next.deadlineAt),
+        next.goal,
         next.updatedAt,
         taskId,
         expectedRevision,

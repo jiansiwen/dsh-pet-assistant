@@ -8,6 +8,7 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import {
   askPrompt,
+  askPromptLite,
   buildOutline,
   canOpenWithApp,
   canOutline,
@@ -15,12 +16,14 @@ import {
   detectDocIntent,
   detectSectionMarkers,
   DOC_SKIP_HOLD_MS,
+  docPreloadPrompt,
   docSpeechPlan,
   DocumentLibrary,
   explainPrompt,
   extensionOf,
   findMentionedDocs,
   isInsideAuthorized,
+  isShortOutline,
   looksLikePath,
   MAX_DOC_BYTES,
   MAX_DOC_CHARS,
@@ -947,5 +950,41 @@ describe('阅读视图快照（不走缓存，每次重查授权与指纹）', (
     roots = ['D:/docs']
     fs.tree.delete('D:/docs/a.pdf')
     assert.equal((await library.snapshot('D:/docs/a.pdf')).kind, 'missing')
+  })
+})
+
+describe('文档预读与只发问题的追问', () => {
+  const shortOutline = outlineOf(buildOutline('短.md', '# 标题\n\n第一段正文。\n\n第二段正文。'))
+  const longOutline = outlineOf(buildOutline('长.md',
+    Array.from({ length: 10 }, (_, i) => `## 章节${i + 1}\n\n这是第${i + 1}章的正文内容。`).join('\n\n')))
+
+  test('短文档判定沿用既有规模上限', () => {
+    assert.equal(isShortOutline(shortOutline), true)
+    assert.equal(isShortOutline(longOutline), false, '段数超上限就算长文档')
+  })
+
+  test('预读只给文档名/路径与工作区提示，不灌正文，让模型自己用工具读', () => {
+    const prompt = docPreloadPrompt('短.md', 'D:/ws/docs/短.md')
+    assert.ok(prompt.includes('D:/ws/docs/短.md'), '文档路径必须在')
+    assert.ok(prompt.includes('companion_document_read'), '让模型自己读文档')
+    assert.ok(prompt.includes('工作区'), '工作区由会话上下文给出')
+    assert.ok(prompt.includes('收到'), '读完只回收到')
+    assert.ok(!prompt.includes('第一段正文'), '不灌正文')
+    assert.ok(!prompt.includes('章节'), '也不附机械提纲')
+  })
+
+  test('预读成功后追问只发问题，并带文档路径供必要时补读', () => {
+    const prompt = askPromptLite('短.md', shortOutline, 0, '为什么限制目录？', 'D:/ws/docs/短.md')
+    assert.ok(prompt.includes('为什么限制目录？'), '问题本身要在')
+    assert.ok(prompt.includes('D:/ws/docs/短.md'), '带文档路径，没读过时可补读')
+    assert.ok(prompt.includes('companion_document_read'), '按需补读的提示保留')
+    assert.ok(!prompt.includes('第一段正文'), '不再重发该段原文')
+    assert.ok(!prompt.includes('整份文档全文'), '不再重发全文')
+  })
+
+  test('预读失败的兜底仍用附原文的旧追问', () => {
+    const prompt = askPrompt('短.md', shortOutline, 0, '为什么限制目录？')
+    assert.ok(prompt.includes('第一段正文'), '兜底附当前段原文')
+    assert.ok(prompt.includes('整份文档全文'), '短文档兜底附全文')
   })
 })

@@ -99,6 +99,16 @@ export interface Config {
   denyExpertTools: string[]
   /** 是否启用主动提醒（design.md §2.7）；关闭后引擎彻底安静，也省掉评估定时器。 */
   proactiveEnabled: boolean
+  /**
+   * 技能自动形成：同类工作攒够样本后自动让模型总结成技能。
+   * 计数归代码、正文归模型；关闭后回到"只记证据、人工触发"。
+   */
+  skillsAutoForm: boolean
+  /**
+   * 自动形成的技能是否默认生效（人工只做事后查验）。
+   * 关闭则生成后停在候选，仍需本人点"让它生效"。扩权（scopeChanged）无论如何都须本人批准。
+   */
+  skillsAutoActivate: boolean
   /** 触发主动提醒的无输入时长（毫秒）；设计原文建议 8 分钟，是可配置实验值不是认知判断。 */
   proactiveIdleMs: number
   /** 两次主动提醒之间的最小间隔（毫秒）；设计原文建议 60 分钟。 */
@@ -156,6 +166,8 @@ export const Config: Schema<Config> = Schema.object({
   approvalTtlMs: Schema.number().default(300000),
   denyExpertTools: Schema.array(Schema.string()).default([]),
   proactiveEnabled: Schema.boolean().default(true),
+  skillsAutoForm: Schema.boolean().default(true),
+  skillsAutoActivate: Schema.boolean().default(true),
   proactiveIdleMs: Schema.number().default(480000),
   proactiveCooldownMs: Schema.number().default(3600000),
   approvalMode: Schema.union(['manual', 'auto']).default('manual'),

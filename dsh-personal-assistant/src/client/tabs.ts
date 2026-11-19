@@ -20,7 +20,7 @@
  * 以为事情做完了（或者反过来，以为系统坏了）。
  */
 
-export type TabId = 'todo' | 'mail' | 'wecom' | 'report' | 'meeting' | 'team' | 'settings'
+export type TabId = 'todo' | 'mail' | 'wecom' | 'report' | 'meeting' | 'team' | 'skills' | 'pet' | 'settings'
 
 /** 列表类 tab：有表头、有行、有空态/读不到两种空。 */
 export type ListTabId = Extract<TabId, 'todo' | 'report' | 'meeting' | 'team'>
@@ -46,6 +46,10 @@ export const TABS: readonly TabDefinition[] = [
   { id: 'report', label: '日报周报', page: 'report' },
   { id: 'meeting', label: '会议', page: 'meeting' },
   { id: 'team', label: '助理团', page: 'team' },
+  // 技能：自动形成 + 人工查验/增删改查，都在这里。
+  { id: 'skills', label: '技能', page: 'team' },
+  // 桌宠右键菜单里可配置的外观项（形象 / 随机动作 / 显示 / 上台）在这里也有一份。
+  { id: 'pet', label: '宠物', page: 'general' },
   { id: 'settings', label: '设置', page: 'general' },
 ]
 
@@ -142,6 +146,8 @@ export const LIST_TABS: Record<ListTabId, ListTabDefinition> = {
     empty: '今天还没有会议',
     unavailable: '暂时读不到今天的会议',
     hint: '会议与纪要由桌面宠物录制并整理。',
+    // 尾列是会议 id（不渲染）：改名/删除按它定位。
+    trailing: 1,
   },
   team: {
     command: '/assistant-team-list',
@@ -182,6 +188,8 @@ export const MEETING_HISTORY: ListTabDefinition = {
   empty: '还没有历史会议',
   unavailable: '暂时读不到历史会议',
   hint: '最多显示 20 条',
+  // 尾列是会议 id（不渲染）：改名/删除按它定位。
+  trailing: 1,
 }
 
 /**
@@ -244,6 +252,13 @@ export function priorityCommand(taskId: string, value: string): string | null {
  * 恒为 null，于是整个优先级列**自动保持只读**——不需要开关变量，也不会出现"点了没反应"的死按钮。
  */
 export function rowTaskId(row: ListRow): string | null {
+  const id = row.trailing[0]?.trim()
+  if (id === undefined || id === '' || id === EMPTY_CELL) return null
+  return /\s/u.test(id) ? null : id
+}
+
+/** 会议行的隐藏 id（尾列）。改名/删除按它定位；后端没给 id 时整列自动只读。 */
+export function rowMeetingId(row: ListRow): string | null {
   const id = row.trailing[0]?.trim()
   if (id === undefined || id === '' || id === EMPTY_CELL) return null
   return /\s/u.test(id) ? null : id

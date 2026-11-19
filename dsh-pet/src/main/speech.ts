@@ -38,6 +38,13 @@ export interface SpeechRequest {
    */
   readonly ephemeral?: boolean
   /**
+   * 整行丢弃 Markdown 引用块（`> 原文…`），只用在讲解追问的回答上。
+   *
+   * 模型常把文档原文用引用块贴回来，那是给眼睛看的资料，不是回答正文；
+   * 念出来就像在朗读提示词。文档原文朗读本身不受影响。
+   */
+  readonly stripQuotes?: boolean
+  /**
    * 这一句用谁的音色说话：给一段**音色设计描述**，暂时覆盖当前语音服务上的描述。
    *
    * 用于"成员自己开口"：小张讲就用小张的描述；不传就沿用服务配置（总助理的声音）。
@@ -171,8 +178,10 @@ const EMPHASIS_MARK = /\*\*|__/gu
  * 清洗后只剩空白时不做特殊处理：`splitIntoSegments` 的 `WORTH_SPEAKING` 会把这样的片段丢掉，
  * 在这里再造一套判断只会多一处会漂移的规则。
  */
-export function cleanForSpeech(raw: string): string {
-  return raw
+export function cleanForSpeech(raw: string, options: { readonly stripQuotes?: boolean } = {}): string {
+  // 追问回答里的引用块整行不念；文档原文朗读（没有这个开关）保持原样。
+  const source = options.stripQuotes === true ? raw.replace(/^[ \t]*>[^\r\n]*(?:\r?\n|$)/gmu, '') : raw
+  return source
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu, '')
     .replace(/\b[0-9a-f]{32}\b/giu, '')
     .replace(/([：:])\s*([，,、。])/gu, '$2')
@@ -199,7 +208,7 @@ export function cleanForSpeech(raw: string): string {
  * 序号是"播放位置"的一部分，续讲要靠它接着往下走。
  */
 export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
-  const { sentences, rest } = drainSentences(cleanForSpeech(request.text))
+  const { sentences, rest } = drainSentences(cleanForSpeech(request.text, { stripQuotes: request.stripQuotes === true }))
   /* 相邻短句先并段再合成，减少"两三个字就发一次请求"造成的句间卡顿。 */
   const raw = rest.length > 0 ? [...sentences, rest] : sentences
   const pieces = shortMergeEnabled ? mergeShortPieces(raw) : raw

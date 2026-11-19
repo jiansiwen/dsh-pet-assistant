@@ -28,6 +28,10 @@ const api = {
   pickVideo: () => invoke('asset-studio-pick-video'),
   /** 从本地视频裁一个动作，产出透明 WebM 并登记为皮肤动作。 */
   extractClip: (input: unknown) => invoke('asset-studio-extract-clip', input),
+  /** 给已有皮肤生成单个动作：先暂存预览，应用后才写入宠物。 */
+  generateAction: (input: unknown) => invoke('asset-studio-generate-action', input),
+  applyAction: (id: string) => invoke('asset-studio-apply-action', { id }),
+  deleteAction: (skinId: string, action: string) => invoke('asset-studio-delete-action', { skinId, action }),
   startClone: (input: unknown) => invoke('asset-studio-start-clone', input),
   applyVoice: (id: string) => invoke('asset-studio-apply-voice', { id }),
   revokeVoice: (id: string) => invoke('asset-studio-revoke-voice', { id }),

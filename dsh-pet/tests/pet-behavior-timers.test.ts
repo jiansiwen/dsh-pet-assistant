@@ -99,6 +99,13 @@ function mount(t: TestContext, initial: PetBehaviorOptions, random = 0.58) {
         render()
       }
     },
+    /** 逐帧驱动（16ms tick + 渲染）：走路这类每帧读 xRef 的逻辑需要真实帧率才能推进。 */
+    frames(count: number) {
+      for (let i = 0; i < count; i++) {
+        t.mock.timers.tick(16)
+        render()
+      }
+    },
     render,
   }
 }
@@ -122,6 +129,89 @@ test('台词变化后随机发言使用最新内容，不重置生活计时', t 
   const pet = mount(t, { lines: { ...lines(), idle: ['旧台词'] } }, 0.1)
   pet.seconds(4, lines)
   assert.equal(pet.behavior.bubble, '最新台词')
+})
+
+test('swagger 向右走：镜像翻面、位置右移、走到收步', t => {
+  const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
+  const right = mount(t, { lines: lines(), randomActions: ['swagger'], home: { x: 100, y: 900 } }, 0.99)
+  for (let i = 0; i < 12 && right.behavior.action !== 'swagger'; i++) right.seconds(1, lines)
+  assert.equal(right.behavior.action, 'swagger')
+  right.frames(60)
+  assert.equal(right.behavior.facing, -1, '视频朝左，向右走应镜像')
+  assert.ok(right.behavior.x > 100, '向右走位置应右移')
+  let sawStopR = false
+  for (let i = 0; i < 80; i++) {
+    right.frames(5)
+    if (right.behavior.action === 'swagger-stop') {
+      sawStopR = true
+      right.behavior.completeAnimation('swagger-stop', right.behavior.animationVersion)
+      right.render()
+    }
+    if (sawStopR && right.behavior.action === 'idle') break
+  }
+  assert.ok(sawStopR, '到站应演 swagger-stop 收步再回 idle')
+  assert.equal(right.behavior.action, 'idle')
+})
+
+test('swagger 向左走：不镜像、位置左移、走到收步', t => {
+  const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
+  const left = mount(t, { lines: lines(), randomActions: ['swagger'], home: { x: 1800, y: 900 } }, 0.3)
+  for (let i = 0; i < 12 && left.behavior.action !== 'swagger'; i++) left.seconds(1, lines)
+  assert.equal(left.behavior.action, 'swagger')
+  left.frames(60)
+  assert.equal(left.behavior.facing, 1, '向左走不镜像')
+  assert.ok(left.behavior.x < 1800, '向左走位置应左移')
+  let sawStopL = false
+  for (let i = 0; i < 80; i++) {
+    left.frames(5)
+    if (left.behavior.action === 'swagger-stop') {
+      sawStopL = true
+      left.behavior.completeAnimation('swagger-stop', left.behavior.animationVersion)
+      left.render()
+    }
+    if (sawStopL && left.behavior.action === 'idle') break
+  }
+  assert.ok(sawStopL, '到站应演 swagger-stop 收步再回 idle')
+  assert.equal(left.behavior.action, 'idle')
+})
+
+test('随机走路落点太近时推远，不会刚迈步就收步', t => {
+  const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
+  const pet = mount(t, { lines: lines(), randomActions: ['walk'], home: { x: 960, y: 900 } }, 0.5)
+  for (let i = 0; i < 12 && pet.behavior.action !== 'walk'; i++) pet.seconds(1, lines)
+  assert.equal(pet.behavior.action, 'walk')
+  pet.frames(30)
+  assert.equal(pet.behavior.action, 'walk', '0.5 秒后仍应在走，落点至少 60px')
+  assert.ok(Math.abs(pet.behavior.x - 960) > 10, '位置应明显离开起点')
+  let sawStop = false
+  for (let i = 0; i < 30; i++) {
+    pet.frames(6)
+    if (pet.behavior.action === 'walk-stop') {
+      sawStop = true
+      //  harness 没挂 PetSprite：手动模拟精灵播完收步的完成回调。
+      pet.behavior.completeAnimation('walk-stop', pet.behavior.animationVersion)
+      pet.render()
+    }
+    if (sawStop && pet.behavior.action === 'idle') break
+  }
+  assert.ok(sawStop, '走到后应演收步再回 idle，不硬切')
+  assert.equal(pet.behavior.action, 'idle')
+})
+
+test('走路进行到一半不打盹，走完后才允许入睡', t => {
+  const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
+  const pet = mount(t, { lines: lines(), randomActions: ['walk'], home: { x: 960, y: 900 }, idleSleepMinutes: 0.083 }, 0.5)
+  for (let i = 0; i < 12 && pet.behavior.action !== 'walk'; i++) pet.seconds(1, lines)
+  assert.equal(pet.behavior.action, 'walk')
+  pet.frames(30)
+  assert.equal(pet.behavior.action, 'walk', '空闲阈值已过但走路中不能睡')
+  pet.frames(150)
+  if (pet.behavior.action === 'walk-stop') {
+    pet.behavior.completeAnimation('walk-stop', pet.behavior.animationVersion)
+    pet.render()
+  }
+  pet.frames(60)
+  assert.equal(pet.behavior.action, 'sleep-in', '走完收步后才入睡')
 })
 
 test('场景占用时随机动作让路，释放后恢复', t => {

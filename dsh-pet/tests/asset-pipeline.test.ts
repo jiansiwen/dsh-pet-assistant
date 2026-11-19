@@ -116,3 +116,26 @@ test('删除皮肤清理素材与登记', async () => {
   assert.equal(listCustomSkins(dir).length, 0)
   assert.ok(!existsSync(path.join(customAssetsRoot(dir), 'pets', `${done.skinId}.png`)))
 })
+
+test('单动作：生成→暂存预览→应用登记→删除清理', async () => {
+  const { dir, pipeline } = setup({ ffmpeg: 'ffmpeg-fake' })
+  const base = pipeline.createJob({ name: '哪吒', prompt: 'p', actions: ['idle'], imageProviderId: 'img', videoProviderId: 'vid', approved: true })
+  const skinId = (await pipeline.run(base.id)).skinId!
+  assert.throws(() => pipeline.createActionJob({ skinId, action: 'Bad Name', prompt: 'p', videoProviderId: 'vid', approved: true }), /动作名/)
+  const job = pipeline.createActionJob({ skinId, action: 'swagger', prompt: '插兜走路', videoProviderId: 'vid', approved: true })
+  const done = await pipeline.runAction(job.id)
+  assert.equal(done.status, 'ready')
+  const root = customAssetsRoot(dir)
+  // 应用前：只有 staging 预览产物，登记表与宠物素材不受影响
+  assert.ok(existsSync(path.join(root, 'staging', skinId, 'swagger.webm')))
+  assert.ok(!existsSync(path.join(root, 'pets', 'webm', skinId, 'swagger.webm')))
+  assert.deepEqual(listCustomSkins(dir).find(s => s.id === skinId)!.actions, ['idle'])
+  const applied = pipeline.applyAction(job.id)
+  assert.ok(applied.appliedAt)
+  assert.ok(existsSync(path.join(root, 'pets', 'webm', skinId, 'swagger.webm')))
+  assert.deepEqual(listCustomSkins(dir).find(s => s.id === skinId)!.actions, ['idle', 'swagger'])
+  assert.equal(pipeline.actionAssets(skinId).swagger, 'webm')
+  pipeline.deleteAction(skinId, 'swagger')
+  assert.ok(!existsSync(path.join(root, 'pets', 'webm', skinId, 'swagger.webm')))
+  assert.deepEqual(listCustomSkins(dir).find(s => s.id === skinId)!.actions, ['idle'])
+})

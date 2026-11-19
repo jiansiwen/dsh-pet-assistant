@@ -11,6 +11,7 @@ import {
   EXPLICIT_CONTINUE_MAX_CHARS,
   initialFollowup,
   isExplicitContinue,
+  isRestResume,
   reduceFollowup,
   type FollowupEvent,
   type FollowupState,
@@ -158,5 +159,18 @@ describe('isExplicitContinue（窄匹配，只认真正在要求继续的短句�
       assert.equal(isExplicitContinue(said), false, said)
     }
     assert.equal(isExplicitContinue('   '), false)
+  })
+})
+
+describe('isRestResume 休息恢复整句判定', () => {
+  test('整句就是继续指令才认', () => {
+    for (const said of ['继续', '继续演讲', '继续讲', '你继续讲', '继续吧', '接着讲', '往下讲', '我们继续讲吧']) {
+      assert.equal(isRestResume(said), true, said)
+    }
+  })
+  test('讨论句里带继续两个字不认', () => {
+    for (const said of ['我们继续讨论这个问题', '继续讨论', '大家继续看看这段', '继续讲的是什么', '这个问题继续怎么办']) {
+      assert.equal(isRestResume(said), false, said)
+    }
   })
 })

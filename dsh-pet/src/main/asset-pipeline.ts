@@ -4,7 +4,7 @@
  * 无 ffmpeg 时停在 needs-postprocess 并保留已下载 clips，不假装产出可用皮肤。
  */
 import { execFile, execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import {
   MediaError, MediaProviderStore, generateImage, pollVideo, submitVideo,
@@ -31,6 +31,9 @@ export interface SkinJob {
   clips: { action: string; src?: string; webm?: string; taskId?: string }[]
   skinId?: string
   error?: string
+  /** skin=整套形象流水线；action=给已有皮肤生成单个动作，先暂存预览再应用 */
+  kind?: 'skin' | 'action'
+  appliedAt?: number
 }
 
 export type SpawnLike = (command: string, args: readonly string[]) => Promise<{ code: number; stderr: string }>
@@ -177,8 +180,8 @@ export class AssetPipeline {
   }
 
   private async generateClips(provider: VideoProviderConfig, job: SkinJob, design: string): Promise<void> {
-    // 图生视频需要可访问 URL；本地设计图以 data URL 传入，provider 不支持时如实失败。
-    const imageUrl = `data:image/png;base64,${readFileSync(design).toString('base64')}`
+    // 部分视频模型（如 wan3.0）不收透明 PNG：先合成白底不透明参考图，失败时退回原图。
+    const imageUrl = await this.opaqueRef(design, job.id)
     for (const clip of job.clips) {
       this.checkCancelled(job.id)
       const submission = await submitVideo(this.deps.store, provider, {
@@ -222,24 +225,184 @@ export class AssetPipeline {
     const ffmpeg = (this.deps.probeFfmpeg ?? (() => probeFfmpeg(config.ffmpegPath)))()
     if (!ffmpeg) return this.update(id, { status: 'needs-postprocess', error: '未找到 ffmpeg：配置 ffmpegPath 后重试后处理' })
     this.update(id, { status: 'post' })
-    const keyColor = (config.keyColor ?? '0x00FF00').replace('#', '0x')
+    const keyColor = config.keyColor
     for (const clip of job.clips) {
       this.checkCancelled(id)
       if (!clip.src || !existsSync(clip.src)) throw new MediaError(`动作 ${clip.action} 缺少源视频`, 'CLIP_MISSING')
       const dest = path.join(this.jobDir(id), `${clip.action}.webm`)
-      const result = await this.spawn(ffmpeg, [
-        '-y', '-i', clip.src,
-        '-vf', `colorkey=${keyColor}:0.30:0.10,fps=24`,
-        '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-an', dest,
-      ])
-      if (result.code !== 0 || !existsSync(dest)) {
-        throw new MediaError(`动作 ${clip.action} 转码失败：${result.stderr.slice(0, 300)}`, 'POST_FAILED')
-      }
+      await this.keyClip(ffmpeg, clip.src, dest, keyColor, clip.action)
       const jobs = this.listJobs()
       const current = jobs.find(item => item.id === id)!
       this.update(id, { clips: current.clips.map(c => c.action === clip.action ? { ...c, webm: dest } : c) })
     }
     return this.registerSkin(id)
+  }
+
+  private async keyClip(ffmpeg: string, src: string, dest: string, keyColor: string | undefined, action: string): Promise<void> {
+    // colorkey 在 YUV 空间算相似度，偏色绿幕会连肤色一起抠白（实测）；
+    // 默认走 RGB 绿主导规则（念诗管线验证过），先缩到 512 高控制 geq 耗时。
+    const vf = keyColor
+      ? `colorkey=${keyColor.replace('#', '0x')}:0.30:0.10,fps=24`
+      : `fps=12,scale=-2:512,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gt(g(X,Y),1.15*max(r(X,Y),b(X,Y)))*gt(g(X,Y),90),0,255)'`
+    const result = await this.spawn(ffmpeg, [
+      '-y', '-i', src,
+      '-vf', vf,
+      '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-an', dest,
+    ])
+    if (result.code !== 0 || !existsSync(dest)) {
+      throw new MediaError(`动作 ${action} 转码失败：${result.stderr.slice(0, 300)}`, 'POST_FAILED')
+    }
+  }
+
+  /** 透明 PNG 合成白底 JPEG 的 data URL；ffmpeg 不可用时退回原 PNG data URL。 */
+  private async opaqueRef(pngPath: string, jobId: string): Promise<string> {
+    const config = this.deps.store.load()
+    const ffmpeg = (this.deps.probeFfmpeg ?? (() => probeFfmpeg(config.ffmpegPath)))()
+    if (ffmpeg) {
+      const dest = path.join(this.jobDir(jobId), 'ref.jpg')
+      mkdirSync(this.jobDir(jobId), { recursive: true })
+      const result = await this.spawn(ffmpeg, [
+        '-y', '-i', pngPath, '-f', 'lavfi', '-i', 'color=c=white:s=2x2',
+        '-filter_complex', '[1:v][0:v]scale2ref[bg][fg];[bg][fg]overlay=format=auto',
+        '-frames:v', '1', dest,
+      ])
+      if (result.code === 0 && existsSync(dest)) {
+        return `data:image/jpeg;base64,${readFileSync(dest).toString('base64')}`
+      }
+    }
+    return `data:image/png;base64,${readFileSync(pngPath).toString('base64')}`
+  }
+
+  /** 给已有皮肤生成单个动作：参考图用皮肤静图，产物先落 staging 供预览，不直接登记。 */
+  createActionJob(input: { skinId: string; action: string; prompt: string; videoProviderId: string; approved: boolean }): SkinJob {
+    if (!input.approved) throw new MediaError('生成会计入你所配 provider 的费用，需先确认', 'NOT_APPROVED')
+    const skin = listCustomSkins(this.deps.userDataDir).find(s => s.id === input.skinId)
+    if (!skin) throw new MediaError('目标皮肤不存在', 'SKIN_MISSING')
+    const action = input.action.trim().toLowerCase()
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(action)) throw new MediaError('动作名只能是小写字母开头的短横线命名，例如 swagger', 'BAD_ACTION')
+    if (!input.prompt.trim() || input.prompt.length > 2000) throw new MediaError('描述需为 1–2000 字', 'BAD_PROMPT')
+    const config = this.deps.store.load()
+    if (!config.video.some(p => p.id === input.videoProviderId)) throw new MediaError('视频 provider 未配置', 'PROVIDER_MISSING')
+    const job: SkinJob = {
+      id: `job-${this.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+      name: `${skin.name} · ${action}`,
+      prompt: input.prompt,
+      actions: [action],
+      imageProviderId: '',
+      videoProviderId: input.videoProviderId,
+      status: 'queued',
+      approvedAt: this.now(),
+      createdAt: this.now(),
+      updatedAt: this.now(),
+      clips: [{ action }],
+      skinId: skin.id,
+      kind: 'action',
+    }
+    this.saveJobs([...this.listJobs(), job])
+    this.deps.emit?.('asset-jobs-changed')
+    return job
+  }
+
+  async runAction(id: string): Promise<SkinJob> {
+    const config = this.deps.store.load()
+    const job = this.listJobs().find(item => item.id === id)
+    if (!job || job.kind !== 'action' || !job.skinId) throw new MediaError('作业不存在', 'JOB_MISSING')
+    const videoProvider = config.video.find(p => p.id === job.videoProviderId)
+    if (!videoProvider) throw new MediaError('provider 配置已变化，请重新选择', 'PROVIDER_MISSING')
+    const ffmpeg = (this.deps.probeFfmpeg ?? (() => probeFfmpeg(config.ffmpegPath)))()
+    if (!ffmpeg) throw new MediaError('未找到 ffmpeg：配置 ffmpegPath 后重试', 'FFMPEG_MISSING')
+    mkdirSync(this.jobDir(id), { recursive: true })
+    try {
+      this.update(id, { status: 'clips', error: undefined })
+      const idle = path.join(customAssetsRoot(this.deps.userDataDir), 'pets', `${job.skinId}.png`)
+      if (!existsSync(idle)) throw new MediaError('皮肤静图缺失，无法做形象参考', 'SKIN_MISSING')
+      const imageUrl = await this.opaqueRef(idle, id)
+      const clip = job.clips[0]
+      // 重试时复用已提交的任务 ID：服务端任务仍在跑，重复提交会重复计费。
+      const submission = clip.taskId ? { taskId: clip.taskId } : await submitVideo(this.deps.store, videoProvider, {
+        prompt: `${job.prompt}。纯色绿幕背景，角色完整居中，结尾恢复初始站姿。`,
+        imageUrl,
+      })
+      if (submission.url) {
+        await this.downloadClip(id, clip.action, submission.url)
+      } else {
+        const taskId = submission.taskId!
+        this.update(id, { clips: [{ ...clip, taskId }] })
+        const deadline = this.now() + (videoProvider.timeoutMs ?? 600_000)
+        for (;;) {
+          this.checkCancelled(id)
+          const poll = await pollVideo(this.deps.store, videoProvider, taskId)
+          if (poll.state === 'succeeded') {
+            await this.downloadClip(id, clip.action, poll.url!)
+            break
+          }
+          if (poll.state === 'failed') throw new MediaError(`动作 ${clip.action} 生成失败`, 'VIDEO_FAILED')
+          if (this.now() > deadline) throw new MediaError(`动作 ${clip.action} 生成超时`, 'VIDEO_TIMEOUT')
+          await this.sleep(videoProvider.pollIntervalMs ?? 15_000)
+        }
+      }
+      this.checkCancelled(id)
+      this.update(id, { status: 'post' })
+      const current = this.listJobs().find(item => item.id === id)!
+      const src = current.clips[0].src!
+      const keyColor = config.keyColor
+      const stagedDir = path.join(customAssetsRoot(this.deps.userDataDir), 'staging', job.skinId)
+      mkdirSync(stagedDir, { recursive: true })
+      const staged = path.join(stagedDir, `${clip.action}.webm`)
+      await this.keyClip(ffmpeg, src, staged, keyColor, clip.action)
+      this.update(id, { clips: [{ ...current.clips[0], webm: staged }] })
+      return this.update(id, { status: 'ready' })
+    } catch (error) {
+      if (error instanceof MediaError && error.code === 'CANCELLED') return this.update(id, { status: 'cancelled' })
+      return this.update(id, { status: 'failed', error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /** 预览满意后把暂存动作写入皮肤并登记；未应用前宠物不受影响。 */
+  applyAction(id: string): SkinJob {
+    const job = this.listJobs().find(item => item.id === id)
+    if (!job || job.kind !== 'action' || !job.skinId) throw new MediaError('作业不存在', 'JOB_MISSING')
+    if (job.status !== 'ready') throw new MediaError('动作尚未生成完成', 'NOT_READY')
+    const staged = job.clips[0]?.webm
+    if (!staged || !existsSync(staged)) throw new MediaError('暂存视频缺失', 'CLIP_MISSING')
+    const skin = listCustomSkins(this.deps.userDataDir).find(s => s.id === job.skinId)
+    if (!skin) throw new MediaError('目标皮肤不存在', 'SKIN_MISSING')
+    const action = job.clips[0].action
+    const webmDir = path.join(customAssetsRoot(this.deps.userDataDir), 'pets', 'webm', job.skinId)
+    mkdirSync(webmDir, { recursive: true })
+    copyFileSync(staged, path.join(webmDir, `${action}.webm`))
+    registerCustomSkin(this.deps.userDataDir, {
+      ...skin,
+      actions: [...new Set([...skin.actions, action])],
+    })
+    this.deps.emit?.('custom-skins-changed')
+    return this.update(id, { appliedAt: this.now() })
+  }
+
+  /** 删除已有皮肤的某个动作：清 webm/帧序列并更新登记表。 */
+  deleteAction(skinId: string, action: string): void {
+    const skin = listCustomSkins(this.deps.userDataDir).find(s => s.id === skinId)
+    if (!skin) throw new MediaError('皮肤不存在', 'SKIN_MISSING')
+    if (!skin.actions.includes(action)) throw new MediaError('该皮肤没有这个动作', 'ACTION_MISSING')
+    const root = customAssetsRoot(this.deps.userDataDir)
+    const webm = path.join(root, 'pets', 'webm', skinId, `${action}.webm`)
+    if (existsSync(webm)) rmSync(webm)
+    const frames = path.join(root, 'pets', 'frames', skinId, action)
+    if (existsSync(frames)) rmSync(frames, { recursive: true })
+    registerCustomSkin(this.deps.userDataDir, { ...skin, actions: skin.actions.filter(a => a !== action) })
+    this.deps.emit?.('custom-skins-changed')
+  }
+
+  /** 每个动作的素材形态：webm 可预览播放，frames 仅宠物可用，none 缺素材。 */
+  actionAssets(skinId: string): Record<string, 'webm' | 'frames' | 'none'> {
+    const root = customAssetsRoot(this.deps.userDataDir)
+    const skin = listCustomSkins(this.deps.userDataDir).find(s => s.id === skinId)
+    const out: Record<string, 'webm' | 'frames' | 'none'> = {}
+    for (const action of skin?.actions ?? []) {
+      out[action] = existsSync(path.join(root, 'pets', 'webm', skinId, `${action}.webm`)) ? 'webm'
+        : existsSync(path.join(root, 'pets', 'frames', skinId, action)) ? 'frames' : 'none'
+    }
+    return out
   }
 
   private registerSkin(id: string): SkinJob {

@@ -55,6 +55,7 @@ import {
   sliceTimeline,
   splitLongSpans,
   spansFromTurns,
+  looksLikeAssistantEcho,
   trackDisplayName,
   trackUnknownSpeakerId,
   uncoveredVoicedSpans,
@@ -461,6 +462,8 @@ function composeRefineNote(input: {
   corrupted: number
   assistantMarked: number
   assistantTrimmed: number
+  /** 与助理播报重叠、但文字内容不同，已恢复为参会者发言的段数。 */
+  assistantReverted: number
   recovered: number
 }): { mode: TranscriptMode; note: string } {
   const parts: string[] = []
@@ -498,6 +501,7 @@ function composeRefineNote(input: {
   if (input.corrupted > 0) parts.push(`${input.corrupted} 块录音解不开（已损坏），对应时间按缺口处理`)
   if (input.recovered > 0) parts.push(`${input.recovered} 段有声片段分人模型没覆盖到，归为「未分人」单独转写`)
   if (input.assistantMarked > 0) parts.push(`${input.assistantMarked} 段与助理播报高度重叠，已标为“小潘（AI 助理）”的发言`)
+  if (input.assistantReverted > 0) parts.push(`${input.assistantReverted} 段虽与助理播报重叠，但内容不同，已保留为参会者发言`)
   if (input.assistantTrimmed > 0) parts.push(`${input.assistantTrimmed} 段裁掉了与助理播报重叠的部分`)
   return { mode, note: `${parts.join('。')}。` }
 }
@@ -1222,6 +1226,8 @@ export class MeetingRecorder {
     const transcribe = this.transcriber()
     const live = this.liveMeetingId === meetingId ? this.liveEntries : new Map<number, LiveEntry>()
     const segments: TranscriptSegment[] = []
+    /** 与 segments 同下标：麦克风"助理播报"段保留的原说话人身份；其余为 null。 */
+    const echoOrigins: Array<{ speaker: string; label: string } | null> = []
     let failed = 0
     for (const span of planned) {
       const timeline = timelines.get(span.track)
@@ -1256,6 +1262,32 @@ export class MeetingRecorder {
         source: outcome.kind === 'failed' ? 'failed' : span.kind === 'assistant' ? 'assistant' : 'asr',
         track: span.track,
       })
+      echoOrigins.push(span.kind === 'assistant' && span.track === 'mic'
+        && span.echoSpeaker !== undefined && span.echoLabel !== undefined
+        ? { speaker: span.echoSpeaker, label: span.echoLabel } : null)
+    }
+    /*
+     * 时间重叠只证明"这段音频里混着助理的声音"，不能证明说话的是助理。
+     * 用 loopback 上的助理原文复核：文字不像回声（用户在播报途中插话提问）就恢复原说话人，
+     * 否则提问会被算到小潘头上（真机复现：评委提问整句被标成"小潘（AI 助理）"）。
+     */
+    let assistantReverted = 0
+    {
+      const references = segments.filter(segment => segment.source === 'assistant' && segment.track === 'loopback'
+        && segment.startMs !== null && segment.endMs !== null)
+      for (let index = 0; index < segments.length; index += 1) {
+        const origin = echoOrigins[index]
+        const segment = segments[index]
+        if (origin === null || origin === undefined || segment.source !== 'assistant' || segment.track !== 'mic') continue
+        const from = segment.startMs ?? 0
+        const to = segment.endMs ?? 0
+        const overlaps = references.filter(item => (item.startMs ?? 0) <= to && (item.endMs ?? 0) >= from)
+        // 没有 loopback 参照（只录了麦克风）：保守按回声处理，不恢复身份。
+        if (overlaps.length === 0) continue
+        if (overlaps.some(item => looksLikeAssistantEcho(segment.text, item.text))) continue
+        segments[index] = { ...segment, speaker: origin.speaker, label: origin.label, source: 'asr' }
+        assistantReverted += 1
+      }
     }
     // 语音停录的指令句不是发言，不能进纪要和转写。
     // 精修会把那一块音频**重新转写一遍**（临时字幕那层抹掉的不够），所以写库前用同一个判据
@@ -1280,6 +1312,7 @@ export class MeetingRecorder {
       corrupted,
       assistantMarked: assistant.marked,
       assistantTrimmed: assistant.trimmed,
+      assistantReverted,
       recovered: segments.filter(segment => segment.source === 'asr' && unknownIds.has(segment.speaker)).length,
     })
     const usable = segments.filter(segment => segment.source !== 'failed').length
@@ -1536,6 +1569,11 @@ export class MeetingRecorder {
    */
   listMeetings(limit = 20): MeetingRow[] {
     return this.store.listMeetings(limit)
+  }
+
+  /** 重命名会议：只改名字，不碰录音/转写/纪要；密封与长度校验在 store 里。 */
+  renameMeeting(meetingId: string, name: string): { ok: true } | { ok: false; error: string } {
+    return this.store.renameMeeting(meetingId, name)
   }
 
   /** 删除整场会议；录音或转写进行中的那场拒绝删除，避免与后台写入交错。 */

@@ -829,6 +829,8 @@ export class MeetingStore {
   }
 
   getMeeting(meetingId: string): MeetingRow | null {
+    // 退出收尾先关库，渲染层轮询可能还在退出窗口里跑；关库后如实返回空，不抛异常崩进程。
+    if (this.closed) return null
     const row = this.db.prepare('SELECT * FROM meetings WHERE id = ?').get(meetingId) as Row | undefined
     if (row === undefined) return null
     return this.toMeetingRow(row)
@@ -1041,6 +1043,7 @@ export class MeetingStore {
    * 都没有就是 null——旧版块没有分轨信息，如实留空。
    */
   listChunks(meetingId: string): ChunkEntry[] {
+    if (this.closed) return []
     const rows = this.db
       .prepare('SELECT seq, path, sha256, track, trackSeq, startMs, frames FROM chunks WHERE meetingId = ? ORDER BY seq')
       .all(meetingId) as Row[]
@@ -1119,6 +1122,7 @@ export class MeetingStore {
   // ===== 转写段 =====
 
   getSegments(meetingId: string): TranscriptSegment[] {
+    if (this.closed) return []
     const rows = this.db
       .prepare('SELECT revision, idx, speaker, label, uncertain, startMs, endMs, text, source, track FROM transcript_segments WHERE meetingId = ? ORDER BY idx')
       .all(meetingId) as Row[]
@@ -1213,6 +1217,7 @@ export class MeetingStore {
 
   /** 机器最后一次写入转写的版本、分人模式与说明。没跑过新版精修的会议返回 null。 */
   getTranscriptMeta(meetingId: string): TranscriptMeta | null {
+    if (this.closed) return null
     const row = this.db.prepare('SELECT machineRevision, mode, note FROM transcript_meta WHERE meetingId = ?').get(meetingId) as Row | undefined
     if (row === undefined) return null
     const mode = String(row.mode)
@@ -1297,6 +1302,7 @@ export class MeetingStore {
   // ===== 纪要 =====
 
   getMinutes(meetingId: string): MinutesRecord | null {
+    if (this.closed) return null
     const row = this.db.prepare('SELECT revision, content, digest, state, confirmedAt, kind, structured FROM minutes WHERE meetingId = ?').get(meetingId) as
       | Row
       | undefined
@@ -1504,6 +1510,7 @@ export class MeetingStore {
 
   /** 读一场会议的授权记录。没有记录 = 从未授权；解不开 = 按没有授权处理并标出来。 */
   getEgress(meetingId: string): EgressRecord {
+    if (this.closed) return { events: [], active: null }
     const row = this.db.prepare('SELECT egress FROM meetings WHERE id = ?').get(meetingId) as Row | undefined
     if (row === undefined || row.egress === null || row.egress === undefined) return { events: [], active: null }
     if (!isSealed(row.egress)) return { events: [], active: null, undecryptable: true }
@@ -1536,6 +1543,24 @@ export class MeetingStore {
     this.db
       .prepare('UPDATE meetings SET egress = ? WHERE id = ?')
       .run(this.seal(key.key, JSON.stringify({ events }), 'meetings', 'egress', meetingId), meetingId)
+    return { ok: true }
+  }
+
+  /**
+   * 重命名会议：只改密封的 name 列，不碰录音/转写/纪要/完整性记录。
+   *
+   * name 是加密列，必须用当前数据密钥重新密封；直接写明文会让这场会议的名字
+   * 变成"解不开"的占位文本。密钥不可用时整条拒绝，不留半截状态。
+   */
+  renameMeeting(meetingId: string, name: string): { ok: true } | { ok: false; error: string } {
+    const meeting = this.getMeeting(meetingId)
+    if (meeting === null) return { ok: false, error: '没有这场会议' }
+    const trimmed = name.trim()
+    if (trimmed === '' || trimmed.length > 200) return { ok: false, error: '会议名称需为 1–200 字' }
+    const key = this.ensureKey()
+    if (!key.ok) return { ok: false, error: key.error }
+    this.db.prepare('UPDATE meetings SET name = ? WHERE id = ?')
+      .run(this.seal(key.key, trimmed, 'meetings', 'name', meetingId), meetingId)
     return { ok: true }
   }
 

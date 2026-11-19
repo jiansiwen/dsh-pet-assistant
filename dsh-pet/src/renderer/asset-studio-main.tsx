@@ -21,6 +21,7 @@ interface StudioState {
   secretFlags: Record<string, boolean>
   jobs: any[]
   skins: any[]
+  actionAssets?: Record<string, Record<string, 'webm' | 'frames' | 'none'>>
   voices: any[]
   ffmpeg: string | null
   selectedTts: string | null
@@ -48,6 +49,24 @@ function useStudio() {
 }
 
 const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+
+/** 百炼 Token Plan 视频生成预设：wan3.0-video 参考生视频，密钥留空由用户自填。 */
+const bailianPreset = () => ({
+  id: newId('video'), name: '百炼 Token Plan · wan3.0-video', type: 'async-task',
+  baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com', model: 'wan3.0-video',
+  auth: { headerName: 'authorization', scheme: 'Bearer ' },
+  extraHeaders: { 'X-DashScope-Async': 'enable' },
+  submitPath: '/api/v1/services/aigc/video-generation/video-synthesis',
+  pollPath: '/api/v1/tasks/{{task_id}}',
+  taskIdPath: 'output.task_id', statusPath: 'output.task_status', videoUrlPath: 'output.video_url',
+  failedValues: ['FAILED', 'CANCELED', 'UNKNOWN', 'failed', 'error'],
+  pollIntervalMs: 15000, timeoutMs: 600000,
+  bodyTemplate: {
+    model: '{{model}}',
+    input: { prompt: '{{prompt}}', media: [{ type: 'reference_image', url: '{{image_url}}' }] },
+    parameters: { resolution: '720P', ratio: '1:1', duration: 6, audio: false, prompt_extend: false },
+  },
+})
 
 function ProviderEditor(props: {
   kind: 'image' | 'video' | 'clone'
@@ -139,7 +158,7 @@ function ProviderEditor(props: {
 
 function App() {
   const { state, error, refresh, setError } = useStudio()
-  const [tab, setTab] = useState<'pipeline' | 'clip' | 'voice' | 'providers'>('pipeline')
+  const [tab, setTab] = useState<'pipeline' | 'clip' | 'actions' | 'voice' | 'providers'>('pipeline')
   /*
    * 从视频裁动作的表单状态。
    *
@@ -156,6 +175,9 @@ function App() {
   const [aiRequest, setAiRequest] = useState('')
   const [aiBusy, setAiBusy] = useState(false)
   const [customAction, setCustomAction] = useState('')
+  const [actSkin, setActSkin] = useState('')
+  const [actForm, setActForm] = useState({ action: '', prompt: '', videoProviderId: '', approved: false })
+  const [previewBg, setPreviewBg] = useState<'checker' | 'white' | 'desk'>('checker')
 
   const config = draft ?? state?.config
   const run = async (label: string, fn: () => Promise<Result>) => {
@@ -198,6 +220,7 @@ function App() {
       <div className="row tabs">
         <button className={tab === 'pipeline' ? 'on' : ''} onClick={() => setTab('pipeline')}>形象流水线</button>
         <button className={tab === 'clip' ? 'on' : ''} onClick={() => setTab('clip')}>从视频裁动作</button>
+        <button className={tab === 'actions' ? 'on' : ''} onClick={() => setTab('actions')}>动作与预览</button>
         <button className={tab === 'voice' ? 'on' : ''} onClick={() => setTab('voice')}>自定义音色</button>
         <button className={tab === 'providers' ? 'on' : ''} onClick={() => setTab('providers')}>模型接入配置</button>
       </div>
@@ -258,6 +281,10 @@ function App() {
         <p className="muted">接你自己的模型：填 baseUrl 与协议字段即可。密钥加密落盘，配置里只留引用。ffmpeg：{state.ffmpeg ?? '未找到（后处理会停住并提示）'}</p>
         <label>ffmpeg 路径（可选）<input value={config.ffmpegPath ?? ''} onChange={e => setDraft({ ...config, ffmpegPath: e.target.value })} /></label>
         <label>抠像底色（可选）<input value={config.keyColor ?? ''} onChange={e => setDraft({ ...config, keyColor: e.target.value })} placeholder="0x00FF00" /></label>
+        <div className="row">
+          <button onClick={() => setDraft({ ...config, video: [...config.video, bailianPreset()] })}>一键添加百炼 Token Plan（wan3.0-video）</button>
+        </div>
+        <p className="muted">添加后在对应视频模型的「API 密钥」栏填你的 sk-sp- 开头密钥并保存配置；密钥加密落盘，配置里只留引用。</p>
         {(['image', 'video', 'clone'] as const).map(kind => (
           <section key={kind}>
             <div className="row">
@@ -362,6 +389,83 @@ function App() {
             <button onClick={() => void run('删除', () => api().deleteSkin(s.id))}>删除</button>
           </div>
         ))}
+      </>}
+
+      {tab === 'actions' && <>
+        <p className="muted">
+          管理已有角色的动作：生成的动作先进预览区，点「应用」才写入宠物；删除立即生效。
+          预览可换底色检查抠像干净程度，左边静图用来对比大小与站姿。
+        </p>
+        <div className="row">
+          <label>角色
+            <select value={actSkin} onChange={e => setActSkin(e.target.value)}>
+              <option value="">选择…</option>
+              {state.skins.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </label>
+          <label>预览底色
+            <select value={previewBg} onChange={e => setPreviewBg(e.target.value as 'checker' | 'white' | 'desk')}>
+              <option value="checker">透明格纹</option>
+              <option value="white">纯白</option>
+              <option value="desk">桌面蓝</option>
+            </select>
+          </label>
+        </div>
+        {actSkin !== '' && <>
+          <h2>生成新动作</h2>
+          <div className="card">
+            <label>动作名<input value={actForm.action} onChange={e => setActForm({ ...actForm, action: e.target.value })} placeholder="swagger" /></label>
+            <label>动作描述（prompt）
+              <textarea rows={3} value={actForm.prompt} onChange={e => setActForm({ ...actForm, prompt: e.target.value })} placeholder="双手插兜、歪头耸肩的swagger迈步，腿明显迈开，吊儿郎当的坏笑…" />
+            </label>
+            <label>视频模型
+              <select value={actForm.videoProviderId} onChange={e => setActForm({ ...actForm, videoProviderId: e.target.value })}>
+                <option value="">选择…</option>
+                {state.config.video.map(p => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
+              </select>
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={actForm.approved} onChange={e => setActForm({ ...actForm, approved: e.target.checked })} />
+              我知悉：1 次视频调用，费用计入我所配平台；形象参考用该角色静图
+            </label>
+            <button disabled={busy !== '' || !actForm.approved || !actForm.videoProviderId || !actForm.action.trim() || !actForm.prompt.trim()}
+              onClick={() => void run('生成动作', () => api().generateAction({ skinId: actSkin, action: actForm.action.trim(), prompt: actForm.prompt, videoProviderId: actForm.videoProviderId, approved: true }))}>
+              生成并进预览区
+            </button>
+          </div>
+          <h2>预览区（未应用）</h2>
+          {state.jobs.filter(j => j.kind === 'action' && j.skinId === actSkin && !j.appliedAt).map(j => (
+            <div className="card" key={j.id}>
+              <div className="row"><strong>{j.clips?.[0]?.action}</strong><span className="muted">{j.status}</span>
+                {j.status === 'ready' && <button onClick={() => void run('应用动作', () => api().applyAction(j.id))}>应用到宠物</button>}
+                {(j.status === 'queued' || j.status === 'clips' || j.status === 'post') && <button onClick={() => void run('取消', () => api().cancelJob(j.id))}>取消</button>}
+              </div>
+              {j.error && <div className="error">{j.error}</div>}
+              {j.status === 'ready' && (
+                <div className="row preview-row">
+                  <img className="preview" src={`pet-asset://custom/pets/${actSkin}.png`} alt="站姿对比" />
+                  <div className={`preview-stage bg-${previewBg}`}>
+                    <video src={`pet-asset://custom/staging/${actSkin}/${j.clips?.[0]?.action}.webm`} autoPlay loop muted playsInline />
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+          <h2>已有动作</h2>
+          {(state.skins.find(s => s.id === actSkin)?.actions ?? []).map((a: string) => (
+            <div className="card" key={a}>
+              <div className="row"><strong>{a}</strong>
+                <span className="muted">{state.actionAssets?.[actSkin]?.[a] === 'webm' ? '透明视频' : state.actionAssets?.[actSkin]?.[a] === 'frames' ? '帧序列' : '缺素材'}</span>
+                <button onClick={() => void run('删除动作', () => api().deleteAction(actSkin, a))}>删除</button>
+              </div>
+              {state.actionAssets?.[actSkin]?.[a] === 'webm' ? (
+                <div className={`preview-stage bg-${previewBg}`}>
+                  <video src={`pet-asset://custom/pets/webm/${actSkin}/${a}.webm`} autoPlay loop muted playsInline />
+                </div>
+              ) : <p className="muted">{state.actionAssets?.[actSkin]?.[a] === 'frames' ? '帧序列动作只在宠物上播放，这里不提供视频预览。' : '该动作暂无素材。'}</p>}
+            </div>
+          ))}
+        </>}
       </>}
 
       {tab === 'voice' && <>

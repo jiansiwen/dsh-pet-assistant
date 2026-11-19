@@ -63,6 +63,9 @@ import { CompanionTaskRuntime } from './task-runtime.ts'
 import { registerCompanionTools } from './task-tools.ts'
 import { decryptDpapiFile, decryptSecret, mailSendAccountKey, readMailConfig, registerMailTools } from './mail.ts'
 import { parseConfigArguments } from './config-args.ts'
+import { PET_SET_USAGE, describePetSetting, parsePetSetting } from './pet-settings.ts'
+import { MEETING_EDIT_USAGE, TASK_EDIT_USAGE, parseMeetingEdit, parseTaskEdit } from './edit-commands.ts'
+import { SKILL_SET_USAGE, parseSkillCommand, skillRequestBody } from './skill-commands.ts'
 import {
   MAIL_CONFIG_HINT,
   checkMailConfig,
@@ -92,6 +95,8 @@ import { registerComputerTools } from './computer.ts'
 import { localDateOf } from './time.ts'
 import { applyRetention, startRetention } from './retention.ts'
 import { registerAssistantTools } from './tools.ts'
+import { SkillFormation, type SkillSample } from './skill-formation.ts'
+import { hostLlm } from './host-agents.ts'
 import { ensureRecallSchema, RECALL_EMPTY_INJECTION, recallMemories, reconcileRecallIndex } from './recall-index.ts'
 import { ActivityTracker } from './tracker.ts'
 import { ArtifactStore } from './artifacts.ts'
@@ -104,6 +109,12 @@ import { mountReportWorkbench } from './workbench.ts'
 import { fileKeyCodec, SubAssistantSecrets } from './sub-assistant-secrets.ts'
 import { SubAssistantRegistry } from './sub-assistant-registry.ts'
 import { SubAssistantDispatch } from './sub-assistant-dispatch.ts'
+import {
+  formatAssistantState,
+  InjectionGate,
+  type AssistantCaptureState,
+  type AssistantPower,
+} from './injection.ts'
 
 export { Config } from './config.ts'
 
@@ -118,6 +129,15 @@ export const inject = ['tools', 'storageDomain', 'systemPrompt']
 
 /** 插件上次经 /session/start 自建的会话 id；桌面再开始会话时据此恢复。 */
 const OWNED_SESSION_FLAG = 'bridge_owned_session_id'
+
+/**
+ * 会话面总开关的持久化标志。
+ *
+ * `true` = 工具与助理人设注入主会话；`false` = 插件仍加载（桌宠桥接在），但模型看不到
+ * 这个插件的任何工具、也不按助理人设说话。缺省值（从没写过）按当时的采集状态推断：
+ * 老用户升级上来时"个人助理模式本来就开着"就继续开，全新安装则保持关闭，等用户自己点。
+ */
+const ASSISTANT_ENABLED_FLAG = 'assistant_enabled'
 
 function dshHome(): string {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
@@ -233,9 +253,11 @@ function hostCommands(ctx: PluginContext): HostCommands | undefined {
 
 export interface UserCommandDeps {
   bridge: SessionBridge
-  tracker: ActivityTracker
-  captureBlockedReason: () => string | null
-  captureScopeAuthorized: () => boolean
+  /**
+   * 会话面总开关。按钮与斜杠命令都走它：开启 = 工具/提示词挂上主会话 + 尽量开始采集；
+   * 关闭 = 撤掉会话面 + 停止采集。桌宠桥接与命令不受它影响。
+   */
+  power: AssistantPower
   log?: (message: string) => void
   /**
    * 工作台概览的三个数字（只读）。宿主没接数据源时整条命令回「暂时读不到」，
@@ -290,7 +312,7 @@ export function registerUserCommands(ctx: PluginContext, deps: UserCommandDeps):
 function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
   const commands = hostCommands(ctx)
   if (!commands) return false
-  const { bridge, tracker } = deps
+  const { bridge, power } = deps
   // 配置命令要落盘，所以这里统一解析一次 home：生产走 dshHome()，测试注入临时目录。
   const home = deps.home ?? dshHome()
   ctx.effect(() => {
@@ -349,34 +371,223 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
 
     register({
       name: 'assistant-on',
-      description: '开启个人助理模式，开始记录电脑活动',
+      description: '开启个人助理：把助理工具与人设注入当前会话，并尽量开始记录电脑活动',
       recordInput: false,
       async handler() {
-        const blocked = deps.captureBlockedReason()
-        if (blocked) return { kind: 'error', text: `未开启活动记录：${blocked}` }
-        if (!deps.captureScopeAuthorized()) {
-          return { kind: 'error', text: '采集范围还没确认：先在对话里说一次「开启个人助理模式」完成确认' }
-        }
-        if (tracker.capturing) return { kind: 'success', text: '个人助理模式已经在运行' }
-        try {
-          await tracker.start()
-          return { kind: 'success', text: '个人助理模式已开启，开始记录电脑活动' }
-        } catch (error) {
-          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-        }
+        const result = await power.enable()
+        return { kind: result.ok ? 'success' : 'error', text: result.text }
       },
     })
 
     register({
       name: 'assistant-off',
-      description: '关闭个人助理模式，停止记录电脑活动',
+      description: '关闭个人助理：撤回助理工具与人设注入，并停止记录电脑活动（桌宠壳保留）',
+      recordInput: false,
+      async handler() {
+        const result = await power.disable()
+        return { kind: result.ok ? 'success' : 'error', text: result.text }
+      },
+    })
+
+    /*
+     * 开关与采集的真实状态。客户端以前只能"按本页点过什么"猜开关，刷新一次就回到未知；
+     * 这条命令把两个事实分开给：工具注入了没有、活动在不在记录。
+     */
+    register({
+      name: 'assistant-state',
+      description: '个人助理开关与活动记录状态（只读）',
+      recordInput: false,
+      handler() {
+        return { kind: 'success', text: formatAssistantState(power.state()) }
+      },
+    })
+
+    /*
+     * 宠物外观配置：形象、随机动作、显示/隐藏、上台/退下。
+     *
+     * 这些项以前只在桌宠右键菜单里改。工作台只做"读一份 + 改一项"，真正的合法性
+     * （皮肤是否登记、动作是否属于当前皮肤）由桌宠主进程裁决 —— 两边各写一份白名单
+     * 迟早会不一致，而皮肤是用户随时会新增的。
+     */
+    register({
+      name: 'assistant-pet-config',
+      description: '读取桌面宠物的形象、随机动作、显示与上台状态（只读，JSON）',
       recordInput: false,
       async handler() {
         try {
-          await tracker.stop()
-          return { kind: 'success', text: '个人助理模式已关闭，已停止记录' }
-        } catch (error) {
-          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+          const reply = await bridge.requestDesktopCommand('pet.config.summary', {}, { timeoutMs: 3_000 })
+          if (reply === null || typeof reply !== 'object' || Array.isArray(reply)) {
+            return { kind: 'success' as const, text: JSON.stringify({ ok: false, unavailable: true, message: '桌面宠物没有回包' }) }
+          }
+          return { kind: 'success' as const, text: JSON.stringify({ ok: true, ...(reply as Record<string, unknown>) }) }
+        } catch {
+          return { kind: 'success' as const, text: JSON.stringify({ ok: false, unavailable: true, message: '桌面宠物没在运行，先召唤它' }) }
+        }
+      },
+    })
+    register({
+      name: 'assistant-pet-set',
+      description: '修改桌面宠物：skin/actions/stage/step（写入后桌宠立即生效）',
+      recordInput: false,
+      async handler(invocation) {
+        const request = parsePetSetting(invocation.rawInput)
+        if (request === null) return { kind: 'success' as const, text: PET_SET_USAGE }
+        try {
+          const reply = await bridge.requestDesktopCommand('pet.config.set', request, { timeoutMs: 5_000 }) as
+            | { applied?: unknown; error?: unknown }
+            | null
+            | undefined
+          if (reply !== null && reply !== undefined && reply.applied === true) {
+            return { kind: 'success' as const, text: describePetSetting(request) }
+          }
+          const reason = typeof reply?.error === 'string' && reply.error !== '' ? reply.error : '桌面宠物没有确认这次修改'
+          return { kind: 'error' as const, text: `设置没改成：${reason}` }
+        } catch {
+          return { kind: 'error' as const, text: '设置没改成：桌面宠物没在运行，先召唤它' }
+        }
+      },
+    })
+
+    // ── 待办/提醒 行内改删（改标题/改期/取消走待批提案；间隔走桌宠本机确认）──
+    register({
+      name: 'assistant-task-set',
+      description: '改一条待办/提醒：title|deadline|interval|cancel（写操作走本人确认）',
+      recordInput: false,
+      async handler(invocation) {
+        const request = parseTaskEdit(invocation.rawInput)
+        if (request === null) return { kind: 'success' as const, text: TASK_EDIT_USAGE }
+        if (request.kind === 'interval') {
+          try {
+            const reply = await bridge.requestDesktopCommand('task.set-interval',
+              { taskId: request.taskId, repeatEverySeconds: request.seconds }, { timeoutMs: 15_000 }) as
+              | { applied?: unknown; error?: unknown } | null | undefined
+            if (reply !== null && reply !== undefined && reply.applied === true) {
+              return { kind: 'success' as const, text: `已把催办间隔改为 ${Math.round(request.seconds / 60)} 分钟` }
+            }
+            const reason = typeof reply?.error === 'string' && reply.error !== '' ? reply.error : '桌面宠物没有确认这次修改'
+            return { kind: 'error' as const, text: `间隔没改成：${reason}` }
+          } catch {
+            return { kind: 'error' as const, text: '间隔没改成：桌面宠物没在运行，先召唤它' }
+          }
+        }
+        const tasks = deps.tasks
+        if (tasks === undefined) return { kind: 'error' as const, text: '没改成：任务运行时不可用' }
+        const path = `/companion/v1/tasks/${encodeURIComponent(request.taskId)}`
+        try {
+          const detail = await tasks.request('GET', path, null, 'client')
+          const view = (detail.body as { task?: { revision?: unknown; title?: unknown; schedule?: { spec?: unknown } } } | null)?.task
+          const revision = view?.revision
+          if (detail.status !== 200 || typeof revision !== 'number') {
+            return { kind: 'error' as const, text: '没改成：没找到这条待办' }
+          }
+          let action: string
+          let payload: Record<string, unknown>
+          if (request.kind === 'title') {
+            action = 'set-title'
+            payload = { title: request.value }
+          } else if (request.kind === 'cancel') {
+            action = 'cancel'
+            payload = {}
+          } else {
+            action = 'reschedule'
+            // 提醒（有 schedule）改期要保留重复规则：只换首次时间/每日时刻；
+            // 人工待办（无 schedule）才用明确截止时间。混用会被运行时拒。
+            const spec = view?.schedule?.spec as { kind?: unknown; localTime?: unknown } | undefined
+            if (spec && typeof spec === 'object' && typeof spec.kind === 'string') {
+              if (spec.kind === 'daily') {
+                const d = new Date(request.value)
+                const hh = String(d.getHours()).padStart(2, '0')
+                const mm = String(d.getMinutes()).padStart(2, '0')
+                payload = { schedule: { ...spec, localTime: `${hh}:${mm}` } }
+              } else {
+                payload = { schedule: { ...spec, runAt: request.value } }
+              }
+            } else {
+              payload = { deadlineAt: request.value }
+            }
+          }
+          const result = await tasks.request('POST', `${path}/${action}`, {
+            protocolVersion: 1,
+            commandId: randomUUID(),
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            payload,
+            taskId: request.taskId,
+            expectedRevision: revision,
+          }, 'client')
+          if (result.status === 202) {
+            const title = typeof view?.title === 'string' ? view.title : request.taskId
+            const label = request.kind === 'title' ? `标题改为「${request.value}」` : request.kind === 'deadline' ? '改期' : '取消（删除）'
+            return { kind: 'success' as const, text: `已提交「${title}」${label}，请在桌面宠物里确认` }
+          }
+          const message = (result.body as { message?: unknown } | null)?.message
+          return { kind: 'error' as const, text: `没改成：${typeof message === 'string' && message !== '' ? message : '桌面还没有确认'}` }
+        } catch {
+          return { kind: 'error' as const, text: '没改成：任务运行时暂时不可用' }
+        }
+      },
+    })
+
+    // ── 会议 行内改删（重命名/删除整场；删除走桌宠原生确认）─────────────
+    register({
+      name: 'assistant-meeting-set',
+      description: '改一场会议：rename|delete（删除整场含录音，走桌面确认）',
+      recordInput: false,
+      async handler(invocation) {
+        const request = parseMeetingEdit(invocation.rawInput)
+        if (request === null) return { kind: 'success' as const, text: MEETING_EDIT_USAGE }
+        const command = request.kind === 'rename' ? 'meeting.rename' : 'meeting.delete'
+        const payload = request.kind === 'rename'
+          ? { meetingId: request.meetingId, name: request.name }
+          : { meetingId: request.meetingId }
+        try {
+          const reply = await bridge.requestDesktopCommand(command, payload, { timeoutMs: 20_000 }) as
+            | { applied?: unknown; error?: unknown } | null | undefined
+          if (reply !== null && reply !== undefined && reply.applied === true) {
+            return {
+              kind: 'success' as const,
+              text: request.kind === 'rename' ? `会议已重命名为「${request.name}」` : '已删除整场会议（录音、转写与纪要）',
+            }
+          }
+          const reason = typeof reply?.error === 'string' && reply.error !== '' ? reply.error : '桌面宠物没有确认这次修改'
+          return { kind: 'error' as const, text: `没改成：${reason}` }
+        } catch {
+          return { kind: 'error' as const, text: '没改成：桌面宠物没在运行，先召唤它' }
+        }
+      },
+    })
+
+    // ── 技能：列表 + 增删改查/晋升/回滚/退役/证据确认（owner=本人桌面操作）──
+    register({
+      name: 'assistant-skills',
+      description: '读取全部技能与待形成/待核实样本（只读，JSON）',
+      recordInput: false,
+      async handler() {
+        const tasks = deps.tasks
+        if (tasks === undefined) return { kind: 'success' as const, text: JSON.stringify({ ok: false, message: '技能库不可用' }) }
+        try {
+          const result = await tasks.request('GET', '/companion/v1/skills', null, 'owner')
+          return { kind: 'success' as const, text: JSON.stringify({ ok: result.status === 200, ...(result.body as Record<string, unknown>) }) }
+        } catch {
+          return { kind: 'success' as const, text: JSON.stringify({ ok: false, message: '技能库暂时读不到' }) }
+        }
+      },
+    })
+    register({
+      name: 'assistant-skill-set',
+      description: '技能增删改查/晋升/回滚/退役/证据确认（写操作走本人桌面可信路由）',
+      recordInput: false,
+      async handler(invocation) {
+        const command = parseSkillCommand(invocation.rawInput)
+        if (command === null) return { kind: 'success' as const, text: SKILL_SET_USAGE }
+        const tasks = deps.tasks
+        if (tasks === undefined) return { kind: 'error' as const, text: '技能库不可用' }
+        try {
+          const result = await tasks.request('POST', '/companion/v1/skills', skillRequestBody(command), 'owner')
+          if (result.status === 200) return { kind: 'success' as const, text: '技能已更新' }
+          const message = (result.body as { message?: unknown } | null)?.message
+          return { kind: 'error' as const, text: `技能没改成：${typeof message === 'string' && message !== '' ? message : '桌面还没有确认'}` }
+        } catch {
+          return { kind: 'error' as const, text: '技能没改成：任务运行时暂时不可用' }
         }
       },
     })
@@ -476,8 +687,9 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
           const raw = Array.isArray(reply?.meetings) ? reply.meetings : null
           const rows: MeetingListRow[] | null = raw === null ? null : raw.flatMap(item => {
             if (item === null || typeof item !== 'object') return []
-            const record = item as { startedAt?: unknown; name?: unknown; state?: unknown }
+            const record = item as { id?: unknown; startedAt?: unknown; name?: unknown; state?: unknown }
             return [{
+              id: typeof record.id === 'string' ? record.id : '',
               startedAt: typeof record.startedAt === 'number' ? record.startedAt : 0,
               name: typeof record.name === 'string' ? record.name : EMPTY_FIELD,
               state: typeof record.state === 'string' ? record.state : '',
@@ -824,6 +1036,15 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     captureScopeAuthorized,
   })
 
+  /*
+   * 会话面总开关。所有"只该在个人助理开启时出现在模型面前"的东西都登记在这里：
+   * 工具、系统提示词、会话事件订阅。桥接、命令、任务库不在其中 —— 桌宠壳依赖它们。
+   *
+   * 先登记、后按持久化状态决定是否 `enable()`：登记顺序与既有装配顺序一致，
+   * 关闭时逐项撤回，开启时再按同一顺序挂回去。
+   */
+  const surface = new InjectionGate({ log })
+
   // 保留期清理排在迁移之后：先搬再删，反过来会把还没搬进新库的原文直接删掉。
   const runRetention = () => {
     if (migration && !migration.complete) return
@@ -866,15 +1087,31 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       try { return statSync(dir).isDirectory() } catch { return false }
     },
   })
+  /*
+   * 成员/文档会话共用的工作区解析器。bridge 构造时成员运行时还没建，先用进程目录兜底；
+   * bridge 建好后立刻换成完整解析（绑定会话 cwd > header cwd > 进程 cwd）。
+   * 文档会话 scope 要把 cwd 进键，必须与成员会话实际落的工作区同一口径。
+   */
+  let memberCwd: () => string | undefined = () => process.cwd()
   const bridge = new SessionBridge({
     dshHome: home,
     petDir: petDirResolution.dir ?? undefined,
     activityState: () => ({ active: tracker.active, capturing: tracker.capturing, titles: tracker.captureTitles }),
     logger,
     sessionHost,
+    cwd: () => memberCwd(),
     evidenceIntake: request => evidenceIntakeHandler?.(request)
       ?? { ok: false, error: '证据库还在初始化，请稍后重试' },
   })
+  memberCwd = () => {
+    let bound: string | null = null
+    try { bound = bridge.boundSessionCwd() } catch { /* 取不到就退回下面的逻辑 */ }
+    let headerCwd: unknown
+    try {
+      headerCwd = (ctx as unknown as { session?: { header?: { cwd?: unknown } } }).session?.header?.cwd
+    } catch { /* 取不到就退回进程目录 */ }
+    return resolveMemberCwd(bound, headerCwd, process.cwd())
+  }
 
   // 帮助授权与主动帮助 episode 各只有一份：工具、团队执行器与主动提醒共用，授权与追溯落在同一处。
   const helpContexts = new HelpContextStore(db)
@@ -918,23 +1155,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   })
   const memberRuntime = new MemberRuntime({
     ctx: ctx as never,
-  /* 成员会话挂到总助理当前的工作目录下：这里取一次，运行时才知道该挂哪儿。 */
-  cwd: () => {
-    /* 优先用绑定会话的真实 cwd：插件根 ctx 没有 session，process.cwd() 是桌面进程目录，
-       拿它建成员会话会落进错误分组。取不到再退回 ctx 会话 header，最后才是进程目录。 */
-    let bound: string | null = null
-    try { bound = bridge.boundSessionCwd() } catch { /* 取不到就退回下面的逻辑 */ }
-    let headerCwd: unknown
-    try {
-      headerCwd = (ctx as unknown as { session?: { header?: { cwd?: unknown } } }).session?.header?.cwd
-    } catch { /* 取不到就退回进程目录 */ }
-    /*
-      退路：插件拿不到当前会话的 cwd 时用宿主进程的工作目录。
-      没有退路时的后果是成员会话落进 `_no-cwd`，在工作区列表里根本看不见 ——
-      用户只会觉得"小会没有会话"，而不是"cwd 传丢了"。
-    */
-    return resolveMemberCwd(bound, headerCwd, process.cwd())
-  },
+  /* 成员会话挂到总助理当前的工作目录下：与文档会话 scope 共用同一个解析器。 */
+  cwd: () => memberCwd(),
   directory: teamStore.directory, defaultModel: () => resolveDefaultModel(home),
     log,
     enabled: () => teamRuntime !== null,
@@ -961,14 +1183,14 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       attachComputerExecutor: fn => companionRuntime.attachComputerExecutor(fn),
     }),
     /*
-     * 成员自报"做完了"只记**未核实**样本：技能判定只数本人确认过的，
-     * 所以这条路径不会让技能自动生效，只会让桌面的"待核实"列表里出现一条。
-     * 长度与空值在存储层还有一道校验，这里先过滤掉明显无意义的 shape。
+     * 成员自报"做完了"记**未核实**样本。自动形成开启时，自报样本攒够也会总结成技能
+     * （来源标 auto-selfreport，界面提示"待查验"），但是否默认生效仍由 skillsAutoActivate 决定；
+     * 扩权一律停候选。长度与空值在存储层还有一道校验，这里先过滤明显无意义的 shape。
      */
     noteWork: (assistantId: string, shape: string) => {
       const clean = shape.trim()
       if (clean.length < 2 || clean.length > 30) return
-      skills.noteSuccess(assistantId, clean, false)
+      skillFormation.record(assistantId, clean, false)
     },
     desktop: { binding: () => bridge.currentDesktopBinding(),
       request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options) },
@@ -998,11 +1220,71 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ttlMs: Math.max(10_000, config.approvalTtlMs),
     runtimeEpoch: bridge.epoch,
   })
+
+  /*
+   * 技能自动形成：本人确认完成 / 成员自报完成 → 记样本 → 达标后让模型总结成技能。
+   * 计数归代码、正文归模型；默认自动生效，扩权（scopeChanged）仍停候选须本人批准。
+   */
+  const skillNorm = (value: string): string => value.trim().normalize('NFKC').toLowerCase()
+  const skillSamples = (ownerId: string, shape: string): SkillSample[] => {
+    const target = skillNorm(shape)
+    return teamStore.listTasks({ runtimeScope: 'companion' })
+      .filter(task => task.ownerId === ownerId && skillNorm(task.goal) === target)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 6)
+      .map(task => ({
+        goal: task.goal,
+        acceptance: Array.isArray(task.acceptance) ? task.acceptance.join('；') : String(task.acceptance ?? ''),
+        artifacts: JSON.stringify(task.artifacts ?? []).slice(0, 600),
+        updatedAt: task.updatedAt,
+      }))
+  }
+  const synthesizeSkill = async (ownerId: string, shape: string, samples: SkillSample[]): Promise<{ body: string; scopeChanged: boolean } | null> => {
+    const llm = hostLlm(ctx as never)
+    const model = resolveDefaultModel(home)
+    if (!llm || !model) return null
+    const material = samples.map((item, index) =>
+      `【样本${index + 1}】目标：${item.goal}\n验收：${item.acceptance || '（无）'}\n产物/证据：${item.artifacts || '（无）'}`).join('\n\n')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60_000)
+    let answer = ''
+    let ended: string | undefined
+    try {
+      for await (const chunk of llm.stream({
+        provider: model.provider, model: model.model,
+        system: '你是技能总结器。把同一类工作的多次真实记录总结成一份可复用技能正文（做什么、按什么步骤、注意什么）。只输出 JSON：{"body": string, "scopeChanged": boolean}。body 用中文、分步骤、可执行；scopeChanged 仅当做法需要读取新目录或执行命令等超出当前只读权限时为 true。不要编造记录里没有的步骤。',
+        messages: [{ role: 'user', content: [{ type: 'text', text: `助理：${ownerId}\n同类工作：${shape}\n真实记录：\n${material}\n请总结成技能。` }] }],
+        maxTokens: 2048, temperature: 0.2, signal: controller.signal,
+      })) {
+        if (chunk.type === 'text-delta') answer += chunk.text
+        else if (chunk.type === 'finish') ended = chunk.reason.kind
+      }
+    } catch { return null } finally { clearTimeout(timer) }
+    if (ended === 'error' || ended === 'aborted') return null
+    const start = answer.indexOf('{')
+    const end = answer.lastIndexOf('}')
+    if (start < 0 || end <= start) return null
+    try {
+      const parsed = JSON.parse(answer.slice(start, end + 1)) as { body?: unknown; scopeChanged?: unknown }
+      if (typeof parsed.body !== 'string' || parsed.body.trim() === '') return null
+      return { body: parsed.body, scopeChanged: parsed.scopeChanged === true }
+    } catch { return null }
+  }
+  const skillFormation = new SkillFormation({
+    skills,
+    autoForm: () => config.skillsAutoForm,
+    autoActivate: () => config.skillsAutoActivate,
+    samples: skillSamples,
+    synthesize: synthesizeSkill,
+    log,
+  })
+
   const companionRuntime = new CompanionTaskRuntime(teamStore, teamApprovals, {
     epoch: bridge.epoch,
     log,
     canRetryBusy: () => bridge.isCurrentDiscovery(),
     onChange: () => bridge.notifyApprovalSnapshot(),
+    onManualComplete: task => skillFormation.record(task.ownerId, task.goal, true),
     activeMailAccount: () => {
       const mail = readMailImapConfig(home)
       const member = mailMember()
@@ -1012,22 +1294,13 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   bridge.attachCompanion(companionRuntime, teamApprovals)
   bridge.setChatContextProvider(() => companionRuntime.consumeContextForChat())
   companionRuntime.start()
-  ctx.effect(() => registerCompanionTools(ctx as never, companionRuntime, bridge), 'personal-assistant:companion-tools')
-  try {
-    const assets = path.join(pluginDir, 'assets')
-    ctx.effect(() => registerComputerTools(ctx as never, {
-      scriptDir: assets, shotDir: path.join(home, 'personal-assistant', 'screenshots'),
-      approvalMode: () => config.approvalMode, bridge, log,
-      attachComputerExecutor: fn => companionRuntime.attachComputerExecutor(fn),
-    }), 'personal-assistant:computer-tools')
-  } catch (error) {
-    log(`[warn] 电脑操作工具注册失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-  try {
-    ctx.effect(() => registerMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log }), 'personal-assistant:mail-tools')
-  } catch (error) {
-    log(`[warn] 邮件工具注册失败：${error instanceof Error ? error.message : String(error)}`)
-  }
+  surface.add('companion-tools', () => registerCompanionTools(ctx as never, companionRuntime, bridge))
+  surface.add('computer-tools', () => registerComputerTools(ctx as never, {
+    scriptDir: path.join(pluginDir, 'assets'), shotDir: path.join(home, 'personal-assistant', 'screenshots'),
+    approvalMode: () => config.approvalMode, bridge, log,
+    attachComputerExecutor: fn => companionRuntime.attachComputerExecutor(fn),
+  }))
+  surface.add('mail-tools', () => registerMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log }))
   // 渠道层只做连接、身份、去重、串行和会话映射；对话与工具仍走宿主同一个 agent。
   const channelsFile = path.join(home, 'personal-assistant', 'channels.json')
   const readChannelSettings = (): ChannelSettings => {
@@ -1138,23 +1411,15 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       ? { accountKey: current, botId: config.botId } : null
   }
   companionRuntime.setChannelAccountKey(() => activeWecomBinding()?.accountKey ?? null)
-  try {
-    ctx.effect(() => registerMeetingMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log,
-      wecomBinding: recipient => channelManager.canDeliver(recipient) ? activeWecomBinding() : null,
-      wecomRecipients: () => channelManager.settingsSnapshot().deliverHere.filter(recipient => channelManager.canDeliver(recipient)),
-      reminderInterval: () => settings.getReminderInterval(),
-      ensureReminder: intentId => companionRuntime.ensureMeetingMailReminder(intentId) }), 'personal-assistant:meeting-mail-tools')
-  } catch (error) {
-    log(`[warn] 会议邮件交接工具注册失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-  try {
-    ctx.effect(() => registerMeetingPresentationTools(ctx as never, {
-      binding: agent => bridge.desktopBinding(agent),
-      request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options),
-    }), 'personal-assistant:meeting-presentation-tools')
-  } catch (error) {
-    log(`[warn] 会议讲解工具注册失败：${error instanceof Error ? error.message : String(error)}`)
-  }
+  surface.add('meeting-mail-tools', () => registerMeetingMailTools(ctx as never, { home, bridge, store: teamStore, epoch: bridge.epoch, log,
+    wecomBinding: recipient => channelManager.canDeliver(recipient) ? activeWecomBinding() : null,
+    wecomRecipients: () => channelManager.settingsSnapshot().deliverHere.filter(recipient => channelManager.canDeliver(recipient)),
+    reminderInterval: () => settings.getReminderInterval(),
+    ensureReminder: intentId => companionRuntime.ensureMeetingMailReminder(intentId) }))
+  surface.add('meeting-presentation-tools', () => registerMeetingPresentationTools(ctx as never, {
+    binding: agent => bridge.desktopBinding(agent),
+    request: (command, payload, options) => bridge.requestDesktopCommand(command, payload, options),
+  }))
   ctx.effect(() => () => {
     mailWatcher.stop()
     void (async () => {
@@ -1286,6 +1551,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const enableTeamMode = (): { toolsRegistered: boolean } => {
     if (teamRuntime) return { toolsRegistered: teamRuntime.toolsRegistered }
     teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log, helpContexts, helpEpisodes, store: teamStore, approvals: teamApprovals, members: memberRuntime })
+    // 总开关关闭时团队服务照常上台（宠物团队页可用），但委派工具不注入主会话。
+    if (!surface.enabled) teamRuntime.unmountTools()
     setUserFlag(db, 'team_mode_enabled', 'true')
     return { toolsRegistered: teamRuntime.toolsRegistered }
   }
@@ -1320,6 +1587,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   }
   const memberManagement = new MemberManagement({
     directory: teamStore.directory, runtime: memberRuntime, memories: memberMemories,
+    cwd: () => memberCwd(),
     /*
      * 记忆共享开关的数据面：只列**已确认的全局记忆**。
      * 候选、项目范围、冲突态不进列表 —— 列表里出现开关，用户就会以为点了能共享，
@@ -1340,11 +1608,20 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     skills: () => skills.list().map(item => ({
       id: item.id, assistantId: item.assistantId,
       assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId,
-      name: item.name, body: item.body, version: item.version, status: item.status, createdAt: item.createdAt,
+      name: item.name, body: item.body, version: item.version, status: item.status, createdAt: item.createdAt, origin: item.origin,
     })),
     skillEdit: input => {
-      if (input.action === 'rollback') skills.rollback(input.id, input.version ?? 1)
-      else {
+      if (input.action === 'create') {
+        skills.save(input.assistantId, { name: input.name, body: input.body }, 'active', Date.now(), 'manual')
+      } else if (input.action === 'delete') {
+        skills.remove(input.id)
+      } else if (input.action === 'edit') {
+        const current = skills.history(input.id)[0]
+        if (!current) throw new Error('技能不存在或已被删除')
+        skills.save(current.assistantId, { name: current.name, body: input.body }, 'active', Date.now(), 'manual')
+      } else if (input.action === 'rollback') {
+        skills.rollback(input.id, input.version ?? 1)
+      } else {
         const current = skills.history(input.id)[0]
         if (!current) throw new Error('技能不存在或已被删除')
         skills.save(current.assistantId, { name: current.name, body: current.body },
@@ -1353,7 +1630,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       return skills.list().map(item => ({
         id: item.id, assistantId: item.assistantId,
         assistantName: teamStore.directory.get(item.assistantId)?.displayName ?? item.assistantId,
-        name: item.name, body: item.body, version: item.version, status: item.status, createdAt: item.createdAt,
+        name: item.name, body: item.body, version: item.version, status: item.status, createdAt: item.createdAt, origin: item.origin,
       }))
     },
     skillUnverified: () => teamStore.directory.list().flatMap(member => skills.listShapes(member.assistantId)
@@ -1515,7 +1792,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     }
   }
 
-  registerAssistantTools(ctx as never, tracker, {
+  surface.add('assistant-tools', () => registerAssistantTools(ctx as never, tracker, {
     reportDir,
     bridge,
     memories,
@@ -1563,7 +1840,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     subAssistantDispatch: {
       dispatch: (assistantId, task, dispatchId) => subAssistantDispatch.dispatch(assistantId, task, dispatchId),
     },
-  })
+  }))
   // 一键入口：输入框「+ → 指令」里的召唤与开关，不经过模型、不产生消息。
   // 工作台概览的数据源：全部只读，且都复用既有存储（team.sqlite 的任务表 / work_items 表）。
   // 会议数没有本地数据源 —— 会议记录在桌宠侧（dsh-pet 的 meetings.sqlite），插件这边读不到，
@@ -1599,11 +1876,141 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     } catch { /* 表还没建好：保持 null */ }
     return { openTodos, awaitingUser, meetingsToday: null, activeMs, topSubject }
   }
+  // 主动帮助的候选与选定：选定的读取范围只经桌面可信审批生效，模型自报的范围无效。
+  surface.add('help-episode-tools', () => registerHelpEpisodeTools(ctx as never, {
+    episodes: helpEpisodes,
+    helpContexts,
+    submit: submission => bridge.submitAssistant(submission),
+  }))
+
+  /**
+   * 采集范围的可信审批提案。`/assistant-on` 按钮在没有确认过范围时直接提交一张，
+   * 而不是让用户先去聊天里说一句话 —— 工具已经注入后模型当然也能提交，但按钮是
+   * 用户此刻明确的意图，多绕一步只会让人以为"点了没反应"。
+   */
+  const proposeCaptureScope = (): void => {
+    const snapshot = structuredClone(describeCaptureScope(tracker.captureTitles))
+    const digest = snapshotDigest(snapshot)
+    bridge.submitAssistant({
+      subject: 'capture',
+      tool: 'personal_assistant_ack_capture_scope',
+      summary: '批准前台活动采集范围。应用、可选标题与空闲指标保存在本机，活动证据可能发往当前会话模型服务商用于解释和日报；不读聊天正文，不采集键鼠内容。',
+      target: '本机活动采样与当前会话模型',
+      risk: 'high',
+      snapshot,
+      validate: () => captureBlockedReason() === null && digest === snapshotDigest(describeCaptureScope(tracker.captureTitles)),
+      execute: () => {
+        setUserFlag(db, 'capture_scope_digest', digest)
+        return { acked: true }
+      },
+    })
+  }
+
+  /** 当前采集事实：在录 / 想录但没起来（等范围或权限）/ 被配置拦住 / 关着。 */
+  const captureStateNow = (): AssistantCaptureState => {
+    if (tracker.capturing) return 'recording'
+    if (captureBlockedReason() !== null) return 'blocked'
+    if (tracker.active) return 'pending'
+    return 'off'
+  }
+
+  const assistantPower: AssistantPower = {
+    enabled: () => surface.enabled,
+    state: () => ({
+      injection: surface.enabled ? 'on' : 'off',
+      capture: captureStateNow(),
+      blocked: captureBlockedReason(),
+    }),
+    async enable() {
+      const changed = !surface.enabled
+      if (changed) {
+        setUserFlag(db, ASSISTANT_ENABLED_FLAG, 'true')
+        surface.enable()
+        teamRuntime?.mountTools()
+      }
+      const blocked = captureBlockedReason()
+      if (blocked !== null) {
+        return {
+          ok: true, changed, capture: 'blocked',
+          text: `${changed ? '个人助理已开启：工具与人设已注入当前会话' : '个人助理已经开启'}；活动记录未开启：${blocked}`,
+        }
+      }
+      if (!captureScopeAuthorized(tracker.captureTitles)) {
+        try {
+          proposeCaptureScope()
+          return {
+            ok: true, changed, capture: 'pending',
+            text: '个人助理已开启：工具已注入当前会话；活动记录等你在桌面宠物里确认采集范围后开始',
+          }
+        } catch (error) {
+          return {
+            ok: true, changed, capture: 'pending',
+            text: `个人助理已开启；但采集范围审批没能提交：${error instanceof Error ? error.message : String(error)}`,
+          }
+        }
+      }
+      if (tracker.capturing) {
+        return { ok: true, changed, capture: 'recording', text: changed ? '个人助理已开启：工具已注入，活动记录进行中' : '个人助理已经在运行' }
+      }
+      try {
+        await tracker.start()
+        return {
+          ok: true, changed, capture: 'recording',
+          text: changed ? '个人助理已开启：工具已注入，开始记录活动' : '个人助理已开启，开始记录活动',
+        }
+      } catch (error) {
+        return {
+          ok: false, changed, capture: captureStateNow(),
+          text: `个人助理工具已开启，但活动记录没能开始：${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+    },
+    async disable() {
+      const changed = surface.enabled
+      if (changed) {
+        setUserFlag(db, ASSISTANT_ENABLED_FLAG, 'false')
+        surface.disable()
+        teamRuntime?.unmountTools()
+      }
+      try {
+        await tracker.stop()
+      } catch (error) {
+        return {
+          ok: false, changed, capture: captureStateNow(),
+          text: `个人助理已关闭，但活动记录停止失败：${error instanceof Error ? error.message : String(error)}`,
+        }
+      }
+      return {
+        ok: true, changed, capture: 'off',
+        text: changed ? '个人助理已关闭：工具已撤回，活动记录已停止；桌面宠物保留' : '个人助理已经是关闭的',
+      }
+    },
+  }
+
+  /*
+   * 初始状态。从没写过标志时沿用当时的采集状态：升级上来的用户"助理模式本来就开着"，
+   * 不应该因为这次改动突然失去工具；全新安装（采集没开过）则保持关闭，等用户自己点。
+   * 明确关闭过（false）时顺手停掉采集 —— 开关关着就"什么都不记录"是这条开关的承诺。
+   */
+  const enabledFlag = getUserFlag(db, ASSISTANT_ENABLED_FLAG)
+  const initialEnabled = enabledFlag === null ? tracker.active : enabledFlag === 'true'
+  if (initialEnabled) {
+    surface.enable()
+    // 团队工具不在 surface 的注册表里（它随 mountTeam 挂载，且当时 gate 可能还没开），
+    // 启动时补挂一次，避免"个人助理开着但团队委派工具缺失"。
+    const mountedTeam = teamRuntime as TeamRuntime | null
+    mountedTeam?.mountTools()
+  } else if (tracker.active) {
+    try { await tracker.stop() } catch (error) {
+      log(`[warn] 个人助理已关闭，但停止采集失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  // 插件卸载时撤回会话面：不留下"插件已卸但工具还在"的幽灵注册。
+  ctx.effect(() => () => surface.disable(), 'personal-assistant:conversation-surface')
+
   registerUserCommands(ctx, {
     bridge,
-    tracker,
-    captureBlockedReason,
-    captureScopeAuthorized: () => captureScopeAuthorized(tracker.captureTitles),
+    power: assistantPower,
     log,
     home,
     summary: workbenchSummary,
@@ -1691,12 +2098,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       },
     },
   })
-  // 主动帮助的候选与选定：选定的读取范围只经桌面可信审批生效，模型自报的范围无效。
-  ctx.effect(() => registerHelpEpisodeTools(ctx as never, {
-    episodes: helpEpisodes,
-    helpContexts,
-    submit: submission => bridge.submitAssistant(submission),
-  }), 'personal-assistant:help-episodes')
+  // 主动帮助工具的登记在 registerUserCommands 之前（见 `help-episode-tools`）：
+  // 它属于会话面，必须和其它工具在同一次开关里挂/撤。
 
   // 会话运行态全量转发；idle 同时驱动原有因果回复结算。
   ctx.on('agent/status', payload => {
@@ -1776,7 +2179,14 @@ interface TeamRuntime {
   team: TeamService
   approvals: ApprovalService
   /** 团队委派工具是否注册成功；false 时团队服务仍在，只是模型缺委派入口。 */
-  toolsRegistered: boolean
+  readonly toolsRegistered: boolean
+  /**
+   * 重新挂上/撤下团队工具。个人助理总开关关闭时团队服务与宠物团队页照常存在，
+   * 只是模型没有委派入口 —— 不然"关掉个人助理"之后团队工具还在主会话里，
+   * 与开关的语义自相矛盾。
+   */
+  mountTools(): boolean
+  unmountTools(): void
   dispose(): Promise<void>
 }
 
@@ -1837,23 +2247,33 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
   team.recoverInterruptedTasks()
   // 装配完成后再注册工具，宿主可能不接受：尽力注册，失败时团队服务照常工作
   //（快照、审批卡片、宠物团队页），只是模型缺委派入口，重启后必然可用。
-  let toolsRegistered = true
   let unregisterTools: (() => void) | undefined
-  try {
-    unregisterTools = registerTeamTools(ctx as never, { team, approvals, bridge: deps.bridge })
-  } catch (error) {
-    toolsRegistered = false
-    deps.log(`team tools registration failed: ${error instanceof Error ? error.message : String(error)}`)
+  const unmountTools = (): void => {
+    const release = unregisterTools
+    unregisterTools = undefined
+    release?.()
   }
+  const mountTools = (): boolean => {
+    if (unregisterTools !== undefined) return true
+    try {
+      unregisterTools = registerTeamTools(ctx as never, { team, approvals, bridge: deps.bridge })
+    } catch (error) {
+      deps.log(`team tools registration failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return unregisterTools !== undefined
+  }
+  mountTools()
   deps.bridge.attachTeam(team, approvals)
   return {
     team,
     approvals,
-    toolsRegistered,
+    get toolsRegistered() { return unregisterTools !== undefined },
+    mountTools,
+    unmountTools,
     dispose: async () => {
       await team.dispose()
       team.recoverInterruptedTasks()
-      unregisterTools?.()
+      unmountTools()
     },
   }
 }

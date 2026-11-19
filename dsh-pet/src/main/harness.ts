@@ -255,7 +255,8 @@ export class BridgeClient {
    * `signal` 只停止本地等待（静音、换话题、暂停讲解都走它），**不向后台发取消**：后台可能仍在跑。
    * 要停掉后台运行用 {@link cancelChat}（按请求 id 定向取消），回执如实区分未执行 / 取消中 / 已终止 / 未知。
    */
-  async chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string): Promise<ChatReply> {
+  async chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string,
+    options: { readonly cancelOnAbort?: boolean; readonly docKey?: string } = {}): Promise<ChatReply> {
     const info = this.info
     if (!info) return { ok: false, error: '未连接到助理运行时：请先从托盘启动团队，或在 dsh 里说"召唤宠物"' }
     const interrupted = (): ChatReply => ({ ok: false, error: signal?.aborted
@@ -266,7 +267,15 @@ export class BridgeClient {
     const abortSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
     const id = `pet-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const replyPromise = new Promise<ChatReply>(resolve => this.pending.set(id, { resolve, onDelta }))
-    const onAbort = (): void => { this.pending.get(id)?.resolve(interrupted()) }
+    const onAbort = (): void => {
+      this.pending.get(id)?.resolve(interrupted())
+      /*
+       * 讲解/成员问答显式要求时，按请求 id 定向取消这一轮：成员会话的写句柄才会尽快释放，
+       * 否则紧接着的提问会撞上宿主的 "already owned by an active write handle"。
+       * 普通回复保持原语义（只停本地等待，后台照常运行，结果仍需核对）——那条契约有测试守着。
+       */
+      if (options.cancelOnAbort === true) void this.cancelChat(id).catch(() => undefined)
+    }
     abortSignal.addEventListener('abort', onAbort, { once: true })
     const timer = setTimeout(() => controller.abort(), 320_000)
     this.outstanding.set(id, { assistantId, startedAt: Date.now() })
@@ -276,7 +285,7 @@ export class BridgeClient {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         signal: abortSignal,
-        body: JSON.stringify({ id, text, assistantId, epoch: info.epoch, bindingId }),
+        body: JSON.stringify({ id, text, assistantId, epoch: info.epoch, bindingId, ...(options.docKey === undefined ? {} : { docKey: options.docKey }) }),
       })
       if (!response.ok) {
         // 明确没受理：后台没有这条请求，不必再取消。

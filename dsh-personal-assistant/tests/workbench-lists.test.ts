@@ -58,7 +58,7 @@ describe('分隔符与字段清理', () => {
   test('状态与人话说人话，未知原样输出', () => {
     assert.equal(describeTaskStatus('awaiting-user'), '待你处理')
     assert.equal(describeTaskStatus('weird'), 'weird')
-    assert.equal(describeRole('wukong'), '悟空')
+    assert.equal(describeRole('wukong'), '助理1')
     assert.equal(describeRole('nobody'), 'nobody')
     assert.equal(describeMeetingState('transcribed'), '已转写')
   })
@@ -117,12 +117,12 @@ describe('待办列表 /assistant-todo-list', () => {
 })
 
 describe('会议列表 /assistant-meeting-list', () => {
-  const meeting = { startedAt: new Date(2026, 0, 2, 9, 30).getTime(), name: '周会', state: 'transcribed' }
+  const meeting = { startedAt: new Date(2026, 0, 2, 9, 30).getTime(), name: '周会', state: 'transcribed', id: 'm-1' }
 
   test('有数据：时间 | 名称 | 状态', () => {
     const text = formatMeetingList([meeting])
     const columns = lines(text)[0].split(FIELD_SEPARATOR)
-    assert.deepEqual(columns, ['09:30', '周会', '已转写'])
+    assert.deepEqual(columns, ['09:30', '周会', '已转写', 'm-1'], '尾列是会议 id，供改名/删除定位')
   })
 
   test('最多 10 条', () => {
@@ -153,7 +153,7 @@ describe('成员列表 /assistant-team-list', () => {
       { name: '小会', role: 'wukong', enabled: true, quota: '1200/8000' },
       { name: '小助', role: 'custom', enabled: false, quota: '—' },
     ])
-    assert.deepEqual(lines(text)[0].split(FIELD_SEPARATOR), ['小会', '悟空', '在岗', '1200/8000'])
+    assert.deepEqual(lines(text)[0].split(FIELD_SEPARATOR), ['小会', '助理1', '在岗', '1200/8000'])
     assert.deepEqual(lines(text)[1].split(FIELD_SEPARATOR), ['小助', '自定义', '停用', '—'])
   })
 
@@ -204,14 +204,14 @@ describe('设置摘要 /assistant-settings-summary（只三行，第四行没有
 describe('历史会议 /assistant-meeting-history', () => {
   const row = (over: Partial<Parameters<typeof formatMeetingHistory>[0] extends readonly (infer T)[] | null ? T : never> = {}) => ({
     startedAt: new Date(2026, 10, 12, 14, 30).getTime(),
-    name: '周会', sources: 'mic+loopback', retentionDays: 30, transcriptStatus: '已转写', ...over,
+    name: '周会', sources: 'mic+loopback', retentionDays: 30, transcriptStatus: '已转写', id: 'm-1', ...over,
   })
 
   test('有数据：5 列，日期时间带日期（历史跨天）', () => {
     const text = formatMeetingHistory([row()])
     const columns = text.split(' | ')
-    assert.equal(columns.length, 5)
-    assert.deepEqual(columns, ['2026-11-12 14:30', '周会', '麦克风+系统声', '30 天', '已转写'])
+    assert.equal(columns.length, 6)
+    assert.deepEqual(columns, ['2026-11-12 14:30', '周会', '麦克风+系统声', '30 天', '已转写', 'm-1'])
   })
 
   test('来源三种组合：两种真实值 + 未知', () => {
@@ -223,8 +223,8 @@ describe('历史会议 /assistant-meeting-history', () => {
 
   test('字段缺失时该格为 —，列数不变', () => {
     const columns = formatMeetingHistory([{ startedAt: 0 }]).split(' | ')
-    assert.equal(columns.length, 5)
-    assert.deepEqual(columns, ['—', '—', '—', '—', '—'])
+    assert.equal(columns.length, 6)
+    assert.deepEqual(columns, ['—', '—', '—', '—', '—', '—'], '缺 id 时尾列占位 —，不丢行')
   })
 
   test('每行第 6 格是真实 taskId，且前 5 格与原来逐字一致', () => {

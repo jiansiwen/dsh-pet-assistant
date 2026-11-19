@@ -279,7 +279,10 @@ export class MemberDirectory {
       // 换类型或换绑定后，旧会话上下文对新平台/新工具不再成立，与权限变化同规则：清会话引用。
       const bindingChanged = current.kind !== normalized.kind
         || JSON.stringify(current.binding ?? null) !== JSON.stringify(normalized.binding ?? null)
-      const sessionInvalidated = permissionsChanged || bindingChanged
+      // 换模型同样要重建会话：宿主不允许在轮次中途换模型（request 阶段改模型会被拒绝），
+      // 旧会话会一直带着旧模型，成员设置里的新模型永远不生效。
+      const modelChanged = current.provider !== normalized.provider || current.model !== normalized.model
+      const sessionInvalidated = permissionsChanged || bindingChanged || modelChanged
       const next: MemberProfile = { ...current, ...normalized, revision: current.revision + 1,
 toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: sessionInvalidated ? null : current.sessionId }
       const changed = this.db.prepare(`UPDATE assistants SET display_name = ?, skin_id = ?, persona = ?, voice_profile = ?, enabled = ?, tool_policy = ?, revision = ?
@@ -356,6 +359,15 @@ toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] },
     })
   }
 
+  /** 清掉某条渠道会话绑定（文档讲解关闭时扔临时会话）；只删绑定，不删宿主里的会话正文。 */
+  clearChannelSession(id: string, scope: string): void {
+    if (!/^[a-f0-9]{64}$/u.test(scope)) throw new Error('渠道会话范围无效')
+    this.transaction(() => {
+      this.require(id)
+      this.db.prepare('DELETE FROM member_channel_sessions WHERE assistant_id = ? AND scope = ?').run(id, scope)
+    })
+  }
+
   private ensureAccount(id: string): void {
     this.db.prepare('INSERT OR IGNORE INTO member_quota_accounts(assistant_id) VALUES (?)').run(id)
   }
@@ -404,16 +416,18 @@ toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] },
     const remaining = Math.max(0, Math.min(profile.maxTokens,
       profile.dailyTokenLimit === 0 ? MAX : profile.dailyTokenLimit - dailyUsed - dailyReserved,
       profile.totalTokenLimit === 0 ? MAX : profile.totalTokenLimit - totalUsed - totalReserved))
+    // 日/总都填 0 = 不限额：此时"用量未知"不影响准入（没有上限可被突破），
+    // 也不该拦着用户去核查账本 —— 否则界面上写着"不限"，实际却要求先重置额度。
+    const unlimited = profile.dailyTokenLimit === 0 && profile.totalTokenLimit === 0
     return { view: { day, dailyUsed, totalUsed, dailyReserved, totalReserved,
       dailyTokenLimit: profile.dailyTokenLimit, totalTokenLimit: profile.totalTokenLimit,
-      thresholdPercent: profile.thresholdPercent, unknown, blocked: !profile.enabled || unknown || remaining < 1, revision: this.quotaRevision(id) },
+      thresholdPercent: profile.thresholdPercent, unknown, blocked: !profile.enabled || (!unlimited && unknown) || remaining < 1, revision: this.quotaRevision(id) },
     remaining }
   }
 
   private atThreshold(view: MemberQuotaView): boolean {
-    // 用整数比较，避免安全整数附近乘百分比后丢精度。
-    // 在途预留也要算进去：只看到已结算量会等真正越线才提示，达不到“快用完先问本人”的目的。
-    if (view.unknown) return true
+    // 不限额（日/总都是 0）时没有"阈值"可申请，用量未知也不打扰用户。
+    if (view.unknown) return view.dailyTokenLimit > 0 || view.totalTokenLimit > 0
     const pairs: Array<[number, number, number]> = [
       [view.dailyUsed, view.dailyReserved, view.dailyTokenLimit],
       [view.totalUsed, view.totalReserved, view.totalTokenLimit],
@@ -455,7 +469,7 @@ toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] },
   }
   private unavailable(profile: MemberProfile, view: MemberQuotaView): string | null {
     if (!profile.enabled) return '成员已停用，无法开始请求'
-    if (view.unknown) return '成员存在未知用量，必须核查并明确重置日额度与总额度后才能继续'
+    if (view.unknown && (view.dailyTokenLimit > 0 || view.totalTokenLimit > 0)) return '成员存在未知用量，必须核查并明确重置日额度与总额度后才能继续'
     if (view.blocked) return '成员额度已用完或已被进行中的请求预留，请等待结算或申请加额'
     return null
   }

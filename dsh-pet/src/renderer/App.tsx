@@ -19,7 +19,8 @@ import { dockEdge, dockPosition, dockStatusTone, type DockEdge } from './pet-doc
 import DockedPet from './DockedPet.js'
 import { PET_WIDTH } from './pet-metrics.js'
 import { HOVER_CLOSE_MS, HOVER_OPEN_MS, hoverActions, initialHover, reduceHover, type HoverEventKind } from './hover-toolbar.js'
-import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isVoiceStop, planInterruptInput, plausibleDirectQuestion } from '../voice-conversation.ts'
+import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isNarrationEcho, isVoiceStop, planInterruptInput, plausibleDirectQuestion } from '../voice-conversation.ts'
+import { isExplicitContinue, isRestResume } from '../main/followup-window.ts'
 import type { VoiceTurn } from '../session-types.js'
 import {
   clearStageHitboxes,
@@ -763,6 +764,18 @@ export default function App() {
   const wakeListenPending = useRef<(() => void) | null>(null)
   const wakeListenTimer = useRef<ReturnType<typeof setTimeout>>()
   const listeningRef = useRef(false)
+  /** 口令打断后的提问窗口：10 秒内没听到问题就把讲解接回去（一次只开一个）。 */
+  const questionWindowRef = useRef<{ timer: number } | null>(null)
+  /** 休息模式：无限期停讲、不听提问，只认整句"继续演讲"恢复（参会人互相讨论时用）。 */
+  const restingRef = useRef(false)
+  const [resting, setResting] = useState(false)
+  /** 当前正在念的段落正文：念稿回声门禁拿它比对识别出的口令（外放把文档里的口令词录回）。 */
+  const narrationTextRef = useRef('')
+  /** 角色是否正在出声：念稿回声门禁只在出声时成立。 */
+  const speakingRef = useRef(false)
+  /** 讲解快捷键回读与注册状态（文档设置页用；false = 被占用）。 */
+  const [docHotkeys, setDocHotkeys] = useState({ interrupt: 'Ctrl+Alt+D', rest: 'Ctrl+Alt+R', resume: 'Ctrl+Alt+C' })
+  const [docHotkeyStatus, setDocHotkeyStatus] = useState<{ interrupt: boolean; rest: boolean; resume: boolean } | null>(null)
   const busyRef = useRef(false)
   /**
    * 忙时排队的话（A1：把"静默丢弃"改成"诚实入队"）。
@@ -1028,6 +1041,7 @@ export default function App() {
       setMeetingDocumentAutoApprove(state.meetingDocumentAutoApprove === true)
       setChatDock(state.chatDock === 'auto' ? 'auto' : 'top')
       setDocSpeechMode(state.docSpeechMode === 'ai' ? 'ai' : 'source')
+      if (state.docHotkeys) setDocHotkeys(state.docHotkeys)
       setPetScale(normalizePetScale(state.petScale))
       setPetOpacity(normalizePetOpacity(state.petOpacity))
       setPetDock(state.petDock !== false)
@@ -1596,6 +1610,28 @@ export default function App() {
     [snapshot],
   )
 
+  const clearQuestionWindow = useCallback(() => {
+    if (questionWindowRef.current !== null) {
+      window.clearTimeout(questionWindowRef.current.timer)
+      questionWindowRef.current = null
+    }
+  }, [])
+
+  /**
+   * 口令打断后进入"等提问"窗口：用户在这 10 秒里说的第一句像样的话就是问题；
+   * 一直没人说话就把讲解接回去。主进程那边只在确有被口令暂停的讲解时才续讲。
+   */
+  const openQuestionWindow = useCallback(() => {
+    clearQuestionWindow()
+    const timer = window.setTimeout(() => {
+      questionWindowRef.current = null
+      stopDictation()
+      void window.petApi.docResume('timeout').catch(() => undefined)
+      showToast('10 秒内没听到问题，继续讲解')
+    }, 10_000)
+    questionWindowRef.current = { timer }
+  }, [clearQuestionWindow, showToast])
+
   /**
    * 第三个参数只在外放插话（M1-05）时给：插话检测器检出用户开口后，把检出点之前的预滚动音频
    * 交给这次听写，用户开头那几个字不丢。
@@ -1624,16 +1660,102 @@ export default function App() {
     if (!gateInterrupt) window.petApi.stopSpeech()
     setListening(true)
     asrDeltaText.current = ''
-    // 讲解与会议里直接说话就是提问（主进程返回 direct）；日常外放仍只认明确口令，防自回声。
+    // 口令门禁：讲解/会议/日常外放都只认明确口令；口令后 10 秒内的问题由提问窗口接收。
     let directMode = false
+    // 听完一句还要接着听（休息模式等恢复、回声/噪声忽略后）：150ms 后重新开麦，与提问窗口续听一致。
+    const relistenSoon = (): void => {
+      const binding = currentBinding.current
+      const gen = dictationGeneration.current
+      window.setTimeout(() => {
+        if (!dictationCancelled.current && dictationGeneration.current === gen
+          && !exitingRef.current && binding && currentBinding.current === binding) {
+          void startListen(true, false, undefined, true, true)
+        }
+      }, 150)
+    }
     const accept = async (text: string): Promise<void> => {
       if (cancelled()) return
       if (gateInterrupt) {
+        // 休息模式：只认整句"继续演讲/继续"，讨论与提问一律不理，继续听恢复指令（无超时）。
+        if (restingRef.current) {
+          if (isRestResume(text)) {
+            restingRef.current = false
+            setResting(false)
+            clearQuestionWindow()
+            stopDictation()
+            void window.petApi.docResume('continue').catch(() => undefined)
+            showToast('继续讲解')
+          } else {
+            relistenSoon()
+          }
+          return
+        }
+        // 念稿回声：外放把文档里的口令词（如"停一下"）录回，落在正在念的段落里 → 不当打断。
+        if (speakingRef.current && isNarrationEcho(text, narrationTextRef.current)) {
+          showToast('念稿里的词，已忽略')
+          relistenSoon()
+          return
+        }
         const plan = planInterruptInput(text, directMode)
-        if (plan.action === 'ignore') return
+        if (plan.action === 'rest') {
+          // 休息：无限期停讲、不听提问，只等整句"继续演讲"或继续键（参会人互相讨论的场景）。
+          window.petApi.stopSpeech(true)
+          clearQuestionWindow()
+          restingRef.current = true
+          setResting(true)
+          showToast('已休息：参会人可讨论，说"继续演讲"或按继续键恢复')
+          relistenSoon()
+          return
+        }
+        if (plan.action === 'ignore') {
+          /*
+           * 口令之后进入提问窗口：窗口里的这句话就是问题。
+           * 仍然过滤自回声和噪声；太短的结果不发送，继续留在窗口里等用户重说。
+           */
+          if (questionWindowRef.current !== null) {
+            // 明确说"继续/接着讲"：不等 10 秒，也不发给模型，直接回一句并续讲。
+            if (isExplicitContinue(text)) {
+              clearQuestionWindow()
+              stopDictation()
+              void window.petApi.docResume('continue').catch(() => undefined)
+              showToast('继续讲解')
+              return
+            }
+            if (isSelfSpeech(text)) {
+              showToast('刚才是我的回声，已忽略；请再说一次')
+              return
+            }
+            if (!plausibleDirectQuestion(text)) {
+              showToast('没听清，请再说一次')
+              const binding = currentBinding.current
+              const resumeGeneration = dictationGeneration.current
+              window.setTimeout(() => {
+                if (!dictationCancelled.current && dictationGeneration.current === resumeGeneration
+                  && !exitingRef.current && binding && currentBinding.current === binding) {
+                  void startListen(true, false, undefined, true, true)
+                }
+              }, 150)
+              return
+            }
+            clearQuestionWindow()
+            if (conversation.active) {
+              stopContinuous(false)
+              // 这是主动从连续对话转入插话，不是用户取消下一次听写。
+              dictationCancelled.current = false
+            }
+            voiceRoundRef.current = true
+            setInput(text)
+            if (!busyRef.current) void send(text)
+            else showToast('上一条消息尚未提交完成，语音已保留在输入框')
+          }
+          return
+        }
         if (plan.action === 'send' || plan.action === 'listen') {
-          // 口令后直接带问题时，回答播完仍要自动回到原讲解；只说“停一下”则保持暂停。
-          window.petApi.stopSpeech(plan.action === 'send')
+          // 口令后直接带问题时，回答播完仍要自动回到原讲解；只说“停一下”则保持暂停，
+          // 10 秒窗口内没等到问题再由 doc-resume 接回去。
+          window.petApi.stopSpeech(true)
+          if (plan.action === 'send') clearQuestionWindow()
+          else window.petApi.docAck('stop')
           if (conversation.active) {
             stopContinuous(false)
             // 这是主动从连续对话转入插话，不是用户取消下一次听写。
@@ -1648,7 +1770,8 @@ export default function App() {
             return
           }
           // 只说了口令：等本次听写释放后再听问题；会议内仍按插话来源申请。
-          showToast('已停下，请说你的问题')
+          showToast('已停下，请说你的问题（10 秒内没听到就继续讲）')
+          openQuestionWindow()
           const binding = currentBinding.current
           const resumeGeneration = dictationGeneration.current
           window.setTimeout(() => {
@@ -1666,7 +1789,24 @@ export default function App() {
             showToast('刚才是我的回声，已忽略；请再说一次')
             return
           }
-          if (!plausibleDirectQuestion(text)) return
+          if (!plausibleDirectQuestion(text)) {
+            /*
+             * 一两个字多半是口令尾巴（"停一下"只识别出"一下"）或环境噪声：
+             * 不停讲解，但必须**立刻重新监听** —— 听写已经在这次结句时结束，
+             * 用户紧随其后说的真问题会落在没人录音的空窗里（真机复现过：
+             * 提问整句丢失，模型只收到文档上下文）。150ms 与"只说了停一下"的续听一致。
+             */
+            showToast('没听清，请再说一次')
+            const binding = currentBinding.current
+            const resumeGeneration = dictationGeneration.current
+            window.setTimeout(() => {
+              if (!dictationCancelled.current && dictationGeneration.current === resumeGeneration
+                && !exitingRef.current && binding && currentBinding.current === binding) {
+                void startListen(true, false, undefined, true, true)
+              }
+            }, 150)
+            return
+          }
           window.petApi.stopSpeech(true)
           if (conversation.active) {
             stopContinuous(false)
@@ -1837,7 +1977,7 @@ export default function App() {
         stopContinuous(false)
       }
     }
-  }, [send, showToast, conversation, stopContinuous, selectedId, cast])
+  }, [send, showToast, conversation, stopContinuous, selectedId, cast, clearQuestionWindow, openQuestionWindow])
   /**
    * 外放插话检出（M1-05，实验开关）：渲染层已经本地止声，主进程随后停掉整段播报。
    * 连续对话里插话就是下一轮（本轮作废、立即续听）；不在连续对话里就按一次自动发送的听写。
@@ -1855,7 +1995,7 @@ export default function App() {
       setContinuousActive(true)
       armIdleDeadline()
     }
-    // 日常外放仍然只认明确口令（防自回声）；会议演讲/讲解时由主进程放开为直接提问。
+    // 日常外放与讲解都只认明确口令（防自回声、防旁人讨论）；口令后的提问由主进程放行。
     void startListen(true, continuous, takeHandover, true, true)
   }
   useEffect(() => {
@@ -2101,10 +2241,49 @@ export default function App() {
   useEffect(() => {
     window.petApi.onSpeechState((status) => {
       setSpeech(status)
+      speakingRef.current = status.speaking
       // 语音归属与合成由主进程处理；停止朗读不改变原生会话状态。
       if (status.error) showToast(speechErrorText(status.error))
     })
   }, [showToast])
+
+  /**
+   * 讲解全局快捷键：打断提问 / 休息 / 继续。与语音口令同一套语义，只是入口换成按键
+   * （外放嘈杂或口令识别不准时，按键是确定性的兜底）。没有正在讲解的文档时如实提示。
+   */
+  useEffect(() => window.petApi.onDocHotkey(({ action }) => {
+    if (exitingRef.current) return
+    if (docState.kind !== 'outline') { showToast('当前没有正在讲解的文档'); return }
+    if (action === 'resume') {
+      restingRef.current = false
+      setResting(false)
+      clearQuestionWindow()
+      stopDictation()
+      void window.petApi.docResume('continue').catch(() => undefined)
+      showToast('继续讲解')
+      return
+    }
+    if (action === 'rest') {
+      window.petApi.stopSpeech(true)
+      clearQuestionWindow()
+      restingRef.current = true
+      setResting(true)
+      showToast('已休息：说"继续演讲"或按继续键恢复')
+      void startListen(true, false, undefined, true, true)
+      return
+    }
+    // interrupt：等价于说"停一下"——停下、开 10 秒提问窗口。
+    window.petApi.stopSpeech(true)
+    window.petApi.docAck('stop')
+    clearQuestionWindow()
+    restingRef.current = false
+    setResting(false)
+    openQuestionWindow()
+    showToast('已停下，请说你的问题（10 秒内没听到就继续讲）')
+    void startListen(true, false, undefined, true, true)
+  }), [docState.kind, startListen, openQuestionWindow, clearQuestionWindow, stopDictation, showToast])
+
+  useEffect(() => window.petApi.onDocHotkeyStatus(setDocHotkeyStatus), [])
 
   /**
    * 快嘴短应答：主进程已用 TTS 念出，这里只显示在角色头顶气泡，并记进自回声过滤表
@@ -2138,7 +2317,12 @@ export default function App() {
 
   useEffect(() => {
     window.petApi.onDocState(setDocState)
-    window.petApi.onDocReply(reply => addDocResult(reply.text))
+    window.petApi.onDocReply(reply => {
+      // 记下正在念的段落：念稿回声门禁靠它判"口令是不是文档里念出来的"；同时进自回声过滤表。
+      narrationTextRef.current = reply.text
+      rememberSelfSpeech(reply.text)
+      addDocResult(reply.text)
+    })
     // 文档提示同时弹一条气泡：这条路径不一定打开文档面板，只写结果区用户就看不见。
     window.petApi.onDocNotice(message => { addDocResult(message); showToast(message) })
     void window.petApi.docRoots().then(setDocRoots)
@@ -2706,6 +2890,7 @@ export default function App() {
                 roots={docRoots}
                 busy={docBusy}
                 speaking={speech.speaking}
+                resting={resting}
                 onOpen={docOpen}
                 onRead={path => void docRead(path)}
                 onExplain={docExplain}
@@ -2724,6 +2909,18 @@ export default function App() {
                     const result = await window.petApi.saveSettings({ docSpeechMode: mode })
                     if (!result.ok) { setDocSpeechMode(previous); showToast('讲解模式未保存') }
                   } catch { setDocSpeechMode(previous); showToast('讲解模式未保存') }
+                }}
+                docHotkeys={docHotkeys}
+                docHotkeyStatus={docHotkeyStatus}
+                onDocHotkeysChange={async hotkeys => {
+                  const previous = docHotkeys
+                  setDocHotkeys(hotkeys)
+                  try {
+                    const result = await window.petApi.saveSettings({
+                      docInterruptHotkey: hotkeys.interrupt, docRestHotkey: hotkeys.rest, docResumeHotkey: hotkeys.resume,
+                    })
+                    if (!result.ok) { setDocHotkeys(previous); showToast('快捷键未保存') }
+                  } catch { setDocHotkeys(previous); showToast('快捷键未保存') }
                 }}
               />
             </>

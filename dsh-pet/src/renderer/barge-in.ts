@@ -276,12 +276,12 @@ export class BargeInSession {
 
   private onFrame(frame: CaptureFrame): void {
     /*
-      宠物自己正在朗读时的帧不参与插话判定。
-      以前靠"播报期间不监听"来避，但那有个缝隙：朗读刚结束、扬声器回声还在，
-      这几百毫秒会把残响当成用户开口，于是"叫不停"或者误触发打断。
-      用帧上的实时标记比切状态更准。
+      朗读期间也要听：插话就是要打断正在念的这一句，整段跳过"助理在说话"的帧
+      等于把用户的话一起丢了（真机表现：连续讲解时喊"停一下"只捡到句尾残片，
+      识别成"さ？"，永远停不下来）。
+      回声已经由采集约束里的 echoCancellation 处理；播报刚结束的尾响由检测器的
+      tailMs/lastEndedAt 兜住，不需要在这里按"是否在朗读"整段拉黑。
     */
-    if (frame.assistantSpeaking) return
     const handover = this.handover
     if (handover !== null) {
       if (handover.ms < HANDOVER_MAX_MS) {

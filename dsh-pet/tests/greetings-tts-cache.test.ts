@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { INTERRUPT_ACKS, LOCAL_ACKS, MAX_GREETING_CHARS, WAKE_GREETINGS, fixedPhrases, pickPhrase } from '../src/main/greetings.ts'
+import { DOC_CONTINUE_ACKS, DOC_RESUME_ACKS, DOC_STOP_ACKS, DOC_THINKING_ACKS, INTERRUPT_ACKS, LOCAL_ACKS, MAX_GREETING_CHARS, WAKE_GREETINGS, fixedPhrases, pickPhrase } from '../src/main/greetings.ts'
 import { TtsCache, voiceFingerprint } from '../src/main/tts-cache.ts'
 
 describe('唤醒应答话术', () => {
@@ -20,7 +20,8 @@ describe('唤醒应答话术', () => {
   })
 
   test('每句都短到像应答而不是回答', () => {
-    for (const line of [...WAKE_GREETINGS, ...INTERRUPT_ACKS, ...LOCAL_ACKS]) {
+    for (const line of [...WAKE_GREETINGS, ...INTERRUPT_ACKS, ...LOCAL_ACKS,
+      ...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS]) {
       assert.ok(line.length <= MAX_GREETING_CHARS, `「${line}」太长（${line.length} 字）`)
       assert.ok(line.trim().length > 0, '不能有空句子')
     }
@@ -35,7 +36,11 @@ describe('唤醒应答话术', () => {
   test('fixedPhrases 去重且并集完整', () => {
     const all = fixedPhrases()
     assert.equal(new Set(all).size, all.length)
-    assert.equal(all.length, new Set([...WAKE_GREETINGS, ...INTERRUPT_ACKS, ...LOCAL_ACKS]).size)
+    assert.equal(all.length, new Set([...WAKE_GREETINGS, ...INTERRUPT_ACKS, ...LOCAL_ACKS,
+      ...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS]).size)
+    for (const line of [...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS]) {
+      assert.ok(all.includes(line), `讲解短句「${line}」必须进入预合成清单`)
+    }
   })
 })
 

@@ -24,6 +24,11 @@ const intervalPayload = z.object({ repeatEverySeconds: z.number().int().min(60).
  * 优先级会影响列表排序，猜错会让"要紧的事"沉到列表底部，而那没人能立刻发现。
  */
 const priorityPayload = z.object({ priority: z.enum(TASK_PRIORITIES) }).strict()
+/**
+ * 改标题的 payload：非空、去首尾空白、限长。
+ * 标题是列表第一列，空串会让整行"看起来消失"；超长会把表格撑破，所以在这里就拒。
+ */
+const titlePayload = z.object({ title: z.string().trim().min(1).max(200) }).strict()
 /** 受管执行器回执：四态 + 证据引用；succeeded 可携带结构化读回证据供语义复核。 */
 const managedReceiptSchema = z.object({
   executorEpoch: z.string().min(1).max(200),
@@ -66,7 +71,7 @@ const meetingTodoSchema = z.object({
   }
 })
 type Action = 'create' | 'pause' | 'resume' | 'cancel' | 'complete' | 'reschedule' | 'respond' | 'set-interval'
-  | 'set-priority'
+  | 'set-priority' | 'set-title'
 
 /** 仅标记尚未进入业务调度、且事务能够回滚的数据库争用。 */
 class RetryableTickBusy extends Error {
@@ -106,6 +111,7 @@ export class CompanionTaskRuntime {
   private readonly log: (message: string) => void
   private readonly canRetryBusy: () => boolean
   private readonly activeMailAccount: () => { accountKey: string; memberId: string } | null
+  private readonly onManualComplete: (task: Task) => void
   private readonly reminders: CompanionReminders
   private readonly managedCommands = new Map<string, ManagedCommandRecord>()
   private computerExecutorApply: ((actionId: string) => Promise<Record<string, unknown>>) | null = null
@@ -128,6 +134,8 @@ export class CompanionTaskRuntime {
     epoch: string; now?: () => number; onChange?: () => void; log?: (message: string) => void; canRetryBusy?: () => boolean
     acceptsRecipient?: (channel: 'desktop' | 'wecom', recipientRef: string) => boolean
     activeMailAccount?: () => { accountKey: string; memberId: string } | null
+    /** 本人亲手标记完成一条人工待办时回调（技能自动形成的可信样本入口）。 */
+    onManualComplete?: (task: Task) => void
   }) {
     if (!options.epoch) throw new Error('运行时代次不能为空')
     this.store = store
@@ -138,6 +146,7 @@ export class CompanionTaskRuntime {
     this.log = options.log ?? (() => {})
     this.canRetryBusy = options.canRetryBusy ?? (() => true)
     this.activeMailAccount = options.activeMailAccount ?? (() => null)
+    this.onManualComplete = options.onManualComplete ?? (() => {})
     const identity = store.companionIdentity()
     this.principalId = identity.principalId
     this.deviceId = identity.deviceId
@@ -787,6 +796,13 @@ export class CompanionTaskRuntime {
         if (!this.accepting || !this.memberManagement) throw new CompanionError('DEVICE_OFFLINE', '成员管理服务尚未就绪', 503)
         return await this.memberManagement.request(method, pathname, body)
       }
+      // 技能/产物/时间线/词库/共享记忆同样归成员管理面；只接受本人桌面操作。
+      if (pathname === '/companion/v1/skills' || pathname === '/companion/v1/artifacts' || pathname === '/companion/v1/glossary'
+        || pathname.startsWith('/companion/v1/timeline') || pathname === '/companion/v1/memories/shared') {
+        if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '技能与资料管理只接受本人在桌面的操作', 403)
+        if (!this.accepting || !this.memberManagement) throw new CompanionError('DEVICE_OFFLINE', '成员管理服务尚未就绪', 503)
+        return await this.memberManagement.request(method, pathname, body)
+      }
       if (pathname === '/companion/v1/settings' || pathname.startsWith('/companion/v1/settings/')) {
         if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '设置仅接受宠物面板中的本人操作', 403)
         if (!this.accepting || !this.settings) throw new CompanionError('DEVICE_OFFLINE', '配置服务尚未就绪', 503)
@@ -869,7 +885,7 @@ export class CompanionTaskRuntime {
 
   private action(pathname: string): { action: Action; pathId?: string } {
     if (pathname === '/companion/v1/tasks') return { action: 'create' }
-    const task = /^\/companion\/v1\/tasks\/([^/]+)\/(pause|resume|cancel|complete|reschedule|set-interval|set-priority)$/.exec(pathname)
+    const task = /^\/companion\/v1\/tasks\/([^/]+)\/(pause|resume|cancel|complete|reschedule|set-interval|set-priority|set-title)$/.exec(pathname)
     if (task) return { action: task[2] as Action, pathId: task[1] }
     const reminder = /^\/companion\/v1\/reminders\/([^/]+)\/respond$/.exec(pathname)
     if (reminder) return { action: 'respond', pathId: reminder[1] }
@@ -940,6 +956,8 @@ export class CompanionTaskRuntime {
       this.reminders.assertIntervalEditable(task.taskId)
     } else if (route.action === 'set-priority') {
       priorityPayload.parse(command.payload)
+    } else if (route.action === 'set-title') {
+      titlePayload.parse(command.payload)
     } else if (route.action === 'reschedule') {
       const payload = reschedulePayload.parse(command.payload)
       if (meta.kind === 'reminder' && (!payload.schedule || payload.deadlineAt)) throw new CompanionError('INVALID_INPUT', '提醒改期需要明确的日程', 422)
@@ -962,6 +980,11 @@ export class CompanionTaskRuntime {
     if (/\/set-priority$/.test(command.pathname)) {
       const priority = (command.command.payload as { priority?: unknown } | null)?.priority
       return { ...base, action: 'set-priority', priority }
+    }
+    // 改标题同理：把新标题摊进绑定，审批窗口能直接看到"批准的是改成哪句话"。
+    if (/\/set-title$/.test(command.pathname)) {
+      const title = (command.command.payload as { title?: unknown } | null)?.title
+      return { ...base, action: 'set-title', title }
     }
     return base
   }
@@ -1049,6 +1072,12 @@ export class CompanionTaskRuntime {
         if (updated === null) throw new CompanionError('NOT_FOUND', '任务不存在', 404)
         this.approvals.invalidateTasks([task.taskId], '任务优先级已变化')
         this.emit(updated)
+      } else if (route.action === 'set-title') {
+        // 只改标题：不动状态、不动日程、不碰提醒周期。改名字不该让进行中的任务跳回队列。
+        const title = titlePayload.parse(current.command.payload).title
+        const updated = this.store.updateTask(task.taskId, task.revision, { goal: title })
+        if (updated === null) throw new CompanionError('NOT_FOUND', '任务不存在', 404)
+        this.emit(updated)
       } else if (meta.kind === 'reminder') {
         if (route.action === 'complete') throw new CompanionError('USE_REMINDER_RESPONSE', '提醒需要本人回应，不能代替业务完成', 422)
         const spec = route.action === 'reschedule' ? reschedulePayload.parse(current.command.payload).schedule : undefined
@@ -1058,6 +1087,8 @@ export class CompanionTaskRuntime {
         this.changeTask(task.taskId, 'done', null, [...task.artifacts, artifact])
         this.store.appendEvent('task.artifact', { taskId: task.taskId, artifactId: artifact }, { taskId: task.taskId })
         this.reminders.cancelRelated(task.taskId, operation.operationId)
+        // 本人确认完成 = 可信成功样本，交给技能自动形成（计数/判定在装配层）。
+        try { this.onManualComplete(task) } catch (cause) { this.log(`技能样本记录失败（不影响任务完成）：${cause instanceof Error ? cause.message : String(cause)}`) }
       } else if (route.action === 'reschedule') {
         const deadlineAt = Date.parse(reschedulePayload.parse(current.command.payload).deadlineAt!)
         const updated = this.store.updateTask(task.taskId, task.revision, { deadlineAt })!

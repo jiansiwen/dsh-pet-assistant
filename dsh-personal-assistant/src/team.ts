@@ -633,7 +633,7 @@ export class TeamService {
    * 执行一个任务：检查依赖与并发额度，以修订号占用，委派给成员，等运行结果，再按产物验收。
    * @returns 任务终态与专家报告；额度不足或依赖未就绪时返回排队中的任务。
    */
-  async runTask(taskId: string, parentAgent: Agent, signal: AbortSignal): Promise<TaskOutcome | null> {
+  async runTask(taskId: string, parentAgent: Agent, signal: AbortSignal, docScope?: string): Promise<TaskOutcome | null> {
     if (this.disposed) throw new Error('团队服务已经停止')
     if (!this.recovered) this.recoverInterruptedTasks()
     const task = this.getTask(taskId)
@@ -698,7 +698,7 @@ export class TeamService {
     let stopDelta: () => void = () => undefined
     try {
       if (managed) {
-        const started = await this.startChild(member, claimed, parentAgent, runSignal, runId, null)
+        const started = await this.startChild(member, claimed, parentAgent, runSignal, runId, null, docScope)
         live.run = started.activation
         live.child = started.child
       } else if (plan) {
@@ -796,9 +796,10 @@ export class TeamService {
     signal: AbortSignal,
     runId: string,
     plan: SideEffectPlan | null,
+    docScope?: string,
   ): Promise<{ activation: SubagentActivation; child: Agent | undefined }> {
     if (this.options.members) return this.options.members.start(member.assistantId, this.buildPrompt(member, task, null), signal, task.taskId,
-      task.originChannel === 'wecom' ? 'wecom' : 'desktop')
+      task.originChannel === 'wecom' ? 'wecom' : 'desktop', docScope)
     const activation = await this.ctx.subagents.startActivation({
       provider: this.options.provider,
       label: runId,

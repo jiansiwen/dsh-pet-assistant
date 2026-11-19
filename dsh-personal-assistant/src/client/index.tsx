@@ -23,7 +23,7 @@ import { overviewValue, type OverviewCommand, type OverviewReadout } from './ove
 import {
   LIST_TABS, MEETING_HISTORY, MEETING_HISTORY_COMMAND, PRIORITY_CHOICES, SETTINGS_SUMMARY_COMMAND, TABS,
   columnClassName, columnTone, narrowTableCss, parseList, parseSettingsSummary, priorityCommand,
-  priorityOutcome, reconcilePending, rowTaskId, tableView,
+  priorityOutcome, reconcilePending, rowMeetingId, rowTaskId, tableView,
   type ListParse, type ListRow, type ListTabDefinition, type ListTabId, type SettingsParse, type TabId,
 } from './tabs.ts'
 import {
@@ -32,6 +32,11 @@ import {
   parseWecomSnapshot, setOptionFailure, validateMail, validateWecom,
   type ConfigSnapshot, type FieldDefinition, type FormErrors, type FormValues, type OptionKey,
 } from './config-forms.ts'
+import {
+  parseAssistantState, parsePetConfig, petSetCommand,
+  type AssistantStateView, type PetCharacterView, type PetConfigSnapshot,
+} from './pet-config.ts'
+import { ORIGIN_LABEL, STATUS_LABEL, parseSkills, type SkillsSnapshot } from './skills-view.ts'
 
 const PANEL_ID = 'personal-assistant'
 
@@ -60,7 +65,10 @@ interface ClientContext {
 export const inject = ['slots', 'uiSession', 'remote', 'remote.commands']
 
 /** 插件已注册的命令（`src/index.ts`）。表是"能不能做成按钮"的唯一依据。 */
-export const KNOWN_COMMANDS = ['summon-pet', 'bind-pet', 'assistant-on', 'assistant-off', 'open-workbench'] as const
+export const KNOWN_COMMANDS = [
+  'summon-pet', 'bind-pet', 'assistant-on', 'assistant-off', 'assistant-state', 'open-workbench',
+  'assistant-pet-config', 'assistant-pet-set',
+] as const
 
 /** 概览三条只读命令。`text` 原样显示，不在前端算数。 */
 const OVERVIEW_COMMANDS: Record<OverviewCommand, string> = {
@@ -235,8 +243,10 @@ const CONFIG_TABS: Record<'mail' | 'wecom', { title: string; state: string; deta
 
 function AssistantPanel({ ctx }: { ctx: ClientContext }) {
   const [busy, setBusy] = useState<null | 'summon' | 'assistant' | 'bind' | 'open'>(null)
-  /** 助理模式开关：插件没有查询命令，只能按本页执行过的结果记；null = 还没操作过。 */
-  const [assistantOn, setAssistantOn] = useState<boolean | null>(null)
+  /** 工具注入与采集的真实状态：`/assistant-state` 是唯一真源，不按本页点过什么猜。 */
+  const [power, setPower] = useState<AssistantStateView | null>(null)
+  /** 召唤成功后让「宠物」tab 自动重读：桌宠刚起来时那一页还停在"读不到"。 */
+  const [petReload, setPetReload] = useState(0)
   /** 绑定状态同样只能按回执推断；端口从回执文本里取，取不到就不显示。 */
   const [bound, setBound] = useState<{ bound: boolean; port: number | null }>({ bound: false, port: null })
   const [outcome, setOutcome] = useState<Outcome | null>(null)
@@ -272,8 +282,29 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
   const [priorityBusy, setPriorityBusy] = useState<string | null>(null)
   /** 表格下面那行反馈：四种结局各有各的说法。 */
   const [priorityNotice, setPriorityNotice] = useState<{ tone: 'ok' | 'warn' | 'bad'; text: string } | null>(null)
+  /** 行内改删：正在编辑哪条待办 / 哪场会议；null = 没打开编辑条。 */
+  const [taskEdit, setTaskEdit] = useState<{ taskId: string; title: string } | null>(null)
+  const [meetingEdit, setMeetingEdit] = useState<{ meetingId: string; name: string } | null>(null)
+  const [editNotice, setEditNotice] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null)
+  const [editBusy, setEditBusy] = useState<string | null>(null)
 
   const sessionId = currentSessionId(ctx)
+
+  /** 回读开关与采集状态。读不到就保持 unknown —— 不把未知显示成"关闭"。 */
+  const refreshPower = async (): Promise<void> => {
+    if (currentSessionId(ctx) === undefined) {
+      setPower(null)
+      return
+    }
+    const result = await executeCommand(ctx, '/assistant-state')
+    setPower(result.ok ? parseAssistantState(result.text) : { injection: 'unknown', capture: 'unknown', blocked: null })
+  }
+
+  useEffect(() => {
+    void refreshPower()
+    // 只在进入页面 / 换会话时回读：开关变化由 run() 自己回读，不做轮询。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctx, sessionId])
 
   /** 并行取三格；每条独立兜底，一条挂了只让那一格显示「暂时读不到」。 */
   useEffect(() => {
@@ -478,7 +509,8 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
       if (result.ok && (kind === 'summon' || kind === 'bind')) {
         setBound({ bound: true, port: parsePort(result.text) })
       }
-      if (kind === 'assistant') setAssistantOn(line === '/assistant-off' ? false : result.ok)
+      if (kind === 'summon' && result.ok) setPetReload(value => value + 1)
+      if (kind === 'assistant') void refreshPower()
     } finally {
       setBusy(null)
     }
@@ -498,13 +530,114 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
     }
   }
 
+  /**
+   * 行内改删的统一提交：发命令 → 显示回执 → 成功则强制回读列表。
+   *
+   * 回读是准绳：改标题/改期/取消走待批提案，列表此刻**不会**变（要等桌面确认），
+   * 回执说"已提交"；会议改删是桌宠本机确认后立即生效，回读就能看到行消失/改名。
+   * 两种结局都用同一句服务端回执，不替它编"已改成"。
+   */
+  const runEdit = async (key: string, line: string, close?: () => void): Promise<void> => {
+    setEditBusy(key)
+    setEditNotice(null)
+    try {
+      const result = await executeCommand(ctx, line)
+      setEditNotice({ tone: result.ok ? 'ok' : 'bad', text: result.text })
+      if (result.ok) {
+        if (isListTab(tab)) await loadList(tab, { force: true })
+        close?.()
+      }
+    } finally {
+      setEditBusy(null)
+    }
+  }
+
+  const editNoticeNode = editNotice === null ? null : (
+    <p role="status" style={{ margin: '8px 0 0', fontSize: 12, color: editNotice.tone === 'ok' ? TOKENS.ok : TOKENS.bad }}>
+      {editNotice.text}
+    </p>
+  )
+
+  /** 待办行尾操作：修改（开编辑条）/ 删除（提交取消提案）。没拿到 taskId 的行只读。 */
+  const todoExtra = {
+    label: '操作',
+    width: '116px',
+    render: (row: ListRow): ReactNode => {
+      const id = rowTaskId(row)
+      if (id === null) return <span style={tableHint}>—</span>
+      return (
+        <span style={{ display: 'inline-flex', gap: 6 }}>
+          <button type="button" style={smallButton} disabled={editBusy !== null}
+            onClick={() => { setTaskEdit({ taskId: id, title: row.cells[0] ?? '' }); setEditNotice(null) }}>修改</button>
+          <button type="button" style={smallButton} disabled={editBusy !== null}
+            onClick={() => void runEdit(`cancel:${id}`, `/assistant-task-set cancel ${id}`)}>删除</button>
+        </span>
+      )
+    },
+  }
+
+  /** 会议行尾操作：重命名（开编辑条）/ 删除（桌宠原生确认后删整场）。没拿到 id 的行只读。 */
+  const meetingExtra = {
+    label: '操作',
+    width: '140px',
+    render: (row: ListRow): ReactNode => {
+      const id = rowMeetingId(row)
+      if (id === null) return <span style={tableHint}>—</span>
+      return (
+        <span style={{ display: 'inline-flex', gap: 6 }}>
+          <button type="button" style={smallButton} disabled={editBusy !== null}
+            onClick={() => { setMeetingEdit({ meetingId: id, name: row.cells[1] ?? '' }); setEditNotice(null) }}>重命名</button>
+          <button type="button" style={smallButton} disabled={editBusy !== null}
+            onClick={() => void runEdit(`meeting-del:${id}`, `/assistant-meeting-set delete ${id}`)}>删除</button>
+        </span>
+      )
+    },
+  }
+
+  const todoFooter = (
+    <>
+      {taskEdit !== null && (
+        <TaskEditBar
+          edit={taskEdit}
+          busy={editBusy !== null}
+          onClose={() => setTaskEdit(null)}
+          onSubmit={(kind, value) => void runEdit(`${kind}:${taskEdit.taskId}`, `/assistant-task-set ${kind} ${taskEdit.taskId} ${value}`, () => setTaskEdit(null))}
+        />
+      )}
+      {editNoticeNode}
+    </>
+  )
+
+  const meetingFooter = (
+    <>
+      {meetingEdit !== null && (
+        <MeetingEditBar
+          edit={meetingEdit}
+          busy={editBusy !== null}
+          onClose={() => setMeetingEdit(null)}
+          onSubmit={name => void runEdit(`meeting-rename:${meetingEdit.meetingId}`, `/assistant-meeting-set rename ${meetingEdit.meetingId} ${name}`, () => setMeetingEdit(null))}
+        />
+      )}
+      {editNoticeNode}
+    </>
+  )
+
   const connected = sessionId !== undefined && bound.bound
   const dotColor = outcome !== null && !outcome.ok ? TOKENS.amber : connected ? TOKENS.green : TOKENS.grey
+  const injectionOn = power?.injection === 'on'
+  const powerText = power === null || power.injection === 'unknown' ? '' : injectionOn ? ' · 助理已开启' : ' · 助理已关闭'
+  // 采集与注入是两件事：工具开着但"等采集范围确认"/"被配置拦住"都要如实显示，
+  // 否则用户会以为记录已经在跑。
+  const captureText = power?.capture === 'recording'
+    ? ' · 记录中'
+    : power?.capture === 'pending'
+      ? ' · 采集待确认'
+      : power?.capture === 'blocked' ? ' · 采集被拦' : ''
   const connectionText = sessionId === undefined
     ? '尚未打开会话'
     : connected
-      ? `会话已绑定${bound.port === null ? '' : ` · 桥接端口 ${bound.port}`}`
-      : '未绑定'
+      ? `会话已绑定${bound.port === null ? '' : ` · 桥接端口 ${bound.port}`}${powerText}${captureText}`
+      : `未绑定${powerText}${captureText}`
 
   return (
     <div style={page}>
@@ -521,17 +654,17 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
 
       {/* 连接状态条：一行，高 ≤44px。 */}
       <section style={statusBar} aria-label="连接状态">
-        <span style={statusRow}><i style={dot(dotColor)} />{connectionText}</span>
+        <span style={statusRow} title={power?.blocked ?? undefined}><i style={dot(dotColor)} />{connectionText}</span>
         <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button type="button" disabled={busy !== null} onClick={() => void run('summon', '/summon-pet')} style={smallButton}>
             {busy === 'summon' ? '召唤中…' : '召唤宠物'}
           </button>
           <button
             type="button" disabled={busy !== null}
-            onClick={() => void run('assistant', assistantOn === true ? '/assistant-off' : '/assistant-on')}
+            onClick={() => void run('assistant', injectionOn ? '/assistant-off' : '/assistant-on')}
             style={smallButton}
           >
-            {busy === 'assistant' ? '处理中…' : assistantOn === true ? '关闭个人助理' : '开启个人助理'}
+            {busy === 'assistant' ? '处理中…' : injectionOn ? '关闭个人助理' : '开启个人助理'}
           </button>
           <button type="button" disabled={busy !== null} onClick={() => void run('bind', '/bind-pet')} style={smallButton}>
             {busy === 'bind' ? '绑定中…' : '仅绑定会话'}
@@ -603,6 +736,16 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
             passwordKeys={['secret']}
             readSnapshot={parseWecomSnapshot}
           />
+        ) : tab === 'skills' ? (
+          <SkillsPanel ctx={ctx} connected={sessionId !== undefined} />
+        ) : tab === 'pet' ? (
+          <PetConfigPanel
+            ctx={ctx}
+            connected={sessionId !== undefined}
+            reloadToken={petReload}
+            summoning={busy === 'summon'}
+            onSummon={() => void run('summon', '/summon-pet')}
+          />
         ) : tab === 'settings' ? (
           <SettingsPanel
             values={optionValues}
@@ -630,8 +773,11 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
                     notice: priorityNotice,
                     onPick: (taskId: string, value: string) => void setPriority(taskId, value),
                   },
+                  extra: todoExtra,
+                  footer: todoFooter,
                 }
                 : {})}
+              {...(tab === 'meeting' ? { extra: meetingExtra, footer: meetingFooter } : {})}
             />
             {tab === 'meeting' && (
               <MeetingHistoryPanel
@@ -640,6 +786,8 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
                 connected={sessionId !== undefined}
                 busy={busy === 'open'}
                 onOpen={pageName => void openInPet(pageName)}
+                extra={meetingExtra}
+                footer={meetingFooter}
               />
             )}
           </>
@@ -728,7 +876,7 @@ function PriorityCell({ value, pending, busy, onOpen }: {
  * 抽出来是因为「今天」与「最近会议」两张表只差列定义与文案：共用一份渲染，才不会出现
  * 一张表补 `—`、另一张不补这种漂移。`keyPrefix` 只用于让两张表的列类名互不干扰。
  */
-function TableBody({ definition, page, result, loading, connected, busy, onOpen, keyPrefix, rightAlignLast = false, renderCell }: {
+function TableBody({ definition, page, result, loading, connected, busy, onOpen, keyPrefix, rightAlignLast = false, renderCell, extra }: {
   definition: ListTabDefinition
   /** 「在桌面宠物里打开」要跳的那一页（列表 tab 用它自己的 id；历史用 meeting）。 */
   page: string
@@ -741,6 +889,8 @@ function TableBody({ definition, page, result, loading, connected, busy, onOpen,
   rightAlignLast?: boolean
   /** 某一列要自定义渲染时用它（目前只有待办的优先级列）。不传就是纯文字。 */
   renderCell?(info: { row: ListRow; column: ListTabDefinition['columns'][number]; cell: string }): ReactNode
+  /** 行尾追加的操作列（修改/删除等）。不进 definition.columns，避免改动服务端列契约。 */
+  extra?: { label: string; width: string; render(row: ListRow): ReactNode }
 }) {
   const state = result?.state
   const message = loading
@@ -764,6 +914,9 @@ function TableBody({ definition, page, result, loading, connected, busy, onOpen,
             }}
           >{column.label}</span>
         ))}
+        {extra !== undefined && (
+          <span style={{ flex: columnFlex(extra.width), minWidth: 0 }}>{extra.label}</span>
+        )}
       </div>
       {state === 'rows' && result !== undefined
         ? result.rows.map((row, rowIndex) => (
@@ -790,6 +943,9 @@ function TableBody({ definition, page, result, loading, connected, busy, onOpen,
                 >{renderCell === undefined || column === undefined ? cell : renderCell({ row, column, cell })}</span>
               )
             })}
+            {extra !== undefined && (
+              <span style={{ flex: columnFlex(extra.width), minWidth: 0 }}>{extra.render(row)}</span>
+            )}
           </div>
         ))
         : (
@@ -819,7 +975,7 @@ function TableBody({ definition, page, result, loading, connected, busy, onOpen,
  * 为什么不做"单元格上的浮层菜单"：`tableWrap` 有 `overflow: hidden`（圆角要用），
  * 浮层会被裁掉一半；改成"贴着表格的操作条"既不会被裁，也能放得下标题。
  */
-function ListPanel({ tab, result, loading, connected, busy, onOpen, priority }: {
+function ListPanel({ tab, result, loading, connected, busy, onOpen, priority, extra, footer }: {
   tab: ListTabId
   result: ListParse | undefined
   loading: boolean
@@ -833,6 +989,10 @@ function ListPanel({ tab, result, loading, connected, busy, onOpen, priority }: 
     notice: { tone: 'ok' | 'warn' | 'bad'; text: string } | null
     onPick(taskId: string, value: string): void
   }
+  /** 行尾操作列（修改/删除）。 */
+  extra?: { label: string; width: string; render(row: ListRow): ReactNode }
+  /** 表格下方的编辑条/反馈（改标题/改期/间隔/重命名）。 */
+  footer?: ReactNode
 }) {
   const definition = LIST_TABS[tab]
   /** 正在选哪一行（null = 没打开选择条）。 */
@@ -867,7 +1027,9 @@ function ListPanel({ tab, result, loading, connected, busy, onOpen, priority }: 
         onOpen={onOpen}
         keyPrefix={tab}
         renderCell={renderCell}
+        extra={extra}
       />
+      {footer}
       {priority !== undefined && editing !== null && (
         <div
           role="menu"
@@ -919,12 +1081,14 @@ function ListPanel({ tab, result, loading, connected, busy, onOpen, priority }: 
  * 与「今天」共用 `TableBody`，差别只有三点：列定义、右对齐最后一列（状态）、
  * 以及窄屏时隐藏「来源 / 保留期」（靠类名 + 内联 `<style>` 的媒体查询，不横向滚动）。
  */
-function MeetingHistoryPanel({ result, loading, connected, busy, onOpen }: {
+function MeetingHistoryPanel({ result, loading, connected, busy, onOpen, extra, footer }: {
   result: ListParse | undefined
   loading: boolean
   connected: boolean
   busy: boolean
   onOpen(pageName: string): void
+  extra?: { label: string; width: string; render(row: ListRow): ReactNode }
+  footer?: ReactNode
 }) {
   return (
     <section aria-label="最近会议" style={{ marginTop: 18 }}>
@@ -942,7 +1106,9 @@ function MeetingHistoryPanel({ result, loading, connected, busy, onOpen }: {
         onOpen={onOpen}
         keyPrefix="history"
         rightAlignLast
+        extra={extra}
       />
+      {footer}
     </section>
   )
 }
@@ -1019,6 +1185,465 @@ function SettingsPanel({ values, loading, connected, saving, errors, onSet }: {
  *
  * 颜色也跟着事实走：只有"读不到"用琥珀（提醒但不算错），其余落灰。
  */
+/** 编辑条外壳：贴着表格下方，不被 tableWrap 的圆角裁掉（与优先级选择条同一套路）。 */
+const editBarStyle = {
+  display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const, marginTop: 8,
+  padding: '8px 12px', border: `1px solid ${TOKENS.line}`, borderRadius: 10, background: TOKENS.soft,
+}
+const editInputStyle = {
+  font: 'inherit', fontSize: 12.5, padding: '4px 8px', borderRadius: 8,
+  border: `1px solid ${TOKENS.line}`, background: '#fff', color: TOKENS.ink,
+}
+
+/**
+ * 待办编辑条：改标题 / 改期 / 改催办间隔，三个独立保存按钮。
+ *
+ * 校验在本地先挡（空标题、越界间隔、没选时间），不发半截命令；
+ * 真正的写仍走可信通道，回执原样显示在表格下方。
+ */
+function TaskEditBar({ edit, busy, onSubmit, onClose }: {
+  edit: { taskId: string; title: string }
+  busy: boolean
+  onSubmit(kind: 'title' | 'deadline' | 'interval', value: string): void
+  onClose(): void
+}) {
+  const [title, setTitle] = useState(edit.title)
+  const [deadline, setDeadline] = useState('')
+  const [interval, setInterval] = useState('')
+  const [problem, setProblem] = useState<string | null>(null)
+
+  const submit = (kind: 'title' | 'deadline' | 'interval', raw: string): void => {
+    if (kind === 'title') {
+      const value = raw.trim()
+      if (value === '' || value.length > 200) { setProblem('标题需为 1–200 字'); return }
+      setProblem(null); onSubmit(kind, value); return
+    }
+    if (kind === 'deadline') {
+      if (raw === '') { setProblem('先选一个时间'); return }
+      const ms = new Date(raw).getTime()
+      if (!Number.isFinite(ms)) { setProblem('时间不合法'); return }
+      setProblem(null); onSubmit(kind, String(ms)); return
+    }
+    const seconds = Number(raw)
+    if (!Number.isInteger(seconds) || seconds < 60 || seconds > 604_800) { setProblem('间隔需为 60–604800 秒'); return }
+    setProblem(null); onSubmit(kind, String(seconds))
+  }
+
+  return (
+    <div role="group" aria-label={`修改待办「${edit.title}」`} style={editBarStyle}>
+      <span style={{ fontSize: 12, color: TOKENS.muted, flexBasis: '100%' }}>修改「{edit.title}」：</span>
+      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+        标题
+        <input style={{ ...editInputStyle, width: 160 }} value={title} disabled={busy} onChange={e => setTitle(e.target.value)} />
+      </label>
+      <button type="button" style={smallButton} disabled={busy} onClick={() => submit('title', title)}>保存标题</button>
+      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+        到期
+        <input type="datetime-local" style={editInputStyle} value={deadline} disabled={busy} onChange={e => setDeadline(e.target.value)} />
+      </label>
+      <button type="button" style={smallButton} disabled={busy} onClick={() => submit('deadline', deadline)}>保存改期</button>
+      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+        间隔秒
+        <input type="number" style={{ ...editInputStyle, width: 90 }} value={interval} disabled={busy} onChange={e => setInterval(e.target.value)} />
+      </label>
+      <button type="button" style={smallButton} disabled={busy} onClick={() => submit('interval', interval)}>保存间隔</button>
+      <button type="button" style={secondaryButton} disabled={busy} onClick={onClose}>关闭</button>
+      {problem !== null && <span role="alert" style={{ color: TOKENS.bad, fontSize: 12, flexBasis: '100%' }}>{problem}</span>}
+      <span style={{ ...tableHint, flexBasis: '100%' }}>
+        改标题/改期提交后需在桌面宠物确认才生效；间隔与删除在桌面弹窗确认。重复提醒改期只换首次时间，不抹掉重复规则。
+      </span>
+    </div>
+  )
+}
+
+/** 会议编辑条：只改名字；删除整场在行尾按钮（走桌宠原生确认）。 */
+function MeetingEditBar({ edit, busy, onSubmit, onClose }: {
+  edit: { meetingId: string; name: string }
+  busy: boolean
+  onSubmit(name: string): void
+  onClose(): void
+}) {
+  const [name, setName] = useState(edit.name)
+  const [problem, setProblem] = useState<string | null>(null)
+  const submit = (): void => {
+    const value = name.trim()
+    if (value === '' || value.length > 200) { setProblem('名称需为 1–200 字'); return }
+    setProblem(null); onSubmit(value)
+  }
+  return (
+    <div role="group" aria-label={`重命名会议「${edit.name}」`} style={editBarStyle}>
+      <span style={{ fontSize: 12, color: TOKENS.muted }}>重命名「{edit.name}」为：</span>
+      <input style={{ ...editInputStyle, width: 200 }} value={name} disabled={busy} onChange={e => setName(e.target.value)} />
+      <button type="button" style={smallButton} disabled={busy} onClick={submit}>保存名称</button>
+      <button type="button" style={secondaryButton} disabled={busy} onClick={onClose}>关闭</button>
+      {problem !== null && <span role="alert" style={{ color: TOKENS.bad, fontSize: 12, flexBasis: '100%' }}>{problem}</span>}
+    </div>
+  )
+}
+
+/**
+ * 工作台「技能」tab：自动形成的技能在这里查验，也可人工增删改查。
+ *
+ * 写操作都走 `/assistant-skill-set`（owner=本人桌面可信路由）；每次写完强制回读，
+ * 界面显示服务端真实状态。自动形成来源（auto-*）会标出来，自报来源提示"待查验"。
+ */
+function SkillsPanel({ ctx, connected }: { ctx: ClientContext; connected: boolean }) {
+  const [snap, setSnap] = useState<SkillsSnapshot | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [editing, setEditing] = useState<{ id: string; body: string } | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [cAssistant, setCAssistant] = useState('')
+  const [cName, setCName] = useState('')
+  const [cBody, setCBody] = useState('')
+
+  const load = async (): Promise<void> => {
+    if (!connected) { setSnap(null); return }
+    setLoading(true)
+    try {
+      const result = await executeCommand(ctx, '/assistant-skills')
+      setSnap(parseSkills(result.ok ? result.text : ''))
+    } finally { setLoading(false) }
+  }
+  useEffect(() => { void load() /* eslint-disable-line react-hooks/exhaustive-deps */ }, [ctx, connected])
+
+  const run = async (key: string, line: string, after?: () => void): Promise<void> => {
+    setBusy(key); setNotice(null)
+    try {
+      const result = await executeCommand(ctx, line)
+      setNotice({ ok: result.ok, text: result.text })
+      if (result.ok) { await load(); after?.() }
+    } finally { setBusy(null) }
+  }
+
+  if (!connected) return <div style={tableWrap}><div style={tableEmpty}><span>未连接：先在左侧打开或新建一个会话</span></div></div>
+  if (snap === null) return <div style={tableWrap}><div style={tableEmpty}><span>{loading ? '读取中…' : '暂时读不到技能'}</span></div></div>
+  if (snap.unavailable) return (
+    <div style={tableWrap}><div style={tableEmpty}>
+      <span>{snap.message ?? '暂时读不到技能'}</span>
+      <button type="button" style={secondaryButton} disabled={loading} onClick={() => void load()}>刷新</button>
+    </div></div>
+  )
+
+  return (
+    <section aria-label="技能">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+        <span style={tableHint}>同类工作攒够样本会自动总结成技能；你在这里查验、修改或删除。</span>
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8 }}>
+          <button type="button" style={smallButton} disabled={loading || busy !== null} onClick={() => void load()}>刷新</button>
+          <button type="button" style={smallButton} disabled={busy !== null} onClick={() => { setCreating(v => !v); setEditing(null) }}>{creating ? '收起新建' : '新建技能'}</button>
+        </span>
+      </div>
+
+      {creating && (
+        <div style={editBarStyle}>
+          <input style={{ ...editInputStyle, width: 140 }} placeholder="助理ID（member-…）" value={cAssistant} onChange={e => setCAssistant(e.target.value)} />
+          <input style={{ ...editInputStyle, width: 140 }} placeholder="技能名称" value={cName} onChange={e => setCName(e.target.value)} />
+          <input style={{ ...editInputStyle, flex: 1, minWidth: 200 }} placeholder="正文：做什么、按什么步骤、注意什么" value={cBody} onChange={e => setCBody(e.target.value)} />
+          <button type="button" style={smallButton} disabled={busy !== null || !cAssistant || !cName || !cBody}
+            onClick={() => void run('create', `/assistant-skill-set create ${cAssistant} ${cName} ${cBody}`, () => { setCreating(false); setCAssistant(''); setCName(''); setCBody('') })}>保存</button>
+        </div>
+      )}
+      {editing && (
+        <div style={editBarStyle}>
+          <textarea style={{ ...editInputStyle, flex: 1, minWidth: 240, minHeight: 64 }} value={editing.body} onChange={e => setEditing({ ...editing, body: e.target.value })} />
+          <button type="button" style={smallButton} disabled={busy !== null || editing.body.trim() === ''}
+            onClick={() => void run(`edit:${editing.id}`, `/assistant-skill-set edit ${editing.id} ${editing.body}`, () => setEditing(null))}>保存修改</button>
+          <button type="button" style={secondaryButton} onClick={() => setEditing(null)}>取消</button>
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gap: 10 }}>
+        {snap.skills.length === 0 && <div style={tableWrap}><div style={tableEmpty}><span>还没有技能。同类活做多了会自动攒出来，也可点"新建技能"。</span></div></div>}
+        {snap.skills.map(skill => (
+          <div key={skill.id} style={configBlock}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <strong style={{ fontSize: 14 }}>{skill.name}</strong>
+              <span style={badge}>{skill.assistantName}</span>
+              <span style={badge}>{STATUS_LABEL[skill.status] ?? skill.status}</span>
+              <span style={badge}>v{skill.version}</span>
+              <span style={{ ...tableHint, color: skill.origin === 'auto-selfreport' ? TOKENS.amber : TOKENS.faint }}>{ORIGIN_LABEL[skill.origin] ?? skill.origin}</span>
+            </div>
+            <p style={{ ...tableHint, margin: 0, whiteSpace: 'pre-wrap' }}>{skill.body.length > 120 ? `${skill.body.slice(0, 120)}…` : skill.body}</p>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => { setEditing({ id: skill.id, body: skill.body }); setCreating(false) }}>编辑</button>
+              {skill.status !== 'active' && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`promote:${skill.id}`, `/assistant-skill-set promote ${skill.id}`)}>让它生效</button>}
+              {skill.status === 'active' && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`retire:${skill.id}`, `/assistant-skill-set retire ${skill.id}`)}>退役</button>}
+              {skill.version > 1 && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`rollback:${skill.id}`, `/assistant-skill-set rollback ${skill.id} ${skill.version - 1}`)}>回滚上一版</button>}
+              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`delete:${skill.id}`, `/assistant-skill-set delete ${skill.id}`)}>删除</button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {(snap.pending.length > 0 || snap.unverified.length > 0) && (
+        <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
+          {snap.unverified.map(item => (
+            <div key={`u:${item.assistantId}:${item.shape}`} style={{ ...editBarStyle, marginTop: 0 }}>
+              <span style={{ fontSize: 12 }}>{item.assistantName}「{item.shape}」自报 {item.count} 次，待你确认</span>
+              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`verify:${item.shape}`, `/assistant-skill-set verify ${item.assistantId} ${item.shape}`)}>确认属实</button>
+              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`retract:${item.shape}`, `/assistant-skill-set retract ${item.assistantId} ${item.shape}`)}>撤回</button>
+            </div>
+          ))}
+          {snap.pending.map(item => (
+            <div key={`p:${item.assistantId}:${item.shape}`} style={{ ...editBarStyle, marginTop: 0 }}>
+              <span style={{ fontSize: 12 }}>{item.assistantName}「{item.shape}」已攒 {item.count} 次可信成功，够格形成技能</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {notice !== null && <p role="status" style={{ margin: '8px 0 0', fontSize: 12, color: notice.ok ? TOKENS.ok : TOKENS.bad }}>{notice.text}</p>}
+    </section>
+  )
+}
+
+/**
+ * 工作台「宠物」tab：把右键菜单里能改的外观项（形象 / 随机动作 / 显示 / 上台）搬到页面上。
+ *
+ * 数据只有一条通道：`/assistant-pet-config` 读、`/assistant-pet-set` 写；写入后**强制回读**，
+ * 界面显示的是桌宠真实落盘的值，不是乐观更新猜出来的值。桌宠没跑时如实显示"读不到" +
+ * 一个真能用的「召唤宠物」，不画一张假表。
+ */
+function PetConfigPanel({ ctx, connected, reloadToken, summoning, onSummon }: {
+  ctx: ClientContext
+  connected: boolean
+  /** 外部动作（召唤宠物）成功后递增，触发一次重读。 */
+  reloadToken: number
+  summoning: boolean
+  onSummon(): void
+}) {
+  const [snapshot, setSnapshot] = useState<PetConfigSnapshot | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const load = async (): Promise<void> => {
+    if (!connected) {
+      setSnapshot(null)
+      return
+    }
+    setLoading(true)
+    try {
+      const result = await executeCommand(ctx, '/assistant-pet-config')
+      setSnapshot(parsePetConfig(result.ok ? result.text : '暂时读不到宠物配置'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void load()
+    // 只在进入 tab / 会话变化 / 召唤成功后读一次；刷新有按钮，开关变化由别的 tab 负责。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctx, connected, reloadToken])
+
+  /**
+   * 改一项：先乐观更新、失败退回、成功回读为准。
+   * 成功文案用命令回执（桌宠说的"已换好形象"），失败原因也原样显示 —— 不统一改成"保存失败"。
+   */
+  const mutate = async (
+    key: string,
+    command: string,
+    optimistic: (current: PetConfigSnapshot) => PetConfigSnapshot,
+  ): Promise<void> => {
+    if (snapshot === null) return
+    const before = snapshot
+    setSnapshot(optimistic(snapshot))
+    setBusy(key)
+    setNotice(null)
+    try {
+      const result = await executeCommand(ctx, command)
+      if (!result.ok) {
+        setSnapshot(before)
+        setNotice({ ok: false, text: result.text })
+        return
+      }
+      setNotice({ ok: true, text: result.text })
+      const refreshed = await executeCommand(ctx, '/assistant-pet-config')
+      setSnapshot(parsePetConfig(refreshed.ok ? refreshed.text : '暂时读不到宠物配置'))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (!connected) {
+    return (
+      <div style={tableWrap}>
+        <div style={tableEmpty}><span>未连接：先在左侧打开或新建一个会话，再配置宠物</span></div>
+      </div>
+    )
+  }
+  if (snapshot === null) {
+    return (
+      <div style={tableWrap}>
+        <div style={tableEmpty}><span>{loading ? '读取中…' : '暂时读不到宠物配置'}</span></div>
+      </div>
+    )
+  }
+  if (snapshot.unavailable) {
+    return (
+      <div style={tableWrap}>
+        <div style={tableEmpty}>
+          <span>{snapshot.message ?? '暂时读不到宠物配置'}</span>
+          <button type="button" disabled={summoning} onClick={onSummon} style={secondaryButton}>
+            {summoning ? '召唤中…' : '召唤宠物'}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <section aria-label="宠物配置">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+        <span style={tableHint}>与桌面宠物右键菜单是同一份设置，改完立即生效。</span>
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8, flexWrap: 'wrap' }}>
+          <button type="button" style={smallButton} disabled={loading || busy !== null} onClick={() => void load()}>
+            {loading ? '刷新中…' : '刷新'}
+          </button>
+          <button
+            type="button" style={smallButton} disabled={busy !== null}
+            onClick={() => void mutate(
+              'stage',
+              petSetCommand({ kind: 'stage', value: !snapshot.stageVisible }),
+              current => ({ ...current, stageVisible: !current.stageVisible }),
+            )}
+          >
+            {snapshot.stageVisible ? '隐藏角色（截图 / 录屏）' : '显示角色'}
+          </button>
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gap: 10 }}>
+        {snapshot.characters.map(character => {
+          const skin = snapshot.skins.find(item => item.id === character.skin) ?? snapshot.skins[0]
+          const actions = skin?.actions ?? []
+          return (
+            <CharacterConfigCard
+              key={character.assistantId}
+              character={character}
+              skins={snapshot.skins}
+              actions={actions}
+              busy={busy !== null}
+              onSkin={value => void mutate(
+                `skin:${character.assistantId}`,
+                petSetCommand({ kind: 'skin', assistantId: character.assistantId, value }),
+                current => ({
+                  ...current,
+                  characters: current.characters.map(item => item.assistantId === character.assistantId
+                    ? { ...item, skin: value } : item),
+                }),
+              )}
+              onActions={value => void mutate(
+                `actions:${character.assistantId}`,
+                petSetCommand({ kind: 'actions', assistantId: character.assistantId, value }),
+                current => ({
+                  ...current,
+                  characters: current.characters.map(item => item.assistantId === character.assistantId
+                    ? { ...item, randomActions: [...value] } : item),
+                }),
+              )}
+              onStep={value => void mutate(
+                `step:${character.assistantId}`,
+                petSetCommand({ kind: 'step', assistantId: character.assistantId, value }),
+                current => ({
+                  ...current,
+                  characters: current.characters.map(item => item.assistantId === character.assistantId
+                    ? { ...item, steppedDown: value === 'down' } : item),
+                }),
+              )}
+            />
+          )
+        })}
+      </div>
+
+      {notice !== null && (
+        <p role="status" style={{ margin: '8px 0 0', fontSize: 12, color: notice.ok ? TOKENS.ok : TOKENS.bad }}>
+          {notice.text}
+        </p>
+      )}
+      <p style={{ ...tableHint, marginTop: 8 }}>
+        随机动作只影响空闲时的自发表演；形象与动作来自桌面宠物当前可用的素材，自定义形象会出现在形象列表里。
+      </p>
+    </section>
+  )
+}
+
+/** 单个角色的配置卡：形象下拉 + 随机动作勾选 + 上台/退下。 */
+function CharacterConfigCard({ character, skins, actions, busy, onSkin, onActions, onStep }: {
+  /** 客户端插件的 React 类型是极简环境，函数组件需要显式声明 key。 */
+  key?: string
+  character: PetCharacterView
+  skins: PetConfigSnapshot['skins']
+  actions: PetConfigSnapshot['skins'][number]['actions']
+  busy: boolean
+  onSkin(value: string): void
+  onActions(value: readonly string[]): void
+  onStep(value: 'up' | 'down'): void
+}) {
+  const selectable = skins.some(skin => skin.id === character.skin)
+  return (
+    <div style={configBlock}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <strong style={{ fontSize: 14 }}>{character.displayName}</strong>
+        {character.chief && <span style={badge}>总助理</span>}
+        {character.steppedDown && <span style={badge}>已退下</span>}
+        {!character.chief && (
+          <button
+            type="button" disabled={busy}
+            onClick={() => onStep(character.steppedDown ? 'up' : 'down')}
+            style={{ ...smallButton, marginLeft: 'auto' }}
+          >
+            {character.steppedDown ? '请上台' : '让TA退下（不退出宠物）'}
+          </button>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12.5 }}>
+        <span style={{ color: TOKENS.muted, minWidth: 64 }}>形象</span>
+        <select
+          aria-label={`${character.displayName} 的形象`}
+          value={character.skin}
+          disabled={busy}
+          onChange={event => onSkin(event.target.value)}
+          style={{
+            font: 'inherit', padding: '4px 8px', borderRadius: 8,
+            border: `1px solid ${TOKENS.line}`, background: '#fff', color: TOKENS.ink,
+          }}
+        >
+          {!selectable && <option value={character.skin}>{character.skin}</option>}
+          {skins.map(skin => <option key={skin.id} value={skin.id}>{skin.label}</option>)}
+        </select>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, flexWrap: 'wrap', fontSize: 12.5 }}>
+        <span style={{ color: TOKENS.muted, minWidth: 64, lineHeight: '18px' }}>随机动作</span>
+        <span style={{ display: 'inline-flex', gap: 12, flexWrap: 'wrap', lineHeight: '18px' }}>
+          {actions.length === 0 && <span style={tableHint}>这个形象没有可勾选的动作</span>}
+          {actions.map(action => {
+            const checked = character.randomActions.includes(action.id)
+            return (
+              <label key={action.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={busy}
+                  onChange={event => onActions(event.target.checked
+                    ? [...character.randomActions, action.id]
+                    : character.randomActions.filter(id => id !== action.id))}
+                />
+                {action.label}
+              </label>
+            )
+          })}
+        </span>
+      </div>
+    </div>
+  )
+}
+
 function configStatusText(snapshot: ConfigSnapshot | null, reading: boolean): { text: string; tone: string } {
   if (reading || snapshot === null) return { text: '读取中…', tone: TOKENS.grey }
   if (snapshot.unavailable) return { text: '暂时读不到当前配置，可以直接填写保存', tone: TOKENS.amber }

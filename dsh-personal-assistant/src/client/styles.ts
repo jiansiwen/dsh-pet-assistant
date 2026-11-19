@@ -103,12 +103,17 @@ export const tabButton = (active: boolean): CSSProperties => ({
 export const tabPanel: CSSProperties = { padding: '16px 0 0' }
 
 export const tableWrap: CSSProperties = {
-  border: `1px solid ${TOKENS.line}`, borderRadius: 12, background: '#fff', overflow: 'hidden',
+  border: `1px solid ${TOKENS.line}`, borderRadius: 12, background: '#fff',
+  // 列表行多时在卡片内部上下滚（表头吸顶），不依赖外层页面是否可滚；
+  // 横向也允许滚，窄屏隐藏列之外仍能看到被截的列。
+  overflow: 'auto', maxHeight: 'min(56vh, 520px)',
 }
 export const tableHeadRow: CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
   borderBottom: `1px solid ${TOKENS.line}`, background: TOKENS.soft,
   color: TOKENS.faint, fontSize: 11.5, fontWeight: 600,
+  // 吸顶：卡片内滚动时表头不跟着滚走，否则滚到下面不知道每列是什么。
+  position: 'sticky', top: 0, zIndex: 1,
 }
 export const tableRow: CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 12, minHeight: 44, padding: '10px 14px',

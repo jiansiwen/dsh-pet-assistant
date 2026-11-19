@@ -119,6 +119,7 @@ export class AssetStudio {
         secretFlags: flags,
         jobs: this.deps.pipeline.listJobs(),
         skins: listCustomSkins(this.deps.userDataDir),
+        actionAssets: Object.fromEntries(listCustomSkins(this.deps.userDataDir).map(s => [s.id, this.deps.pipeline.actionAssets(s.id)])),
         voices: this.deps.voices.list(),
         ffmpeg: this.ffmpegCache.value,
         selectedTts: this.deps.voiceStore.snapshot().selected.tts,
@@ -259,6 +260,34 @@ export class AssetStudio {
       })
       this.deps.broadcast('pet-settings-changed')
       return ok({ skinId, action, path: output })
+    })
+
+    this.handle('asset-studio-generate-action', async (input) => {
+      const raw = (input ?? {}) as { skinId?: string; action?: string; prompt?: string; videoProviderId?: string; approved?: boolean }
+      const confirmed = await this.confirm('给已有角色生成一个新动作？',
+        `将调用你配置的视频 provider 1 次，费用计入对应平台账户；产物先进预览区，你点应用后才写入宠物。`)
+      if (!confirmed) return fail('已取消')
+      const job = this.deps.pipeline.createActionJob({
+        skinId: String(raw.skinId ?? ''), action: String(raw.action ?? ''), prompt: String(raw.prompt ?? ''),
+        videoProviderId: String(raw.videoProviderId ?? ''), approved: true,
+      })
+      void this.deps.pipeline.runAction(job.id)
+      return ok(job)
+    })
+
+    this.handle('asset-studio-apply-action', (input) => {
+      const job = this.deps.pipeline.applyAction(String((input as { id: string }).id))
+      this.deps.broadcast('pet-settings-changed')
+      return ok(job)
+    })
+
+    this.handle('asset-studio-delete-action', async (input) => {
+      const { skinId, action } = (input ?? {}) as { skinId?: string; action?: string }
+      const confirmed = await this.confirm('删除这个动作？', `将删除 ${String(skinId)} 的 ${String(action)} 素材（视频/帧序列）并从登记表移除。`)
+      if (!confirmed) return fail('已取消')
+      this.deps.pipeline.deleteAction(String(skinId ?? ''), String(action ?? ''))
+      this.deps.broadcast('pet-settings-changed')
+      return ok()
     })
 
     this.handle('asset-studio-pick-audio', async () => {

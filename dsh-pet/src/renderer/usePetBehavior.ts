@@ -13,6 +13,8 @@ export type PetAction =
   | 'drop' | 'think' | 'laptop-in' | 'laptop-out'
   /** 走路收步（一次）：走姿 → 站定。走到目标时插在 walk 与 idle 之间 */
   | 'walk-stop'
+  /** 插兜swagger走：行走类自定义动作，接窗口移动与翻面，素材朝左 */
+  | 'swagger'
   /** 打盹三步（与 InteractionPhase 同名，直接投影成动作） */
   | 'sleep-in' | 'sleep-loop' | 'sleep-out'
 
@@ -81,6 +83,8 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   const frozenRef = useRef(false)
   const actionRef = useRef(action)
   actionRef.current = action
+  /** swagger 本轮步速：按路程反推，使走完≈一轮视频时长。 */
+  const swaggerSpeedRef = useRef(0.5)
   // 编制外成员的台词对象可能每次重渲染都重建；只更新内容，不重置生活计时器。
   const linesRef = useRef(lines)
   linesRef.current = lines
@@ -161,6 +165,20 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
     targetRef.current = { x: clampX(nx), y: clampY(ny) }
     setAction('walk')
   }, [clampX, clampY])
+  /** 随机徘徊落点：太近会 0.2 秒就"走到"，走路像被截断；保证至少 60px 路程。 */
+  const wanderTarget = useCallback(() => {
+    const max = window.innerWidth - PET_WIDTH - STAGE_MARGIN
+    const lo = Math.max(STAGE_MARGIN, homeRef.current.x - WANDER_RADIUS)
+    const hi = Math.min(max, homeRef.current.x + WANDER_RADIUS)
+    let tx = Math.round(lo + Math.random() * (hi - lo))
+    const MIN = 60
+    if (Math.abs(tx - xRef.current) < MIN) {
+      const dir = Math.random() < 0.5 ? -1 : 1
+      tx = Math.round(Math.min(max, Math.max(STAGE_MARGIN, xRef.current + dir * MIN)))
+      if (Math.abs(tx - xRef.current) < MIN) tx = Math.round(Math.min(max, Math.max(STAGE_MARGIN, xRef.current - dir * MIN)))
+    }
+    return { x: tx, y: yRef.current }
+  }, [])
   const startActivity = useCallback((act: PetAction, minMs = 4500, maxMs = 9000) => {
     if (frozenRef.current || interactionProtected(interactionRef.current)) return
     const holdMs = minMs + Math.random() * (maxMs - minMs)
@@ -175,23 +193,25 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   const doWrite = useCallback(() => startActivity('write', 3000, 3000), [startActivity])
 
   useEffect(() => subscribeTick(() => {
-    if (frozenRef.current || interactionProtected(interactionRef.current) || actionRef.current !== 'walk') return
+    const cur = actionRef.current
+    if (frozenRef.current || interactionProtected(interactionRef.current) || (cur !== 'walk' && cur !== 'swagger')) return
     const target = targetRef.current
     if (!target) return
-    const speed = 1.1
+    // swagger 速度按"走完恰好一轮视频（3.5s）"反推，动作演完整才收步；内置 walk 保持原速。
+    const speed = cur === 'swagger' ? swaggerSpeedRef.current : 1.1
     const dx = target.x - xRef.current, dy = target.y - yRef.current
     if (Math.abs(dx) <= speed && Math.abs(dy) <= speed) {
       setX(target.x)
       setY(target.y)
       targetRef.current = null
-      // 走到目标直接淡回 idle。以前这里插 3 帧 walk-stop 站姿，
-      // 但那段素材和 walk 的比例/姿势不一致，看起来像突然闪回初始形态。
-      setAction('idle')
+      // 内置 walk 收步演 3 帧站定再回 idle；swagger 收步演转身站定一段，姿势衔接不闪现。
+      setAction(cur === 'walk' ? 'walk-stop' : 'swagger-stop')
       return
     }
     if (Math.abs(dx) > speed) {
       const dir = dx > 0 ? 1 : -1
-      setFacing(dir)
+      // 内置 walk 素材朝右、swagger 视频朝左：翻面方向相反，保证脸朝着前进方向。
+      setFacing(cur === 'swagger' ? (dir === 1 ? -1 : 1) : dir)
       setX(xRef.current + speed * dir)
     }
     if (Math.abs(dy) > speed) setY(yRef.current + speed * (dy > 0 ? 1 : -1))
@@ -201,7 +221,10 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
   useEffect(() => {
     const timer = window.setInterval(() => {
       const opts = optionsRef.current
-      dispatch({ type: 'tick', working: opts.working, idleMinutes: opts.idleSleepMinutes, sleepMinutes: opts.sleepMinutes })
+      const cur = actionRef.current
+      const active = targetRef.current !== null || cur === 'happy' || cur === 'drop' || cur === 'walk-stop'
+        || cur === 'swagger-stop' || cur === 'sit' || cur === 'read' || cur === 'play'
+      dispatch({ type: 'tick', working: opts.working, idleMinutes: opts.idleSleepMinutes, sleepMinutes: opts.sleepMinutes, active })
     }, 1000)
     return () => window.clearInterval(timer)
   }, [dispatch])
@@ -220,10 +243,10 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
         const cur = actionRef.current
         const inActivity = cur === 'sit' || cur === 'read' || cur === 'play' || cur === 'write'
         // 走到一半不能被随机调度截断：目标还在就先把这一步走完。
-        const walking = cur === 'walk' && targetRef.current !== null
+        const walking = (cur === 'walk' || cur === 'swagger') && targetRef.current !== null
         // happy / drop / walk-stop 都是**一次性演出**，各自带回落定时器，
         // 演出期间不能被这一拍换掉 —— 否则「摔到一半突然开始走路」。
-        const oneShotPlaying = cur === 'happy' || cur === 'drop' || cur === 'walk-stop'
+        const oneShotPlaying = cur === 'happy' || cur === 'drop' || cur === 'walk-stop' || cur === 'swagger-stop'
         const currentLines = linesRef.current
         if (!interactionProtected(interactionRef.current) && !optionsRef.current.sceneBound && !inActivity && !walking && !oneShotPlaying) {
           if (optionsRef.current.working) {
@@ -236,10 +259,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
             const act = list.length > 0 ? pick(list) : 'idle'
             if (act === 'idle' || Math.random() < 0.25) setAction('idle')
             else if (act === 'walk') {
-              const max = window.innerWidth - PET_WIDTH - STAGE_MARGIN
-              const lo = Math.max(STAGE_MARGIN, homeRef.current.x - WANDER_RADIUS)
-              const hi = Math.min(max, homeRef.current.x + WANDER_RADIUS)
-              targetRef.current = { x: Math.round(lo + Math.random() * (hi - lo)), y: yRef.current }
+              targetRef.current = wanderTarget()
               setAction('walk')
             } else if (act === 'jump') startActivity('jump', 5000, 5000)
             else if (act === 'wave') {
@@ -252,7 +272,16 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
               startActivity('play', 6600, 6600)
               if (Math.random() < 0.3) chatter(pick(currentLines.activity))
             } else if (act === 'write') startActivity('write', 3000, 4500)
-            // 自定义动作（转身/呼吸/swagger/经典动作等帧序列或透明 webm）：通用播放一轮，
+            else if (act === 'swagger') {
+              // 行走类自定义动作：和内置 walk 一样在屏幕里走动，方向随机。
+              const t = wanderTarget()
+              targetRef.current = t
+              // 3.5s ≈ 219 个 16ms tick：速度=路程/219，走完恰好一轮视频，不截断动作。
+              swaggerSpeedRef.current = Math.min(1.1, Math.max(0.3, Math.abs(t.x - xRef.current) / 219))
+              console.log('[dsh-pet] random action swagger', t.x >= xRef.current ? 'right' : 'left')
+              setAction('swagger')
+            }
+            // 自定义动作（转身/呼吸/经典动作等帧序列或透明 webm）：通用播放一轮，
             // 素材缺失时 PetSprite 的 resolveAction 会优雅退到 idle。
             else { console.log('[dsh-pet] random action', act); startActivity(act as PetAction, 12000, 12000) }
             if (Math.random() < 0.22) chatter(pick(assistantActive ? currentLines.work : currentLines.idle))
@@ -260,10 +289,7 @@ export function usePetBehavior({ assistantActive = false, lines, home, working =
             const r = Math.random()
             if (r < 0.30) setAction('idle')
             else if (r < 0.55) {
-              const max = window.innerWidth - PET_WIDTH - STAGE_MARGIN
-              const lo = Math.max(STAGE_MARGIN, homeRef.current.x - WANDER_RADIUS)
-              const hi = Math.min(max, homeRef.current.x + WANDER_RADIUS)
-              targetRef.current = { x: Math.round(lo + Math.random() * (hi - lo)), y: yRef.current }
+              targetRef.current = wanderTarget()
               setAction('walk')
             } else if (r < 0.60) startActivity('jump', 5000, 5000)
             else if (r < 0.66) {

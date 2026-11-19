@@ -15,3 +15,10 @@ label.check input { display: inline; width: auto; margin: 0; }
 .muted { color: #6b7488; font-size: 12px; }
 .error { background: #fdecec; border: 1px solid #f3b7b7; color: #8c2626; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
 .preview { width: 72px; height: 72px; object-fit: contain; background: #eef1f8; border-radius: 8px; }
+.preview-row { align-items: flex-start; }
+.preview-row .preview { width: 150px; height: 150px; }
+.preview-stage { width: 240px; height: 150px; border-radius: 8px; overflow: hidden; display: flex; align-items: flex-start; justify-content: center; }
+.preview-stage video { height: 150px; width: auto; object-fit: contain; }
+.bg-checker { background: repeating-conic-gradient(#d9dde6 0% 25%, #fff 0% 50%) 0 0 / 16px 16px; }
+.bg-white { background: #fff; }
+.bg-desk { background: #7ec8e3; }

@@ -11,7 +11,7 @@ export type InteractionEvent = ConversationEvent
   | { type: 'wake' | 'grab' }
   | { type: 'release'; moved: boolean }
   | { type: 'complete'; phase: string; version: number }
-  | { type: 'tick'; working: boolean; idleMinutes: number; sleepMinutes: number }
+  | { type: 'tick'; working: boolean; idleMinutes: number; sleepMinutes: number; active?: boolean }
 
 export interface InteractionState {
   phase: InteractionPhase
@@ -103,6 +103,8 @@ export function reduceInteraction(state: InteractionState, event: InteractionEve
       }
       if (interactionProtected(state)) return state
       if (event.working) return { ...state, lastInteraction: now }
+      // 走路/演出进行到一半不打盹：否则刚迈步就被 sleep-in 截断，看起来像闪回站姿。
+      if (event.active) return state
       return now - state.lastInteraction >= event.idleMinutes * 60_000 ? enter('sleep-in') : state
   }
 }
@@ -112,6 +114,7 @@ export function oneShot(action: string | undefined): boolean {
     || action === 'laptop-in' || action === 'laptop-out'
     // 走路收步：3 帧演一次就停在站姿，不能回绕（回绕会重复"收步"的动作）
     || action === 'walk-stop'
+    || action === 'swagger-stop'
 }
 
 /** 最后一帧停满一个帧周期后才完成，一次动作永远不回绕第一帧。 */

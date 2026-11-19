@@ -96,6 +96,19 @@ export interface PetSettings {
    */
   docSpeechMode?: PresentationMode
   /**
+   * 讲解全局快捷键（Electron accelerator，如 `Ctrl+Alt+D`），可在文档设置页改。
+   *
+   * - interrupt：打断提问（= 说"停一下"，停下开 10 秒提问窗口）；
+   * - rest：休息（= 说"休息一下"，无限期停、不听提问，只认整句"继续"）；
+   * - resume：继续（= 说"继续演讲"，从打断或休息恢复）。
+   *
+   * 默认刻意避开 Ctrl+空格（中文输入法切换）与 Ctrl+Z/X（全局撤销/剪切），
+   * 用 Ctrl+Alt+字母 这类不易冲突的组合；注册时被占用会如实提示，用户可自行改键。
+   */
+  docInterruptHotkey?: string
+  docRestHotkey?: string
+  docResumeHotkey?: string
+  /**
    * 总助理自己的音色设计描述（按性格生成，可手改）。
    *
    * 音色属于"这个人怎么说"，不属于"接哪家语音服务"——所以存在这里，
@@ -153,6 +166,10 @@ const DEFAULTS: PetSettings = {
   chatDock: 'top',
   // 讲解默认按原文念稿：真人会议优先，AI 逐段讲解要等模型、更慢也更费。
   docSpeechMode: 'source',
+  // 讲解快捷键默认避开输入法切换（Ctrl+空格）与撤销/剪切（Ctrl+Z/X）。
+  docInterruptHotkey: 'Ctrl+Alt+D',
+  docRestHotkey: 'Ctrl+Alt+R',
+  docResumeHotkey: 'Ctrl+Alt+C',
   // 默认原大、不透明：任何"一装上就变了样子"的默认值都会让用户以为是 bug。
   petScale: 1,
   petOpacity: 1,
@@ -171,6 +188,14 @@ let cacheMtimeMs = 0
 
 function settingsPath(): string {
   return path.join(app.getPath('userData'), 'pet-settings.json')
+}
+
+/** 快捷键 accelerator 归一化：非空、≤60 字、含修饰键组合（'+'）才认，否则退回默认。 */
+function normalizeHotkey(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.length > 60 || !trimmed.includes('+')) return fallback
+  return trimmed
 }
 
 function normalize(raw: Partial<PetSettings>): PetSettings {
@@ -260,6 +285,10 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   // 讲解形态同理：设置文件是用户可以手改的，认不出的值一律退回 source（照稿念，最保守），
   // 而不是留一个 undefined 让调用方各自猜默认值。
   if (merged.docSpeechMode !== 'ai' && merged.docSpeechMode !== 'source') merged.docSpeechMode = 'source'
+  // 快捷键：只接受带修饰键的组合（含 '+'），长度受限；认不出退回默认，注册时再验占用。
+  merged.docInterruptHotkey = normalizeHotkey(merged.docInterruptHotkey, DEFAULTS.docInterruptHotkey!)
+  merged.docRestHotkey = normalizeHotkey(merged.docRestHotkey, DEFAULTS.docRestHotkey!)
+  merged.docResumeHotkey = normalizeHotkey(merged.docResumeHotkey, DEFAULTS.docResumeHotkey!)
   // 档位制：不在枚举里的一律退回默认（用户手改过、旧版本、或将来缩减档位）。
   if (merged.petScale !== 0.8 && merged.petScale !== 1 && merged.petScale !== 1.2) merged.petScale = 1
   if (merged.petOpacity !== 0.6 && merged.petOpacity !== 0.8 && merged.petOpacity !== 1) merged.petOpacity = 1

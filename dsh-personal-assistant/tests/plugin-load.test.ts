@@ -18,7 +18,7 @@ import { Config, type Config as ConfigType } from '../src/config.ts'
 import * as plugin from '../src/index.ts'
 import { resolvePetDir } from '../src/pet-dir.ts'
 import { ObservationStore } from '../src/observation.ts'
-import { openAssistantStore } from '../src/store.ts'
+import { getUserFlag, openAssistantStore, setUserFlag } from '../src/store.ts'
 
 type Tool = { execute(args: unknown, exec?: unknown): Promise<string> }
 
@@ -77,6 +77,17 @@ function quietConfig(home: string, overrides: Omit<Partial<ConfigType>, 'petDir'
   const petDir = path.join(home, 'nonexistent-dsh-pet')
   assert.equal(existsSync(petDir), false, '夹具的桌宠路径必须不存在')
   return Config({ captureActivity: false, proactiveEnabled: false, migrateLegacy: false, ...overrides, petDir } as never)
+}
+
+/**
+ * 把总开关预置成开启。
+ *
+ * 新语义下"从没写过标志 + 采集没开过"= 不注入工具；需要工具的老用例必须先写这个标志，
+ * 否则它们验的就不是同一件事了（插件确实加载了，只是会话面没挂）。
+ */
+function enableAssistant(home: string): void {
+  const db = openAssistantStore(path.join(home, 'personal-assistant', 'assistant.sqlite'))
+  try { setUserFlag(db, 'assistant_enabled', 'true') } finally { db.close() }
 }
 
 function bridgeClient(home: string) {
@@ -140,6 +151,7 @@ const pluginShape = { name: plugin.name, inject: plugin.inject, apply: plugin.ap
 test('工作区构建产物可在隔离宿主中装配并注册本轮工具，不启动真实桌宠', async t => {
   const root = new Context()
   const home = isolatedHome(t, () => root.fiber.dispose())
+  enableAssistant(home)
   const host = hostServices()
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { main: string }
   assert.match(pkg.main, /^dist\/index-[a-zA-Z0-9-]+\.js$/)
@@ -170,6 +182,7 @@ test('工作区构建产物可在隔离宿主中装配并注册本轮工具，�
 test('插件源码装配后主会话同时拥有独立录音和讲解工具', async t => {
   const root = new Context()
   const home = isolatedHome(t, () => root.fiber.dispose())
+  enableAssistant(home)
   const host = hostServices()
   await root.plugin((ctx: Context) => {
     ctx.provide('tools', host.services.tools)
@@ -235,6 +248,7 @@ test('inject 只声明必需服务、不含 agents（cordis 4 的 inject 每一�
 test('真实 cordis：没有 agents 也加载并监听；agents 后装可现取；自建会话归本插件并在卸载时释放，网页会话不碰', async t => {
   const root = new Context()
   const home = isolatedHome(t, () => root.fiber.dispose())
+  enableAssistant(home)
   const host = hostServices()
   await root.plugin((ctx: Context) => {
     ctx.provide('tools', host.services.tools)
@@ -321,6 +335,79 @@ test('假宿主连 ctx.get 都没有：插件照常加载、监听，开始会�
   assert.deepEqual([result.status, result.body.code], [503, 'agents-unavailable'])
 })
 
+test('总开关：默认不注入；开启挂上工具与人设，关闭在下一条消息前撤回', async t => {
+  const root = new Context()
+  const home = isolatedHome(t, () => root.fiber.dispose())
+  const tools = new Map<string, unknown>()
+  /** 已注册的提示词块与变量；撤回后必须从这里消失，才算真的"不再影响模型"。 */
+  const promptBlocks: string[] = []
+  interface TestCommand {
+    name: string
+    handler(invocation: { agent?: unknown; rawInput?: string }): Promise<{ kind: string; text: string }> | { kind: string; text: string }
+  }
+  const commands = new Map<string, TestCommand>()
+  await root.plugin((ctx: Context) => {
+    ctx.provide('tools', {
+      register(definition: { name: string }) {
+        tools.set(definition.name, definition)
+        return () => { tools.delete(definition.name) }
+      },
+    })
+    ctx.provide('systemPrompt', {
+      section(section: { name: string }) {
+        promptBlocks.push(section.name)
+        return () => {
+          const index = promptBlocks.indexOf(section.name)
+          if (index >= 0) promptBlocks.splice(index, 1)
+        }
+      },
+      variable(name: string) {
+        const key = `变量:${name}`
+        promptBlocks.push(key)
+        return () => {
+          const index = promptBlocks.indexOf(key)
+          if (index >= 0) promptBlocks.splice(index, 1)
+        }
+      },
+    })
+    ctx.provide('storageDomain', { async open() { return fakeDomain() } })
+    ctx.provide('commands', {
+      register(definition: TestCommand) {
+        commands.set(definition.name, definition)
+        return () => { commands.delete(definition.name) }
+      },
+    })
+  })
+  await root.plugin(pluginShape, quietConfig(home))
+
+  // 缺省（采集没开过）= 不注入。插件本身仍然加载：命令在、桥接在。
+  assert.equal(tools.has('personal_assistant_summon_pet'), false)
+  assert.equal(tools.has('personal_assistant_start'), false)
+  assert.equal(promptBlocks.includes('personal-assistant-identity'), false, '人设块也不该注入')
+  assert.ok(commands.has('assistant-on'), '开关命令不随会话面撤回，否则关掉就再也打不开')
+
+  const on = await commands.get('assistant-on')!.handler({})
+  assert.equal(on.kind, 'success')
+  assert.ok(tools.has('personal_assistant_summon_pet'), '开启后工具应出现')
+  assert.ok(tools.has('personal_assistant_start'))
+  assert.equal(promptBlocks.includes('personal-assistant-identity'), true, '开启后「你是谁」应注入')
+  const db = openAssistantStore(path.join(home, 'personal-assistant', 'assistant.sqlite'))
+  try { assert.equal(getUserFlag(db, 'assistant_enabled'), 'true', '开关必须持久化') } finally { db.close() }
+
+  const off = await commands.get('assistant-off')!.handler({})
+  assert.equal(off.kind, 'success')
+  assert.equal(tools.has('personal_assistant_summon_pet'), false, '关闭后工具应从会话面消失')
+  assert.equal(tools.has('personal_assistant_start'), false)
+  assert.equal(promptBlocks.includes('personal-assistant-identity'), false, '关闭后人设块也应撤回')
+  const after = openAssistantStore(path.join(home, 'personal-assistant', 'assistant.sqlite'))
+  try { assert.equal(getUserFlag(after, 'assistant_enabled'), 'false') } finally { after.close() }
+
+  // 命令通道始终可用：关着也能再开回来。
+  assert.ok(commands.has('assistant-state'))
+  const state = await commands.get('assistant-state')!.handler({})
+  assert.deepEqual(JSON.parse(state.text).injection, 'off')
+})
+
 test('平台闸门：macOS 不再被拦（开启助理只待可信批准），Linux 如实拒绝；都不拉起采样器', async () => {
   const original = Object.getOwnPropertyDescriptor(process, 'platform')!
   const previousHome = process.env.DSH_HOME
@@ -330,6 +417,7 @@ test('平台闸门：macOS 不再被拦（开启助理只待可信批准），Li
     process.env.DSH_HOME = home
     Object.defineProperty(process, 'platform', { ...original, value: platform })
     try {
+      enableAssistant(home)
       const host = hostServices()
       await plugin.apply({ ...host.services, effect(execute: () => () => unknown) { disposers.push(execute()) }, on() {} } as never,
         quietConfig(home, { captureActivity: true }))

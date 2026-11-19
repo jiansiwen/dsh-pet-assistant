@@ -99,3 +99,36 @@ test('克隆响应缺 voice_id 报形状错误', async () => {
   const store = new MediaProviderStore(tmp(), { key: () => KEY, fetch: fakeFetch(() => ({ nope: 1 })) })
   await assert.rejects(() => cloneVoice(store, provider, [{ base64: 'AA', name: 'a.wav' }]), /voice_id/)
 })
+
+test('百炼形状：自定义请求头、GET 轮询、参考图注入 media 数组', async () => {
+  const seen: { url: string; method: string; headers: Record<string, string>; body?: any }[] = []
+  const store = new MediaProviderStore(tmp(), {
+    key: () => KEY,
+    fetch: fakeFetch((url, init) => {
+      seen.push({ url, method: init.method, headers: init.headers, body: init.body ? JSON.parse(init.body) : undefined })
+      if (init.method === 'POST') return { output: { task_id: 't-9' } }
+      return { output: { task_status: 'SUCCEEDED', video_url: 'https://cdn/w.mp4' } }
+    }),
+  })
+  store.putSecret('bl', 'sk-sp-test')
+  const provider: VideoProviderConfig = {
+    id: 'bl', name: '百炼', type: 'async-task', baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com', model: 'wan3.0-video',
+    auth: { apiKeyRef: 'bl' }, extraHeaders: { 'X-DashScope-Async': 'enable' },
+    submitPath: '/api/v1/services/aigc/video-generation/video-synthesis', pollPath: '/api/v1/tasks/{{task_id}}',
+    bodyTemplate: {
+      model: '{{model}}',
+      input: { prompt: '{{prompt}}', media: [{ type: 'reference_image', url: '{{image_url}}' }] },
+      parameters: { resolution: '720P', ratio: '1:1', duration: 6 },
+    },
+  }
+  const sub = await submitVideo(store, provider, { prompt: '走路', imageUrl: 'data:image/jpeg;base64,AA' })
+  assert.equal(sub.taskId, 't-9')
+  assert.equal(seen[0].headers['X-DashScope-Async'], 'enable')
+  assert.equal(seen[0].headers.authorization, 'Bearer sk-sp-test')
+  assert.deepEqual(seen[0].body.input.media, [{ type: 'reference_image', url: 'data:image/jpeg;base64,AA' }])
+  const poll = await pollVideo(store, provider, 't-9')
+  assert.deepEqual(poll, { state: 'succeeded', url: 'https://cdn/w.mp4' })
+  assert.equal(seen[1].method, 'GET')
+  assert.equal(seen[1].headers['X-DashScope-Async'], undefined)
+  assert.ok(seen[1].url.endsWith('/api/v1/tasks/t-9'))
+})

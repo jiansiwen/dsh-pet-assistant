@@ -12,6 +12,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { after, afterEach, before, beforeEach, mock, test } from 'node:test'
 import { setImmediate as nextTurn } from 'node:timers/promises'
+import { DOC_CONTINUE_ACKS, DOC_RESUME_ACKS, DOC_STOP_ACKS, DOC_THINKING_ACKS } from '../src/main/greetings.ts'
 import type { BridgeCallbacks, ChatReply } from '../src/main/harness.ts'
 import type { InterruptLevel, SpeechRequest } from '../src/main/speech.ts'
 import { Narrator, type NarratorHooks, type TtsTransport, type TtsWorkerEvent } from '../src/main/tts.ts'
@@ -62,6 +63,10 @@ let bridgeCallbacks: BridgeCallbacks
 let initialAutoApproval: unknown
 /** 主进程讲解前会查一次成员目录；测试按需返回“小会”。 */
 let presentationMembers: { enabled: boolean; members: Array<{ profile: Record<string, unknown> }> } = { enabled: true, members: [] }
+/** 文档静默预读是否成功：默认 false，让既有源模式用例继续走"附原文"兜底；新用例置 true 验证只发问题。 */
+let docPreloadOk = false
+const docPreloads: Array<{ assistantId: string; docKey: string; text: string }> = []
+const docCloses: Array<{ assistantId: string; docKey: string }> = []
 const sessionCommands: SessionCommand[] = []
 const desktopReplies: Array<{ id: string; ok: boolean; result?: unknown; error?: string }> = []
 const chats: Array<{
@@ -70,6 +75,7 @@ const chats: Array<{
   signal?: AbortSignal
   onDelta?: (text: string) => void
   bindingId?: string
+  docKey?: string
   resolve: (reply: ChatReply) => void
 }> = []
 class FakeBridge {
@@ -83,9 +89,10 @@ class FakeBridge {
     sessionCommands.push(command)
     return { ok: true }
   }
-  chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string): Promise<ChatReply> {
+  chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string,
+    options?: { cancelOnAbort?: boolean; docKey?: string }): Promise<ChatReply> {
     const deferredReply = deferred<ChatReply>()
-    chats.push({ text, assistantId, signal, onDelta, bindingId, resolve: deferredReply.resolve })
+    chats.push({ text, assistantId, signal, onDelta, bindingId, docKey: options?.docKey, resolve: deferredReply.resolve })
     chatEvents.emit('chat')
     return deferredReply.promise
   }
@@ -94,6 +101,15 @@ class FakeBridge {
     if (route === '/companion/v1/desktop/claim') return claimDesktopCommand()
     // 讲解/纪要会先查有没有会议+文档成员；默认没有，按用例返回。
     if (route === '/companion/v1/members') return { status: 200, body: presentationMembers }
+    // 文档预读/关闭是独立文档会话通道，不算桌面命令回执，不进 desktopReplies。
+    if (route === '/companion/v1/members/doc-preload') {
+      docPreloads.push(body as unknown as { assistantId: string; docKey: string; text: string })
+      return { status: 200, body: { ok: docPreloadOk } }
+    }
+    if (route === '/companion/v1/members/doc-close') {
+      docCloses.push(body as unknown as { assistantId: string; docKey: string })
+      return { status: 200, body: { ok: true } }
+    }
     desktopReplies.push(body as { id: string; ok: boolean; result?: unknown; error?: string })
     return { status: desktopResultStatus, body: {} }
   }
@@ -327,7 +343,7 @@ mock.module('electron', {
     },
     dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [authorized] }),
       showMessageBox: async (options: Record<string, unknown>) => { meetingPresentationDialogs.push(options); return confirmMeetingPresentation() } },
-    globalShortcut: { register: () => true, unregisterAll() {} },
+    globalShortcut: { register: () => true, unregister() {}, unregisterAll() {} },
     Menu: { buildFromTemplate: () => ({ popup() {} }) },
     shell: {
       openPath: () => { throw new Error('文档测试不得打开外部应用') },
@@ -402,12 +418,23 @@ async function chatAt(index: number): Promise<(typeof chats)[number]> {
   while (chats.length <= index) await once(chatEvents, 'chat', { signal: AbortSignal.timeout(2000) })
   return chats[index]
 }
+const DOC_ACK_TEXTS = new Set<string>([...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS])
+function playingText(): string {
+  return playing ? Buffer.from(playing.b64, 'base64').toString('utf8') : ''
+}
+/** 讲解即时反馈短句（好的你说/稍等我想一下/继续）是产品行为，测试关心的是正文：先放掉它们。 */
+function drainDocAcks(): void {
+  while (playing && DOC_ACK_TEXTS.has(playingText())) finishSentence()
+}
 function finishSentence(): string {
-  const current = playing
-  assert.ok(current, '没有等待完成的音频句子')
-  playing = null
-  deliver({ finished: { id: current.id } })
-  return Buffer.from(current.b64, 'base64').toString('utf8')
+  for (;;) {
+    const current = playing
+    assert.ok(current, '没有等待完成的音频句子')
+    const text = Buffer.from(current.b64, 'base64').toString('utf8')
+    playing = null
+    deliver({ finished: { id: current.id } })
+    if (!DOC_ACK_TEXTS.has(text)) return text
+  }
 }
 async function startExplanation(from = 0): Promise<(typeof chats)[number]> {
   const chatIndex = chats.length
@@ -454,6 +481,9 @@ beforeEach(async () => {
   claimDesktopCommand = async () => ({ status: 200, body: { claimed: true } })
   desktopResultStatus = 200
   presentationMembers = { enabled: true, members: [] }
+  docPreloadOk = false
+  docPreloads.length = 0
+  docCloses.length = 0
   wpsInstalled = false
   wpsOpens.length = 0
   meetingPresentationDialogs.length = 0
@@ -1249,8 +1279,9 @@ test('独立讲解的插话可交接听写、识别并发送，回答播完后�
     assert.equal(wiring.handovers.length, 1)
     const granted = await invoke<{ ok: boolean; direct?: boolean }>('asr-begin', { bargeIn: true })
     assert.equal(granted.ok, true)
-    // 讲解中直接开口就是提问：主进程不再要求"停一下"口令（功能设计：随时插话打断）。
-    assert.equal(granted.direct, true)
+    // 口令门禁：讲解中也要先听到"停一下/等一下"这类明确口令才停下并进入提问窗口；
+    // 旁人低声讨论不会被当成提问（产品要求：一边播报一边提问不符合人的交互）。
+    assert.equal(granted.direct, false)
     assert.ok((wiring.handovers[0]()?.frames.length ?? 0) > 0)
     // 检出人声本身不停讲解；识别出“停一下”后才停这一句。
     assert.equal(narrator.isSpeaking(), true, '还没听到口令时讲解应继续')
@@ -2650,6 +2681,7 @@ test('讲解暂停后又打断了一次回答：一句“继续”不替用户�
   const chat = await chatAt(1)
   chat.onDelta!('回答的第一句。回答的第二句。')
   await nextTurn()
+  drainDocAcks()
   assert.ok(playing, '回答已经开始播放')
   send('speech-stop')
   await answer(chat, '回答的第一句。回答的第二句。')
@@ -2685,18 +2717,18 @@ test('评委插话：检出人声不停，明确口令才打断；回答播完�
   const question = await chatAt(1)
   await answer(question, '只读是为了避免误改原始资料。')
   assert.equal((await asking).ok, true)
-  assert.equal(narrator.requests.length, before + 1, '回答先播')
+  assert.equal(narrator.requests.length, before + 2, '先"稍等我想一下"，再播回答')
   assert.equal(finishSentence(), '只读是为了避免误改原始资料。')
 
   // 答完不自动接着讲：先反问一句「还有其他问题吗？」（ephemeral，不进会话），
   // 再等 5 秒窗口；没人再说话才继续原讲解。
-  await until(() => narrator.requests.length > before + 1, '答完先反问一句')
+  await until(() => narrator.requests.length > before + 2, '答完先反问一句')
   assert.equal(narrator.requests.at(-1)!.text, '还有其他问题吗？')
   assert.equal(narrator.requests.at(-1)!.ephemeral, true, '反问不得进会话/记忆/纪要')
   assert.equal(finishSentence(), '还有其他问题吗？')
   await new Promise(resolve => setTimeout(resolve, 5600))
   await nextTurn()
-  assert.equal(narrator.requests.length, before + 3, '窗口结束自动继续原讲解')
+  assert.equal(narrator.requests.length, before + 4, '窗口结束自动继续原讲解')
   assert.match(narrator.requests.at(-1)!.utteranceId, /^doc:/, '续讲的是原文档，不是新问题')
   finishSentence()
   send('speech-stop')
@@ -2761,6 +2793,79 @@ test('没点名视图且没装 WPS 时，讲解照常进行且不尝试打开 WP
   assert.equal(wpsOpens.length, 0, '没装 WPS 时不应尝试打开 WPS')
   finishSentence()
   await prompt('结束讲解')
+})
+
+test('原文朗读+成员：打开静默预读，提问只发问题走独立文档会话，结束扔会话', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  docPreloadOk = true
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(result.ok, true, result.error)
+    // 打开文档就后台静默预读：走独立文档会话通道，带文档路径与预读提示。
+    await until(() => docPreloads.length > 0, '打开文档触发静默预读')
+    assert.equal(docPreloads[0].assistantId, 'member-bailongma')
+    assert.ok(docPreloads[0].docKey.includes('讲解样本.txt'), '预读按文档路径建会话')
+    assert.ok(docPreloads[0].text.includes('收到'), '预读只要求回收到')
+    const docKey = docPreloads[0].docKey
+    // 照原文念稿不产生模型请求（预读走 companionRequest，不算 chat）。
+    finishSentence()
+    await until(() => narrator.requests.some(request => /^doc:/.test(request.utteranceId)), '第一段原文开口')
+    assert.equal(chats.length, 0, '念稿不调模型')
+    // 提问：只发问题、不重发原文，且带上同一条文档会话标识。
+    const asking = invoke('doc-ask', documentPath, 0, '为什么限制目录？')
+    const question = await chatAt(0)
+    assert.equal(question.assistantId, 'member-bailongma', '追问沿用讲解成员')
+    assert.equal(question.docKey, docKey, '提问与预读同一条独立文档会话')
+    assert.ok(question.text.includes('为什么限制目录？'), '问题本身要在')
+    assert.ok(!question.text.includes('该段原文：'), '预读成功后不再附该段原文')
+    assert.ok(!question.text.includes('整份文档全文'), '不重发全文')
+    await answer(question, '避免误读。')
+    assert.equal((await asking).ok, true)
+    // 结束讲解不再清会话绑定：scope 由 (成员, 工作区, 文档) 持久复用，用户培训保留。
+    await prompt('结束讲解')
+    await new Promise(resolve => setTimeout(resolve, 300))
+    assert.equal(docCloses.length, 0, '结束讲解不再扔会话绑定')
+    // 重开同一份文档：再预读一次喂进同一条会话，提问仍复用该会话（培训还在）。
+    const preloadsBefore = docPreloads.length
+    const chatsBefore = chats.length
+    const reopen = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(reopen.ok, true, reopen.error)
+    await until(() => docPreloads.length > preloadsBefore, '重开再次预读进同一条会话')
+    assert.equal(docPreloads[preloadsBefore].docKey, docKey, '预读仍按同一文档路径')
+    const asking2 = invoke('doc-ask', documentPath, 0, '培训过的名词是什么意思？')
+    const question2 = await chatAt(chatsBefore)
+    assert.equal(question2.docKey, docKey, '重开后提问仍复用同一条文档会话')
+    assert.ok(!question2.text.includes('该段原文：'), '复用会话后仍只发问题')
+    await answer(question2, '按培训口径解释。')
+    assert.equal((await asking2).ok, true)
+  } finally {
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
+})
+
+test('原文朗读+成员：预读失败时提问退回附原文，仍走独立文档会话', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  docPreloadOk = false
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(result.ok, true, result.error)
+    await until(() => docPreloads.length > 0, '预读发起')
+    finishSentence()
+    const asking = invoke('doc-ask', documentPath, 0, '为什么限制目录？')
+    const question = await chatAt(0)
+    assert.equal(question.docKey, docPreloads[0].docKey, '兜底也走独立文档会话')
+    assert.ok(question.text.includes(paragraphs[0]), '预读失败兜底附当前段原文')
+    await answer(question, '避免误读。')
+    assert.equal((await asking).ok, true)
+  } finally {
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
 })
 /**
  * 推进链是异步的（每次换段还要重新校验文档与授权），断言"下一段开口了"不能靠一次 nextTurn：

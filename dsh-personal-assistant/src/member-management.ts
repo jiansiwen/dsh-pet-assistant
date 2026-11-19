@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import type { MemberDirectory } from './member-directory.ts'
 import type { MemberRuntime } from './member-runtime.ts'
+import { documentSessionScope } from './member-runtime.ts'
 import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberSnapshot } from './member-contract.ts'
 import type { MemberMemory } from './member-memory.ts'
 import type { CompanionHttpResult } from './companion-contract.ts'
@@ -40,6 +41,9 @@ const assistSchema = z.object({ request: z.string().trim().min(1).max(4000), cur
 const noticeAcknowledgement = z.object({ attemptId: z.string().uuid(), expectedState: z.enum(['failed', 'unknown']) }).strict()
 const sendAcknowledgement = z.object({ expectedState: z.enum(['partial', 'unknown']) }).strict()
 const channelAcknowledgement = z.object({ expectedRevision: revision }).strict()
+/** 文档讲解会话：预读（静默喂文档）。docKey 用文档路径，插件侧结合工作区算范围摘要。 */
+const docPreloadSchema = z.object({ assistantId: z.string().trim().min(1).max(100),
+  docKey: z.string().trim().min(1).max(2048), text: z.string().trim().min(1).max(60_000) }).strict()
 
 export class MemberManagement {
   private readonly options: {
@@ -47,6 +51,8 @@ export class MemberManagement {
     enabled(): boolean; setMode(enabled: boolean): Promise<void>
     defaultModel(): { provider: string; model: string } | null
     changed(): void
+    /** 成员/文档会话的工作区解析器；文档 scope 进键用，与成员会话同一口径。 */
+    cwd?: () => string | undefined
     activeTasks?(id: string): number
     mailNoticeAttention?(): NonNullable<MemberSnapshot['mailNoticeAttention']>
     acknowledgeMailNotice?(analysisId: string, attemptId: string, expectedState: 'failed' | 'unknown'): boolean
@@ -69,10 +75,15 @@ export class MemberManagement {
     glossaryEdit?(input: { term: string; expansion?: string; remove?: boolean }): Array<{ term: string; expansion: string; createdAt: number }>
     /** 最近产出过的文件指针（含已消失的，界面上要如实标出来）。 */
     artifacts?(): Array<{ path: string; label: string; kind: string; state: 'ok' | 'missing'; createdAt: number }>
-    /** 技能列表（每个助理最新一版）；界面用来展示与操作。 */
-    skills?(): Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>
-    /** 技能操作：晋升为生效 / 切回某版 / 退役。返回最新列表。 */
-    skillEdit?(input: { action: 'promote' | 'rollback' | 'retire'; id: string; version?: number }): Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>
+    /** 技能列表（每个助理最新一版）；界面用来展示与操作。origin 标明人工/自动形成来源。 */
+    skills?(): Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number; origin: string }>
+    /** 技能操作：增/改/删/晋升/回滚/退役。返回最新列表。 */
+    skillEdit?(input:
+      | { action: 'promote' | 'rollback' | 'retire'; id: string; version?: number }
+      | { action: 'create'; assistantId: string; name: string; body: string }
+      | { action: 'edit'; id: string; body: string }
+      | { action: 'delete'; id: string }
+    ): Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number; origin: string }>
     /** 攒够可信成功、但还没成形的"同类工作"；只提示，不自动写正文。 */
     skillPending?(): Array<{ assistantId: string; assistantName: string; shape: string; count: number }>
     /** 有样本但都还没核实的"同类工作"：界面据此请本人确认。 */
@@ -153,6 +164,24 @@ export class MemberManagement {
     const { directory, memories } = this.options
     try {
       if (method === 'GET' && pathname === '/companion/v1/members') return { status: 200, body: this.snapshot() }
+      if (method === 'POST' && pathname === '/companion/v1/members/doc-preload') {
+        const input = docPreloadSchema.parse(raw)
+        try {
+          // 静默预读：走成员独立文档会话，不进团队任务、不推可见气泡；回复内容桌面丢弃。
+          // scope 含工作区：同工作区同文档重开复用同一条会话，培训不丢。
+          // 加超时：模型卡住时预读不能永久占着会话写句柄，否则后续打开/追问全被
+          // "already owned by an active write handle" 挡住。
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(new Error('文档预读超时')), 120_000)
+          try {
+            await this.options.runtime.chat(input.assistantId, input.text, controller.signal, undefined, 'desktop', undefined, documentSessionScope(input.docKey, this.options.cwd?.()))
+          } finally { clearTimeout(timer) }
+          return { status: 200, body: { ok: true } }
+        } catch (error) {
+          return { status: 200, body: { ok: false, error: error instanceof Error ? error.message : String(error) } }
+        }
+      }
+      // 文档关闭不再清会话绑定：scope 由 (成员, 工作区, 文档) 决定，重开复用，培训保留。
       if (method === 'POST' && pathname === '/companion/v1/members/assist') {
         if (!this.options.assistant) return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: '成员配置助手尚未启用' } }
         const input = assistSchema.parse(raw)
@@ -297,11 +326,12 @@ export class MemberManagement {
           const removed = this.options.skillRetract(input.assistantId, input.shape)
           return { status: 200, body: { removed, skills: this.options.skills(), pending: this.options.skillPending?.() ?? [], unverified: this.options.skillUnverified?.() ?? [] } }
         }
-        const input = z.object({
-          action: z.enum(['promote', 'rollback', 'retire']),
-          id: z.string().trim().min(1).max(400),
-          version: z.number().int().min(1).optional(),
-        }).strict().parse(raw)
+        const input = z.discriminatedUnion('action', [
+          z.object({ action: z.enum(['promote', 'rollback', 'retire']), id: z.string().trim().min(1).max(400), version: z.number().int().min(1).optional() }).strict(),
+          z.object({ action: z.literal('create'), assistantId: z.string().trim().min(1).max(200), name: z.string().trim().min(1).max(120), body: z.string().trim().min(1).max(20_000) }).strict(),
+          z.object({ action: z.literal('edit'), id: z.string().trim().min(1).max(400), body: z.string().trim().min(1).max(20_000) }).strict(),
+          z.object({ action: z.literal('delete'), id: z.string().trim().min(1).max(400) }).strict(),
+        ]).parse(raw)
         if (input.action === 'rollback' && input.version === undefined) {
           return { status: 400, body: { code: 'INVALID_INPUT', message: '回滚需要指定要回到哪一版' } }
         }

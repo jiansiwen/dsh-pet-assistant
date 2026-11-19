@@ -10,8 +10,9 @@
  * 3. **范围不变才自动晋升，扩权必须本人批准**。技能想读新目录、想执行命令，那是权限扩张，
  *    不是学习。这一条在 {@link SkillPlan} 的 `scopeChanged` 里表达，由调用方决定要不要拦。
  *
- * 这一版只做**存储与注入**：技能的"自动形成"需要任务账本的可信成功样本，
- * 还没接上；`record()` 现在只接受显式提交（本人或成员提候选）。
+ * 存储与注入之外，"自动形成"由装配层接上：同类工作攒够可信样本后，
+ * 计数归代码、正文归模型，生成后默认自动生效（扩权仍须本人批准），人工只做事后查验。
+ * `record()`/`save()` 仍接受显式提交（本人或模型提候选）。
  */
 import type { DatabaseSync } from 'node:sqlite'
 
@@ -27,6 +28,8 @@ export interface SkillVersion {
   version: number
   status: SkillStatus
   createdAt: number
+  /** 来源：manual=人工/模型显式提交；auto-verified=本人确认样本自动形成；auto-selfreport=成员自报样本自动形成（待查验）。 */
+  origin: 'manual' | 'auto-verified' | 'auto-selfreport'
 }
 
 /** 技能的声明式形状；`scopeChanged` 为真表示这次演化扩大了权限，必须本人批准。 */
@@ -106,6 +109,10 @@ export class SkillStore {
     const columns = (this.db.prepare('PRAGMA table_info(skill_evidence)').all() as Array<Record<string, unknown>>)
       .map(row => String(row.name))
     if (!columns.includes('verified')) this.db.exec('ALTER TABLE skill_evidence ADD COLUMN verified INTEGER NOT NULL DEFAULT 0')
+    // 技能来源：老库默认 manual；自动形成的两条路各自打标，界面据此提示"待查验"。
+    const skillColumns = (this.db.prepare('PRAGMA table_info(skill_versions)').all() as Array<Record<string, unknown>>)
+      .map(row => String(row.name))
+    if (!skillColumns.includes('origin')) this.db.exec("ALTER TABLE skill_versions ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
   }
 
   /**
@@ -115,7 +122,7 @@ export class SkillStore {
    * 这里**不做自动晋升判断**——扩权要不要拦是调用方（审批层）的事，
    * 存储层只负责如实记下"谁在什么时候写了第几版、状态是什么"。
    */
-  save(assistantId: string, plan: SkillPlan, status: SkillStatus, now = Date.now()): SkillVersion {
+  save(assistantId: string, plan: SkillPlan, status: SkillStatus, now = Date.now(), origin: SkillVersion['origin'] = 'manual'): SkillVersion {
     const owner = assistantId.trim()
     const name = plan.name.trim()
     const body = plan.body.trim()
@@ -127,10 +134,16 @@ export class SkillStore {
     const row = this.db.prepare('SELECT MAX(version) AS v FROM skill_versions WHERE skill_key = ?').get(key) as Record<string, unknown> | undefined
     const version = Number(row?.v ?? 0) + 1
     this.db.prepare(`
-      INSERT INTO skill_versions(skill_key, assistant_id, name, body, version, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(key, owner, name, body, version, status, now)
-    return { id: key, assistantId: owner, name, body, version, status, createdAt: now }
+      INSERT INTO skill_versions(skill_key, assistant_id, name, body, version, status, created_at, origin)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(key, owner, name, body, version, status, now, origin)
+    return { id: key, assistantId: owner, name, body, version, status, createdAt: now, origin }
+  }
+
+  /** 删除一个技能的全部版本（界面"删"）。回滚/退役仍走版本化，删除是彻底移除。 */
+  remove(id: string): number {
+    const changed = this.db.prepare('DELETE FROM skill_versions WHERE skill_key = ?').run(id)
+    return Number(changed.changes)
   }
 
   /** 某个助理当前生效的技能（每项取最高版本且状态为 active）。 */
@@ -175,7 +188,7 @@ export class SkillStore {
     const rows = this.db.prepare('SELECT * FROM skill_versions WHERE skill_key = ? AND version = ?').get(id, version) as Record<string, unknown> | undefined
     if (rows === undefined) throw new Error('目标版本不存在')
     const target = this.map(rows)
-    return this.save(target.assistantId, { name: target.name, body: target.body }, 'active', now)
+    return this.save(target.assistantId, { name: target.name, body: target.body }, 'active', now, target.origin)
   }
 
   /**
@@ -270,10 +283,12 @@ export class SkillStore {
 
   /** 某个 shape 目前攒了几次可信成功。 */
   private map(row: Record<string, unknown>): SkillVersion {
+    const origin = String(row.origin ?? 'manual')
     return {
       id: String(row.skill_key ?? ''), assistantId: String(row.assistant_id ?? ''), name: String(row.name ?? ''),
       body: String(row.body ?? ''), version: Number(row.version ?? 0),
       status: (String(row.status ?? 'candidate') as SkillStatus), createdAt: Number(row.created_at ?? 0),
+      origin: origin === 'auto-verified' || origin === 'auto-selfreport' ? origin : 'manual',
     }
   }
 }

@@ -11,7 +11,7 @@ import type { LlmCallConfig, StreamChunk, TokenUsage, UserMessage } from '@deeps
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import { ApprovalService } from '../src/approval.ts'
 import type { MemberDraft } from '../src/member-contract.ts'
-import { MemberRuntime, type MemberDirectory } from '../src/member-runtime.ts'
+import { MemberRuntime, documentSessionScope, type MemberDirectory } from '../src/member-runtime.ts'
 import { registerMeetingPresentationTools } from '../src/meeting-presentation-tools.ts'
 import { TeamStore } from '../src/team-domain.ts'
 import { TeamService, watchReplyDeltas } from '../src/team.ts'
@@ -143,10 +143,11 @@ async function fixture(t: TestContext, file?: string) {
   const arrivals: Driver[] = []
   const waiters: Array<(driver: Driver) => void> = []
   let failResume = false
+  let resumeBusyTimes = 0
   let channelFollowup = false
   let beforeSetup: ((driver: Driver) => void) | undefined
   let runtime!: MemberRuntime
-  const globalNames = ['read', 'web_search', 'bash', 'write', 'subagent', 'desktop_team_assign', 'personal_assistant_remember_preference',
+  const globalNames = ['read', 'glob', 'grep', 'web_search', 'bash', 'write', 'subagent', 'desktop_team_assign', 'personal_assistant_remember_preference',
     'personal_assistant_list_preferences', 'personal_assistant_start', 'personal_assistant_delete_activity', 'companion_set_owner',
     'personal_assistant_send_mail', 'personal_assistant_meeting_artifacts', 'personal_assistant_send_meeting_minutes',
     'personal_assistant_start_meeting_presentation', 'personal_assistant_meeting_presentation_status', 'personal_assistant_finish_meeting_presentation',
@@ -165,6 +166,10 @@ async function fixture(t: TestContext, file?: string) {
     const resume = 'resumeSessionId' in options
     const id = String(resume ? options.resumeSessionId : options.sessionId)
     calls.push({ kind: resume ? 'resume' : 'create', id })
+    if (resume && resumeBusyTimes > 0) {
+      resumeBusyTimes--
+      throw new Error(`session "${id}" is already owned by an active write handle`)
+    }
     if (resume && (failResume || !logs.has(id))) throw new Error('持久日志读取失败')
     const driver = new Driver(root, id, logs.get(id) ?? [], driver => {
       if (!channelFollowup) assert.equal(store.directory.list().find(member => member.sessionId === id)?.sessionId, id, '先持久 sessionId 再 followup')
@@ -211,7 +216,8 @@ async function fixture(t: TestContext, file?: string) {
   return { root, store, calls, drivers, logs, memories, proposals, desktopCalls, mailReads, bodies, options,
     get runtime() { return runtime }, restart() { runtime = new MemberRuntime(options); return runtime },
     notifications: () => notifications, setEnabled: (value: boolean) => { enabled = value }, setDesktopBinding: (value: string | null) => { desktopBinding = value },
-    failResume: () => { failResume = true }, beforeSetup: (callback: (driver: Driver) => void) => { beforeSetup = callback },
+    failResume: () => { failResume = true }, resumeBusy: (times: number) => { resumeBusyTimes = times },
+    beforeSetup: (callback: (driver: Driver) => void) => { beforeSetup = callback },
     allowChannelFollowup: () => { channelFollowup = true },
     next: () => arrivals.length ? Promise.resolve(arrivals.shift()!) : new Promise<Driver>(resolve => waiters.push(resolve)),
     async start(id: string, signal = new AbortController().signal, taskId?: string) {
@@ -224,6 +230,67 @@ async function fixture(t: TestContext, file?: string) {
 async function complete(driver: Driver, value = 10, text = '本次成员回复') {
   await driver.preStep(); await driver.request(); driver.startAttempt(); driver.finish(usage(value)); driver.end('completed', text)
 }
+
+test('上一轮写句柄尚未释放时重试恢复会话，不把提问判成任务失败', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('重试成员'))
+  const first = await h.start(member.assistantId)
+  await complete(first.driver)
+  await first.activation.dispose()
+  h.resumeBusy(2)
+  const second = await h.start(member.assistantId)
+  assert.equal(h.calls.filter(item => item.kind === 'resume').length, 3, '两次短暂占用 + 一次成功')
+  await complete(second.driver)
+  await second.activation.dispose()
+})
+
+test('文档 scoped 会话写句柄持续被占：丢弃旧绑定并新建，不判任务失败', async t => {
+  const h = await fixture(t)
+  h.allowChannelFollowup()
+  const member = h.store.directory.create(draft('文档成员', { capabilities: ['document'] }))
+  const scope = documentSessionScope('D:/docs/甲.md', 'D:/ws/alpha')
+  const preload = h.runtime.chat(member.assistantId, '全文', undefined, undefined, 'desktop', undefined, scope)
+  void preload.catch(() => undefined)
+  const first = await h.next()
+  await complete(first)
+  assert.equal(await preload, '本次成员回复')
+  const oldId = h.store.directory.getChannelSession(member.assistantId, scope)
+  assert.equal(oldId, first.agent.id)
+
+  // 写句柄一直不放（6 次重试全部被占）：scoped 会话可重建，应换新而不是把提问判失败。
+  h.resumeBusy(6)
+  const question = h.runtime.chat(member.assistantId, '培训过的名词是什么意思？', undefined, undefined, 'desktop', undefined, scope)
+  void question.catch(() => undefined)
+  const second = await h.next()
+  assert.notEqual(second.agent.id, oldId, '旧绑定被丢弃，换新会话')
+  assert.equal(h.store.directory.getChannelSession(member.assistantId, scope), second.agent.id, '新绑定立刻写回')
+  await complete(second)
+  assert.equal(await question, '本次成员回复')
+})
+
+test('桌面持久成员会话写句柄持续被占：如实拒绝，不静默换新', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('持久成员'))
+  const first = await h.start(member.assistantId)
+  await complete(first.driver)
+  await first.activation.dispose()
+  h.resumeBusy(6)
+  await assert.rejects(() => h.start(member.assistantId), /成员持久会话不可用/u)
+})
+
+test('具备文档能力的成员可用只读三件套核对工作区代码，普通成员不行', async t => {
+  const h = await fixture(t)
+  const docMember = h.store.directory.create(draft('文档成员', { capabilities: ['document'] }))
+  const first = await h.start(docMember.assistantId)
+  for (const name of ['read', 'glob', 'grep']) assert.equal((await first.driver.tool(name)).isError, false, name)
+  await complete(first.driver)
+  await first.activation.dispose()
+  const plain = h.store.directory.create(draft('普通成员'))
+  const second = await h.start(plain.assistantId)
+  for (const name of ['glob', 'grep']) assert.equal((await second.driver.tool(name)).isError, true, `${name} 不应默认开放`)
+  await complete(second.driver)
+  await second.activation.dispose()
+})
 
 test('不同成员会话隔离，任务与聊天共享持久 id，重建运行时只 resume，流式不重放历史', async t => {
   const h = await fixture(t)
@@ -297,6 +364,54 @@ test('成员企微会话按机器人和聊天范围持久隔离，桌面历史�
   h.failResume()
   await assert.rejects(h.runtime.chat(member.assistantId, '不能换会话', undefined, 'wecom:single:主人', 'desktop', scopeA), /不可用.*未创建替代会话/u)
   assert.equal(h.store.directory.getChannelSession(member.assistantId, scopeA), first.agent.id)
+  assert.equal(h.runtime.busy(), false)
+})
+
+test('文档讲解按文档建独立临时会话，与桌面会话隔离、记忆照常注入、关闭扔绑定', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('讲解成员', { capabilities: ['document'] }))
+  h.memories.set(member.assistantId, '本人确认过的成员记忆')
+  const desktop = await h.start(member.assistantId)
+  await complete(desktop.driver, 10, '桌面私有历史')
+  await desktop.activation.dispose()
+  await h.next()
+  h.allowChannelFollowup()
+  const scopeA = documentSessionScope('D:/docs/甲.md', 'D:/ws/alpha')
+  const scopeB = documentSessionScope('D:/docs/乙.md', 'D:/ws/alpha')
+  assert.match(scopeA, /^[a-f0-9]{64}$/u, '文档范围是 64 位十六进制摘要')
+  assert.notEqual(scopeA, scopeB)
+  // 工作区进键：同文档换工作区 → 新 scope → 新会话；同三元组 → 同 scope → 复用。
+  assert.notEqual(scopeA, documentSessionScope('D:/docs/甲.md', 'D:/ws/beta'), '换工作区必须新开')
+  assert.equal(scopeA, documentSessionScope('D:/docs/甲.md', 'D:/ws/alpha'), '同工作区同文档复用')
+  // 预读：独立文档会话，不沾桌面历史，记忆仍注入。
+  const preload = h.runtime.chat(member.assistantId, '这是全文，读完回收到', undefined, undefined, 'desktop', undefined, scopeA)
+  void preload.catch(() => undefined)
+  const first = await h.next()
+  assert.equal(h.store.directory.getChannelSession(member.assistantId, scopeA), first.agent.id, '文档会话先登记再交付')
+  assert.notEqual(first.agent.id, desktop.child.id, '文档会话独立于桌面持久会话')
+  assert.doesNotMatch(JSON.stringify(first.events), /桌面私有历史/u)
+  assert.match(await first.prompt(), /本人确认过的成员记忆/u, '记忆照常注入文档会话')
+  await complete(first, 10, '收到')
+  assert.equal(await preload, '收到')
+  // 提问：复用同一条文档会话，预读历史还在。
+  const question = h.runtime.chat(member.assistantId, '为什么限制目录？', undefined, undefined, 'desktop', undefined, scopeA)
+  const resumed = await h.next()
+  assert.equal(resumed.agent.id, first.agent.id, '提问复用预读那条文档会话')
+  assert.match(JSON.stringify(resumed.events), /收到/u, '预读历史还在')
+  await complete(resumed, 10, '避免误读')
+  assert.equal(await question, '避免误读')
+  // 另一份文档：另一条会话，不沾甲文档历史。
+  const other = h.runtime.chat(member.assistantId, '乙文档全文', undefined, undefined, 'desktop', undefined, scopeB)
+  const second = await h.next()
+  assert.notEqual(second.agent.id, first.agent.id)
+  assert.doesNotMatch(JSON.stringify(second.events), /收到|桌面私有历史/u)
+  await complete(second, 10, '收到')
+  assert.equal(await other, '收到')
+  // 桌面持久会话绑定不变；关闭扔绑定后查不到。
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, desktop.child.id)
+  h.store.directory.clearChannelSession(member.assistantId, scopeA)
+  assert.equal(h.store.directory.getChannelSession(member.assistantId, scopeA), null, '关闭扔临时会话绑定')
+  assert.equal(h.store.directory.getChannelSession(member.assistantId, scopeB), second.agent.id, '只扔甲文档，乙文档不动')
   assert.equal(h.runtime.busy(), false)
 })
 
@@ -532,11 +647,12 @@ test('邮件能力可只读检查未读；邮件来源和企微来源不能拿�
   await second.activation.dispose()
 })
 
-test('每请求覆盖模型与输出上限，usage 快照不累加，重复终止与跨代理帧不重复结账', async t => {
+test('每请求只覆盖输出上限（模型随会话固定），usage 快照不累加，重复终止与跨代理帧不重复结账', async t => {
   const h = await fixture(t)
   const member = h.store.directory.create(draft('计量成员', { dailyTokenLimit: 100, totalTokenLimit: 150 }))
   const { driver, activation } = await h.start(member.assistantId)
-  assert.deepEqual(await driver.request(), { provider: '成员提供方', model: '成员模型', maxTokens: 80 })
+  // 模型由会话创建时的 agentOptions 固定；request 阶段不能再改（宿主会拒绝）。
+  assert.deepEqual(await driver.request(), { provider: '宿主', model: '宿主模型', maxTokens: 80 })
   driver.startAttempt()
   driver.chunk({ type: 'usage', usage: usage(3) })
   driver.finish({ inputTokens: 5, outputTokens: 20, cacheReadTokens: 10, cacheWriteTokens: 15, reasoningTokens: 7, totalTokens: 50 })
@@ -557,7 +673,7 @@ test('每请求覆盖模型与输出上限，usage 快照不累加，重复终�
 for (const mode of ['无流', '缺终止', '缺用量', '失败', '无效用量']) {
   test(`${mode}记未知并跨轮阻断，不假装零用量，不允许请求错误钩子重试`, async t => {
     const h = await fixture(t)
-    const member = h.store.directory.create(draft('未知成员', { dailyTokenLimit: 0, totalTokenLimit: 0 }))
+    const member = h.store.directory.create(draft('未知成员', { dailyTokenLimit: 100, totalTokenLimit: 300 }))
     const { driver, activation } = await h.start(member.assistantId)
     await driver.request()
     if (mode !== '无流') {

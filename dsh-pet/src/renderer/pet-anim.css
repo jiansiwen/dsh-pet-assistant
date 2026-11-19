@@ -46,6 +46,27 @@
   transform: translateX(-8px) scale(1.38);
   transform-origin: 50% 40%;
 }
+/* swagger 侧身走路：角色重心在素材里从 0.486 漂到 0.443，用线性漂移补偿把
+   起步/循环尾/收步尾三个边界都对齐静图重心（±0.5px），过渡不闪不跳。 */
+.pose-layer[data-pose-action='swagger'] .pet-video {
+  transform-origin: 50% 100%;
+  animation: swagger-drift 3500ms linear forwards;
+}
+@keyframes swagger-drift {
+  from { transform: translateX(-7px) scale(1); }
+  to { transform: translateX(-1px) scale(1); }
+}
+.pose-layer[data-pose-action='swagger-stop'] .pet-video {
+  transform: translateX(-1px) scale(1);
+  transform-origin: 50% 100%;
+}
+/* 左瞧右看 / 睡觉 / 变身：站姿首尾与静图等大对齐；睡觉躺卧中段、变身火焰向上延伸自然不强行对齐。 */
+.pose-layer[data-pose-action='look-around'] .pet-video,
+.pose-layer[data-pose-action='sleep'] .pet-video,
+.pose-layer[data-pose-action='transform'] .pet-video {
+  transform: translateX(-2px) scale(1);
+  transform-origin: 50% 100%;
+}
 .pose-layer[data-pose-action='drop'] .pet-video {
   transform: translate(-8px, -6.5px) scale(1.22);
 }

@@ -117,6 +117,8 @@ export const FRAME_ACTIONS = [
   'sleep-in', 'sleep-loop', 'sleep-out',
   // 走路收步：3 帧，走姿 → 站定。走到目标时插在 walk 与 idle 之间，消除硬切。
   'walk-stop',
+  // swagger 收步：转身站定一段，走到目标时插在 swagger 与 idle 之间，消除硬切。
+  'swagger-stop',
 ] as const
 
 /**

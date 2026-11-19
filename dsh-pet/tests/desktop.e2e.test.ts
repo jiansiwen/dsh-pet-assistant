@@ -127,6 +127,7 @@ const ipcRemoved: Array<{ kind: string; channel: string }> = []
 const appHandlers = new Map<string, (event?: unknown, ...rest: unknown[]) => void>()
 const quitCalls: number[] = []
 const registeredShortcuts: string[] = []
+const shortcutCallbacks = new Map<string, () => void>()
 let shortcutsCleared = 0
 let dockHideCalls = 0
 /** 注册过几次桌面采集授权回调。装配时必须正好一次 —— 不注册，会议就永远只有麦克风一轨。 */
@@ -274,9 +275,15 @@ const fakeElectron = {
     showOpenDialog: () => Promise.resolve({ canceled: true, filePaths: [] }),
   },
   globalShortcut: {
-    register: (accelerator: string) => {
+    register: (accelerator: string, callback: () => void) => {
       registeredShortcuts.push(accelerator)
+      shortcutCallbacks.set(accelerator, callback)
       return true
+    },
+    unregister: (accelerator: string) => {
+      const index = registeredShortcuts.indexOf(accelerator)
+      if (index >= 0) registeredShortcuts.splice(index, 1)
+      shortcutCallbacks.delete(accelerator)
     },
     unregisterAll: () => {
       shortcutsCleared += 1
@@ -334,10 +341,20 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
   assert.equal(windows.length, 1, '舞台窗口建了一个')
   assert.ok(windows[0].loaded?.endsWith(`renderer${path.sep}index.html`), '加载的是渲染层页面')
   assert.equal(trays.length, 1, '托盘建了一个')
-  assert.deepEqual(registeredShortcuts, ['CommandOrControl+Alt+P'],
-    '主选注册成功就停手；备选 Ctrl+Alt+Space 只在主选被占用时兜底')
+  assert.deepEqual(registeredShortcuts, ['CommandOrControl+Alt+P', 'Ctrl+Alt+D', 'Ctrl+Alt+R', 'Ctrl+Alt+C'],
+    '召唤主选注册成功就停手（备选只在被占用时兜底）；讲解打断/休息/继续三个快捷键也注册')
   assert.equal(kwsStarts.length, 1, 'boot 后 KWS 唤醒被仲裁器拉起一次（替身，不加载真模型）')
   assert.equal(playHostCalls.starts, 1, '唤醒应答的常驻播放进程在装配时预热一次')
+})
+
+test('讲解快捷键按下经 doc-hotkey 通知渲染层（打断/休息/继续），注册状态也投影', () => {
+  for (const [accelerator, action] of [['Ctrl+Alt+D', 'interrupt'], ['Ctrl+Alt+R', 'rest'], ['Ctrl+Alt+C', 'resume']] as const) {
+    const callback = shortcutCallbacks.get(accelerator)
+    assert.ok(callback, `${accelerator} 应已注册`)
+    callback!()
+    assert.deepEqual(lastSent('doc-hotkey'), { action }, `${accelerator} 应发出 ${action}`)
+  }
+  assert.deepEqual(lastSent('doc-hotkey-status'), { interrupt: true, rest: true, resume: true }, '注册状态投影到设置页')
 })
 
 test('邮件通知只有系统确认显示后才回执，失败和未知如实保留', { timeout: 10000 }, async t => {
@@ -397,7 +414,7 @@ test('邮件通知只有系统确认显示后才回执，失败和未知如实�
 
 test('通道清单：舞台侧注册的每一条都该在，一条不多', () => {
   const expectedOn = [
-    'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'speech-local', 'stage-set-visible', 'stage-set-focus',
+    'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'speech-local', 'doc-ack', 'stage-set-visible', 'stage-set-focus',
     // 演示隐私模式（M5-05）：与专注、隐藏各自独立，只改"渲染哪些历史与预览"。
     'presentation-mode',
     'proactive-respond', 'overlay-state',
@@ -448,6 +465,8 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     // 助理设置页（渠道与邮箱）+ 邮件页：配置读写与值守结果列表，都走舞台发送方校验。
     'assistant-settings-state', 'assistant-settings-save',
     'assistant-mail-state', 'assistant-mail-save', 'assistant-mail-analyses',
+    // 讲解口令打断后的 10 秒提问窗口：超时把暂停的讲解接回去；口令应答走预合成短句。
+    'doc-resume',
     // 形象与音色工作室（底座 4.8/4.9）：工作室窗口专用通道，发送方校验只认该窗口。
     'custom-skins-list', 'asset-studio-open',
     'asset-studio-state', 'asset-studio-save-providers', 'asset-studio-test-provider',
@@ -456,6 +475,8 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'asset-studio-apply-skin', 'asset-studio-delete-skin', 'asset-studio-pick-audio',
     // 从本地视频裁动作：选文件、裁剪、登记为皮肤动作（不需要视频模型）。
     'asset-studio-pick-video', 'asset-studio-extract-clip',
+    // 已有角色动作管理：生成单动作先暂存预览、应用才写入、删除清素材。
+    'asset-studio-generate-action', 'asset-studio-apply-action', 'asset-studio-delete-action',
     'asset-studio-start-clone', 'asset-studio-apply-voice', 'asset-studio-revoke-voice',
     // 快速应答（快嘴旁路）：配置/测试只认舞台窗口；开启在主进程过原生隐私确认。
     'fast-reply-state', 'fast-reply-save', 'fast-reply-test',
@@ -487,7 +508,7 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
     'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines', 'runtime-start', 'runtime-stop',
     'stage-set-visible', 'stage-set-focus',
-    'doc-open', 'doc-explain', 'doc-ask', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
+    'doc-open', 'doc-explain', 'doc-ask', 'doc-resume', 'doc-ack', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
     'meeting-state', 'meeting-delete', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',

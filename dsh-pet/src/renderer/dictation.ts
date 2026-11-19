@@ -290,11 +290,11 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
       kind: 'dictation',
       onFrame: (frame) => {
         /*
-          宠物自己正在朗读：扬声器放出来的声音会被麦克风收回去。
-          这一段不能当成用户在说话，否则它会把自己念的内容转成你的提问。
-          录音侧不受影响 —— 会议轨自己决定要不要保留这段现场声。
+          不是插话交接的普通听写：朗读期间的帧仍然跳过（避免把助理自己的声音转成提问）。
+          插话交接例外 —— 用户就是在讲解声中开口的，整段丢弃会把问题后半句吞掉
+          （真机复现：只识别出"い下。"/"さ？"）。回声由 echoCancellation 处理。
         */
-        if (frame.assistantSpeaking) return
+        if (frame.assistantSpeaking && !takenOver) return
         if (!takenOver && options.takeHandover) {
           // 交接还没取走时先攒着，取走后按序号去重再处理。
           live.push(frame)
