@@ -131,7 +131,7 @@ export default function App() {
   const [readReplies, setReadReplies] = useState(false)
   const [meetingDocumentAutoApprove, setMeetingDocumentAutoApprove] = useState<boolean | null>(null)
   /** 会话框停靠方式与尺寸；默认固定在头顶，尺寸 440×560。 */
-  const [chatDock, setChatDock] = useState<'top' | 'auto'>('top')
+  const [chatDock, setChatDock] = useState<'top' | 'auto'>('auto')
   const [chatSize, setChatSize] = useState<{ width: number; height: number }>({ width: 440, height: 560 })
   const conversation = useRef(new VoiceConversation()).current
   const [continuousActive, setContinuousActive] = useState(false)
@@ -1437,7 +1437,7 @@ export default function App() {
                         else showToast('会话框设置未保存')
                       } catch { showToast('会话框设置未保存') }
                     }} />
-                  会话框固定在宠物头顶（关闭后按屏幕空间自动换到上/下/左/右）
+                  会话框优先固定在宠物头顶（空间不够或会挡住时，仍会自动换到旁边）
                 </label>
               </section>
               <ResidencySettings

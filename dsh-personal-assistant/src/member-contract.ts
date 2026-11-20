@@ -18,6 +18,8 @@ export interface PlatformBinding {
   /** OpenAI 兼容端点（仅 https 或本机回环）；路径不以 /chat/completions 结尾时由适配层补全。 */
   endpoint: string
   model: string
+  /** 平台智能体标识（X-Agent-Id 头 + 请求体 agentId 字段双发）；空串=不指定，此时 model 必填。 */
+  agentId: string
   /** 指向加密密钥库中密钥条目的标识；空串=尚未配置密钥（分派时如实拒绝）。 */
   secretId: string
 }

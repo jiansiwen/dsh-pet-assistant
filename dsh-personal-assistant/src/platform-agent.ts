@@ -43,12 +43,19 @@ export class PlatformAgent {
     try {
       const headers = new Headers({ 'content-type': 'application/json' })
       if (key) headers.set('Authorization', `Bearer ${key}`)
+      // 平台靠 X-Agent-Id / 请求体 agentId 指定智能体（二者任一即可，双发最稳）；旧存档可能缺字段，按空串兜底。
+      const agentId = this.binding.agentId ?? ''
+      const model = this.binding.model ?? ''
+      if (agentId !== '') headers.set('X-Agent-Id', agentId)
+      const payload: Record<string, unknown> = { messages, stream: false }
+      if (model !== '') payload.model = model
+      if (agentId !== '') payload.agentId = agentId
       const response = await fetch(completionsUrl(this.binding.endpoint), {
         method: 'POST',
         headers,
         redirect: 'error',
         signal: controller.signal,
-        body: JSON.stringify({ model: this.binding.model, messages, stream: false }),
+        body: JSON.stringify(payload),
       })
       if (!response.ok) {
         return { kind: 'error', text: response.status === 401 || response.status === 403

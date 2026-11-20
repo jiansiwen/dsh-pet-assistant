@@ -70,8 +70,10 @@ const draftKeys = ['displayName', 'description', 'personality', 'permissionMode'
 function subAssistantBinding(value: unknown): SubAssistantBinding {
   const bound = record(value)
   if (bound.kind === 'platform') {
-    keys(bound, ['kind', 'endpoint', 'model', 'secretId'])
-    return { kind: 'platform', endpoint: text(bound.endpoint, 2048), model: text(bound.model, 256), secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100) }
+    keys(bound, ['kind', 'endpoint', 'model', 'agentId', 'secretId'])
+    return { kind: 'platform', endpoint: text(bound.endpoint, 2048), model: text(bound.model, 256),
+      agentId: bound.agentId === undefined ? '' : text(bound.agentId, 128),
+      secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100) }
   }
   if (bound.kind === 'local-cli') {
     keys(bound, ['kind', 'command', 'args'])

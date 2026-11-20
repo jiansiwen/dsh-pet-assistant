@@ -94,6 +94,7 @@ export default function ChatOverlay(props: Props) {
         dockRef.current,
       )
       element.style.transform = `translate3d(${position.x}px, ${position.y}px, 0)`
+      element.dataset.dockSide = position.side
       const rect = element.getBoundingClientRect()
       const box = { x1: Math.max(0, rect.left), y1: Math.max(0, rect.top), x2: Math.min(innerWidth, rect.right), y2: Math.min(innerHeight, rect.bottom) }
       registerPanelHitbox(box.x2 > box.x1 && box.y2 > box.y1 ? box : null)

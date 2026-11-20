@@ -3644,7 +3644,7 @@ function registerIpc(): void {
       layoutVersion: settings.layoutVersion,
       idleSleepMinutes: settings.idleSleepMinutes,
       sleepMinutes: settings.sleepMinutes,
-      chatDock: settings.chatDock ?? 'top',
+      chatDock: settings.chatDock ?? 'auto',
       chatSize: settings.chatSize,
     }
   })

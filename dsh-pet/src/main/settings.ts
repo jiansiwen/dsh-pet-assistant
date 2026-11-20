@@ -72,13 +72,13 @@ export interface PetSettings {
    * 镜像只负责转发，不能因为它"看起来是自家的"就跳过校验。
    */
   modelMirror?: string
-  /** 会话框固定挂在头顶；auto = 按屏幕剩余空间自动选上/下/左/右。 */
+  /** 会话框停靠：auto = 按屏幕空间避开宠物选上/下/左/右；top = 固定挂在头顶。 */
   chatDock?: 'top' | 'auto'
   /** 会话框尺寸（CSS 像素），由右下角拖拽调整后保存。 */
   chatSize?: { width: number; height: number }
 }
 
-const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false, chatDock: 'top' }
+const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false, chatDock: 'auto' }
 
 let cache: PetSettings | null = null
 

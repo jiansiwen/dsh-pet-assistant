@@ -21,13 +21,13 @@ const limitLabel = (limit: number): string => limit === 0 ? '不限' : limit.toL
 type DraftForm = Omit<MemberDraft, 'maxTokens' | 'dailyTokenLimit' | 'totalTokenLimit' | 'thresholdPercent' | 'kind' | 'binding' | 'reportMode' | 'apiKey'> & {
   maxTokens: string; dailyTokenLimit: string; totalTokenLimit: string; thresholdPercent: string
   kind: MemberKind; reportMode: SubAssistantReportMode
-  endpoint: string; platformModel: string; secretId: string
+  endpoint: string; platformModel: string; agentId: string; secretId: string
   command: string; argsText: string
   apiKey: string
 }
 const COMPARE_FIELDS: ReadonlyArray<readonly [keyof DraftForm, string]> = [
   ['displayName', '名称'], ['description', '职责'], ['personality', '性格'], ['persona', '工作要求'],
-  ['kind', '成员类型'], ['reportMode', '汇报模式'], ['endpoint', '平台端点'], ['platformModel', '平台模型'],
+  ['kind', '成员类型'], ['reportMode', '汇报模式'], ['endpoint', '平台端点'], ['platformModel', '平台模型'], ['agentId', '智能体 ID'],
   ['command', '工具命令'], ['argsText', '工具参数'],
   ['permissionMode', '权限'], ['skinId', '形象'], ['enabled', '启用状态'], ['capabilities', '能力'],
   ['provider', '模型服务商'], ['model', '模型'], ['maxTokens', '单次最大输出量'], ['dailyTokenLimit', '日额度'],
@@ -59,6 +59,7 @@ function initialForm(member: MemberView | null): DraftForm {
     timezone: p?.timezone ?? localTimezone(),
     kind: p?.kind ?? 'expert', reportMode: p?.reportMode ?? 'chief',
     endpoint: binding?.kind === 'platform' ? binding.endpoint : '', platformModel: binding?.kind === 'platform' ? binding.model : '',
+    agentId: binding?.kind === 'platform' ? binding.agentId : '',
     secretId: binding?.kind === 'platform' ? binding.secretId : '',
     command: binding?.kind === 'local-cli' ? binding.command : '', argsText: binding?.kind === 'local-cli' ? binding.args.join(' ') : '',
     apiKey: '',
@@ -69,6 +70,7 @@ function fromDraft(draft: MemberDraft): DraftForm {
   const bound = binding ?? null
   return { ...rest, kind: kind ?? 'expert', reportMode: reportMode ?? 'chief',
     endpoint: bound?.kind === 'platform' ? bound.endpoint : '', platformModel: bound?.kind === 'platform' ? bound.model : '',
+    agentId: bound?.kind === 'platform' ? bound.agentId : '',
     secretId: bound?.kind === 'platform' ? bound.secretId : '',
     command: bound?.kind === 'local-cli' ? bound.command : '', argsText: bound?.kind === 'local-cli' ? bound.args.join(' ') : '',
     apiKey: '',
@@ -82,7 +84,7 @@ function safeInteger(value: string, fallback: number, min = 0): number {
 /** 给 AI 的基准草稿；表单临时空值用默认值补齐，不用于保存。 */
 /** 由表单构建外部绑定；expert 成员恒为 null（绑定变化会清空子助理会话，属预期）。 */
 function bindingOf(form: DraftForm): MemberDraft['binding'] {
-  if (form.kind === 'platform') return { kind: 'platform', endpoint: form.endpoint.trim(), model: form.platformModel.trim(), secretId: form.secretId }
+  if (form.kind === 'platform') return { kind: 'platform', endpoint: form.endpoint.trim(), model: form.platformModel.trim(), agentId: form.agentId.trim(), secretId: form.secretId }
   if (form.kind === 'local-cli') return { kind: 'local-cli', command: form.command.trim(), args: form.argsText.split(/\s+/).filter(Boolean) }
   return null
 }
@@ -94,13 +96,13 @@ function validBinding(form: DraftForm): boolean {
       if (!/^https?:$/.test(url.protocol)) return false
       if (url.protocol === 'http:' && !/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(url.host)) return false
     } catch { return false }
-    return form.platformModel.trim().length > 0
+    return form.platformModel.trim().length > 0 || form.agentId.trim().length > 0
   }
   if (form.kind === 'local-cli') return form.command.trim().length > 0
   return true
 }
 function formDraft(form: DraftForm, member: MemberView | null): MemberDraft {
-  const { endpoint, platformModel, secretId, command, argsText, apiKey, ...rest } = form
+  const { endpoint, platformModel, agentId, secretId, command, argsText, apiKey, ...rest } = form
   return {
     ...rest, displayName: rest.displayName.trim() || '新成员', provider: rest.provider.trim(), model: rest.model.trim(),
     maxTokens: safeInteger(rest.maxTokens, member?.profile.maxTokens ?? 16384, 1),
@@ -288,9 +290,12 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
         <label className="editor-field"><span>平台端点（OpenAI 兼容，https 或本机回环）</span>
           <input autoComplete="off" maxLength={2048} value={form.endpoint} disabled={busy} onChange={event => set('endpoint', event.target.value)}
             placeholder="例：https://api.platform-a.com/v1" /></label>
-        <label className="editor-field"><span>平台模型名</span>
+        <label className="editor-field"><span>平台模型名（填了智能体 ID 时可留空）</span>
           <input autoComplete="off" maxLength={256} value={form.platformModel} disabled={busy} onChange={event => set('platformModel', event.target.value)}
             placeholder="例：agent-1" /></label>
+        <label className="editor-field"><span>智能体 ID（平台用 X-Agent-Id 指定智能体，可选）</span>
+          <input autoComplete="off" maxLength={128} value={form.agentId} disabled={busy} onChange={event => set('agentId', event.target.value)}
+            placeholder="例：1464" /></label>
         <label className="editor-field"><span>API 密钥{form.secretId ? '（已配置，留空＝沿用原密钥）' : '（未配置）'}</span>
           <input type="password" autoComplete="new-password" maxLength={4096} value={form.apiKey} disabled={busy}
             onChange={event => set('apiKey', event.target.value)} placeholder={form.secretId ? '留空保持不变' : '保存在本机加密存储，不会回显'} /></label>
