@@ -17,7 +17,7 @@
 }
 
 .voice-api-settings {
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--rule);
   margin-top: 8px;
   padding: 8px 0;
   font-size: 12px;
@@ -35,7 +35,7 @@
   min-width: 0;
   margin: 10px 0 0;
   padding: 8px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--rule);
   border-radius: 6px;
 }
 
@@ -52,19 +52,19 @@
   min-width: 0;
   margin-top: 4px;
   padding: 6px;
-  border: 1px solid #cbd0dc;
+  border: 1px solid var(--rule-strong);
   border-radius: 4px;
-  background: #fff;
-  color: #333a48;
+  background: var(--paper-raised);
+  color: var(--ink);
   font: inherit;
 }
 
 .voice-api-settings button {
   padding: 4px 8px;
-  border: 1px solid #cbd0dc;
+  border: 1px solid var(--rule-strong);
   border-radius: 4px;
-  background: #f5f7fb;
-  color: #333a48;
+  background: var(--paper-sunken);
+  color: var(--ink);
   cursor: pointer;
   font: inherit;
 }
@@ -75,7 +75,7 @@
 }
 
 .voice-api-settings :focus-visible {
-  outline: 2px solid #6a8fe7;
+  outline: 2px solid var(--indigo);
   outline-offset: 2px;
 }
 
@@ -103,11 +103,11 @@
 }
 
 .voice-api-error {
-  color: #a62d36;
+  color: var(--danger);
 }
 
 .voice-api-confirm {
-  border-left: 3px solid #a62d36;
+  border-left: 3px solid var(--danger);
   padding-left: 8px;
   margin-bottom: 10px;
 }

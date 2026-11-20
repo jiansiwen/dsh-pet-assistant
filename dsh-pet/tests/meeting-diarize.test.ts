@@ -23,6 +23,7 @@ import {
   diarizationModelStatus,
   diarizeTimelineSamples,
   fallbackSpans,
+  looksLikeAssistantEcho,
   mapCompressedToOriginal,
   spansFromTurns,
   splitLongSpans,
@@ -135,12 +136,21 @@ describe('分离结果 → 说话人段（纯函数）', () => {
     ]
     const result = applyAssistantSpeech(spans, [{ startMs: 500, endMs: 1700 }, { startMs: 5000, endMs: 5500 }])
     assert.deepEqual(result.spans, [
-      { track: 'mic', speaker: ASSISTANT_SPEAKER, label: ASSISTANT_LABEL, startMs: 0, endMs: 2000, kind: 'assistant', chunkSeq: 0 },
+      { track: 'mic', speaker: ASSISTANT_SPEAKER, label: ASSISTANT_LABEL, startMs: 0, endMs: 2000, kind: 'assistant', chunkSeq: 0, echoSpeaker: 'mic-s1', echoLabel: 'x' },
       { track: 'mic', speaker: 'mic-s1', label: 'x', startMs: 3000, endMs: 4800, kind: 'speech' },
       spans[2],
     ])
     assert.equal(result.marked, 1)
     assert.equal(result.trimmed, 1)
+  })
+
+  test('助理重叠的文字复核：回声算助理，插话提问保留原说话人', () => {
+    assert.equal(looksLikeAssistantEcho('提醒功能是怎么实现的', '小潘会把提醒做成一个需要回应的周期，到点提醒你，没回应就按间隔催办'), false,
+      '用户在播报途中插话提问，文字完全不同，不能算小潘的发言')
+    assert.equal(looksLikeAssistantEcho('小潘会把提醒做成一个需要回应的周期', '小潘会把提醒做成一个需要回应的周期。'), true)
+    const long = '文档讲解不是把整份文档一次读完，而是按页推进。读完这一段，才推进下一段。'
+    assert.equal(looksLikeAssistantEcho('读完这一段才推进下一段', long), true, '助理长段按句比对')
+    assert.equal(looksLikeAssistantEcho('一下', long), true, '太短无法判断，按回声处理')
   })
 
   test('长段在目标位置前的低能量处切开，每段不超过上限', () => {

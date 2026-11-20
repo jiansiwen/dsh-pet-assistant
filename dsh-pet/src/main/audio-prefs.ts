@@ -24,15 +24,29 @@ export interface AudioPrefs {
   readonly wakeEngine: WakeEngine | null
   /** 用户给助理起的唤醒词；默认「小潘同学」。 */
   readonly wakeName: string
-  /** 只认已注册的声纹；默认关（关闭时谁喊都应，保持旧行为）。 */
+  /**
+   * 只认已注册的声纹；默认关（关闭时谁喊都应，保持旧行为）。
+   *
+   * 与 {@link wakeDuringSpeech} 是两件事，别混：
+   * - `wakeVoiceprint` 在**声纹层**过滤（只有主人的声音能通过）；
+   * - `wakeDuringSpeech` 在**逻辑层**过滤（播报中要不要响应唤醒）。
+   * 而且声纹在讲解中一律放行（见 `wake-scene.ts`）：讲解是公开场合。
+   */
   readonly wakeVoiceprint: boolean
+  /**
+   * 播报（回答/讲解）中是否也响应唤醒；默认 **false** = 播报中安静。
+   *
+   * 关着更接近真人助理：它正在说话时你插话，它不会每次都"我在呢"地打断自己。
+   * 讲解中例外 —— 那时候被打断是常态，不受这个开关影响。
+   */
+  readonly wakeDuringSpeech: boolean
   /** 声纹相似度阈值；0.5–0.9，默认 0.65。 */
   readonly wakeVoiceprintThreshold: number
   readonly launchAtLogin: boolean
   readonly bargeIn: boolean
 }
 
-export type AudioPrefsPatch = Partial<Pick<AudioPrefs, 'wakeEnabled' | 'wakeVoiceprint' | 'wakeVoiceprintThreshold' | 'launchAtLogin' | 'bargeIn'>> & {
+export type AudioPrefsPatch = Partial<Pick<AudioPrefs, 'wakeEnabled' | 'wakeVoiceprint' | 'wakeVoiceprintThreshold' | 'wakeDuringSpeech' | 'launchAtLogin' | 'bargeIn'>> & {
   wakeEngine?: WakeEngine
   wakeName?: string
 }
@@ -48,6 +62,8 @@ export function normalizeAudioPrefs(raw: unknown, platform: SupportedPlatform): 
     wakeEngine: engine,
     wakeName: normalizeWakeName(record.wakeName),
     wakeVoiceprint: record.wakeVoiceprint === true,
+    // 默认 false：播报中不响应唤醒（安静优先）。只有明确的 true 才打开。
+    wakeDuringSpeech: record.wakeDuringSpeech === true,
     wakeVoiceprintThreshold: typeof record.wakeVoiceprintThreshold === 'number'
       && Number.isFinite(record.wakeVoiceprintThreshold)
       && record.wakeVoiceprintThreshold >= 0.5 && record.wakeVoiceprintThreshold <= 0.9
@@ -70,6 +86,7 @@ export function sanitizePatch(raw: unknown, platform: SupportedPlatform): AudioP
   }
   if (typeof record.wakeName === 'string') patch.wakeName = record.wakeName
   if (typeof record.wakeVoiceprint === 'boolean') patch.wakeVoiceprint = record.wakeVoiceprint
+  if (typeof record.wakeDuringSpeech === 'boolean') patch.wakeDuringSpeech = record.wakeDuringSpeech
   if (typeof record.wakeVoiceprintThreshold === 'number' && Number.isFinite(record.wakeVoiceprintThreshold)) {
     patch.wakeVoiceprintThreshold = record.wakeVoiceprintThreshold
   }

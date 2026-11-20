@@ -454,7 +454,7 @@ export class TeamService {
     })
   }
 
-  /** 仅补写缺失的旧版种子；已有成员的启用状态、权限和人设均以持久目录为准。 */
+  /** 仅首装补写种子；已有成员的启用状态、权限和人设均以持久目录为准。 */
   ensureRoster(): MemberConfig[] {
     const { enabled, unknown } = resolveSeats(ROSTER, this.options.seats)
     for (const name of unknown) this.options.logger.warn(`团队席位名单里认不出这个名字，已忽略：${name}`)
@@ -462,22 +462,22 @@ export class TeamService {
     if (chief && !enabled.has(chief.assistantId)) {
       this.options.logger.warn('团队席位名单里没有总助理：没人拆任务、转交审批与汇总专家结论')
     }
+    // 删除必须永久生效：启动时不再补回缺失的种子。总助理不可删除，
+    // 因此"表全空"等价于首次安装；任何删除之后表必非空，种子不会复活。
+    if (this.store.listMembers().length > 0) return this.roster()
     for (const seed of ROSTER) {
       const onStage = enabled.has(seed.assistantId)
-      const existing = this.store.getMember(seed.assistantId)
-      if (!existing) {
-        this.store.upsertMember({
-          assistantId: seed.assistantId,
-          roleId: seed.roleId,
-          displayName: seed.displayName,
-          skinId: seed.skinId,
-          persona: seed.persona,
-          voiceProfile: seed.voiceProfile,
-          toolPolicy: { mode: seed.mode, denyTools: [] },
-          enabled: onStage,
-          revision: 1,
-        })
-      }
+      this.store.upsertMember({
+        assistantId: seed.assistantId,
+        roleId: seed.roleId,
+        displayName: seed.displayName,
+        skinId: seed.skinId,
+        persona: seed.persona,
+        voiceProfile: seed.voiceProfile,
+        toolPolicy: { mode: seed.mode, denyTools: [] },
+        enabled: onStage,
+        revision: 1,
+      })
     }
     return this.roster()
   }
@@ -554,7 +554,9 @@ export class TeamService {
       this.store.insertTask(task)
       this.store.appendEvent('task/created', { taskId, goal: task.goal, ownerId, status: task.status }, { taskId, assistantId: ownerId })
     })
-    return task
+    // 回读而不是回内存里那份：`insertTask` 会补默认列（priority/source 等），
+    // 返回内存对象会让调用方拿到一个和库里不一致的 Task。
+    return this.store.getTask(taskId) ?? task
   }
 
   getTask(taskId: string): Task | null {
@@ -631,7 +633,7 @@ export class TeamService {
    * 执行一个任务：检查依赖与并发额度，以修订号占用，委派给成员，等运行结果，再按产物验收。
    * @returns 任务终态与专家报告；额度不足或依赖未就绪时返回排队中的任务。
    */
-  async runTask(taskId: string, parentAgent: Agent, signal: AbortSignal): Promise<TaskOutcome | null> {
+  async runTask(taskId: string, parentAgent: Agent, signal: AbortSignal, docScope?: string): Promise<TaskOutcome | null> {
     if (this.disposed) throw new Error('团队服务已经停止')
     if (!this.recovered) this.recoverInterruptedTasks()
     const task = this.getTask(taskId)
@@ -696,7 +698,7 @@ export class TeamService {
     let stopDelta: () => void = () => undefined
     try {
       if (managed) {
-        const started = await this.startChild(member, claimed, parentAgent, runSignal, runId, null)
+        const started = await this.startChild(member, claimed, parentAgent, runSignal, runId, null, docScope)
         live.run = started.activation
         live.child = started.child
       } else if (plan) {
@@ -794,9 +796,10 @@ export class TeamService {
     signal: AbortSignal,
     runId: string,
     plan: SideEffectPlan | null,
+    docScope?: string,
   ): Promise<{ activation: SubagentActivation; child: Agent | undefined }> {
     if (this.options.members) return this.options.members.start(member.assistantId, this.buildPrompt(member, task, null), signal, task.taskId,
-      task.originChannel === 'wecom' ? 'wecom' : 'desktop')
+      task.originChannel === 'wecom' ? 'wecom' : 'desktop', docScope, parentAgent)
     const activation = await this.ctx.subagents.startActivation({
       provider: this.options.provider,
       label: runId,
@@ -924,6 +927,13 @@ export class TeamService {
     this.recovered = true
   }
 
+  /** 成员最新工作汇报：同步给总助理_prompt 知悉；成员已亲自汇报过，总助不再复述。 */
+  private readonly recentReports: Array<{ at: number; member: string; text: string }> = []
+  latestReports(): string {
+    if (this.recentReports.length === 0) return ''
+    return this.recentReports.map(item => `- ${item.member}：${item.text}`).join('\n')
+  }
+
   /** 只有产物可核验才算完成；跑完但拿不出证据的进复核，不伪装成功；副作用结果不明的进 unknown。 */
   private settle(taskId: string, runId: string, member: MemberConfig, task: Task, result: SubagentResult): TaskOutcome {
     const report = this.parseReport(result.structured)
@@ -956,6 +966,8 @@ export class TeamService {
       for (const artifact of artifacts) this.store.appendEvent('task/artifact', { taskId, artifact }, { taskId, assistantId: member.assistantId })
       const ledger = ledgerLine(operations)
       const text = report?.summary ?? this.fallbackText(result)
+      this.recentReports.push({ at: Date.now(), member: member.displayName, text: text.slice(0, 1200) })
+      if (this.recentReports.length > 5) this.recentReports.shift()
       this.store.appendEvent('reply/done', {
         requestId: updated.originRequestId, taskId, assistantId: member.assistantId, displayName: member.displayName,
         skinId: member.skinId, status, text: ledger ? `${ledger}\n${text}` : text, diagnostic,
@@ -1111,6 +1123,23 @@ export class TeamService {
   /** 暂停或恢复后续步骤。暂停不中止在跑的运行（那是取消的职责），恢复也不自动补跑排队任务。 */
   setFollowupsPaused(paused: boolean): void {
     this.paused = paused
+  }
+
+  /**
+   * 本人复核确认：把"等你点头/等复核/等你回话"的任务标记完成。
+   * 模型自报"做完了"不构成成功，但**用户本人**是可信验收方——他在面板上核对产物后点确认，
+   * 才允许 done。只接受 waiting 三态，其余状态拒绝，避免把在跑/已终止的任务误改。
+   */
+  confirmTask(taskId: string): { ok: boolean; status?: TaskStatus; message: string } {
+    const task = this.getTask(taskId)
+    if (!task) return { ok: false, message: `任务 ${taskId} 不存在` }
+    if (!['awaiting-approval', 'awaiting-user', 'review'].includes(task.status)) {
+      return { ok: false, status: task.status, message: `任务当前状态（${task.status}）不需要确认，或已终止` }
+    }
+    const updated = this.setStatus(task, 'done')
+    if (!updated) return { ok: false, status: task.status, message: '任务状态已变化，请刷新后重试' }
+    this.store.appendEvent('task/updated', { taskId, by: 'user', note: '本人复核产物后确认完成', status: 'done' }, { taskId, assistantId: task.ownerId })
+    return { ok: true, status: updated.status, message: '已按你的确认标记完成' }
   }
 
   /** 等待自有启动、运行及释放全部结束后，调用方才可关闭业务库。 */

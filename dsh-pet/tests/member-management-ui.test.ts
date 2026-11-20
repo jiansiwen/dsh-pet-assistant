@@ -23,9 +23,9 @@ function text(node: ReactNode): string {
   return typeof node === 'string' || typeof node === 'number' ? String(node) : ''
 }
 function snapshot(): MemberSnapshot {
-  return { enabled: false, defaultModel: { provider: '主服务商', model: '主模型' }, members: [{ profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', description: '通用研究', persona: '按证据回答',
-    roleId: 'wukong', skinId: 'wukong', voiceProfile: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision: 3, sessionId: '独立会话甲', provider: '', model: '',
-    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' },
+  return { enabled: false, defaultModel: { provider: '主服务商', model: '主模型' }, members: [{ profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', description: '通用研究', persona: '按证据回答',
+    roleId: 'wukong', skinId: 'wukong', voiceProfile: '', voiceDesign: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision: 3, sessionId: '独立会话甲', provider: '', model: '',
+    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai', kind: 'expert', binding: null },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 60, totalReserved: 60, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
     requests: [{ requestId: '申请甲', assistantId: '成员甲', reason: '达到阈值', state: 'pending', createdAt: 1, quotaRevision: 9 }] }
 }
@@ -75,7 +75,7 @@ function mount(feedOnly = false) {
     membersState: async () => { reads++; return readResult },
     memberMemories: async () => ({ ok: true, data: { records: [memory] } }),
     memberCommand: async (action: string, input: Record<string, unknown>) => { writes.push({ action, input: structuredClone(input) }); return reply(action) },
-    memberAssist: async () => ({ ok: true, data: { draft: { displayName: 'AI 草稿', description: '', personality: '', permissionMode: 'ask', persona: '', skinId: 'panda', enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai' }, notes: '已填好' } }),
+    memberAssist: async () => ({ ok: true, data: { draft: { displayName: 'AI 草稿', description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', persona: '', skinId: 'panda', enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai' }, notes: '已填好' } }),
     openMemberEditor: async (id: string | null) => { opened.push(id); return { ok: true } },
   } } })
   let feed: Feed
@@ -292,10 +292,19 @@ test('接线保留任务审批底座，移除独立标签，主动提示有可�
   const app = readFileSync(new URL('../src/renderer/App.tsx', import.meta.url), 'utf8')
   const panel = readFileSync(new URL('../src/renderer/PetSettingsPanel.tsx', import.meta.url), 'utf8')
   const settings = readFileSync(new URL('../src/renderer/AssistantSettings.tsx', import.meta.url), 'utf8')
+  const nav = readFileSync(new URL('../src/renderer/settings-nav.ts', import.meta.url), 'utf8')
   assert.ok(app.indexOf('<MemberManagement') < app.indexOf('<TeamPanel'))
   assert.match(app, /onOpenApproval=\{openApproval\}/)
   assert.match(app, /registerCharacterHitbox\('__member_quota__'/)
   assert.match(app, /打开团队/)
-  assert.doesNotMatch(panel, /\['agent',/)
-  assert.doesNotMatch(settings, /setAgent|tokenBudget|企业微信独立智能体/)
+  // 2026-11-11 用户要求性格入口可见：总助理页暴露名字与性格；模型/额度仍不在该页编辑。
+  // 2026-11-12 导航收成九项之后，「总助理」不再是导航项，入口改到「通用」页的按钮上；
+  // 这条断言跟着挪位，但要钉的意图不变：这个入口必须仍然存在、且指向 agent 页。
+  assert.match(panel, /settingsPageMeta/)
+  assert.match(nav, /page === 'agent'\) return \{ title: '总助理'/)
+  assert.match(app, /总助理设置（名字与性格）/)
+  assert.match(app, /setSettingsPage\('agent'\)/)
+  assert.match(settings, /setAgentPersona/)
+  assert.doesNotMatch(settings, /企业微信独立智能体/)
+  assert.doesNotMatch(settings, /setAgentMaxTokens|setAgentTokenBudget|value=\{state\.agent\.(maxTokens|tokenBudget)/)
 })

@@ -66,3 +66,45 @@ body {
   .office-btn { padding: 5px 8px; }
   .office-page { display: none; }
 }
+
+/*
+ * Markdown 正文（`markdown.ts` 的产出）。只作用于 `.office-markdown`，不碰 docx/pptx 的
+ * 页面样式：那两边由 docx-preview / pptx-preview 自己排版，覆盖它们的类会把分页弄乱。
+ *
+ * 行高取 1.75：中文长文在这个行高下眼睛不容易串行；表格与代码块给浅底，是为了在大段
+ * 白底文字里一眼认出"这不是正文"。
+ */
+.office-markdown { font: 15px/1.75 -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif; }
+.office-markdown .md-section {
+  padding: 4px 0 16px 14px;
+  border-left: 3px solid transparent;
+  transition: border-color .2s ease, background-color .2s ease;
+}
+/* 当前讲解段落：左侧竖条 + 极浅底色。滚出视口时由脚本摘掉，不会留一片高亮。 */
+.office-markdown .md-section[data-current='true'] { border-left-color: #2f6feb; background: #f4f8ff; }
+.office-markdown h1 { font-size: 24px; line-height: 1.4; margin: 18px 0 10px; }
+.office-markdown h2 { font-size: 20px; line-height: 1.4; margin: 16px 0 8px; }
+.office-markdown h3 { font-size: 17px; line-height: 1.45; margin: 14px 0 6px; }
+.office-markdown h4, .office-markdown h5, .office-markdown h6 { font-size: 15px; margin: 12px 0 6px; }
+.office-markdown p { margin: 8px 0; }
+.office-markdown ul, .office-markdown ol { margin: 8px 0; padding-left: 24px; }
+.office-markdown li { margin: 4px 0; }
+.office-markdown blockquote {
+  margin: 10px 0; padding: 2px 12px; color: #57606a;
+  border-left: 3px solid #d0d7de; background: #fafbfc;
+}
+.office-markdown hr { border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0; }
+.office-markdown a { color: #0969da; text-decoration: none; }
+.office-markdown a:hover { text-decoration: underline; }
+/* 代码：块与行内分开，行内代码不换行、不撑破行高。 */
+.office-markdown .md-code {
+  margin: 10px 0; padding: 10px 12px; background: #f6f8fa; border: 1px solid #e5e7eb;
+  border-radius: 6px; overflow: auto; font: 13px/1.6 Consolas, 'Courier New', monospace;
+}
+.office-markdown code { padding: 1px 4px; background: #f0f2f5; border-radius: 4px; font: 13px/1.5 Consolas, 'Courier New', monospace; }
+.office-markdown .md-code code { padding: 0; background: none; }
+/* 表格：真正的边框 + 斑马纹，用户抱怨的就是竖线裸露成一串 `|`。 */
+.office-markdown .md-table { width: 100%; margin: 12px 0; border-collapse: collapse; font-size: 14px; }
+.office-markdown .md-table th, .office-markdown .md-table td { padding: 7px 10px; border: 1px solid #d8dee4; text-align: left; }
+.office-markdown .md-table th { background: #f2f4f7; font-weight: 600; }
+.office-markdown .md-table tbody tr:nth-child(even) { background: #fafbfc; }

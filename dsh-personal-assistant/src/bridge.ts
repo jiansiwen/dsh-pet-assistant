@@ -43,6 +43,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ActionProposal, MemberConfig, Task, TaskStatus, TeamEvent, TeamEventType } from './team-domain.ts'
 import type { TeamService, CancelReceipt } from './team.ts'
+import { documentSessionScope } from './member-runtime.ts'
 import { ApprovalError, ApprovalService } from './approval.ts'
 import type { ReportApprovalService, ReportAutoPublishResult, ReportProposal } from './report-approval.ts'
 import type { AssistantApprovalService, AssistantProposal, AssistantSubmission } from './assistant-approval.ts'
@@ -200,6 +201,8 @@ export interface BridgeEvent {
   voiceProfile?: string
   /** subassistant-report：汇报模式（self=子助理直接播报）。 */
   reportMode?: 'chief' | 'self'
+  /** subassistant-report：事件产生时刻；桌宠据此只念新鲜汇报，重连重放的旧汇报不念。 */
+  at?: number
 }
 
 interface PendingRequest {
@@ -256,6 +259,11 @@ export interface SessionBridgeOptions {
   onEvent?: (event: BridgeEvent) => void
   /** 「从桌面开始会话」的宿主能力；缺省时 /session/start 如实回 agents-unavailable。 */
   sessionHost?: SessionHost
+  /**
+   * 成员/文档会话的工作区解析器。文档会话 scope 要把 cwd 进键，
+   * 必须与成员会话实际落的工作区同一口径，否则"换工作区新开"会判错。
+   */
+  cwd?: () => string | undefined
   /**
    * 外部证据收件（桌面壳 → 插件）：已确认的会议纪要、用户主动记录的窗口文本。
    *
@@ -400,11 +408,14 @@ const UNCERTAIN_ERROR =
   '共享会话里这一轮混入了来源不明的输入，无法确认是不是别的用户插进来的；请把网页与宠物分开成不同会话，我不会猜'
 
 /**
- * 已知的非人类消息来源（`source.kind`）。0.2.x 起运行时上下文与时间块会以自己的来源种类注入
- * （runtime-context / time-context），它们是注入的上下文而不是用户说的话：既不该在宠物里
- * 当作用户气泡铺出来，也不该让回复归属被判成"来源不明"。
+ * 非用户输入的判据：**只有 `source.kind === 'user'` 是真人输入**。
+ *
+ * DSH 的每个生产者都用自己的来源种类注入上下文（runtime-context / time-context /
+ * skill-catalog / goal / dsh-rewind / model-selection / plugin:<name>……），
+ * 名单会随宿主版本与已装插件变化，白名单永远追不上 —— 追不上就把正常注入误判成
+ * "别的用户插进来的输入"。所以只把"有名字且不是 user"的来源视为注入上下文；
+ * 只有**缺失/空来源**无法自证清白，才按来源不明拒绝。
  */
-const NON_USER_SOURCE_KINDS = new Set(['plugin', 'model', 'tool', 'runtime-context', 'time-context', 'system-prompt'])
 
 /** turn/end 的 reason.kind 非 completed 时，按具体原因如实描述失败，不含糊成「超时」。 */
 function reasonFailure(kind: unknown): string {
@@ -497,8 +508,9 @@ export function settleFromEvents(
   const windowEnd = turnEndIndex >= 0 ? turnEndIndex : events.length
 
   // 4) 收集本轮次内的 user/message，判定是否混入了其他用户输入。
-  //    只有 source.kind==='user' 是真人输入；plugin/model/tool 是可证明的非用户产物（注入上下文、
-  //    模型与工具消息），跳过；缺失或未知来源无法自证清白，判 uncertain。mixed/uncertain 都不猜。
+  //    只有 source.kind==='user' 是真人输入；有名字的其他来源（skill-catalog / goal /
+  //    runtime-context / plugin:<name> 等）都是宿主或插件注入的上下文，跳过；
+  //    **来源缺失/空**无法自证清白，判 uncertain。mixed/uncertain 都不猜。
   for (let i = turnStartIndex + 1; i < windowEnd; i += 1) {
     const event = events[i]
     if (event.type !== 'user/message') continue
@@ -506,7 +518,12 @@ export function settleFromEvents(
     if (data.id === messageId) continue
     const sourceKind = data.source?.kind
     if (sourceKind === 'user') return { kind: 'failed', attribution: 'mixed', error: MIXED_ERROR }
-    if (typeof sourceKind === 'string' && NON_USER_SOURCE_KINDS.has(sourceKind)) continue
+    if (typeof sourceKind === 'string' && sourceKind !== '') continue
+    // 连来源都没有：无法确认是谁写的，如实拒绝并把 id 记下来（不含正文）。
+    try {
+      console.warn('[dsh-personal-assistant] 会话里出现无来源的 user/message，拒绝归属本轮回复',
+        JSON.stringify({ id: data.id ?? null }))
+    } catch { /* 日志失败不影响判定 */ }
     return { kind: 'failed', error: UNCERTAIN_ERROR }
   }
 
@@ -592,7 +609,7 @@ export class SessionBridge {
    * 宠物上报的桌面状态，主动提醒评估的输入（§2.7：会议/演示/免打扰不提醒）。
    * 桥接断开或重启后回到默认（可见、不专注）—— 宁可多看一眼，不可该提醒时漏掉。
    */
-  private petState: { focus: boolean; visible: boolean; meeting: boolean } = { focus: false, visible: true, meeting: false }
+  private petState: { focus: boolean; visible: boolean; meeting: boolean; locked?: boolean; screenSharing?: boolean } = { focus: false, visible: true, meeting: false }
   private teamCursor = 0
   private teamTimer: NodeJS.Timeout | null = null
   private events: BridgeEvent[] = []
@@ -648,6 +665,11 @@ export class SessionBridge {
   /** 成员桌面请求在启动时锁定绑定，执行时仍须核对该绑定没有改变。 */
   currentDesktopBinding(): string | null {
     return this.desktopBinding(this.agent)
+  }
+
+  /** 当前绑定的主会话 agent（总助理）。供成员 spawn 继承宿主工具时作 parent；未绑定为 null。 */
+  sessionAgent(): unknown {
+    return this.closed ? null : this.agent
   }
 
   get teamEnabled(): boolean {
@@ -994,7 +1016,7 @@ export class SessionBridge {
     text: string; runId: number | string; reportMode: 'chief' | 'self'
   }): void {
     const { assistantId, displayName, skinId, voiceProfile, text, runId, reportMode } = report
-    this.push({ type: 'subassistant-report', assistantId, displayName, skinId, voiceProfile, text: text.slice(0, 8000), runId: String(runId), reportMode })
+    this.push({ type: 'subassistant-report', assistantId, displayName, skinId, voiceProfile, text: text.slice(0, 8000), runId: String(runId), reportMode, at: Date.now() })
   }
 
   private teamSnapshot(): {
@@ -1340,7 +1362,7 @@ export class SessionBridge {
   }
 
   /** 宠物消息入口：串行排队，前一条结算后才注入下一条，不再踢掉未完成的请求。 */
-  enqueueChat(requestId: string, text: string, assistantId?: string): void {
+  enqueueChat(requestId: string, text: string, assistantId?: string, docScope?: string): void {
     if (this.closed) {
       this.push({ type: 'reply', id: requestId, ok: false, error: '助理已停止' })
       return
@@ -1350,8 +1372,10 @@ export class SessionBridge {
       this.push({ type: 'reply', id: requestId, ok: false, error: `没有叫「${assistantId}」的成员，也不会替你换人` })
       return
     }
-    if (member && this.team && this.teamAgent) {
-      const running = this.runTeamTask(requestId, text, member)
+    // 委派给成员就走成员独立会话；teamAgent 未注入时回退主会话作父身份，
+    // 不让委派落回总助理会话（否则子助理没有自己的会话记录）。
+    if (member && this.team && (this.teamAgent ?? this.agent)) {
+      const running = this.runTeamTask(requestId, text, member, docScope)
       this.inflightTasks.set(requestId, running)
       return
     }
@@ -1369,9 +1393,9 @@ export class SessionBridge {
   }
 
   /** 点名成员：建任务 → 子代理执行 → 用 run.result 归属回复。 */
-  private runTeamTask(requestId: string, text: string, member: MemberConfig): Promise<void> {
+  private runTeamTask(requestId: string, text: string, member: MemberConfig, docScope?: string): Promise<void> {
     const team = this.team
-    const parent = this.teamAgent
+    const parent = this.teamAgent ?? (this.agent as unknown as Agent | null)
     if (!team || !parent) return Promise.resolve()
     const task = team.submitTask({
       goal: text,
@@ -1393,7 +1417,7 @@ export class SessionBridge {
     })
     const signal = new AbortController().signal
     return team
-      .runTask(task.taskId, parent, signal)
+      .runTask(task.taskId, parent, signal, docScope)
       .then(() => undefined)
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error)
@@ -1988,6 +2012,7 @@ export class SessionBridge {
           assistantId?: string
           epoch?: string
           bindingId?: string
+          docKey?: string
         }
         if (body.bindingId !== undefined && body.bindingId !== this.mirror.bindingId) {
           this.respond(response, 409, { error: 'stale binding' })
@@ -2012,7 +2037,8 @@ export class SessionBridge {
           this.respond(response, 429, { error: 'too many pending requests' })
           return
         }
-        this.enqueueChat(requestId, text, typeof body.assistantId === 'string' ? body.assistantId : undefined)
+        const docScope = typeof body.docKey === 'string' && body.docKey.trim() ? documentSessionScope(body.docKey.trim(), this.options.cwd?.()) : undefined
+        this.enqueueChat(requestId, text, typeof body.assistantId === 'string' ? body.assistantId : undefined, docScope)
         this.respond(response, 200, { accepted: true, requestId, epoch: this.epoch })
       } catch (error) {
         const message = error instanceof Error ? error.message : 'malformed body'
@@ -2028,10 +2054,12 @@ export class SessionBridge {
     }
     if (request.method === 'POST' && url.pathname === '/pet-state') {
       try {
-        const body = JSON.parse(await this.readBody(request)) as { focus?: unknown; visible?: unknown; meeting?: unknown }
+        const body = JSON.parse(await this.readBody(request)) as { focus?: unknown; visible?: unknown; meeting?: unknown; locked?: unknown; screenSharing?: unknown }
         if (typeof body.focus === 'boolean') this.petState.focus = body.focus
         if (typeof body.visible === 'boolean') this.petState.visible = body.visible
         if (typeof body.meeting === 'boolean') this.petState.meeting = body.meeting
+        if (typeof body.locked === 'boolean') this.petState.locked = body.locked
+        if (typeof body.screenSharing === 'boolean') this.petState.screenSharing = body.screenSharing
         this.respond(response, 200, { ok: true })
       } catch (error) {
         const message = error instanceof Error ? error.message : 'malformed body'
@@ -2039,7 +2067,7 @@ export class SessionBridge {
       }
       return
     }
-    if (request.method === 'POST' && (url.pathname === '/chat/cancel' || url.pathname === '/team/cancel' || url.pathname === '/team/pause')) {
+    if (request.method === 'POST' && (url.pathname === '/chat/cancel' || url.pathname === '/team/cancel' || url.pathname === '/team/pause' || url.pathname === '/team/confirm')) {
       await this.handleCancelRoute(request, response, url.pathname)
       return
     }
@@ -2125,6 +2153,21 @@ export class SessionBridge {
         }
         const { status, receipt } = await this.cancelTeamTask(taskId)
         this.respond(response, status, { ok: status === 200, ...receipt })
+        return
+      }
+      if (pathname === '/team/confirm') {
+        const taskId = text(body.taskId) ?? text(body.id)
+        if (!taskId) {
+          this.respond(response, 400, { ok: false, error: '必须指定 taskId' })
+          return
+        }
+        const team = this.team
+        if (!team) {
+          this.respond(response, 503, { ok: false, error: '团队模式没有开启' })
+          return
+        }
+        const result = team.confirmTask(taskId)
+        this.respond(response, result.ok ? 200 : 409, result)
         return
       }
       const requestId = text(body.id) ?? text(body.requestId)
@@ -2371,7 +2414,7 @@ export class SessionBridge {
   }
 
   /** 最新一次宠物上报的桌面状态（专注 / 可见 / 会议中）。 */
-  getPetState(): { focus: boolean; visible: boolean; meeting: boolean } {
+  getPetState(): { focus: boolean; visible: boolean; meeting: boolean; locked?: boolean; screenSharing?: boolean } {
     return { ...this.petState }
   }
 
@@ -2382,8 +2425,10 @@ export class SessionBridge {
   boundSessionCwd(): string | null {
     if (this.agent === null) return null
     if (this.owned !== null && this.owned.handle.agent === this.agent) return this.options.sessionHost?.cwd() ?? null
-    const meta = (this.agent as { session?: { meta?: { cwd?: unknown } } }).session?.meta
-    return typeof meta?.cwd === 'string' && path.isAbsolute(meta.cwd) ? meta.cwd : null
+    // 会话的创建元数据落在不可变 header 上（Session.header.cwd）；旧写法读 session.meta 取不到值。
+    const session = (this.agent as { session?: { header?: { cwd?: unknown }; meta?: { cwd?: unknown } } }).session
+    const cwd = session?.header?.cwd ?? session?.meta?.cwd
+    return typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : null
   }
 
   /**

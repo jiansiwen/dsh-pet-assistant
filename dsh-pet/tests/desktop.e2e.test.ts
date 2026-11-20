@@ -14,7 +14,7 @@
  * 还注册了 window-all-closed / before-quit，没有回头路。
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { mock, test } from 'node:test'
@@ -22,6 +22,7 @@ import { BridgeClient } from '../src/main/harness.ts'
 
 // ── 隔离：所有写盘都落在临时目录，绝不碰真用户的 ~/.dsh 与 pet-settings.json ──
 const sandbox = mkdtempSync(path.join(tmpdir(), 'dsh-pet-e2e-'))
+const builtMenus: Array<{ template: unknown; popup: () => void }> = []
 process.env.DSH_HOME = path.join(sandbox, 'dsh-home')
 
 const wakeStarts: Array<{ onWake: unknown; onLost: unknown }> = []
@@ -126,6 +127,7 @@ const ipcRemoved: Array<{ kind: string; channel: string }> = []
 const appHandlers = new Map<string, (event?: unknown, ...rest: unknown[]) => void>()
 const quitCalls: number[] = []
 const registeredShortcuts: string[] = []
+const shortcutCallbacks = new Map<string, () => void>()
 let shortcutsCleared = 0
 let dockHideCalls = 0
 /** 注册过几次桌面采集授权回调。装配时必须正好一次 —— 不注册，会议就永远只有麦克风一轨。 */
@@ -273,19 +275,25 @@ const fakeElectron = {
     showOpenDialog: () => Promise.resolve({ canceled: true, filePaths: [] }),
   },
   globalShortcut: {
-    register: (accelerator: string) => {
+    register: (accelerator: string, callback: () => void) => {
       registeredShortcuts.push(accelerator)
+      shortcutCallbacks.set(accelerator, callback)
       return true
+    },
+    unregister: (accelerator: string) => {
+      const index = registeredShortcuts.indexOf(accelerator)
+      if (index >= 0) registeredShortcuts.splice(index, 1)
+      shortcutCallbacks.delete(accelerator)
     },
     unregisterAll: () => {
       shortcutsCleared += 1
     },
   },
   Menu: {
-    buildFromTemplate: (template: unknown) => ({
-      template,
-      popup: () => {},
-    }),
+    buildFromTemplate: (template: unknown) => {
+      const menu = { template, popup: () => { builtMenus.push(menu) } }
+      return menu
+    },
   },
   shell: {
     openPath: () => Promise.resolve(''),
@@ -333,10 +341,20 @@ test('装配完成：窗口、托盘、全局快捷键、桥接轮询都起来�
   assert.equal(windows.length, 1, '舞台窗口建了一个')
   assert.ok(windows[0].loaded?.endsWith(`renderer${path.sep}index.html`), '加载的是渲染层页面')
   assert.equal(trays.length, 1, '托盘建了一个')
-  assert.deepEqual(registeredShortcuts, ['CommandOrControl+Alt+P'],
-    '主选注册成功就停手；备选 Ctrl+Alt+Space 只在主选被占用时兜底')
+  assert.deepEqual(registeredShortcuts, ['CommandOrControl+Alt+P', 'Ctrl+Alt+D', 'Ctrl+Alt+R', 'Ctrl+Alt+C'],
+    '召唤主选注册成功就停手（备选只在被占用时兜底）；讲解打断/休息/继续三个快捷键也注册')
   assert.equal(kwsStarts.length, 1, 'boot 后 KWS 唤醒被仲裁器拉起一次（替身，不加载真模型）')
   assert.equal(playHostCalls.starts, 1, '唤醒应答的常驻播放进程在装配时预热一次')
+})
+
+test('讲解快捷键按下经 doc-hotkey 通知渲染层（打断/休息/继续），注册状态也投影', () => {
+  for (const [accelerator, action] of [['Ctrl+Alt+D', 'interrupt'], ['Ctrl+Alt+R', 'rest'], ['Ctrl+Alt+C', 'resume']] as const) {
+    const callback = shortcutCallbacks.get(accelerator)
+    assert.ok(callback, `${accelerator} 应已注册`)
+    callback!()
+    assert.deepEqual(lastSent('doc-hotkey'), { action }, `${accelerator} 应发出 ${action}`)
+  }
+  assert.deepEqual(lastSent('doc-hotkey-status'), { interrupt: true, rest: true, resume: true }, '注册状态投影到设置页')
 })
 
 test('邮件通知只有系统确认显示后才回执，失败和未知如实保留', { timeout: 10000 }, async t => {
@@ -396,7 +414,7 @@ test('邮件通知只有系统确认显示后才回执，失败和未知如实�
 
 test('通道清单：舞台侧注册的每一条都该在，一条不多', () => {
   const expectedOn = [
-    'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'speech-local', 'stage-set-visible', 'stage-set-focus',
+    'mouse-state', 'exit-done', 'context-menu', 'speech-stop', 'speech-local', 'doc-ack', 'stage-set-visible', 'stage-set-focus',
     // 演示隐私模式（M5-05）：与专注、隐藏各自独立，只改"渲染哪些历史与预览"。
     'presentation-mode',
     'proactive-respond', 'overlay-state',
@@ -413,9 +431,9 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'report-workbench-open', 'report-workbench:load', 'report-workbench:edit', 'report-workbench:edit-memory', 'report-workbench:request-publish',
     'report-workbench:deletion-preview', 'report-workbench:request-deletion', 'report-workbench:import-material',
     'report-workbench:request-share',
-    'team-get', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
+    'team-get', 'team-confirm', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
-    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select',
+    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines',
     // 环境检查（M5-06）：只查、只按用户确认执行，不主动下载、不主动改系统设置。
     'first-run-report', 'first-run-download', 'first-run-open-settings',
     // 会议系统音频能力查询（M4-03）：渲染层开会前问一次，拿不到就不去反复试。
@@ -426,11 +444,16 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'meeting-state', 'meeting-delete', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm', 'meeting-todo-import',
     'audio-sync', 'residency-state', 'residency-set',
+    // 记忆共享 / 词库 / 产物 / 技能 / 时间线：全部走同一套舞台发送方校验，只回列表，不返回凭据。
+    'assistant-glossary-state', 'assistant-glossary-update',
+    'assistant-artifacts-state', 'assistant-timeline-state',
+    'assistant-skills-state', 'assistant-skills-update', 'assistant-skills-evidence',
     // 声纹唤醒：注册只接收舞台窗口送来的 WAV，只落加密特征；状态查询不返回 embedding。
-    'voiceprint-status', 'voiceprint-enroll', 'voiceprint-clear',
+    'voiceprint-status', 'voiceprint-enroll', 'voiceprint-clear', 'voiceprint-diagnose',
     // 成员目录、成员编辑窗口与额度（团队管理）。
     'members-state', 'member-command', 'member-memories', 'member-assist',
-    'member-editor-open', 'member-editor-context', 'member-editor-close',
+    'member-editor-open', 'member-editor-context', 'member-editor-close', 'member-session-view',
+    'member-voice-get', 'member-voice-save', 'member-voice-pick-sample', 'member-model-options', 'member-tts-profiles', 'member-voice-preview',
     // 普通任务与提醒窗口（P0-02/P0-03）。
     'companion-tasks-open', 'companion-tasks:list', 'companion-tasks:detail', 'companion-tasks:create',
     'companion-tasks:control', 'companion-tasks:reminders', 'companion-tasks:respond',
@@ -439,8 +462,24 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'meeting-take-command',
     'office-open', 'office-view-session', 'office-view-bytes', 'office-view-image', 'office-view-check',
     'office-view-fullscreen', 'office-view-close',
-    // 助理设置页（渠道与邮箱）。
+    // 助理设置页（渠道与邮箱）+ 邮件页：配置读写与值守结果列表，都走舞台发送方校验。
     'assistant-settings-state', 'assistant-settings-save',
+    'assistant-mail-state', 'assistant-mail-save', 'assistant-mail-analyses',
+    // 讲解口令打断后的 10 秒提问窗口：超时把暂停的讲解接回去；口令应答走预合成短句。
+    'doc-resume',
+    // 形象与音色工作室（底座 4.8/4.9）：工作室窗口专用通道，发送方校验只认该窗口。
+    'custom-skins-list', 'asset-studio-open',
+    'asset-studio-state', 'asset-studio-save-providers', 'asset-studio-test-provider',
+    'asset-studio-assist',
+    'asset-studio-start-job', 'asset-studio-cancel-job', 'asset-studio-rerun-post',
+    'asset-studio-apply-skin', 'asset-studio-delete-skin', 'asset-studio-pick-audio',
+    // 从本地视频裁动作：选文件、裁剪、登记为皮肤动作（不需要视频模型）。
+    'asset-studio-pick-video', 'asset-studio-extract-clip',
+    // 已有角色动作管理：生成单动作先暂存预览、应用才写入、删除清素材。
+    'asset-studio-generate-action', 'asset-studio-apply-action', 'asset-studio-delete-action',
+    'asset-studio-start-clone', 'asset-studio-apply-voice', 'asset-studio-revoke-voice',
+    // 快速应答（快嘴旁路）：配置/测试只认舞台窗口；开启在主进程过原生隐私确认。
+    'fast-reply-state', 'fast-reply-save', 'fast-reply-test',
   ]
   assert.deepEqual([...ipcListeners.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedOn].sort())
   assert.deepEqual([...ipcHandlers.keys()].filter(ch => !ch.startsWith('approval-')).sort(), [...expectedHandle].sort())
@@ -465,17 +504,22 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
   const exposed = [
     'get-state', 'save-settings', 'mouse-state', 'context-menu', 'chat-send', 'speech-stop', 'speech-local',
     'session-get', 'session-command', 'session-start', 'overlay-state', 'report-workbench-open',
-    'team-get', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
+    'team-get', 'team-confirm', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
-    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'runtime-start', 'runtime-stop',
+    'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines', 'runtime-start', 'runtime-stop',
     'stage-set-visible', 'stage-set-focus',
-    'doc-open', 'doc-explain', 'doc-ask', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
+    'doc-open', 'doc-explain', 'doc-ask', 'doc-resume', 'doc-ack', 'doc-roots', 'doc-add-root', 'doc-remove-root', 'doc-forget-dir',
     'meeting-start', 'meeting-stop', 'meeting-chunk', 'meeting-track-missing', 'meeting-flush-done',
     'meeting-state', 'meeting-delete', 'meeting-transcribe', 'meeting-speakers', 'meeting-speaker-rename',
     'meeting-speaker-merge', 'meeting-speaker-split', 'meeting-minutes', 'meeting-minutes-confirm',
     'exit-done',
     'audio-sync', 'kws-feed', 'audio-consumer-lost', 'tts-playback-receipt', 'barge-in-detected', 'barge-in-metrics',
     'residency-state', 'residency-set',
+    'assistant-glossary-state', 'assistant-glossary-update',
+    'assistant-artifacts-state', 'assistant-timeline-state',
+    'assistant-skills-state', 'assistant-skills-update', 'assistant-skills-evidence',
+    'custom-skins-list', 'asset-studio-open',
+    'fast-reply-state', 'fast-reply-save', 'fast-reply-test',
   ]
   for (const channel of exposed) {
     assert.ok(ipcHandlers.has(channel) || ipcListeners.has(channel), `preload 暴露了 ${channel}，主进程没接`)
@@ -584,6 +628,30 @@ test('before-quit：第一次挡下退出收尾，收尾完放行第二次；资
   beforeQuit({ preventDefault: () => { prevented = true } })
   assert.equal(prevented, false, '第二次不再挡')
   assert.equal(narrator.disposed, 2, 'dispose 幂等，多次触发无害')
+})
+
+test('右键换形象菜单含本地登记的自定义皮肤：生成形象不进仓库也选得到', () => {
+  const customDir = path.join(sandbox, 'electron-userData', 'custom-assets')
+  mkdirSync(customDir, { recursive: true })
+  const registry = path.join(customDir, 'custom-skins.json')
+  writeFileSync(registry, JSON.stringify({ skins: [
+    { id: 'nezha', name: '哪吒（电影版）', createdAt: 1, actions: ['turnaround', 'swagger'], sourceJobId: 'test', license: 'generated' },
+  ] }))
+  try {
+    const stageWin = windows[0]
+    const frame = (stageWin.webContents as unknown as { mainFrame?: unknown }).mainFrame
+    ipcListeners.get('context-menu')?.({ sender: stageWin.webContents, senderFrame: frame } as object,
+      { assistantId: 'member-tangseng', displayName: '小潘同学', skin: 'nezha' })
+    const menu = builtMenus[builtMenus.length - 1] as { template: Array<{ label?: string; submenu?: Array<{ label?: string }> }> }
+    const entry = menu.template.find(item => String(item.label ?? '').startsWith('换个形象'))
+    assert.ok(entry?.submenu?.some(item => item.label === '哪吒（电影版）'), '自定义皮肤应出现在右键形象菜单')
+    assert.ok(entry?.submenu?.some(item => item.label === '国宝熊猫'), '内置三个仍在')
+    const random = menu.template.find(item => String(item.label ?? '').startsWith('随机动作'))
+    assert.ok(random?.submenu?.some(item => item.label === '转身'), '随机候选应跟随当前皮肤的自定义动作（中文标签）')
+    assert.ok(random?.submenu?.some(item => item.label === '插兜swagger走'), '随机候选应跟随当前皮肤的自定义动作（中文标签）')
+  } finally {
+    rmSync(registry, { force: true })
+  }
 })
 
 test('收尾：桥接轮询与托盘定时器都停了，沙盒目录清掉', async () => {

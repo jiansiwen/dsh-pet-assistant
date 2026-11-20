@@ -275,6 +275,13 @@ export class BargeInSession {
   }
 
   private onFrame(frame: CaptureFrame): void {
+    /*
+      朗读期间也要听：插话就是要打断正在念的这一句，整段跳过"助理在说话"的帧
+      等于把用户的话一起丢了（真机表现：连续讲解时喊"停一下"只捡到句尾残片，
+      识别成"さ？"，永远停不下来）。
+      回声已经由采集约束里的 echoCancellation 处理；播报刚结束的尾响由检测器的
+      tailMs/lastEndedAt 兜住，不需要在这里按"是否在朗读"整段拉黑。
+    */
     const handover = this.handover
     if (handover !== null) {
       if (handover.ms < HANDOVER_MAX_MS) {

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { TASK_STATUSES } from './team-domain.ts'
+import { TASK_PRIORITIES, TASK_SOURCES, TASK_STATUSES } from './team-domain.ts'
 
 export const COMPANION_TASK_KINDS = [
   'reminder', 'mail-send', 'mail-analyze', 'context-analyze', 'document-translate',
@@ -29,6 +29,10 @@ export const companionTaskViewSchema = z.object({
   deviceId: identifier,
   artifactIds: z.array(identifier),
   updatedAt: timestamp,
+  // 这两个字段在 `.strict()` 里必须声明，否则 parse 直接失败；
+  // 取值白名单与团队域一字不差（见 team-domain.ts 的 TASK_PRIORITIES/TASK_SOURCES）。
+  priority: z.enum(TASK_PRIORITIES),
+  source: z.enum(TASK_SOURCES),
 }).strict()
 export type CompanionTaskView = z.infer<typeof companionTaskViewSchema>
 
@@ -49,6 +53,12 @@ export const companionCreateSchema = z.object({
   dependsOn: z.array(identifier).max(20),
   budgetAccountId: identifier.optional(),
   parentTaskId: identifier.optional(),
+  /**
+   * 来源由**创建方**声明：界面手点传 manual、邮件/企微链路传 enterprise、
+   * 会议链路传 meeting、模型主动建传 ai。缺省按 kind 推断（见 task-runtime 的 sourceForKind）。
+   * 这是创建期一次性字段，之后不可改。
+   */
+  source: z.enum(TASK_SOURCES).optional(),
 }).strict()
 export type CompanionCreateInput = z.infer<typeof companionCreateSchema>
 

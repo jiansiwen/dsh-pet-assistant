@@ -1,7 +1,8 @@
 # dsh-personal-assistant
 
-DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里，负责三件事：记录你当天在电脑上做了什么、
-把你的长期偏好记下来并自动生效、把桌面宠物和专家助理团接进当前会话。
+DeepSeek Harness（dsh）的**个人电脑助理插件**。跑在 dsh 会话里：记录你当天在电脑上做了什么、
+把长期偏好记下来并自动生效、把桌面宠物和「1 总 + N 子」助理团接进当前会话，并提供成员定时自主任务、
+技能自动形成、外部智能助理平台通用对接，以及一个收拢宠物配置/技能/待办/会议的工作台设置页。
 
 宠物那一侧（Electron 外壳、语音、文档讲解）在 [`dsh-pet/`](../dsh-pet/README.md)。
 
@@ -66,10 +67,11 @@ dsh plugin --profile web add ./dsh-personal-assistant
 
 ### 桌面专家助理团（可选，默认关闭）
 
-- **编制**：总助理（总助理，可执行副作用）+ 助理1 / 助理2（只读专家）+ 助理3 / 助理4（未启用席位）。
-  默认只有前三人上台，谁上台由配置 `teamSeats` 决定
-- **派活**：`desktop_team_assign` 把任务交给指定成员，走真实子代理运行
-  （`spawn` 不继承父上下文，专家只看得到任务材料），等真实结果回来
+- **编制**：1 总助理 + N 自定义子助理。成员名字 / 职责 / 性格 / 人设 / 形象 / 音色 / 能力 / 权限均可配置，
+  每位成员独立会话 + 独立记忆；默认席位由 `teamSeats` 决定，未启用席位不播放假工作
+- **派活**：`desktop_team_assign` 按成员目录职责自动选人，走真实子代理运行等真实结果；
+  受管成员经 DSH 子代理工厂 spawn 时**继承总助理的宿主工具**，宿主未开放时回退插件会话＋只读网页桥
+- **任务确认**：等待类任务可由本人「确认完成」（`POST /team/confirm`）或「取消」；模型自报不构成完成
 - **可信审批**：专家默认只读。需要外部副作用时提出提案，由用户在桌面审批窗口决定；
   批准绑定「任务 + 操作目标 + 参数摘要 + 输入修订」的哈希，改任何一项旧批准即失效
 - **执行点门禁**：门禁装在子代理自己的 agent ctx 上，没有有效批准就调不动 write / bash 这类工具；
@@ -107,6 +109,62 @@ dsh plugin --profile web add ./dsh-personal-assistant
 - 策略在 [`src/proactive.ts`](./src/proactive.ts)（纯函数），桥接侧是 `/proactive/*` 反馈端点
   与 `/pet-state` 状态上报（专注/可见），显示与否由桌面壳按专注状态再挡一道
 
+### 开启总开关与工具注入
+
+- 「开启个人助理」是**工具注入闸门**：关闭时不向 dsh 注入本插件的工具，但**保留 AI 宠物壳**
+  （关插件不等于关宠物）。`assistant-on` / `assistant-off` / `assistant-state` 读写该开关，选择持久化
+- 采集与注入是两件事：工具开着但「等采集范围确认」或「被配置拦住」都会如实显示，不假装在采集
+
+### 个人助理设置页（dsh 工作台）
+
+工作台把原来散在桌宠右键菜单里的能力收进一个页面，列表类 tab 支持卡片内滚动：
+
+- **待办 / 会议**：行内改标题、改期、改间隔、取消；待办改优先级走「提案 + 本人确认」，不直接改
+- **宠物**：形象 / 随机动作 / 显示 / 上台退下，与桌宠右键菜单同一份配置（`assistant-pet-config` / `assistant-pet-set`）
+- **技能**：查看自动形成与人工技能，增删改查、让它生效 / 退役 / 回滚；「待核实 / 够格」样本可确认属实或撤回
+- **设置**：唤醒 / 播报 / 讲解模式等只读摘要；邮件 / 企业微信连接配置（`assistant-mail-config` / `assistant-wecom-config`）
+
+### 子助理团：1 总 + N 子，独立会话与记忆
+
+- 成员是**自定义**的（名字 / 职责 / 性格 / 人设 / 形象 / 音色），不再是固定角色；每位成员用**独立会话 + 独立记忆**
+- **能力**按勾选绑定：企业微信接收 / 邮件 / 会议 / 文档 / 活动日报 / 提醒 / 操作电脑 / 外部平台对接；
+  权限三档（每次询问 / 自动审批 / 完全访问），汇报两种（总助理汇总 / 成员自己播报）
+- **记忆**：总助理的已确认记忆可**只读共享**给所有子助理；子助理另有私有记忆（`companion_member_remember` 提交候选，本人确认）
+- **技能自动形成**：同类工作攒够样本（默认 3 次）后由模型总结成技能，计数归代码、正文归模型；
+  `skillsAutoForm` / `skillsAutoActivate` 控制是否自动形成 / 默认生效（人工只做事后查验）；**扩权一律须本人批准**
+- **沿用宿主工具**：成员会话经 DSH 子代理工厂 spawn 时继承总助理的宿主工具；宿主未开放时回退插件会话＋
+  只读网页抓取桥（`companion_web_fetch`，仅 https 公开页、防内网 SSRF），不替代宿主工具
+
+### 成员定时任务（到点自主干活再推送）
+
+- [`src/member-scheduler.ts`](./src/member-scheduler.ts)：`daily` / `once` / `interval` 三种计划，到点让成员**用自己的工具真干活**
+  （抓 GitHub 热门、整理日报等），再把结果推送给本人——不是发一条固定提醒
+- 推送渠道：企业微信（文本带 `【成员名】` 前缀，同一机器人下分得清是谁）或桌面以成员形象+音色播报
+- 成员可在**企业微信里改自己的定时任务**（`companion_member_schedule`：list / update 查询内容 / 时刻 / 频率 / 渠道），
+  离开桌面也能调整；总助理也可用 `personal_assistant_member_schedule` 安排
+- 自报播报带时间戳守卫：召唤 / 重连**不重播**旧汇报，只念新鲜结果
+
+### 外部智能助理平台对接（通用、配置驱动）
+
+- [`src/platform-connector.ts`](./src/platform-connector.ts)：单地址 POST `{service,appid,channel,sid,timestamp,sign,data}`，
+  加签为可配置模板的大写 MD5；**公司 specifics 全在配置文件，代码不绑定任何公司/产品**
+- 能力：实时聊天查询、列智能体、查聊天记录、上传知识库 / 文件、更新长期记忆、通用 service 调用
+- 配置命令 `assistant-platform-get` / `assistant-platform-set`（endpoint / appid / secret / userId / assistId / signTemplate）；
+  配置文件 `personal-assistant/platform-connector.json`。新建子助理勾选「外部平台对接」能力即可使用
+
+### 文档讲解（dsh-pet 侧）
+
+- **表格照念**：md 表格不再整段跳过，格子转逗号逐行念，和屏幕看到的一致（只不念竖线 / 分隔行等格式符号）；
+  代码 / 公式仍提示一句并停 10 秒看屏幕
+- **音色一致**：开讲 / 交接前先暖成员音色缓存，交接、开场白、正文全程用成员自己的嗓子，不中途混入总助理
+- **预读同会话**：打开文档时静默预读只给文档名 / 路径与工作区提示，模型用 `companion_document_read` 自己读；
+  预读与后续提问在**同一条**成员文档会话，追问只发问题不重发原文
+
+### 任务确认与取消
+
+- 等待类任务（等你点头 / 等复核 / 等你回话）在团队页既有「取消」也有「**确认完成**」：
+  用户本人核对产物后确认才标记 done（模型自报不算），走 `POST /team/confirm`
+
 ## 架构
 
 ```
@@ -142,7 +200,8 @@ dsh web（常驻）── 会话 S
 | `personal-assistant/reports/` | 定稿日报 Markdown |
 | `personal-assistant/bridge.json` | 桥接端口与聊天令牌（宠物读）。插件加载即写；另一运行时正健康服务时加载不抢、召唤时接管；卸载只删自己写的那份 |
 | `personal-assistant/bridge-approval.json` | 审批凭据（只有桌面壳主进程读） |
-| `desktop-team/team.sqlite` | 团队编制与任务（`teamEnabled` 时） |
+| `personal-assistant/platform-connector.json` | 外部智能助理平台对接配置（endpoint/appid/secret/userId/assistId/signTemplate；secret 只存配置不入代码） |
+| `desktop-team/team.sqlite` | 团队编制 / 任务 / 提案 / 批准 / 操作记录 / 成员定时计划与运行账本（`teamEnabled` 时） |
 | `storages/personal_assistant/` | **旧版**存储域，默认只读导入新库，不自动删 |
 
 ## 安装
@@ -242,6 +301,17 @@ dsh --profile web --patch <插件目录>/cordis.team.patch.yml
         proactiveEnabled: true      # 关闭后引擎彻底安静，也省掉评估定时器
         proactiveIdleMs: 480000     # 无输入多久后可以提醒（8 分钟）
         proactiveCooldownMs: 3600000 # 两次提醒的最小间隔（60 分钟）
+
+        # 技能自动形成
+        skillsAutoForm: true        # 同类工作攒够样本后自动让模型总结成技能
+        skillsAutoActivate: true    # 自动形成的技能默认生效（人工只做事后查验）；扩权仍须本人批准
+
+        # 写入方式与子助理会话
+        approvalMode: manual        # manual=桌面逐条批准；auto=用户明确选择的自动记录（模型仍拿不到凭据）
+        subAssistantIdleTtlMs: 480000   # 子助理会话空闲回收时长
+        maxSubAssistantSessions: 8      # 子助理常驻会话上限（LRU 淘汰）
+        maxDispatchDepth: 2             # 越权回退后最大重分派深度（防转发循环）
+        subAssistantTimeoutMs: 600000   # 单次子助理分派超时
 ```
 
 `teamSeats` 写 assistantId（`member-shaseng`）或 roleId（`shaseng`）都认，写错的名字会被忽略并记一条 warn。
@@ -256,12 +326,14 @@ dsh --profile web --patch <插件目录>/cordis.team.patch.yml
 
 ## 工具清单
 
-### 助理（15 个，始终注册）
+### 助理（始终注册，受开启总开关闸门）
 
 | 工具 | 用途 |
 |---|---|
 | `personal_assistant_summon_pet` | 召唤桌面宠物并绑定当前会话 |
 | `personal_assistant_set_team_mode` | 开启/关闭团队模式（运行时挂载/卸载团队服务，选择持久化） |
+| `personal_assistant_member_schedule` | 为成员安排/查询/取消/立即执行定时自主任务（daily/once/interval，企微/桌面推送） |
+| `personal_assistant_dispatch_subassistant` | 把任务分派给外部平台/本地 CLI 子助理（越权回退、防环） |
 | `personal_assistant_start` | 开启助理模式 |
 | `personal_assistant_stop` | 关闭助理模式（不出日报） |
 | `personal_assistant_status` | 模式状态与今日概览 |
@@ -275,6 +347,27 @@ dsh --profile web --patch <插件目录>/cordis.team.patch.yml
 | `personal_assistant_remember_preference` | 记录长期偏好（必须给 topic） |
 | `personal_assistant_list_preferences` | 列出全部记忆及状态 |
 | `personal_assistant_forget_preference` | 删除记忆，返回四类结果 |
+
+### 成员本地工具（按能力/权限注册到成员会话）
+
+| 工具 | 用途 |
+|---|---|
+| `companion_member_remember` | 提交本成员私有记忆候选（本人确认后才生效） |
+| `companion_member_request_quota` | 申请额度（不自行批准） |
+| `companion_member_schedule` | 成员改自己的定时任务（list/update，企微绑定本人可用） |
+| `companion_web_fetch` | 只读抓取公开 https 网页/API（防内网 SSRF；宿主工具不可用时的桥） |
+| `companion_mail_unread` / `personal_assistant_send_mail` | 读未读 / 发信（mail 能力，发送需审批） |
+| `companion_platform_*` | 外部平台查询/列智能体/查记录/上传知识库/上传文件/更新记忆/通用 call（platform 能力） |
+| `personal_assistant_computer_*` | 看屏幕/点/输入/滚动（computer 能力，每次动作需桌面批准） |
+
+### 斜杠命令（工作台 / 会话快捷入口）
+
+`assistant-on/off/state`（总开关）、`assistant-pet-config/set`（宠物配置）、`assistant-task-set`（待办改删）、
+`assistant-meeting-set`（会议改名/删除）、`assistant-set-task-priority`（待办优先级提案）、
+`assistant-skills` / `assistant-skill-set`（技能查验/增删改/生效/退役/回滚/证据确认）、
+`assistant-platform-get/set`（外部平台配置）、`assistant-mail-config` / `assistant-wecom-config`（连接配置）、
+`assistant-settings-summary`、以及只读列表 `assistant-todo-list/count`、`assistant-meeting-today/list/history`、
+`assistant-report-list`、`assistant-team-list`、`assistant-today-summary`、`assistant-set-option`。
 
 ### 团队（6 个，仅 `teamEnabled` 时注册）
 
@@ -319,8 +412,13 @@ dsh --profile web --patch <插件目录>/cordis.team.patch.yml
 - **两个 SQLite 库都是明文落盘，没有静态加密**：库里存着窗口标题、日报正文与记忆原文。
   介意的话请勿开启助理模式，或自行加密磁盘
 - 常驻的 dsh web 加载的是启动当时的插件构建：升级插件后必须重启 dsh web 才生效
-- 桌宠的多角色舞台、语音、文档讲解与群体场景目前只有单测与构建覆盖，尚未完成真机验收
-- 会议录音、转写与纪要依赖的静态加密尚未实现，这部分功能暂缓；当前只有空闲提醒等不涉及录音的能力
+- **成员沿用宿主工具依赖 DSH 开放子代理工厂**：宿主未向插件开放 subagents/预置组合时，成员回退插件会话＋
+  只读网页桥；纯定时自主运行没有核心创建的父会话可 spawn，拿不到宿主核心工具，这是 DSH 侧能力边界
+- **外部平台对接需自行配置凭据**：代码只实现通用报文与加签骨架，endpoint/appid/secret 等须用
+  `assistant-platform-set` 填写；加签顺序若与缺省模板不同，改 `signTemplate`，不改代码
+- **企业微信接收能力全系统最多一位成员持有**（避免多成员抢同一渠道）；推送通知不要求该能力，
+  只要企微已配置且收件会话已绑定（deliverHere）
+- 桌宠的多角色舞台、语音、文档讲解以单测/e2e 覆盖为主，真机验收持续进行
 
 ## 开发与验证
 
@@ -361,3 +459,9 @@ pnpm run build       # esbuild 打包到 dist/
 | `/session/start` 回 `agents-unavailable` | 当前宿主没有 `ctx.agents`（或还没装上）：只能在 dsh 里召唤宠物；插件不会退化成假成功 |
 | 开始会话回 `created` 且带 `resumeError` | 上次自建的会话恢复不了（例如宿主没配会话持久化），已新建并如实给出原因；旧会话记录不会被删 |
 | 新起的运行时没写 `bridge.json` | 另一个运行时正健康地占着它，加载时不抢；在这个运行时里召唤宠物即可接管 |
+| 外部平台返回「签名校验失败」(code 100) | 报文/加签骨架已对，但 secret/appid 未配或加签顺序不符；用 `assistant-platform-set` 填凭据，必要时改 `signTemplate` |
+| 企微消息分不清是哪个助理 | 推送已带 `【成员名】` 前缀；若看不到，确认该成员定时计划渠道为 wecom 且收件会话已绑定 |
+| 召唤宠物重播旧英文汇报 | 自报播报有时间守卫，只念 60 秒内新鲜汇报；旧版无 `at` 的事件不念。升级后重启桌宠即可 |
+| 讲解 md 表格没念 | 旧版会整段跳过；新版表格照念（格子转逗号）。确认桌宠已加载新构建 |
+| 讲解中途混入总助理声音 | 成员音色缓存冷时回退总助理所致；新版开讲/交接前先暖缓存，全程成员嗓子。重启桌宠加载新构建 |
+| 成员说改不了定时任务（企微） | 成员需有 `companion_member_schedule`（装配了 memberSchedule 即注册）；企微绑定本人可直接改自己的计划 |

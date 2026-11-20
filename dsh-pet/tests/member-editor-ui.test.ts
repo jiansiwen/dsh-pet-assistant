@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import ts from 'typescript'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import * as contract from '../src/member-types.ts'
+import * as speakerVoice from '../src/shared/speaker-voice.ts'
 import type { MemberDraft, MemberResult, MemberView } from '../src/member-types.ts'
 
 const source = readFileSync(new URL('../src/renderer/MemberEditor.tsx', import.meta.url), 'utf8')
@@ -22,12 +23,12 @@ function text(node: ReactNode): string {
   return typeof node === 'string' || typeof node === 'number' ? String(node) : ''
 }
 function member(revision = 3): MemberView {
-  return { profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', description: '通用研究', persona: '按证据回答',
-    roleId: 'wukong', skinId: 'panda', voiceProfile: '', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision, sessionId: '独立会话甲', provider: '', model: '',
-    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' },
+  return { profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceProfile: '', voiceDesign: '', description: '通用研究', persona: '按证据回答',
+    roleId: 'wukong', skinId: 'panda', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision, sessionId: '独立会话甲', provider: '', model: '',
+    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai', kind: 'expert', binding: null },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 0, totalReserved: 0, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }
 }
-const baseDraft: MemberDraft = { displayName: '日报助理', description: '整理日报', personality: '简洁直接', permissionMode: 'ask', persona: '只依据证据', skinId: 'panda',
+const baseDraft: MemberDraft = { displayName: '日报助理', description: '整理日报', personality: '简洁直接', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceProfile: '', voiceDesign: '', persona: '只依据证据', skinId: 'panda',
   enabled: true, provider: '', model: '', maxTokens: 2048, capabilities: ['activity'], allowedTools: [], dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai' }
 function mount(initial: MemberView | null, latest = initial ?? undefined) {
   const slots: unknown[] = []
@@ -44,7 +45,7 @@ function mount(initial: MemberView | null, latest = initial ?? undefined) {
     useEffect() {},
   }
   const module = { exports: {} as { MemberEditorPanel: (props: Record<string, unknown>) => ReactNode; default: () => ReactNode } }
-  new Function('require', 'module', 'exports', compiled)((name: string) => name === 'react' ? hooks : name === '../member-types.ts' ? contract : require(name), module, module.exports)
+  new Function('require', 'module', 'exports', compiled)((name: string) => name === 'react' ? hooks : name === '../member-types.ts' ? contract : name === '../shared/speaker-voice.ts' ? speakerVoice : require(name), module, module.exports)
   const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
   Object.defineProperty(globalThis, 'window', { configurable: true, value: { memberEditorApi: {
     memberAssist: async () => assistResult,

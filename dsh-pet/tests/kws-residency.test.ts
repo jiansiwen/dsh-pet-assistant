@@ -31,7 +31,11 @@ class FakeWorker implements KwsWorkerLike {
   posted: unknown[] = []
   terminated = 0
   private handlers = new Map<string, Array<(value: never) => void>>()
-  postMessage(message: unknown): void { this.posted.push(message) }
+  postMessage(message: unknown): void {
+    this.posted.push(message)
+    // 模拟真 worker：收到 shutdown 后自己退出（优雅退出契约）。
+    if ((message as { type?: string } | null)?.type === 'shutdown') queueMicrotask(() => this.emit('exit', 0))
+  }
   on(event: string, listener: (value: never) => void): unknown {
     this.handlers.set(event, [...(this.handlers.get(event) ?? []), listener])
     return this
@@ -115,7 +119,9 @@ describe('KWS 会话生命周期（假 worker）', () => {
       worker.emit('message', { type: 'wake', keyword: '小潘同学', atMs: 1200 })
       assert.deepEqual(wakes, ['小潘同学'])
       session.stop()
-      assert.equal(worker.terminated, 1)
+      assert.ok(worker.posted.some(m => (m as { type?: string } | null)?.type === 'shutdown'), 'stop 先请 worker 自己退，不强杀原生线程')
+      await tick()
+      assert.equal(worker.terminated, 0, '优雅退出路径不 terminate')
       worker.emit('exit', 1)
       worker.emit('message', { type: 'wake', keyword: '小潘同学', atMs: 1500 })
       assert.deepEqual(lost, [], '自己停的不算丢失')
@@ -174,7 +180,8 @@ describe('KWS 会话生命周期（假 worker）', () => {
       assert.equal(lost.length, 1)
       assert.match(lost[0], /加载失败.*bad model/)
       assert.equal(session.running, false)
-      assert.equal(worker.terminated, 1)
+      assert.ok(worker.posted.some(m => (m as { type?: string } | null)?.type === 'shutdown'))
+      assert.equal(worker.terminated, 0)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 
@@ -192,10 +199,11 @@ describe('KWS 会话生命周期（假 worker）', () => {
 })
 
 describe('四个独立开关', () => {
-  test('缺省：Windows 唤醒开（既有行为）、macOS 唤醒关；开机自启与外放插话一律关', () => {
-    assert.deepEqual(normalizeAudioPrefs({}, 'win32'), { wakeEnabled: true, wakeEngine: 'kws', wakeName: '小潘同学', wakeVoiceprint: false, wakeVoiceprintThreshold: 0.65, launchAtLogin: false, bargeIn: false })
-    assert.deepEqual(normalizeAudioPrefs({}, 'darwin'), { wakeEnabled: false, wakeEngine: 'kws', wakeName: '小潘同学', wakeVoiceprint: false, wakeVoiceprintThreshold: 0.65, launchAtLogin: false, bargeIn: false })
-    assert.deepEqual(normalizeAudioPrefs({ wakeEnabled: true }, 'linux'), { wakeEnabled: false, wakeEngine: null, wakeName: '小潘同学', wakeVoiceprint: false, wakeVoiceprintThreshold: 0.65, launchAtLogin: false, bargeIn: false }, '没有引擎的平台开关存了也是关')
+  test('缺省：Windows 唤醒开（既有行为）、macOS 唤醒关；开机自启、外放插话、播报中响应唤醒一律关', () => {
+    // wakeDuringSpeech 默认 false = 播报中安静（讲解中例外，见 wake-scene.ts）。
+    assert.deepEqual(normalizeAudioPrefs({}, 'win32'), { wakeEnabled: true, wakeEngine: 'kws', wakeName: '小潘同学', wakeVoiceprint: false, wakeVoiceprintThreshold: 0.65, wakeDuringSpeech: false, launchAtLogin: false, bargeIn: false })
+    assert.deepEqual(normalizeAudioPrefs({}, 'darwin'), { wakeEnabled: false, wakeEngine: 'kws', wakeName: '小潘同学', wakeVoiceprint: false, wakeVoiceprintThreshold: 0.65, wakeDuringSpeech: false, launchAtLogin: false, bargeIn: false })
+    assert.deepEqual(normalizeAudioPrefs({ wakeEnabled: true }, 'linux'), { wakeEnabled: false, wakeEngine: null, wakeName: '小潘同学', wakeVoiceprint: false, wakeVoiceprintThreshold: 0.65, wakeDuringSpeech: false, launchAtLogin: false, bargeIn: false }, '没有引擎的平台开关存了也是关')
   })
 
   test('只接受平台列出的引擎；未知键与非布尔值丢掉', () => {

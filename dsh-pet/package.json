@@ -13,7 +13,7 @@
     "build": "node scripts/build.mjs",
     "start": "node scripts/build.mjs && node scripts/launch-electron.mjs",
     "dev": "node scripts/build.mjs --watch",
-    "test": "node --test --experimental-test-module-mocks \"tests/**/*.test.ts\"",
+    "test": "node --test --experimental-test-module-mocks --test-concurrency=1 \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "pack:mac": "electron-builder --mac --config build/electron-builder.yml",
     "pack:win": "electron-builder --win --config build/electron-builder.yml"

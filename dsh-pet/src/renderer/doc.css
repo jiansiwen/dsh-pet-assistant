@@ -7,10 +7,10 @@
  */
 
 :root {
-  /* 选中行底色。与 --task-active #1d4ed8 的文字对比 5.90，过 AA。 */
-  --doc-selected-bg: #eef2ff;
+  /* 选中行底色。与 --task-active var(--indigo) 的文字对比 5.90，过 AA。 */
+  --doc-selected-bg: var(--indigo-wash);
   /* "正在讲"徽标。底色同上，文字用 --task-active，对比 5.90。 */
-  --doc-live-fg: #1d4ed8;
+  --doc-live-fg: var(--indigo);
 }
 
 .doc-page {
@@ -223,7 +223,7 @@
 }
 
 .doc-tag.done {
-  background: #eaf6ee;
+  background: var(--win-green-wash);
   color: var(--task-ok);
 }
 
@@ -259,7 +259,7 @@
 .doc-btn.primary {
   border-color: transparent;
   background: var(--approve-bg);
-  color: #fff;
+  color: var(--paper-raised);
   font-weight: 700;
 }
 
@@ -269,7 +269,7 @@
 }
 
 .doc-btn.danger {
-  border-color: #e6c9c9;
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--rule-strong));
   color: var(--risk-high);
 }
 

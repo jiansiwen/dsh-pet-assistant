@@ -20,6 +20,8 @@ import type { CancelReceipt } from '../session-types.js'
 
 /** 还能被取消的任务状态：终态与结果不明的任务没有可停的东西，不给按钮。 */
 const CANCELLABLE = new Set(['created', 'queued', 'running', 'awaiting-approval', 'awaiting-user', 'review'])
+/** 能被本人确认完成的任务状态：等待用户动手的三态。用户是可信验收方。 */
+const CONFIRMABLE = new Set(['awaiting-approval', 'awaiting-user', 'review'])
 const RECEIPT_LABEL: Record<CancelReceipt['state'], string> = {
   'not-executed': '未执行', cancelling: '取消中', terminated: '已终止', 'partially-executed': '已部分执行', unknown: '结果未知',
 }
@@ -42,6 +44,8 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval, bindi
   /** 正在取消的任务 id，以及每个任务最近一次的取消回执（如实显示 state，不把取消中说成已停止）。 */
   const [cancelling, setCancelling] = useState<string | null>(null)
   const [receipts, setReceipts] = useState<Record<string, { state: CancelReceipt['state'] | null; text: string }>>({})
+  const [confirming, setConfirming] = useState<string | null>(null)
+  const [confirmNotes, setConfirmNotes] = useState<Record<string, string>>({})
   const [pauseNote, setPauseNote] = useState<string | null>(null)
   const paused = (snapshot as (TeamSnapshot & { paused?: boolean }) | null)?.paused === true
 
@@ -59,6 +63,20 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval, bindi
       setCancelling(null)
     }
   }, [bindingId, cancelling])
+
+  /** 本人复核确认：核对产物后把等待中的任务标记完成。用户是可信验收方，模型自报不算。 */
+  const confirmTask = useCallback(async (taskId: string) => {
+    if (confirming !== null) return
+    setConfirming(taskId)
+    try {
+      const result = await window.petApi.confirmTeamTask(taskId)
+      setConfirmNotes(previous => ({ ...previous, [taskId]: result.message }))
+    } catch (reason) {
+      setConfirmNotes(previous => ({ ...previous, [taskId]: `确认没有送达：${String(reason)}` }))
+    } finally {
+      setConfirming(null)
+    }
+  }, [confirming])
 
   /** 暂停 / 恢复后续步骤：只挡新的领取，不中止在跑的任务。 */
   const togglePause = useCallback(async () => {
@@ -233,14 +251,26 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval, bindi
                         {task.note}
                       </p>
                     )}
-                    {bindingId && CANCELLABLE.has(task.status) && (
+                    {bindingId && (CANCELLABLE.has(task.status) || CONFIRMABLE.has(task.status)) && (
                       <div className="team-proposal-foot">
-                        <button type="button" className="team-go" disabled={cancelling !== null}
-                          title="定向取消这个任务：只停插件持有的子代理，不影响主会话；已发生的副作用不会撤回"
-                          onClick={() => void cancelTask(task.taskId)}>
-                          {cancelling === task.taskId ? '正在取消…' : '取消'}
-                        </button>
+                        {CONFIRMABLE.has(task.status) && (
+                          <button type="button" className="team-go" disabled={confirming !== null}
+                            title="你已核对产物/结果，本人确认完成（模型自报不算，你的确认才算）"
+                            onClick={() => void confirmTask(task.taskId)}>
+                            {confirming === task.taskId ? '正在确认…' : '确认完成'}
+                          </button>
+                        )}
+                        {CANCELLABLE.has(task.status) && (
+                          <button type="button" className="team-go" disabled={cancelling !== null}
+                            title="定向取消这个任务：只停插件持有的子代理，不影响主会话；已发生的副作用不会撤回"
+                            onClick={() => void cancelTask(task.taskId)}>
+                            {cancelling === task.taskId ? '正在取消…' : '取消'}
+                          </button>
+                        )}
                       </div>
+                    )}
+                    {confirmNotes[task.taskId] && (
+                      <p className="team-note" role="status">{confirmNotes[task.taskId]}</p>
                     )}
                     {receipts[task.taskId] && (
                       <p className={`team-note${receipts[task.taskId].state ? ` cancel-${receipts[task.taskId].state}` : ''}`} role="status">

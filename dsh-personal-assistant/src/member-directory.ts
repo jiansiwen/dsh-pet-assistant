@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS, READ_ONLY_DENY_CANDIDATES } from './gate.ts'
-import { MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_PERMISSION_MODES, SUB_ASSISTANT_REPORT_MODES,
+import { MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY,
   type MemberDraft, type MemberProfile, type MemberKind, type MemberQuotaRequest, type MemberQuotaView,
   type NormalizedMemberDraft, type SubAssistantBinding } from './member-contract.ts'
 import type { MemberConfig, RoleId, ToolPolicy } from './team-domain.ts'
@@ -16,9 +16,9 @@ const MAX = Number.MAX_SAFE_INTEGER
 const SKINS = ['panda', 'girl-glasses', 'boy-glasses']
 
 function defaults(): Extension {
-  return { description: '', personality: '', permissionMode: 'ask', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
+return { description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceDesign: '', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
     dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai', sessionId: null,
-    kind: 'expert', binding: null, reportMode: 'chief' }
+    kind: 'expert', binding: null }
 }
 
 /** 只在 TeamStore 的版本迁移事务中调用，当前版本打开时不重复建表、写默认值。 */
@@ -145,10 +145,10 @@ function normalizeBinding(kind: MemberKind, value: unknown): SubAssistantBinding
   return { kind: 'local-cli', command, args: args.map(item => printable(item, '工具参数', 1024, false)) }
 }
 function extension(profile: MemberProfile): Extension {
-  return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
+  return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, reportMode: profile.reportMode, speechBy: profile.speechBy, voiceDesign: profile.voiceDesign, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
     capabilities: profile.capabilities, allowedTools: profile.allowedTools, dailyTokenLimit: profile.dailyTokenLimit,
     totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId,
-    kind: profile.kind, binding: profile.binding, reportMode: profile.reportMode }
+    kind: profile.kind, binding: profile.binding }
 }
 function normalize(draft: MemberDraft): NormalizedMemberDraft {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) throw new Error('成员配置无效')
@@ -167,20 +167,24 @@ function normalize(draft: MemberDraft): NormalizedMemberDraft {
   if (!!text(draft.provider, '模型提供方', 200) !== !!text(draft.model, '模型名称', 200)) throw new Error('模型提供方和模型必须同时填写，或同时留空使用默认模型')
   const permissionMode = draft.permissionMode ?? 'ask'
   if (!MEMBER_PERMISSION_MODES.includes(permissionMode)) throw new Error('权限只能是每次询问、自动审批或完全访问')
+const reportMode = draft.reportMode ?? 'chief'
+  if (!MEMBER_REPORT_MODES.includes(reportMode)) throw new Error('汇报方式只能由总助理汇报，或由该成员自己汇报')
+  const speechBy = draft.speechBy ?? 'self'
+  if (!MEMBER_SPEECH_BY.includes(speechBy)) throw new Error('语音朗读只能是成员自己读，或由总助理代读')
   const kind = draft.kind ?? 'expert'
   if (!MEMBER_KINDS.includes(kind)) throw new Error('成员类型无效')
-  const reportMode = draft.reportMode ?? 'chief'
-  if (!SUB_ASSISTANT_REPORT_MODES.includes(reportMode)) throw new Error('汇报模式只能是总助理汇报或自行汇报')
   const binding = normalizeBinding(kind, draft.binding)
   if (kind !== 'expert' && binding === null) throw new Error('子助理必须配置外部绑定')
   return { displayName: text(draft.displayName, '成员名称', 80, true), description: text(draft.description, '职责说明', 4000),
-    personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode,
+    personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode, reportMode, speechBy,
     persona: text(draft.persona, '人设', 16000), skinId, enabled: draft.enabled,
+    voiceProfile: text(draft.voiceProfile ?? '', '音色', 200),
+    voiceDesign: text(draft.voiceDesign ?? '', '音色设计描述', 2000),
     provider: text(draft.provider, '模型提供方', 200), model: text(draft.model, '模型名称', 200),
     maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 131072), capabilities: [...new Set(draft.capabilities)],
     allowedTools: [...new Set(draft.allowedTools)], dailyTokenLimit: integer(draft.dailyTokenLimit, '日额度'),
     totalTokenLimit: integer(draft.totalTokenLimit, '总额度'), thresholdPercent: integer(draft.thresholdPercent ?? 80, '申请阈值', 1, 100), timezone,
-    kind, binding, reportMode }
+    kind, binding }
 }
 
 export class MemberDirectory {
@@ -254,7 +258,7 @@ export class MemberDirectory {
     const normalized = normalize(draft)
     return this.transaction(() => {
       this.validateUnique(normalized)
-      const profile: MemberProfile = { ...normalized, assistantId: `member-${randomUUID()}`, roleId: 'custom', voiceProfile: '',
+      const profile: MemberProfile = { ...normalized, assistantId: `member-${randomUUID()}`, roleId: 'custom',
         toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 1, sessionId: null }
       this.db.prepare(`INSERT INTO assistants(assistant_id, role_id, display_name, skin_id, persona, voice_profile, tool_policy, enabled, revision)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(profile.assistantId, profile.roleId, profile.displayName, profile.skinId,
@@ -278,11 +282,14 @@ export class MemberDirectory {
       // 换类型或换绑定后，旧会话上下文对新平台/新工具不再成立，与权限变化同规则：清会话引用。
       const bindingChanged = current.kind !== normalized.kind
         || JSON.stringify(current.binding ?? null) !== JSON.stringify(normalized.binding ?? null)
-      const sessionInvalidated = permissionsChanged || bindingChanged
+      // 换模型同样要重建会话：宿主不允许在轮次中途换模型（request 阶段改模型会被拒绝），
+      // 旧会话会一直带着旧模型，成员设置里的新模型永远不生效。
+      const modelChanged = current.provider !== normalized.provider || current.model !== normalized.model
+      const sessionInvalidated = permissionsChanged || bindingChanged || modelChanged
       const next: MemberProfile = { ...current, ...normalized, revision: current.revision + 1,
-        toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: sessionInvalidated ? null : current.sessionId }
-      const changed = this.db.prepare(`UPDATE assistants SET display_name = ?, skin_id = ?, persona = ?, enabled = ?, tool_policy = ?, revision = ?
-        WHERE assistant_id = ? AND revision = ?`).run(next.displayName, next.skinId, next.persona, Number(next.enabled),
+toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] }, sessionId: sessionInvalidated ? null : current.sessionId }
+      const changed = this.db.prepare(`UPDATE assistants SET display_name = ?, skin_id = ?, persona = ?, voice_profile = ?, enabled = ?, tool_policy = ?, revision = ?
+        WHERE assistant_id = ? AND revision = ?`).run(next.displayName, next.skinId, next.persona, next.voiceProfile, Number(next.enabled),
         JSON.stringify(next.toolPolicy), next.revision, id, expectedRevision)
       if (Number(changed.changes) !== 1) throw new Error('成员修订冲突，请刷新后重试')
       this.saveExtra(next)
@@ -355,6 +362,15 @@ export class MemberDirectory {
     })
   }
 
+  /** 清掉某条渠道会话绑定（文档讲解关闭时扔临时会话）；只删绑定，不删宿主里的会话正文。 */
+  clearChannelSession(id: string, scope: string): void {
+    if (!/^[a-f0-9]{64}$/u.test(scope)) throw new Error('渠道会话范围无效')
+    this.transaction(() => {
+      this.require(id)
+      this.db.prepare('DELETE FROM member_channel_sessions WHERE assistant_id = ? AND scope = ?').run(id, scope)
+    })
+  }
+
   private ensureAccount(id: string): void {
     this.db.prepare('INSERT OR IGNORE INTO member_quota_accounts(assistant_id) VALUES (?)').run(id)
   }
@@ -403,16 +419,18 @@ export class MemberDirectory {
     const remaining = Math.max(0, Math.min(profile.maxTokens,
       profile.dailyTokenLimit === 0 ? MAX : profile.dailyTokenLimit - dailyUsed - dailyReserved,
       profile.totalTokenLimit === 0 ? MAX : profile.totalTokenLimit - totalUsed - totalReserved))
+    // 日/总都填 0 = 不限额：此时"用量未知"不影响准入（没有上限可被突破），
+    // 也不该拦着用户去核查账本 —— 否则界面上写着"不限"，实际却要求先重置额度。
+    const unlimited = profile.dailyTokenLimit === 0 && profile.totalTokenLimit === 0
     return { view: { day, dailyUsed, totalUsed, dailyReserved, totalReserved,
       dailyTokenLimit: profile.dailyTokenLimit, totalTokenLimit: profile.totalTokenLimit,
-      thresholdPercent: profile.thresholdPercent, unknown, blocked: !profile.enabled || unknown || remaining < 1, revision: this.quotaRevision(id) },
+      thresholdPercent: profile.thresholdPercent, unknown, blocked: !profile.enabled || (!unlimited && unknown) || remaining < 1, revision: this.quotaRevision(id) },
     remaining }
   }
 
   private atThreshold(view: MemberQuotaView): boolean {
-    // 用整数比较，避免安全整数附近乘百分比后丢精度。
-    // 在途预留也要算进去：只看到已结算量会等真正越线才提示，达不到“快用完先问本人”的目的。
-    if (view.unknown) return true
+    // 不限额（日/总都是 0）时没有"阈值"可申请，用量未知也不打扰用户。
+    if (view.unknown) return view.dailyTokenLimit > 0 || view.totalTokenLimit > 0
     const pairs: Array<[number, number, number]> = [
       [view.dailyUsed, view.dailyReserved, view.dailyTokenLimit],
       [view.totalUsed, view.totalReserved, view.totalTokenLimit],
@@ -454,7 +472,7 @@ export class MemberDirectory {
   }
   private unavailable(profile: MemberProfile, view: MemberQuotaView): string | null {
     if (!profile.enabled) return '成员已停用，无法开始请求'
-    if (view.unknown) return '成员存在未知用量，必须核查并明确重置日额度与总额度后才能继续'
+    if (view.unknown && (view.dailyTokenLimit > 0 || view.totalTokenLimit > 0)) return '成员存在未知用量，必须核查并明确重置日额度与总额度后才能继续'
     if (view.blocked) return '成员额度已用完或已被进行中的请求预留，请等待结算或申请加额'
     return null
   }

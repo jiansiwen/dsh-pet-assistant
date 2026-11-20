@@ -321,11 +321,14 @@ test('扫描件计划：状态如实说明只能按页看，不暗示会开讲',
   assert.equal(gotos([turn]).length, 0)
 })
 
-test('视图选择：点名优先，auto 只在出声的 PDF 且 WPS 可用时选 WPS', () => {
+test('视图选择：点名优先；auto 一律用内置阅读视图（WPS 12.x 做不到页码对应）', () => {
+  // 点名优先，两条都不变。
   assert.equal(chooseDocVia('reading', { speak: true, pdf: true, wpsReady: true }), 'reading', '点名内置视图不被 WPS 覆盖')
   assert.equal(chooseDocVia('wps', { speak: true, pdf: true, wpsReady: false }), 'wps', '点名 WPS 时不因探测失败改成内置')
-  assert.equal(chooseDocVia('auto', { speak: true, pdf: true, wpsReady: true }), 'wps', '装了 WPS 的 PDF 出声讲解默认用 WPS')
-  assert.equal(chooseDocVia('auto', { speak: true, pdf: true, wpsReady: false }), 'reading', '没装 WPS 回退内置阅读视图')
-  assert.equal(chooseDocVia('auto', { speak: true, pdf: false, wpsReady: true }), 'reading', 'WPS 不能跟随非 PDF，仍用内置视图')
-  assert.equal(chooseDocVia('auto', { speak: false, pdf: true, wpsReady: true }), 'reading', '不出声的提纲不打开 WPS')
+  // auto 恒 reading：真机上 WPS 12.1 的 Qt5 窗口读不到页码、跳页无法验证，
+  // 讲的内容和屏幕页码对不上，比"用不上 WPS 原版式"更糟。
+  assert.equal(chooseDocVia('auto', { speak: true, pdf: true, wpsReady: true }), 'reading', 'auto 不再因为装了 WPS 就选 WPS')
+  assert.equal(chooseDocVia('auto', { speak: true, pdf: true, wpsReady: false }), 'reading')
+  assert.equal(chooseDocVia('auto', { speak: true, pdf: false, wpsReady: true }), 'reading')
+  assert.equal(chooseDocVia('auto', { speak: false, pdf: true, wpsReady: true }), 'reading', '不出声的提纲也只装阅读视图')
 })

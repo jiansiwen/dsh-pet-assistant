@@ -14,6 +14,16 @@ export type VoicePhase = 'stopped' | 'waiting' | 'recording' | 'generating' | 'p
 export const isVoiceStop = (text: string): boolean => /^(先这样|结束对话|停止对话)[。！!，,\s]*$/u.test(text.trim())
 
 /**
+ * 讲解中直接提问的"像话"判据：去掉空白、标点与符号后至少三个字。
+ *
+ * 讲解里不要求先说"停一下"（主进程返回 direct），但回声、咳嗽、键盘声，以及
+ * **被截断的口令尾巴**（例如"停一下"只识别出"一下"）经常只有一两个字；
+ * 这类结果既不该停讲解，也不该变成一条用户消息送给模型。
+ */
+export const plausibleDirectQuestion = (text: string): boolean =>
+  text.replace(/[\s\p{P}\p{S}]/gu, '').length >= 3
+
+/**
  * 口令式打断：只有明确说了「停一下 / 等等 / 等一下 / 打断一下」这类词才打断朗读。
  *
  * 为什么需要它：外放时麦克风会收到助理自己的声音（回声消除之后仍可能残留），若把任何声音
@@ -22,8 +32,13 @@ export const isVoiceStop = (text: string): boolean => /^(先这样|结束对话|
  *
  * 返回去掉口令后的剩余内容：用户可能一口气说「停一下，这一段是什么意思」。
  */
-const INTERRUPT_PREFIX = /^(?:请?停一下|停一停|停停|停下来|暂停一下|暂停|等等|等一等|等一下|打断一下|打断|别说了|先别说|安静一下)[，,。.！!？?、\s]*/u
+const INTERRUPT_PREFIX = /^(?:请?停一下|先停(?:一下)?|停一停|停停|停下来|暂停一下|暂停|稍等(?:一下)?|等等|等一等|等一下|等会(?:儿)?|打断一下|打断|别说了|先别说|安静一下)[，,。.！!？?、\s]*/u
 const INTERRUPT_EXACT = /^(?:停|安静|别吵)[嘛啊呀吧。！!，,\s]*$/u
+/**
+ * 口令前的客套/口头语：`稍微等一下`、`请你停一下`、`麻烦先停一下` 都是同一个意思。
+ * 只在"后面紧跟口令"时剥掉（最多剥一次），真提问里出现"停一下"不会被劫持。
+ */
+const INTERRUPT_FILLER = /^(?:(?:嗯+|额+|那个|就是|麻烦|请您?|我说|我想|我要|你|我(?:们)?|先|稍微|要不|帮我|能不能|可以)[，,。.！!？?、\s]*)+/u
 
 export interface InterruptPhrase {
   readonly matched: boolean
@@ -31,20 +46,63 @@ export interface InterruptPhrase {
   readonly rest: string
 }
 
-export function parseInterruptPhrase(text: string): InterruptPhrase {
-  const trimmed = text.trim()
+function matchInterrupt(trimmed: string): InterruptPhrase | null {
   if (INTERRUPT_EXACT.test(trimmed)) return { matched: true, rest: '' }
   const match = INTERRUPT_PREFIX.exec(trimmed)
-  if (match === null) return { matched: false, rest: trimmed }
+  if (match === null) return null
   return { matched: true, rest: trimmed.slice(match[0].length).trim() }
 }
 
-/** 讲解插话可以直接提问；单独的停止口令需要接着听问题。 */
+export function parseInterruptPhrase(text: string): InterruptPhrase {
+  const trimmed = text.trim()
+  const direct = matchInterrupt(trimmed)
+  if (direct !== null) return direct
+  const stripped = trimmed.replace(INTERRUPT_FILLER, '')
+  if (stripped !== trimmed) {
+    const polite = matchInterrupt(stripped)
+    if (polite !== null) return polite
+  }
+  return { matched: false, rest: trimmed }
+}
+
+/**
+ * 休息口令：「休息一下 / 休息一会儿」。进入无限期休息（不听提问），只认整句"继续"恢复。
+ *
+ * 必须带"一下/一会儿/片刻"这类时长词：光一个"休息"在讨论里太常见（"我们休息讨论一下"），
+ * 带上时长词才是明确的"停下来歇着"指令，与提问暂停（停一下）分开。
+ */
+const REST_PREFIX = /^(?:请|麻烦|大家|我们|你们|先)?休息(?:一下|一会儿|一会(?:儿)?|片刻)[，,。.！!？?、\s]*/u
+
+/** 讲解插话可以直接提问；单独的停止口令需要接着听问题；休息口令进入无限期休息。 */
 export function planInterruptInput(text: string, direct: boolean):
-  { action: 'ignore' | 'direct' | 'listen' } | { action: 'send'; text: string } {
+  { action: 'ignore' | 'direct' | 'listen' | 'rest' } | { action: 'send'; text: string } {
+  const trimmed = text.trim()
+  if (REST_PREFIX.test(trimmed) || REST_PREFIX.test(trimmed.replace(INTERRUPT_FILLER, ''))) return { action: 'rest' }
   const phrase = parseInterruptPhrase(text)
   if (!phrase.matched) return { action: direct ? 'direct' : 'ignore' }
   return phrase.rest ? { action: 'send', text: phrase.rest } : { action: 'listen' }
+}
+
+const normForEcho = (text: string): string => text.replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase()
+
+/**
+ * 这句口令是不是"念稿回声"：外放时麦克风把助理正在念的正文录了回来。
+ *
+ * 文档里恰好有"停一下"，念到那里时麦克风识别出"停一下"，会被当成真口令误停。
+ * 判据：识别出的口令核心**落在当前正在念的段落里** → 是念稿回声，忽略。用户真喊口令时
+ * 念的段落里没有这几个字 → 照常打断。代价：用户喊的口令恰好与当前念的字一样会被吞，按快捷键即可。
+ */
+export function isNarrationEcho(text: string, narration: string): boolean {
+  const narr = normForEcho(narration)
+  if (narr.length === 0) return false
+  const trimmed = text.trim()
+  const direct = matchInterrupt(trimmed)
+  const stripped = trimmed.replace(INTERRUPT_FILLER, '')
+  const phrase = direct ?? (stripped !== trimmed ? matchInterrupt(stripped) : null)
+  if (phrase === null) return false
+  const source = direct !== null ? trimmed : stripped
+  const core = normForEcho(source.slice(0, source.length - phrase.rest.length))
+  return core.length > 0 && narr.includes(core)
 }
 
 /** 只管理本地语音生命周期；不拥有模型或共享会话的取消权。 */

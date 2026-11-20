@@ -38,7 +38,7 @@ function input(kind: VoiceApiKind = 'tts'): VoiceApiInput {
   return { kind, name: '本地测试', endpoint: 'https://example.invalid/v1', model: 'test-model', voice: kind === 'tts' ? 'alloy' : '', apiKey: SECRET, provider: 'openai' }
 }
 function profile(endpoint: string, kind: VoiceApiKind = 'tts', apiKey = SECRET): ResolvedVoiceApi {
-  return { ...input(kind), id: '11111111-1111-4111-8111-111111111111', endpoint, apiKey, voice: kind === 'tts' ? 'alloy' : '', provider: 'openai' }
+  return { ...input(kind), id: '11111111-1111-4111-8111-111111111111', endpoint, apiKey, voiceDesign: '', voice: kind === 'tts' ? 'alloy' : '', provider: 'openai' }
 }
 function safe(error: unknown): boolean {
   assert.ok(error instanceof Error)
@@ -140,7 +140,8 @@ test('种类、标识、数量、字段必填及长度校验', t => {
   const { store, file } = fixture(t)
   const id = store.save(input()).profiles[0].id
   const before = readFileSync(file, 'utf8')
-  const invalid = [null, [], {}, { ...input(), kind: 'other' }, { ...input(), name: '' }, { ...input(), name: 'x'.repeat(101) }, { ...input(), model: '' }, { ...input(), model: 'x'.repeat(201) }, { ...input(), voice: '' }, { ...input(), voice: 'x'.repeat(201) }, { ...input(), endpoint: 'https://example.invalid/' + 'x'.repeat(2048) }, { ...input(), extra: SECRET }, { ...input(), id: 'custom-id' }, { ...input(), id: '11111111-1111-4111-8111-111111111111' }, { ...input('asr'), id }]
+  // 音色 ID 不在必填之列：语音设置页只配模型，音色由说话人自带（见 SpeechRequest.voiceDesign）。
+  const invalid = [null, [], {}, { ...input(), kind: 'other' }, { ...input(), name: '' }, { ...input(), name: 'x'.repeat(101) }, { ...input(), model: '' }, { ...input(), model: 'x'.repeat(201) }, { ...input(), voice: 'x'.repeat(201) }, { ...input(), endpoint: 'https://example.invalid/' + 'x'.repeat(2048) }, { ...input(), extra: SECRET }, { ...input(), id: 'custom-id' }, { ...input(), id: '11111111-1111-4111-8111-111111111111' }, { ...input('asr'), id }]
   for (const value of invalid) assert.throws(() => store.save(value), safe)
   assert.throws(() => store.select('asr', id), safe)
   assert.throws(() => store.select('other', null), safe)

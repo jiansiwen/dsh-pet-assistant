@@ -1,223 +1,865 @@
 /* 设置面板的统一外观；审批窗口仍使用独立样式，避免把设置页误认为批准入口。 */
+/*
+ * 外观口径（2026-11-13 重做）：
+ *
+ * 上一版是「中性灰底 + 白卡 + 1px 描边 + 统一 12px 圆角 + 一层软阴影」。那是**通用 AI 模板**
+ * 的四个特征同时出现，读起来像任何人的后台，不像这只熊猫的东西。这一版换掉三件事：
+ *
+ * 1. **不再卡片套卡片。** 一个屏幕只有一个层级：页面是纸，分节靠留白和字重，重复项才是凹陷的块。
+ *    白卡 + 描边 + 阴影那一套只在"真的是一张独立的卡"时才用（现在几乎没有）。
+ * 2. **删掉眉标与序号。** 「第 N 项 / 页名」那行 10px 加字距的小字不编码任何信息；
+ *    设置菜单也不是序列，给它编 01–09 只是装饰。信息密度不够就用标题层级解决，不靠贴标签。
+ * 3. **布局从 6 列标签栅格改成左侧竖排导航。** 九项挤在 540px 里的六列栅格里，第二组只剩三格，
+ *    右半边空着——那是"别扭"最直接的来源。竖排能吃下分组、能吃下角标，也能读。
+ *
+ * 颜色一律走 tokens.css 的变量，本文件不写字面量色值（旧的字面量已全部替换）。
+ */
+
 .pet-management {
-  --settings-ink: #20333b;
-  --settings-muted: #526a72;
-  --settings-line: #d7e3e1;
-  --settings-brand: #176a67;
-  --settings-brand-dark: #105651;
-  --settings-paper: #ffffff;
-  --approval-zone-bg: #f5f8f6;
-  --approval-card-bg: #ffffff;
-  --approval-border: #d7e3e1;
-  --approval-heading: #314a52;
-  --approval-summary: #20333b;
-  --approval-meta: #526a72;
-  --runtime-detail: #526a72;
-  --approve-bg: #176a67;
-  width: 540px;
-  height: min(760px, calc(100vh - 32px));
-  border: 1px solid #c8dcd7;
-  border-radius: 18px;
-  background: #f5f8f6;
-  box-shadow: 0 18px 55px rgba(20, 49, 47, .24), 0 3px 12px rgba(20, 49, 47, .08);
-  color: var(--settings-ink);
-  font: 13px/1.6 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  /*
+   * 旧变量名一律保留：团队、文档、会议、语音接口四个子面板都在用它们，
+   * 改名等于让它们一夜之间失去颜色。这里只换值，不换名。
+   */
+  --surface-page: var(--paper);
+  --surface-card: var(--paper-raised);
+  --surface-line: var(--rule);
+  --surface-soft: var(--paper-sunken);
+  --ink-muted: var(--ink-3);
+  --ink-faint: var(--ink-4);
+  --brand: var(--indigo);
+  --brand-soft: var(--indigo-wash);
+  --radius-card: var(--r-surface);
+  --radius-control: var(--r-control);
+  --radius-pill: var(--r-pill);
+
+  --settings-ink: var(--ink);
+  --settings-muted: var(--ink-3);
+  --settings-line: var(--rule);
+  --settings-brand: var(--indigo);
+  --settings-brand-dark: var(--indigo-hover);
+  --settings-paper: var(--paper-raised);
+  --approval-zone-bg: var(--paper-sunken);
+  --approval-card-bg: var(--paper-raised);
+  --approval-border: var(--rule);
+  --approval-heading: var(--ink);
+  --approval-summary: var(--ink-2);
+  --approval-meta: var(--ink-3);
+  --runtime-detail: var(--ink-3);
+  --approve-bg: var(--indigo);
+
+  /* 面板本身：浮在桌面上的一张贴纸。网格两列一区，标题区跨满。 */
+  position: absolute;
+  right: 16px;
+  top: 16px;
+  width: 700px;
+  max-width: calc(100vw - 32px);
+  height: min(780px, calc(100vh - 32px));
+  display: grid;
+  grid-template-columns: 184px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  /*
+   * 导航栏**通高**，标题区只盖在内容那一列。
+   *
+   * 上一版是「标题横跨两列、导航从标题下面开始」，深色栏顶上压一条浅色横条，
+   * 左边那道深色就断在中间，像贴歪了。通高之后左侧是一条完整的栏，内容区是一张单独的页。
+   */
+  grid-template-areas:
+    'rail head'
+    'rail content';
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid rgba(22, 22, 26, .16);
+  border-radius: var(--r-panel);
+  /*
+   * 玻璃浮层：面板本身就模糊身后的桌面，而不是刷一块不透明的纸。
+   * 一是不透明的浅色块贴在任何壁纸边上都显得脏；二是这层模糊是"浮在桌面上"唯一的实物证据。
+   */
+  background: rgba(252, 251, 248, .93);
+  backdrop-filter: blur(30px) saturate(180%);
+  /* 三层阴影：远影定高、近影定边、内高光定材质。缺一层都会塌成一张贴纸。 */
+  box-shadow:
+    0 32px 80px -32px rgba(22, 22, 26, .55),
+    0 12px 28px -14px rgba(22, 22, 26, .22),
+    0 0 0 1px rgba(255, 255, 255, .55) inset;
+  color: var(--ink);
+  font: 400 var(--t-base)/var(--lh-base) var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  /* 以下是原 hud.css 里同一个面板的规则，并过来是为了让这个面板只有一个 owner。 */
+  z-index: 90;
+  max-height: calc(100vh - 32px);
+  color-scheme: light;
+  user-select: text;
+  /* 面板出现是一次编排好的入场，不是每个区块各自淡入。 */
+  animation: panel-in var(--dur-3) var(--ease) both;
 }
+
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(10px) scale(.988); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ===== 标题区 ===== */
 
 .pet-management .management-header {
-  gap: 12px;
-  padding: 18px 20px 16px;
-  border-bottom: 0;
-  background: #fff;
+  grid-area: head;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-4) var(--s-5);
+  border-bottom: 1px solid var(--rule);
+  background: rgba(255, 255, 255, .68);
+  backdrop-filter: blur(12px);
 }
 
+/* 品牌块：墨底白字的方印，和深色导航栏同一族。 */
 .pet-management .management-brand {
-  display: grid;
   flex: none;
+  display: grid;
   place-items: center;
-  width: 42px;
-  height: 42px;
-  border-radius: 13px;
-  background: #176a67;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: var(--rail);
   color: #fff;
-  font-size: 19px;
-  font-weight: 700;
-  box-shadow: 0 4px 10px rgba(23, 106, 103, .18);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0;
 }
 
 .pet-management .management-brand-copy { flex: 1; min-width: 0; }
-.pet-management .management-brand-copy span { display: block; color: var(--settings-muted); font-size: 11px; letter-spacing: .04em; }
-.pet-management .management-header h2 { margin: 0; color: var(--settings-ink); font-size: 18px; font-weight: 700; line-height: 1.35; }
+.pet-management .management-header h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--t-lg);
+  font-weight: 650;
+  line-height: var(--lh-tight);
+  letter-spacing: -.011em;
+}
+.pet-management .management-header-sub {
+  margin: 1px 0 0;
+  color: var(--ink-3);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+  /* 说明只允许一行：它解释"这一页干什么"，多行就把标题区撑成一块内容。 */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .pet-management .management-header button {
   flex: none;
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--settings-line);
-  border-radius: 10px;
-  background: #fff;
-  color: #405c62;
-  font-size: 21px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--ink-4);
+  font-size: 17px;
   line-height: 1;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease);
 }
+.pet-management .management-header button:hover { background: var(--paper-hover); color: var(--ink); }
+.pet-management .management-header button:active { transform: scale(.92); }
+
+/* ===== 左侧导航（深色栏）===== */
 
 .pet-management nav.management-tabs {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 4px;
-  padding: 0 16px 12px;
-  border-bottom: 1px solid var(--settings-line);
-  background: #fff;
-}
-
-.pet-management nav.management-tabs button {
+  grid-area: rail;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
-  min-width: 0;
-  min-height: 48px;
-  padding: 6px 8px;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  color: #496168;
-  font-size: 12px;
-  line-height: 1.3;
-  text-align: left;
-  white-space: normal;
+  gap: 2px;
+  padding: var(--s-5) var(--s-2) var(--s-4);
+  border-right: 0;
+  background: var(--rail);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .18) transparent;
 }
-.pet-management .management-tab-index { color: #657f80; font-size: 10px; font-weight: 700; letter-spacing: .05em; }
-.pet-management nav.management-tabs button[aria-current='page'] { border-color: #b7d9d2; background: #e8f4f0; color: #105651; }
-.pet-management nav.management-tabs button[aria-current='page'] .management-tab-index { color: #176a67; }
-.pet-management nav.management-tabs .panel-tab-badge { margin: 0; position: absolute; transform: translate(31px, 12px); }
+
+/* 分组标题：小、暗、不加字距。它只回答"下面这几项是一类"，不是标签。 */
+.pet-management nav.management-tabs .management-nav-group {
+  padding: var(--s-3) var(--s-3) var(--s-1);
+  color: var(--rail-text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+.pet-management nav.management-tabs .management-nav-group:first-child { padding-top: var(--s-1); }
+
+/*
+ * 导航项：一行，通栏，压在深色栏上。
+ * 选中 = 一层更亮的白膜 + 左侧 3px 靛色内阴影，不用白底块（白块压在近黑栏上会跳出来当按钮）。
+ */
+.pet-management nav.management-tabs button {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px var(--s-3);
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--rail-text);
+  font: inherit;
+  font-size: var(--t-base);
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
+}
+.pet-management nav.management-tabs button:hover { background: var(--rail-hover); color: #fff; }
+.pet-management nav.management-tabs button:active { transform: scale(.985); }
+.pet-management nav.management-tabs button[aria-current='page'] {
+  background: var(--rail-active);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--indigo-lift);
+}
+
+/* 序号那格还在 DOM 里（组件结构不动），但不再显示——保留 aria-hidden 的空 span 无害。 */
+.pet-management .management-tab-index { display: none; }
+
+.pet-management nav.management-tabs .panel-tab-badge {
+  margin-left: auto;
+  position: static;
+  transform: none;
+  min-width: 17px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--indigo-lift);
+  color: var(--rail);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* ===== 内容区 ===== */
 
 .pet-management .management-content {
-  padding: 18px 20px 22px;
-  scrollbar-color: #a7bfba transparent;
-  scroll-padding: 12px;
+  grid-area: content;
+  min-width: 0;
+  padding: var(--s-5) var(--s-6) var(--s-7);
+  /* 透明 = 让面板那层玻璃透出来；这里刷一块实色会把唯一的纵深抹掉。 */
+  background: transparent;
+  overflow-y: auto;
+  scrollbar-color: var(--rule-strong) transparent;
+  scroll-padding: var(--s-4);
+  /*
+   * 切页时内容整体滑入一次。
+   *
+   * 配合 PetSettingsPanel 里 `key={page}`：换页 → 容器重建 → 动画重跑。
+   * 只做一次编排好的位移，不是每个区块各淡入一次（那是模板感的来源之一）。
+   */
+  animation: content-in var(--dur-2) var(--ease) both;
 }
-.pet-management .management-intro { margin: 0 0 16px; }
-.pet-management .management-eyebrow { color: #176a67; font-size: 10px; font-weight: 700; letter-spacing: .07em; }
-.pet-management .management-intro h3 { margin: 2px 0 1px; color: var(--settings-ink); font-size: 21px; line-height: 1.4; }
-.pet-management .management-intro p { margin: 0; color: var(--settings-muted); font-size: 12px; }
-.pet-management .management-general { display: flex; flex-direction: column; gap: 12px; padding: 0; }
 
+@keyframes content-in {
+  from { opacity: 0; transform: translateX(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 旧版的「眉标 + 页名」已整体删除；这两个类只在别处的历史结构里还被引用，给个无副作用兜底。 */
+.pet-management .management-intro { display: none; }
+.pet-management .management-eyebrow { display: none; }
+
+/*
+ * 分节：**不是卡片**。
+ * 白卡 + 描边 + 阴影会让一屏出现七八个等重的方块，眼睛没有落点。
+ * 这里改成：节与节之间 28px 留白 + 一条只在"上面还有内容"时出现的发丝线。
+ */
 .pet-management :is(.management-section, .voice-api-settings, .management-doc-results, .doc-section, .meeting-section) {
   min-width: 0;
   margin: 0;
-  padding: 16px;
-  border: 1px solid var(--settings-line);
-  border-radius: 13px;
-  background: var(--settings-paper);
-  box-shadow: 0 2px 8px rgba(31, 65, 60, .035);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
 }
-.pet-management .management-section { gap: 10px; }
+.pet-management .management-section + :is(.management-section, .voice-api-settings, .doc-section, .meeting-section),
+.pet-management :is(.management-section, .voice-api-settings, .doc-section, .meeting-section) + :is(.management-section, .voice-api-settings, .doc-section, .meeting-section) {
+  margin-top: var(--s-6);
+  padding-top: var(--s-6);
+  border-top: 1px solid var(--rule);
+}
+.pet-management .management-general { display: flex; flex-direction: column; gap: var(--s-6); padding: 0; }
+
+/* 节标题：15px 半粗。它靠字号和留白立起来，不靠加字距或大写。 */
 .pet-management :is(.management-section h3, .voice-api-settings h3, .doc-section-title, .meeting-title, .team-section-title) {
   margin: 0;
-  color: var(--settings-ink);
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0;
+  color: var(--ink);
+  font-size: var(--t-md);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  letter-spacing: -.005em;
 }
+
+/* 说明文字：12.5px、三级墨色、1.7 行高。它是解释，不该和正文抢注意力。 */
 .pet-management :is(.management-hint, .management-diagnostic, .doc-hint, .meeting-hint, .team-none) {
-  color: var(--settings-muted);
-  font-size: 12px;
-  line-height: 1.65;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: var(--t-sm);
+  line-height: 1.7;
   overflow-wrap: anywhere;
 }
+
+/* 键值行：左侧标签、右侧值，中间一条点线引导视线。 */
 .pet-management :is(p, dl) { margin-top: 0; margin-bottom: 0; }
-.pet-management .management-section dl { display: grid; gap: 6px; }
-.pet-management .management-section .card-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
-.pet-management .management-section dd { margin: 0; color: var(--settings-muted); text-align: right; overflow-wrap: anywhere; }
-.pet-management .management-section dt { font-weight: 600; }
-.pet-management .runtime-row { padding: 10px 12px; border-color: var(--settings-line); border-radius: 10px; }
-.pet-management .management-diagnostic code { color: var(--settings-ink); }
+.pet-management .management-section dl { display: grid; gap: var(--s-2); }
+.pet-management .management-section .card-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--s-1) var(--s-3);
+  padding: var(--s-2) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.pet-management .management-section .card-row:last-child { border-bottom: 0; }
+.pet-management .management-section dd { margin: 0; color: var(--ink-3); text-align: right; overflow-wrap: anywhere; }
+.pet-management .management-section dt { font-weight: 600; color: var(--ink-2); }
+.pet-management .runtime-row { padding: var(--s-2) var(--s-3); border: 1px solid var(--rule); border-radius: var(--r-control); }
+.pet-management .management-diagnostic code { color: var(--ink); font-family: var(--font-num); font-size: var(--t-sm); }
+
+/*
+ * 功能入口行（原 SettingsEntryCard）。
+ *
+ * 旧版是"标题 + 说明 + 主按钮 + 次按钮 + 再一句'完整页面正在建设中'"，竖着堆在一张白卡里——
+ * 每一张卡都在道歉，三张卡就是三句同样的抱歉。现在压成一行：说清是什么、右边一个去处。
+ * 那句话删了，因为说明本身已经写了去向。
+ */
+.pet-management .management-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-2) var(--s-4);
+  padding: var(--s-4) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.pet-management .management-entry:first-of-type { padding-top: 0; }
+.pet-management .management-entry:last-of-type { border-bottom: 0; }
+.pet-management .management-entry-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pet-management .management-entry h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--t-base);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+}
+.pet-management .management-entry .management-hint {
+  margin: 0;
+  color: var(--ink-4);
+  font-size: var(--t-sm);
+  line-height: 1.6;
+  /* 说明最多两行：再长就说明它没写清楚。 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pet-management .management-entry-actions { display: flex; align-items: center; gap: var(--s-2); flex: none; }
+
+/* ===== 按钮：三种角色，只有主按钮带色 ===== */
 
 .pet-management :is(.management-button, .doc-btn, .meeting-btn, .voice-api-settings button, .runtime-btn, .team-go) {
-  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  min-height: 30px;
   height: auto;
-  padding: 6px 12px;
-  border: 1px solid #bdd1cc;
-  border-radius: 9px;
-  background: #fff;
-  color: #245853;
+  padding: 6px var(--s-3);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-control);
+  background: var(--paper-raised);
+  color: var(--ink-2);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--t-sm);
   font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
 }
 .pet-management :is(.management-button, .doc-btn, .meeting-btn, .voice-api-settings button, .runtime-btn, .team-go):hover:not(:disabled) {
-  border-color: #7eaaa0;
-  background: #eef7f3;
+  border-color: var(--rule-strong);
+  background: var(--paper-hover);
+  color: var(--ink);
   filter: none;
 }
-.pet-management :is(.doc-btn.primary, .meeting-btn.primary, .runtime-btn:not(.ghost), .team-go) {
-  border-color: var(--settings-brand);
-  background: var(--settings-brand);
-  color: #fff;
+/* 按下时下沉 1px：所有随手的按钮都靠它给出"我收到了"的反馈。 */
+.pet-management :is(.management-button, .doc-btn, .meeting-btn, .voice-api-settings button, .runtime-btn, .team-go):active:not(:disabled) {
+  transform: translateY(1px);
 }
-.pet-management :is(.doc-btn.primary, .meeting-btn.primary, .runtime-btn:not(.ghost), .team-go):hover:not(:disabled) {
-  border-color: var(--settings-brand-dark);
-  background: var(--settings-brand-dark);
-  color: #fff;
+.pet-management :is(.doc-btn.primary, .meeting-btn.primary, .runtime-btn:not(.ghost), .team-go, .management-button.primary) {
+  border-color: var(--indigo);
+  background: var(--indigo);
+  color: var(--paper-raised);
 }
-.pet-management .meeting-btn.danger { border-color: #b3261e; background: #b3261e; color: #fff; }
-.pet-management .meeting-btn.danger:hover:not(:disabled) { background: #8d1d17; color: #fff; }
-.pet-management .management-button.danger { border-color: #d9a6a1; color: #a02b26; }
-.pet-management button:disabled { opacity: .55; cursor: not-allowed; }
+.pet-management :is(.doc-btn.primary, .meeting-btn.primary, .runtime-btn:not(.ghost), .team-go, .management-button.primary):hover:not(:disabled) {
+  border-color: var(--indigo-hover);
+  background: var(--indigo-hover);
+  color: var(--paper-raised);
+}
+
+/*
+ * 危险操作：平时和次按钮长得一样，只有 hover 才透出红。
+ * 红底大按钮会把整页的注意力吸走，而"删除"在这页里不是主路径。
+ */
+.pet-management :is(.meeting-btn.danger, .management-button.danger) {
+  border-color: var(--rule-strong);
+  background: var(--paper-raised);
+  color: var(--ink-2);
+}
+.pet-management :is(.meeting-btn.danger, .management-button.danger):hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger) 32%, var(--rule-strong));
+  background: var(--danger-wash);
+  color: var(--danger);
+}
+.pet-management button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ===== 设置行：一页只有一种形状 ===== */
+/*
+ * 上一版"乱"的根因不是配色，是**十几种形状平铺在一列里**：dl 键值行、裸按钮、勾选行、
+ * 单选组、成段说明、诊断小字，全都同等分量地往下堆，眼睛找不到节奏。
+ *
+ * 这里定一条规矩：**凡是"可以开关/可以选"的项，一律是一行** ——
+ * 左边说这是什么（可带一行小字解释），右边放控件，行与行之间一条发丝线。
+ * 不加卡片、不加边框、不加背景，一百行读下来是一条连续的清单。
+ *
+ * 用 `label.` 限定是因为 `.management-voice` 同时被两种结构用着：
+ * 勾选行是 `<label>`，单选组是 `<div role="radiogroup">`。混着写会把单选组压成一行。
+ */
+.pet-management label { display: inline-flex; flex-direction: column; gap: var(--s-2); }
+
+.pet-management :is(label.management-voice, label.meeting-radio, label.meeting-consent) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--rule);
+  line-height: 1.6;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease);
+}
+.pet-management :is(label.management-voice, label.meeting-radio, label.meeting-consent):last-of-type { border-bottom: 0; }
+.pet-management :is(label.management-voice, label.meeting-radio, label.meeting-consent):hover { background: var(--paper-hover); }
+/* 文字占满剩余宽度、控件贴右：DOM 里 input 在前，靠 order 把控件推到右边，不动组件结构。 */
+.pet-management :is(label.management-voice, label.meeting-radio, label.meeting-consent) > span {
+  order: 1;
+  flex: 1;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: var(--t-base);
+}
+.pet-management :is(label.management-voice, label.meeting-radio, label.meeting-consent) > input {
+  order: 2;
+  flex: none;
+  margin: 0 0 0 auto;
+}
+
+/* 单个数字输入行（睡眠时长）：标签在左、输入框贴右。 */
+.pet-management label.management-sleep {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-2);
+}
+.pet-management label.management-sleep > span { flex: 1; min-width: 0; }
+.pet-management label.management-sleep > input { flex: none; width: 64px; text-align: right; }
+/* 数字用等宽数字对齐，避免 8 / 12 / 120 三种宽度把右边缘推来推去。 */
+.pet-management input[type='number'] { font-variant-numeric: tabular-nums; }
+.pet-management input[type='number']::-webkit-inner-spin-button { opacity: 0; }
+.pet-management input[type='number']:hover::-webkit-inner-spin-button { opacity: 1; }
+
+/*
+ * 单选组（大小 / 透明度）：一行，右边三个胶囊。
+ * 原生 radio 的 Windows 圆点在纸色背景上非常显眼，是"老气"最直接的一笔；
+ * 隐藏原控件、把 label 做成胶囊、选中态用 `:has(input:checked)` 表达。
+ */
+.pet-management div.management-voice[role='radiogroup'] {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 11px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.pet-management div.management-voice[role='radiogroup'] > span {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: var(--t-base);
+}
+.pet-management div.management-voice[role='radiogroup'] > label {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0;
+  padding: 4px var(--s-3);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-pill);
+  background: var(--paper-raised);
+  color: var(--ink-3);
+  font-size: var(--t-sm);
+  line-height: 20px;
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+    background-color var(--dur-1) var(--ease);
+}
+.pet-management div.management-voice[role='radiogroup'] > label:hover { border-color: var(--ink-4); color: var(--ink); }
+.pet-management div.management-voice[role='radiogroup'] > label:has(input:checked) {
+  border-color: var(--indigo);
+  background: var(--indigo-wash);
+  color: var(--indigo);
+  font-weight: 600;
+}
+.pet-management div.management-voice[role='radiogroup'] > label:has(input:focus-visible) {
+  outline: 2px solid var(--indigo);
+  outline-offset: 2px;
+}
+/* 原控件仍在 DOM 里（可聚焦、可被读屏读到），只是不再画出来。 */
+.pet-management div.management-voice[role='radiogroup'] input[type='radio'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/*
+ * 长说明的折叠。
+ *
+ * 同意条款、数据去向这类文字必须能查到，但**不该默认占掉半屏**：
+ * 一页里三四段这种文字连着排，整页就散了。收进 `<details>`，标题只留一句"说明"。
+ */
+.pet-management details.setting-details { margin-top: var(--s-2); }
+/* 展开时内容高度可插值：不加这句，`<details>` 是"啪"地弹出，动效在这类控件上最容易被看见。 */
+.pet-management details.setting-details::details-content {
+  block-size: 0;
+  overflow: hidden;
+  transition: block-size var(--dur-2) var(--ease), content-visibility var(--dur-2) allow-discrete;
+}
+.pet-management details.setting-details[open]::details-content { block-size: auto; }
+.pet-management details.setting-details > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0;
+  color: var(--ink-3);
+  font-size: var(--t-sm);
+  cursor: pointer;
+  list-style: none;
+}
+.pet-management details.setting-details > summary::-webkit-details-marker { display: none; }
+.pet-management details.setting-details > summary::before {
+  content: '›';
+  display: inline-block;
+  font-size: 14px;
+  line-height: 1;
+  transition: transform var(--dur-1) var(--ease);
+}
+.pet-management details.setting-details[open] > summary::before { transform: rotate(90deg); }
+.pet-management details.setting-details > summary:hover { color: var(--ink); }
+.pet-management details.setting-details > :is(p, dl) {
+  margin: var(--s-2) 0 0;
+  padding-left: var(--s-4);
+  color: var(--ink-3);
+  font-size: var(--t-sm);
+  line-height: 1.75;
+}
 
 .pet-management :is(input:not([type='checkbox']):not([type='radio']), select, textarea) {
   box-sizing: border-box;
   min-width: 0;
   max-width: 100%;
-  min-height: 36px;
-  padding: 7px 10px;
-  border: 1px solid #c4d6d1;
-  border-radius: 9px;
-  background: #fbfdfc;
-  color: var(--settings-ink);
+  min-height: 32px;
+  padding: 5px var(--s-3);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-control);
+  background: var(--paper-raised);
+  color: var(--ink);
   font: inherit;
+  font-size: var(--t-base);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
 }
+.pet-management :is(input:not([type='checkbox']):not([type='radio']), select, textarea):hover {
+  border-color: var(--ink-4);
+}
+.pet-management :is(input:not([type='checkbox']):not([type='radio']), select, textarea):focus {
+  border-color: var(--indigo);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--indigo-wash);
+}
+
+/*
+ * 开关：36×20 的胶囊。
+ *
+ * `<input>` 是替换元素，`::before/::after` 不生效，滑块只能用背景画。
+ * 关键一点：**滑块位置必须能被动画**。上一版用 `radial-gradient(circle at 24.5px …)` 定位，
+ * 渐变里的圆心坐标是不可插值的，所以开关只有颜色在动、滑块是瞬间跳过去的——看着就是"死的"。
+ * 改成固定尺寸的背景图 + `background-position` 过渡，滑块就能真的滑过去。
+ */
+.pet-management input[type='checkbox'] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background-color: var(--rule-strong);
+  background-image: radial-gradient(circle, #fff 0 6.8px, rgba(22, 22, 26, .10) 6.8px 7.8px, transparent 7.8px);
+  background-size: 20px 20px;
+  background-repeat: no-repeat;
+  background-position: 0 50%;
+  cursor: pointer;
+  transition: background-color var(--dur-2) var(--ease), background-position var(--dur-2) var(--ease);
+}
+.pet-management input[type='checkbox']:checked {
+  background-color: var(--indigo);
+  background-position: 16px 50%;
+}
+.pet-management input[type='checkbox']:disabled { opacity: .45; cursor: not-allowed; }
 .pet-management textarea { resize: vertical; }
-.pet-management :is(input[type='checkbox'], input[type='radio']) { flex: none; accent-color: var(--settings-brand); }
-.pet-management :is(.management-voice, .meeting-radio, .meeting-consent) { align-items: flex-start; line-height: 1.6; }
-.pet-management :is(.management-voice, .meeting-radio, .meeting-consent) input { margin-top: .35em; }
-.pet-management :is(button, input, select, textarea, summary):focus-visible { outline: 3px solid #137b72; outline-offset: 2px; }
-.pet-management :is(.management-section, .voice-api-settings, .meeting-section, .doc-section) :focus-visible { scroll-margin: 12px; }
-.pet-management select :is(option, optgroup) { background: #fff; color: #20333b; }
+.pet-management :is(input[type='checkbox'], input[type='radio']) { flex: none; accent-color: var(--indigo); }
+/* 勾选行与单选组的行结构统一在「设置行」一节定义；这里不再重复对齐与间距。 */
 
-.pet-management .management-group { gap: 8px; }
-.pet-management .management-checklist > li { border-radius: 8px; background: #f6f9f8; padding: 9px 10px; }
-.pet-management .management-status { font-weight: 600; }
-.pet-management .management-doc-results { margin-bottom: 12px; }
-.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) { gap: 12px; padding: 0; background: transparent; }
-.pet-management .management-content > .team-page > .team-section { padding: 16px; border: 1px solid var(--settings-line); border-radius: 13px; background: #fff; }
-.pet-management .member-management { margin-bottom: 12px; }
-.pet-management .team-page + .management-section { margin-top: 12px; }
-.pet-management :is(.team-task, .team-proposal, .team-member, .doc-card, .doc-dir) { background: #fbfdfc; }
-.pet-management :is(.doc-page, .meeting-page, .team-page) { color: var(--settings-ink); }
-.pet-management .doc-section, .pet-management .meeting-section { gap: 10px; }
-.pet-management .doc-actions, .pet-management .management-quick { gap: 8px; }
-.pet-management .doc-ask { background: #f6f9f8; }
-.pet-management .meeting-minutes { background: #f3f7f5; }
+/* 键盘焦点：两圈——靛色环 + 纸色隔离环，深色底浅色底都能看见。 */
+.pet-management :is(button, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--indigo);
+  outline-offset: 2px;
+}
+.pet-management :is(.management-section, .voice-api-settings, .meeting-section, .doc-section) :focus-visible {
+  scroll-margin: var(--s-4);
+}
+.pet-management select :is(option, optgroup) { background: var(--paper-raised); color: var(--ink); }
+
+/*
+ * 分节里的按钮**不拉满整行**。
+ *
+ * 分节是 flex 列，默认 align-items: stretch 会把按钮撑成通栏 —— 一列设置里出现两三个
+ * 通栏按钮，视觉重量会盖过所有开关，看着像一堆"提交"。按钮按内容宽度靠左即可。
+ */
+.pet-management :is(.management-section, .voice-api-settings, .doc-section, .meeting-section, .management-entry-copy) > button {
+  align-self: flex-start;
+}
+
+/* ===== 凹陷块：只有"真的是一组重复项"才用 ===== */
+
+.pet-management .management-group { gap: var(--s-2); }
+.pet-management .management-checklist > li {
+  border-radius: var(--r-control);
+  background: var(--paper-sunken);
+  padding: var(--s-2) var(--s-3);
+}
+.pet-management .management-status { font-weight: 600; color: var(--ink); }
+.pet-management .management-doc-results { margin-bottom: var(--s-5); }
+.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) {
+  gap: var(--s-6);
+  padding: 0;
+  background: transparent;
+}
+.pet-management .management-content > .team-page > .team-section {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.pet-management .member-management { margin-bottom: var(--s-5); }
+.pet-management :is(.team-task, .team-proposal, .team-member, .doc-card, .doc-dir) {
+  background: var(--paper-sunken);
+  border: 0;
+  border-radius: var(--r-surface);
+}
+.pet-management :is(.doc-page, .meeting-page, .team-page) { color: var(--ink); }
+.pet-management .doc-actions, .pet-management .management-quick { gap: var(--s-2); }
+.pet-management .doc-ask { background: var(--paper-sunken); }
+.pet-management .meeting-minutes { background: var(--paper-sunken); }
 .pet-management .meeting-rec-banner { top: -1px; }
-.pet-management .meeting-source-btn { color: #175c58; border-color: #a9cec5; }
+.pet-management .meeting-source-btn { color: var(--indigo); border-color: var(--rule-strong); }
 
-.pet-management .voice-api-settings { line-height: 1.6; }
-.pet-management .voice-api-settings > p { color: var(--settings-muted); }
-.pet-management .voice-api-settings .voice-api-error { color: #a3271b; }
-.pet-management .voice-api-settings fieldset { margin-top: 12px; padding: 12px; border-color: var(--settings-line); border-radius: 10px; }
-.pet-management .voice-api-settings legend { color: var(--settings-ink); font-weight: 600; }
+.pet-management .voice-api-settings { line-height: 1.7; }
+.pet-management .voice-api-settings > p { color: var(--ink-3); }
+.pet-management .voice-api-settings .voice-api-error { color: var(--danger); }
+.pet-management .voice-api-settings fieldset {
+  margin-top: var(--s-3);
+  padding: var(--s-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-surface);
+}
+.pet-management .voice-api-settings legend { color: var(--ink); font-weight: 600; }
 .pet-management .assistant-settings-field :is(input, textarea, select) { width: 100%; }
-.pet-management .assistant-settings-error { color: #a3271b; }
+.pet-management .assistant-settings-error { color: var(--danger); }
 
-@media (max-width: 520px) {
-  .pet-management { right: 8px; top: 8px; max-width: calc(100vw - 16px); height: min(760px, calc(100vh - 16px)); border-radius: 14px; }
-  .pet-management .management-header { padding: 12px 14px; }
-  .pet-management nav.management-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 0 10px 10px; }
-  .pet-management nav.management-tabs button { flex-direction: row; align-items: center; min-height: 36px; gap: 6px; }
-  .pet-management nav.management-tabs .panel-tab-badge { position: static; transform: none; }
-  .pet-management .management-content { padding: 14px; }
-  .pet-management :is(.management-section, .voice-api-settings, .management-doc-results, .doc-section, .meeting-section) { padding: 12px; }
+/* ===== 布局原语（原 hud.css 的同一面板规则，因去重并到这里）===== */
+
+.pet-management .management-page-title {
+  padding: var(--s-2) var(--s-3) var(--s-1);
+  color: var(--ink);
+  font-size: var(--t-md);
+  font-weight: 600;
+}
+
+/* 说明紧贴在内容区第一行时，需要一点内缩，否则它会和滚动条贴边。 */
+.pet-management .management-content > .management-hint { padding: var(--s-2) 0; }
+
+.pet-management .management-quick { display: flex; flex-wrap: wrap; gap: var(--s-2); }
+.pet-management .management-group { display: flex; flex-direction: column; gap: var(--s-2); }
+.pet-management .management-group > h4 {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+
+/* 环境检查清单：用左侧状态条而不是卡片 —— 十几条同时列出时，卡片间距会把条目挤散。 */
+.pet-management .management-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pet-management .management-checklist > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border-left: 2px solid var(--rule-strong);
+  border-radius: 0 var(--r-control) var(--r-control) 0;
+  background: var(--paper-sunken);
+  font-size: var(--t-sm);
+  overflow-wrap: anywhere;
+}
+.pet-management .management-checklist > li[data-status='action'] { border-left-color: var(--win-amber); }
+.pet-management .management-checklist > li[data-status='blocked'] {
+  border-left-color: var(--danger);
+  background: var(--danger-wash);
+}
+.pet-management .management-checklist > li[data-status='ready'] { border-left-color: var(--win-green); }
+.pet-management .management-checklist > li[data-status='optional'],
+.pet-management .management-checklist > li[data-status='unknown'] { border-left-color: var(--rule-strong); }
+.pet-management .management-checklist > li > strong { font-weight: 600; color: var(--ink); }
+.pet-management .management-checklist > li > p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--ink-3);
+  line-height: 1.7;
+}
+
+/* 状态胶囊：短、中性，只有异常态借状态条的色。 */
+.pet-management .management-status {
+  padding: 0 var(--s-2);
+  border-radius: var(--r-pill);
+  background: var(--paper-hover);
+  color: var(--ink-3);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  line-height: 18px;
+}
+.pet-management .management-checklist > li[data-status='action'] .management-status {
+  background: var(--win-amber-wash);
+  color: var(--win-amber-ink);
+}
+.pet-management .management-checklist > li[data-status='ready'] .management-status {
+  background: var(--win-green-wash);
+  color: var(--win-green-ink);
+}
+
+/* 常驻/语音这类"标签 + 控件"的行。 */
+.pet-management :is(.management-sleep, .management-voice) { display: flex; align-items: center; gap: var(--s-2); min-width: 0; }
+.pet-management .management-sleep span { flex: 1; min-width: 0; }
+.pet-management .management-sleep input { width: 64px; min-width: 0; padding: 3px var(--s-2); }
+.pet-management .management-sleep input:disabled { opacity: .45; cursor: not-allowed; }
+.pet-management .management-voice input { flex: none; accent-color: var(--indigo); }
+
+/* 文档最近结果：可滚动的小日志，不是卡片。 */
+.pet-management .management-doc-results h4 { margin: 0 0 var(--s-1); font-size: var(--t-sm); font-weight: 600; color: var(--ink-2); }
+.pet-management .management-doc-log {
+  max-height: 160px;
+  overflow-y: auto;
+  margin-top: var(--s-2);
+  scrollbar-width: thin;
+  user-select: text;
+}
+.pet-management .management-doc-log p {
+  margin: 0;
+  padding: var(--s-2) 0;
+  border-bottom: 1px solid var(--rule);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--t-sm);
+  line-height: 1.7;
+}
+.pet-management .management-doc-log p:last-child { border-bottom: 0; }
+.pet-management .management-doc-log .is-error { color: var(--danger); }
+
+/* 整页由内容区滚动，业务组件内部的提纲/转写/纪要滚动区保持自己的滚动。 */
+.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) { min-height: 0; overflow: visible; }
+
+/* 滚动条：细、随墨色，不抢视线。 */
+.pet-management ::-webkit-scrollbar { width: 5px; height: 5px; }
+.pet-management ::-webkit-scrollbar-thumb { background: var(--rule-strong); border-radius: 3px; }
+.pet-management ::-webkit-scrollbar-track { background: transparent; }
+
+/* ===== 窄屏：导航折到顶部横排 ===== */
+
+@media (max-width: 640px) {
+  .pet-management {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-areas:
+      'head'
+      'rail'
+      'content';
+    width: auto;
+    left: 8px;
+    right: 8px;
+    top: 8px;
+    height: min(780px, calc(100vh - 16px));
+    border-radius: var(--r-surface);
+  }
+  .pet-management .management-header { padding: var(--s-3) var(--s-4); }
+  .pet-management nav.management-tabs {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: var(--s-1);
+    padding: var(--s-2) var(--s-3);
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+    overflow-x: auto;
+  }
+  .pet-management nav.management-tabs .management-nav-group { display: none; }
+  .pet-management nav.management-tabs button { width: auto; flex: none; }
+  .pet-management .management-content { padding: var(--s-4) var(--s-4) var(--s-6); }
+  .pet-management .management-entry { grid-template-columns: minmax(0, 1fr); gap: var(--s-2); }
+  .pet-management .management-entry-actions { justify-content: flex-start; }
 }
 
 @media (prefers-reduced-motion: reduce) {

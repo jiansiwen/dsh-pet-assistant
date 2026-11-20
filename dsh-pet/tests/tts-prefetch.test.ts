@@ -32,8 +32,7 @@ function makeEngine() {
 
 const api: ResolvedVoiceApi = {
   id: '00000000-0000-4000-8000-000000000000', kind: 'tts', name: 'mimo', endpoint: 'https://example.com/v1/chat/completions',
-  model: 'mimo-v2.5-tts', voice: '冰糖', apiKey: 'k', provider: 'mimo',
-}
+  model: 'mimo-v2.5-tts', voice: '冰糖', voiceDesign: '', apiKey: 'k', provider: 'mimo' }
 
 const tick = (ms = 20) => new Promise(resolve => setTimeout(resolve, ms))
 

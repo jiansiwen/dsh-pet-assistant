@@ -9,8 +9,7 @@ import type { ResolvedVoiceApi } from '../src/voice-api-types.ts'
 
 const API: ResolvedVoiceApi = {
   id: 'p1', kind: 'tts', name: '我的服务', endpoint: 'https://example.com/v1',
-  model: 'tts-1', voice: 'alloy', apiKey: 'sk-test', provider: 'openai',
-}
+  model: 'tts-1', voice: 'alloy', voiceDesign: '', apiKey: 'sk-test', provider: 'openai' }
 
 class Lines implements TtsTransport {
   readonly lines: string[] = []

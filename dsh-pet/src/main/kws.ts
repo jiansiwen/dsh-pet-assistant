@@ -224,6 +224,7 @@ try {
   parentPort.postMessage({ type: 'error', stage: 'load', error: String((error && error.message) || error) })
 }
 parentPort.on('message', (msg) => {
+  if (msg && msg.type === 'shutdown') { parentPort.close(); return }
   if (spotter === null || !msg || msg.type !== 'pcm') return
   try {
     push(msg.samples)
@@ -334,7 +335,14 @@ export function startKws(options: KwsOptions): KwsSession {
     pendingSamples = 0
     const current = worker
     worker = null
-    try { void current?.terminate() } catch { /* 已退出 */ }
+    // 优雅退出：terminate 会强杀正在原生解码的线程，sherpa-onnx 在这种时机可能直接崩进程。
+    // 先通知 worker 自己关（等当前这块解码完），3 秒还没退才兜底 terminate。
+    if (current) {
+      try { current.postMessage({ type: 'shutdown' }) } catch { /* 已退出 */ }
+      const fallback = setTimeout(() => { try { void current.terminate() } catch { /* 已退出 */ } }, 3000)
+      fallback.unref?.()
+      current.on('exit', () => clearTimeout(fallback))
+    }
   }
 
   try {

@@ -212,6 +212,13 @@ test('真实设置持久化：默认值、上下限、非法类型和数值归�
   const { loadSettings, saveSettings } = await import('../src/main/settings.ts')
   assert.equal(loadSettings().idleSleepMinutes, 2)
   assert.equal(loadSettings().sleepMinutes, 20)
+  // 讲解形态默认是 source（照原文念稿）：用户第一次用就是"跟真人开会一样念稿"，
+  // 而不是每段先等一次模型。这条单独钉住 —— e2e 都是显式切模式，默认值没有别的地方断言。
+  assert.equal(loadSettings().docSpeechMode, 'source')
+  // 设置文件是用户可以手改的：认不出的值必须退回 source，不能留 undefined 让调用方各自猜默认。
+  assert.equal(saveSettings({ docSpeechMode: 'ai' }).docSpeechMode, 'ai')
+  assert.equal(saveSettings({ docSpeechMode: 'nonsense' as never }).docSpeechMode, 'source')
+  saveSettings({ docSpeechMode: 'source' })
   assert.equal(saveSettings({ sleepMinutes: 1 }).sleepMinutes, 1)
   assert.equal(saveSettings({ sleepMinutes: 120 }).sleepMinutes, 120)
   for (const value of [0, 121, -1, 1.5, NaN, Infinity, '20', null]) {

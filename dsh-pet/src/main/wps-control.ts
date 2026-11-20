@@ -174,7 +174,11 @@ export interface WpsController {
   /** 不动作，只看"现在能不能继续同步讲解"。 */
   status(session: WpsSession): Promise<WpsSyncStatus>
   /** 讲解推进到第 N 页时调用：跳页并给出同步状态。失败时 state 为 paused。 */
-  syncTo(session: WpsSession, page: number): Promise<WpsSyncStatus>
+  /**
+   * 跳到第 page 页。`expectText` 是这一段的原文：给了就拿跳页后读回的文字做一次比对，
+   * 对不上不返回 in-sync（见 `matchesPageText`）。
+   */
+  syncTo(session: WpsSession, page: number, expectText?: string): Promise<WpsSyncStatus>
   dispose(): void
 }
 
@@ -194,8 +198,89 @@ export interface WpsControllerOptions {
 
 const defaultSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
+// ---------------------------------------------------------------------------
+// 可用性探测缓存
+//
+// 探测要拉起辅助进程（首次约 8 秒），所以结果必须缓存，否则每次讲解都要等一次启动。
+// 但**成功和失败不能共用一个有效期**：
+// 用户的典型顺序是"先开桌宠、再开 WPS"。桌宠启动那一刻探测失败，如果把"不可用"也缓存
+// 10 分钟，用户打开 WPS 之后这十分钟里每次讲解都会报"没在注册表里找到可用的 WPS" ——
+// 真机上就是这么撞的。所以失败只做一个几秒的抖动窗口（防同一秒内连续拉起辅助进程），
+// 过期立刻重探；成功才长期缓存。
+// ---------------------------------------------------------------------------
+
+/** 探测成功后的复用时长：10 分钟。 */
+export const WPS_PROBE_TTL_MS = 10 * 60_000
+/** 探测失败后的复用时长：只防抖，不做结论。 */
+export const WPS_PROBE_FAIL_TTL_MS = 3_000
+
+export interface WpsProbeCache {
+  readonly at: number
+  readonly available: boolean
+  /** 这次结论是"探测失败/抛异常"兜出来的，还是真的问到了。两者过期策略不同。 */
+  readonly failed: boolean
+}
+
+/**
+ * 读缓存：有效就返回结论，失效返回 `null`（调用方去重探）。
+ *
+ * 纯函数（时间由调用方给），因为"失败只缓存 3 秒"这条规则没法在真机上稳定复现。
+ */
+export function cachedWpsProbe(cache: WpsProbeCache | null, now: number): boolean | null {
+  if (cache === null) return null
+  const ttl = cache.failed ? WPS_PROBE_FAIL_TTL_MS : WPS_PROBE_TTL_MS
+  return now - cache.at < ttl ? cache.available : null
+}
+
+/**
+ * 记一次探测结果。`located` 为 `null` 表示探测本身抛了异常（等同于失败，但同样只缓存 3 秒）。
+ *
+ * 失败时**不保留旧的可用结论**：上次成功说明那时装了 WPS，这次问不到说明现在有问题
+ * （被卸载、辅助进程挂了），保守报"暂不可用"并让调用方 3 秒后重探，比抱着旧的成功
+ * 结论去拉起一个不存在的进程要好。
+ */
+export function nextWpsProbe(located: { ok: boolean } | null, now: number): WpsProbeCache {
+  const available = located?.ok === true
+  return { at: now, available, failed: !available }
+}
+
+
 /** 打开后轮询找窗口时，哪些失败值得继续等（WPS 还在加载 / 标签还没切过来）。 */
 const RETRY_WHILE_OPENING = new Set(['window-not-found', 'identity-changed'])
+
+/** 比对时只看"非空白字符"：PDF 提起的文字会带换行、右边界断行，空格位置完全不可信。 */
+const squeeze = (text: string): string => text.replace(/\s+/gu, '')
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`
+}
+
+/** 这一段拿去做比对的"针"。太短（<8 个非空白字符）就不比 —— 三个字能命中任何一页。 */
+function needleOf(expectText: string | undefined): string | null {
+  if (expectText === undefined) return null
+  const squeezed = squeeze(expectText)
+  return squeezed.length >= 8 ? squeezed : null
+}
+
+/**
+ * 读回的文字里有没有这一段原文。
+ *
+ * 规则（按 lead 的要求）：先取该段前 20 个非空白字符，找不到再放宽到 12 个。
+ *
+ * **口径要说清**：`pageText` 在 WPS 12.x 上是 Ctrl+A 抓的整份文档，不是当前页。所以"命中"
+ * 只能证明"这份文档里有这一段"，**不能**证明"现在停在第 N 页"；页码本身由 Ctrl+G 的绝对
+ * 跳转保证。"未命中"则是硬证据：这份文档里根本没有这段原文（拿错文件/换了文件），必须停。
+ */
+export function matchesPageText(pageText: string, expectText: string): boolean {
+  const hay = squeeze(pageText)
+  const needle = squeeze(expectText)
+  if (hay === '' || needle === '') return false
+  for (const length of [20, 12]) {
+    const probe = needle.slice(0, length)
+    if (probe.length >= 8 && hay.includes(probe)) return true
+  }
+  return false
+}
 
 export function createWpsController(options: WpsControllerOptions): WpsController {
   const platform = platformOf(options.platform ?? process.platform)
@@ -219,6 +304,23 @@ export function createWpsController(options: WpsControllerOptions): WpsControlle
     const base: ActionEvidence = { action: 'locate', platform }
     if (platform === 'win32') {
       const a = actions() as WinDesktopActions
+      // 注册表可能指向另一个已安装版本，而单实例 WPS 会把新进程交接给正在运行的版本。
+      // 优先按"正在运行的进程"认安装目录，启动与窗口身份才一致；没在运行再查注册表。
+      const running = await a.runningWpsPaths()
+      if (running.ok) {
+        const order = ['wps.exe', 'wpp.exe', 'et.exe', 'wpspdf.exe']
+        const sorted = [...running.value].sort((x, y) =>
+          order.indexOf(path.win32.basename(x).toLowerCase()) - order.indexOf(path.win32.basename(y).toLowerCase()))
+        for (const raw of sorted) {
+          const file = path.win32.normalize(raw.trim().replace(/^"+|"+$/g, ''))
+          if (!order.includes(path.win32.basename(file).toLowerCase()) || !exists(file)) continue
+          const install: WpsInstall = {
+            platform: 'win32', executable: file, installDir: path.win32.dirname(file),
+            source: 'running-process', version: WIN_VERSION_RE.exec(file)?.[1],
+          }
+          return ok(install, { ...base, method: install.source })
+        }
+      }
       const reg = await a.readWpsRegistry()
       if (!reg.ok) return reg
       const install = resolveWpsInstallWin(reg.value, exists)
@@ -341,9 +443,29 @@ export function createWpsController(options: WpsControllerOptions): WpsControlle
 
     status,
 
-    async syncTo(session, page) {
+    async syncTo(session, page, expectText) {
       const r = await gotoPage(session, page)
       if (!r.ok) return { state: 'paused', reason: pauseReasonOf(r.error), error: r.error, evidence: r.evidence }
+      const readBack = r.value.pageText
+      const needle = needleOf(expectText)
+      if (needle !== null && readBack !== undefined) {
+        const hit = matchesPageText(readBack, expectText ?? '')
+        // 每次跳页都留一行证据：目标页、读回文本前 40 字、是否匹配。
+        console.log(`[dsh-pet] WPS 跳页 page=${page} 读回「${clip(readBack, 40)}」${hit ? '命中' : '未命中'}本段原文`)
+        if (!hit) {
+          const error: ActionError = {
+            code: 'unsupported',
+            detail: 'page-mismatch',
+            message: `WPS 没跳到第 ${page} 页（读回的内容里找不到这一段原文）`,
+            guidance: '把 WPS 切到前台、确认显示的是这份文档；讲解可以从这一段重新开始',
+          }
+          return { state: 'paused', reason: 'error', error, evidence: r.evidence }
+        }
+        return { state: 'in-sync', position: r.value, foreground: r.evidence.foregroundAfter, evidence: r.evidence }
+      }
+      if (needle !== null && readBack === undefined) {
+        console.log(`[dsh-pet] WPS 跳页 page=${page}：读回文本不可用，无原文可比（绝对跳转已由 Ctrl+G 完成）`)
+      }
       return { state: 'in-sync', position: r.value, foreground: r.evidence.foregroundAfter, evidence: r.evidence }
     },
 

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { copyFileSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { z } from 'zod'
+import { checkMailConfig, readMailConfigView, saveMailConfig } from './mail-config.ts'
 
 export interface AssistantAgentSettings {
   name: string
@@ -45,8 +46,18 @@ const wecomRequestSchema = z.object({
 const reminderRequestSchema = reminderSchema.extend({ expectedRevision: revisionSchema }).strict()
 const agentRequestSchema = z.object({ expectedRevision: revisionSchema, ...agentShape }).strict().refine(pairedModel)
 const reconnectSchema = z.object({ expectedRevision: revisionSchema }).strict()
+/** 邮箱配置走独立文件（mail.json + mail.secret），没有 settings revision；密码空=沿用已保存的授权码。 */
+const MAIL_ROUTE = '/companion/v1/settings/mail'
+const mailRequestSchema = z.object({
+  address: z.string().max(320).trim(),
+  smtpHost: z.string().max(255).trim(),
+  smtpPort: z.number().int().min(1).max(65_535),
+  imapHost: z.string().max(255).trim(),
+  imapPort: z.number().int().min(1).max(65_535),
+  password: z.string().max(4096).optional(),
+}).strict()
 const routes = ['/companion/v1/settings', '/companion/v1/settings/wecom', '/companion/v1/settings/reminders',
-  '/companion/v1/settings/agent', '/companion/v1/settings/wecom/reconnect'] as const
+  '/companion/v1/settings/agent', '/companion/v1/settings/wecom/reconnect', MAIL_ROUTE] as const
 const envelopeSchema = z.object({ method: z.enum(['GET', 'POST']), pathname: z.enum(routes) }).strict()
 const cipherSchema = z.string().min(4).max(65536).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/)
 const journalSchema = z.object({ hadSettings: z.boolean(), hadWecom: z.boolean(), hadSecret: z.boolean(), replaceSecret: z.boolean() }).strict()
@@ -291,8 +302,37 @@ export class AssistantSettings {
       this.check()
       if (!envelopeSchema.safeParse({ method, pathname }).success) throw invalid()
       if (method === 'GET') {
-        if (pathname !== routes[0] || !z.union([z.undefined(), z.null(), z.object({}).strict()]).safeParse(body).success) throw invalid()
+        if (!z.union([z.undefined(), z.null(), z.object({}).strict()]).safeParse(body).success) throw invalid()
+        if (pathname === MAIL_ROUTE) return { status: 200, body: { ok: true, mail: readMailConfigView(this.options.home) } }
+        if (pathname !== routes[0]) throw invalid()
         return { status: 200, body: this.snapshot() }
+      }
+      if (pathname === MAIL_ROUTE) {
+        const parsed = mailRequestSchema.safeParse(body)
+        if (!parsed.success) throw invalid()
+        if (process.platform !== 'win32' && !this.options.encrypt && (parsed.data.password ?? '') !== '') {
+          throw new SettingsError(503, 'CREDENTIALS_UNSUPPORTED', '当前系统不支持修改授权码，请在 Windows 上配置。')
+        }
+        if (this.busy) throw new SettingsError(409, 'SETTINGS_BUSY', '设置正在保存或重连，请稍后刷新重试。')
+        this.busy = true
+        try {
+          // 校验复用 mail-config 的同一套规则：表单放过的输入必须能被值守/发信层接住。
+          const checked = checkMailConfig({
+            address: parsed.data.address,
+            smtphost: parsed.data.smtpHost,
+            smtpport: String(parsed.data.smtpPort),
+            imaphost: parsed.data.imapHost,
+            imapport: String(parsed.data.imapPort),
+            password: parsed.data.password ?? '',
+          })
+          if (!checked.ok) throw new SettingsError(422, 'INVALID_INPUT', checked.reason)
+          const saved = await saveMailConfig({
+            home: this.options.home,
+            ...(this.options.encrypt ? { encrypt: this.options.encrypt } : {}),
+          }, checked.value)
+          if (!saved.ok) throw new SettingsError(422, 'SAVE_FAILED', saved.reason)
+          return { status: 200, body: { ok: true, mail: readMailConfigView(this.options.home) } }
+        } finally { this.busy = false }
       }
       if (pathname === routes[0]) throw invalid()
       const schema = pathname === routes[1] ? wecomRequestSchema : pathname === routes[2] ? reminderRequestSchema

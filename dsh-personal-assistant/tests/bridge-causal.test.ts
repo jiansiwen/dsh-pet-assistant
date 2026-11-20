@@ -125,19 +125,18 @@ describe('settleFromEvents：因果折叠的纯逻辑', () => {
     if (outcome.kind === 'failed') assert.equal(outcome.attribution, 'mixed')
   })
 
-  test('来源未知的其他消息 → uncertain（failed，但不标记 mixed）', () => {
-    const events: Ev[] = [
-      turnStart(1),
-      userMsg('m1'),
-      userMsg('x', 'mystery-producer'),
-      assistantMsg(1, 1, '回答'),
-      turnEnd(1, 'completed'),
-    ]
-    const outcome = settleFromEvents(events, { messageId: 'm1' })
-    assert.equal(outcome.kind, 'failed')
-    if (outcome.kind === 'failed') {
-      assert.notEqual(outcome.attribution, 'mixed')
-      assert.match(outcome.error, /来源不明|分开/)
+  test('有名字的非 user 来源都是注入上下文，不算混入（白名单永远追不上新注入）', () => {
+    for (const kind of ['skill-catalog', 'goal', 'dsh-rewind', 'model-selection', 'tool-jobs', 'compact-checkpoint', 'mystery-producer']) {
+      const events: Ev[] = [
+        turnStart(1),
+        userMsg('m1'),
+        userMsg(`ctx-${kind}`, kind),
+        assistantMsg(1, 1, '回答'),
+        turnEnd(1, 'completed'),
+      ]
+      const outcome = settleFromEvents(events, { messageId: 'm1' })
+      assert.equal(outcome.kind, 'settled', `source.kind=${kind} 不该被判来源不明`)
+      if (outcome.kind === 'settled') assert.equal(outcome.reply, '回答')
     }
   })
 
@@ -161,6 +160,19 @@ describe('settleFromEvents：因果折叠的纯逻辑', () => {
       assert.equal(outcome.kind, 'settled', `source.kind=${kind} 不该判 mixed`)
       if (outcome.kind === 'settled') assert.equal(outcome.reply, '回答')
     }
+  })
+
+  test('v4 命名插件来源（plugin:dsh-better-sidebar）也是非用户注入，不算来源不明', () => {
+    const events: Ev[] = [
+      turnStart(1),
+      userMsg('m1'),
+      userMsg('side-injection', 'plugin:dsh-better-sidebar'),
+      assistantMsg(1, 1, '回答'),
+      turnEnd(1, 'completed'),
+    ]
+    const outcome = settleFromEvents(events, { messageId: 'm1' })
+    assert.equal(outcome.kind, 'settled', '插件上下文注入不该让宠物回复被判来源不明')
+    if (outcome.kind === 'settled') assert.equal(outcome.reply, '回答')
   })
 
   test('消息没进入模型（无匹配 user/message）→ failed 且不重试', () => {

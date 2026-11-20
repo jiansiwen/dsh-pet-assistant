@@ -6,12 +6,13 @@
  */
 import assert from 'node:assert/strict'
 import { EventEmitter, once } from 'node:events'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { after, afterEach, before, beforeEach, mock, test } from 'node:test'
 import { setImmediate as nextTurn } from 'node:timers/promises'
+import { DOC_CONTINUE_ACKS, DOC_RESUME_ACKS, DOC_STOP_ACKS, DOC_THINKING_ACKS } from '../src/main/greetings.ts'
 import type { BridgeCallbacks, ChatReply } from '../src/main/harness.ts'
 import type { InterruptLevel, SpeechRequest } from '../src/main/speech.ts'
 import { Narrator, type NarratorHooks, type TtsTransport, type TtsWorkerEvent } from '../src/main/tts.ts'
@@ -62,6 +63,10 @@ let bridgeCallbacks: BridgeCallbacks
 let initialAutoApproval: unknown
 /** 主进程讲解前会查一次成员目录；测试按需返回“小会”。 */
 let presentationMembers: { enabled: boolean; members: Array<{ profile: Record<string, unknown> }> } = { enabled: true, members: [] }
+/** 文档静默预读是否成功：默认 false，让既有源模式用例继续走"附原文"兜底；新用例置 true 验证只发问题。 */
+let docPreloadOk = false
+const docPreloads: Array<{ assistantId: string; docKey: string; text: string }> = []
+const docCloses: Array<{ assistantId: string; docKey: string }> = []
 const sessionCommands: SessionCommand[] = []
 const desktopReplies: Array<{ id: string; ok: boolean; result?: unknown; error?: string }> = []
 const chats: Array<{
@@ -70,6 +75,7 @@ const chats: Array<{
   signal?: AbortSignal
   onDelta?: (text: string) => void
   bindingId?: string
+  docKey?: string
   resolve: (reply: ChatReply) => void
 }> = []
 class FakeBridge {
@@ -83,9 +89,10 @@ class FakeBridge {
     sessionCommands.push(command)
     return { ok: true }
   }
-  chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string): Promise<ChatReply> {
+  chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string,
+    options?: { cancelOnAbort?: boolean; docKey?: string }): Promise<ChatReply> {
     const deferredReply = deferred<ChatReply>()
-    chats.push({ text, assistantId, signal, onDelta, bindingId, resolve: deferredReply.resolve })
+    chats.push({ text, assistantId, signal, onDelta, bindingId, docKey: options?.docKey, resolve: deferredReply.resolve })
     chatEvents.emit('chat')
     return deferredReply.promise
   }
@@ -94,6 +101,15 @@ class FakeBridge {
     if (route === '/companion/v1/desktop/claim') return claimDesktopCommand()
     // 讲解/纪要会先查有没有会议+文档成员；默认没有，按用例返回。
     if (route === '/companion/v1/members') return { status: 200, body: presentationMembers }
+    // 文档预读/关闭是独立文档会话通道，不算桌面命令回执，不进 desktopReplies。
+    if (route === '/companion/v1/members/doc-preload') {
+      docPreloads.push(body as unknown as { assistantId: string; docKey: string; text: string })
+      return { status: 200, body: { ok: docPreloadOk } }
+    }
+    if (route === '/companion/v1/members/doc-close') {
+      docCloses.push(body as unknown as { assistantId: string; docKey: string })
+      return { status: 200, body: { ok: true } }
+    }
     desktopReplies.push(body as { id: string; ok: boolean; result?: unknown; error?: string })
     return { status: desktopResultStatus, body: {} }
   }
@@ -145,8 +161,15 @@ mock.module('../src/main/office-view-window.ts', {
     registerIpc() { return () => {} }
   } },
 })
+// 探测缓存的判定必须用**真实现**：接手替身时如果在这里重抄一份规则，产品一改就悄悄漂移。
+// 只把"拉起真实辅助脚本"的那部分换成替身。
+const realWpsControl = await import('../src/main/wps-control.ts')
 mock.module('../src/main/wps-control.ts', {
   namedExports: {
+    cachedWpsProbe: realWpsControl.cachedWpsProbe,
+    nextWpsProbe: realWpsControl.nextWpsProbe,
+    WPS_PROBE_TTL_MS: realWpsControl.WPS_PROBE_TTL_MS,
+    WPS_PROBE_FAIL_TTL_MS: realWpsControl.WPS_PROBE_FAIL_TTL_MS,
     // 端到端不得拉起真实 WPS 辅助脚本：替身一律报"未安装"，只记录被要求打开的真实路径。
     createWpsController: () => ({
       platform: 'win32', unverifiedOnDevice: false,
@@ -320,7 +343,7 @@ mock.module('electron', {
     },
     dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [authorized] }),
       showMessageBox: async (options: Record<string, unknown>) => { meetingPresentationDialogs.push(options); return confirmMeetingPresentation() } },
-    globalShortcut: { register: () => true, unregisterAll() {} },
+    globalShortcut: { register: () => true, unregister() {}, unregisterAll() {} },
     Menu: { buildFromTemplate: () => ({ popup() {} }) },
     shell: {
       openPath: () => { throw new Error('文档测试不得打开外部应用') },
@@ -395,12 +418,23 @@ async function chatAt(index: number): Promise<(typeof chats)[number]> {
   while (chats.length <= index) await once(chatEvents, 'chat', { signal: AbortSignal.timeout(2000) })
   return chats[index]
 }
+const DOC_ACK_TEXTS = new Set<string>([...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS])
+function playingText(): string {
+  return playing ? Buffer.from(playing.b64, 'base64').toString('utf8') : ''
+}
+/** 讲解即时反馈短句（好的你说/稍等我想一下/继续）是产品行为，测试关心的是正文：先放掉它们。 */
+function drainDocAcks(): void {
+  while (playing && DOC_ACK_TEXTS.has(playingText())) finishSentence()
+}
 function finishSentence(): string {
-  const current = playing
-  assert.ok(current, '没有等待完成的音频句子')
-  playing = null
-  deliver({ finished: { id: current.id } })
-  return Buffer.from(current.b64, 'base64').toString('utf8')
+  for (;;) {
+    const current = playing
+    assert.ok(current, '没有等待完成的音频句子')
+    const text = Buffer.from(current.b64, 'base64').toString('utf8')
+    playing = null
+    deliver({ finished: { id: current.id } })
+    if (!DOC_ACK_TEXTS.has(text)) return text
+  }
 }
 async function startExplanation(from = 0): Promise<(typeof chats)[number]> {
   const chatIndex = chats.length
@@ -447,12 +481,19 @@ beforeEach(async () => {
   claimDesktopCommand = async () => ({ status: 200, body: { claimed: true } })
   desktopResultStatus = 200
   presentationMembers = { enabled: true, members: [] }
+  docPreloadOk = false
+  docPreloads.length = 0
+  docCloses.length = 0
   wpsInstalled = false
   wpsOpens.length = 0
   meetingPresentationDialogs.length = 0
   readingViews.length = 0
   fakeMeetingTranscription = false
-  await invoke('save-settings', { meetingDocumentAutoApprove: false })
+  // 讲解形态钉在 ai：这套 e2e 考察的是"逐段先向模型要一段讲解"的既有链路（换段、插话、
+  // 续讲、进度落盘、部分完成都建立在这条链上）。产品默认已经改成 source（照原文念稿），
+  // 而那不是这批用例的对象 —— 显式声明模式，免得将来默认值一动就整片红。
+  // 原文朗读模式由文件末尾「原文朗读」那两条用例单独覆盖。
+  await invoke('save-settings', { meetingDocumentAutoApprove: false, docSpeechMode: 'ai', memberHandover: false })
 })
 afterEach(async () => {
   await prompt('结束讲解')
@@ -1057,6 +1098,61 @@ test('等待时文档变化或会话换绑不会启动独立讲解', async () =>
   bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session } })
 })
 
+test('等待开讲不受命令受理时限限制：受理期过后会话空闲仍开讲', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '短受理期', command: 'document.presentation.start',
+    payload: { bindingId: session.bindingId, documentPath }, expiresAt: Date.now() + 400 } })
+  for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === '短受理期'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(desktopReplies.find(item => item.id === '短受理期')?.ok, true)
+  // 命令受理期（回执时限）已过，但等待开讲的宽限期仍在：会话空闲后必须照常开讲。
+  await new Promise(resolve => setTimeout(resolve, 600))
+  assert.equal(narrator.requests.length, 0)
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing, '受理期过后等待开讲仍应在会话空闲时开始，而不是报讲解超时')
+})
+
+test('受理期过后文档变化仍不会启动独立讲解', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'running' } })
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '短受理期变更', command: 'document.presentation.start',
+    payload: { bindingId: session.bindingId, documentPath }, expiresAt: Date.now() + 400 } })
+  for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === '短受理期变更'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  await new Promise(resolve => setTimeout(resolve, 600))
+  writeFileSync(documentPath, '受理期过后内容已变更。', 'utf8')
+  bridgeCallbacks.onEvent?.({ type: 'session/update', payload: { ...session, status: 'idle' } })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  const status = await independentCommand('变更后状态', 'document.presentation.control', { action: 'status' })
+  assert.equal((status.result as { state: string }).state, 'failed')
+  assert.equal(chats.length, 0)
+  assert.equal(narrator.requests.length, 0)
+})
+
+test('桌面开录不自动打开设置页；出声讲解开始时收起管理面板', async () => {
+  confirmMeetingPresentation = async () => ({ response: 0 })
+  let meetingId = ''
+  try {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '无页面开录', command: 'meeting.recording.start',
+      payload: { bindingId: session.bindingId, name: '无页面会议', sources: 'mic', retentionDays: 30 }, expiresAt: Date.now() + 10_000 } })
+    for (let i = 0; i < 100 && sent('meeting-command').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    const request = sent<{ requestId: string; consent: typeof meetingConsent }>('meeting-command').at(-1)!
+    const started = await invoke<{ ok: boolean; meetingId: string }>('meeting-start', request.consent, request.requestId)
+    assert.equal(started.ok, true)
+    meetingId = started.meetingId
+    assert.equal(sent('settings-open').length, 0, '开录不再自动弹设置页')
+    await invoke('meeting-chunk', meetingId, Buffer.alloc(1600, 3).toString('base64'),
+      { track: 'mic', seq: 0, startMs: 0, sampleRate: 16_000, frames: 800 })
+    for (let i = 0; i < 100 && !desktopReplies.some(item => item.id === '无页面开录'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(desktopReplies.find(item => item.id === '无页面开录')?.ok, true)
+    assert.equal((await independentCommand('无页面讲解', 'document.presentation.start', { documentPath })).ok, true)
+    for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(playing)
+    assert.ok(sent('settings-close').length >= 1, '出声讲解开始时应收起管理面板，避免挡屏')
+    assert.equal((await independentCommand('无页面停讲', 'document.presentation.control', { action: 'stop' })).ok, true)
+  } finally { if (meetingId) await finishAudioMeeting(meetingId) }
+})
+
 test('讲解启动回执未获接受时不自动播放或外发', async () => {
   confirmMeetingPresentation = async () => ({ response: 0 })
   desktopResultStatus = 409
@@ -1183,7 +1279,8 @@ test('独立讲解的插话可交接听写、识别并发送，回答播完后�
     assert.equal(wiring.handovers.length, 1)
     const granted = await invoke<{ ok: boolean; direct?: boolean }>('asr-begin', { bargeIn: true })
     assert.equal(granted.ok, true)
-    // 讲解中也要先听到明确口令才打断；任何声音都不再直接当成提问。
+    // 口令门禁：讲解中也要先听到"停一下/等一下"这类明确口令才停下并进入提问窗口；
+    // 旁人低声讨论不会被当成提问（产品要求：一边播报一边提问不符合人的交互）。
     assert.equal(granted.direct, false)
     assert.ok((wiring.handovers[0]()?.frames.length ?? 0) > 0)
     // 检出人声本身不停讲解；识别出“停一下”后才停这一句。
@@ -1202,10 +1299,16 @@ test('独立讲解的插话可交接听写、识别并发送，回答播完后�
     assert.ok(!question.text.includes('停一下'), '口令本身不能当成提问发出去')
     await answer(question, '隔离回答。')
     assert.equal((await asking).ok, true)
+    const beforeAnswer = narrator.requests.length
     assert.equal(finishSentence(), '隔离回答。')
-    await new Promise(resolve => setTimeout(resolve, 1800))
+    // 答完不自动续讲：先反问一句（ephemeral，不进会话），再等 5 秒窗口。
+    await until(() => narrator.requests.length > beforeAnswer, '答完先反问一句')
+    assert.equal(narrator.requests.at(-1)!.text, '还有其他问题吗？')
+    assert.equal(narrator.requests.at(-1)!.ephemeral, true, '反问不得进会话/记忆/纪要')
+    finishSentence()
+    await new Promise(resolve => setTimeout(resolve, 5600))
     await answer(await chatAt(1), '继续原来的文档。')
-    assert.ok(playing, '回答实际播完后续讲')
+    assert.ok(playing, '窗口结束（没人再问）后续讲')
   } finally { wiring.dispose(); fakeAsrText = '测试会议转写' }
 })
 
@@ -1696,8 +1799,14 @@ test('会议讲解中插话先停播，回答结束后从未播完的原句续�
     const asking = prompt('这个目录为什么只读？', true)
     await answer(await chatAt(1), '只读可以避免误改原件。')
     assert.equal((await asking).ok, true)
+    const beforeAnswer = narrator.requests.length
     assert.equal(finishSentence(), '只读可以避免误改原件。')
-    await new Promise(resolve => setTimeout(resolve, 1800))
+    // 答完先反问一句（ephemeral），再等 5 秒窗口；没人再说话就到点从原句续讲。
+    await until(() => narrator.requests.length > beforeAnswer, '答完先反问一句')
+    assert.equal(narrator.requests.at(-1)!.text, '还有其他问题吗？')
+    assert.equal(narrator.requests.at(-1)!.ephemeral, true, '反问不得进会话/记忆/纪要')
+    assert.equal(finishSentence(), '还有其他问题吗？')
+    await new Promise(resolve => setTimeout(resolve, 5600))
     assert.equal(narrator.requests.at(-1)?.fromIndex, 1, '只能从尚未完整播完的句子继续')
     assert.equal(finishSentence(), '再解释目录边界。')
     assert.equal(finishSentence(), '最后补充撤销方式。')
@@ -1848,6 +1957,21 @@ test('代码或无法提取的文档段落不会冒充整份讲完，状态和�
   } finally { await finishAudioMeeting(prepared.meetingId); rmSync(file, { force: true }) }
 })
 
+test('TTS 合成失败后本轮立即收掉，后续讲解委派不被挡', async () => {
+  const sending = prompt('你好，介绍一下你自己', true)
+  const chat = await chatAt(0)
+  chat.resolve({ ok: true, reply: '先说明授权范围。' })
+  await nextTurn()
+  // 合成 worker 报错：真实链路里 Narrator.fail 会调 onError，这里直接喂错误事件。
+  deliver({ ok: false, error: '模拟合成失败' })
+  await nextTurn()
+  await sending
+  // 失败前这一轮若没被收掉，spokenRound 永远非空，下面的委派会被闸门挡死。
+  const result = await invoke('doc-explain', documentPath, 0, false)
+  assert.equal(result.ok, true, result.error)
+  await prompt('结束讲解')
+})
+
 test('隔离黄金链：双轨讲解、停录转写、本人确认文件、审批发信和企微提醒逐步衔接', async () => {
   fakeMeetingTranscription = true
   const prepared = await prepareMeetingPresentation('完整模拟会议')
@@ -1865,6 +1989,12 @@ test('隔离黄金链：双轨讲解、停录转写、本人确认文件、审�
       finishSentence()
     }
     await nextTurn()
+    // 负载高时采集块可能还没到就停录，转写会空。等至少一条实时字幕再停，消除偶发。
+    for (let i = 0; i < 200; i++) {
+      const st = await invoke<{ captions?: unknown[] }>('meeting-state')
+      if ((st.captions?.length ?? 0) > 0) break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
     bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '黄金链停录', command: 'meeting.presentation.finish',
       payload: { presentationId: prepared.presentationId }, expiresAt: Date.now() + 10_000 } })
     for (let i = 0; i < 50 && sent('meeting-stopping').length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
@@ -2551,6 +2681,7 @@ test('讲解暂停后又打断了一次回答：一句“继续”不替用户�
   const chat = await chatAt(1)
   chat.onDelta!('回答的第一句。回答的第二句。')
   await nextTurn()
+  drainDocAcks()
   assert.ok(playing, '回答已经开始播放')
   send('speech-stop')
   await answer(chat, '回答的第一句。回答的第二句。')
@@ -2586,13 +2717,18 @@ test('评委插话：检出人声不停，明确口令才打断；回答播完�
   const question = await chatAt(1)
   await answer(question, '只读是为了避免误改原始资料。')
   assert.equal((await asking).ok, true)
-  assert.equal(narrator.requests.length, before + 1, '回答先播')
+  assert.equal(narrator.requests.length, before + 2, '先"稍等我想一下"，再播回答')
   assert.equal(finishSentence(), '只读是为了避免误改原始资料。')
 
-  // 自动续讲在“生成结束 + 播完”之后才安排；生成收尾可能晚一拍，等到 4 秒。
-  await new Promise(resolve => setTimeout(resolve, 4000))
+  // 答完不自动接着讲：先反问一句「还有其他问题吗？」（ephemeral，不进会话），
+  // 再等 5 秒窗口；没人再说话才继续原讲解。
+  await until(() => narrator.requests.length > before + 2, '答完先反问一句')
+  assert.equal(narrator.requests.at(-1)!.text, '还有其他问题吗？')
+  assert.equal(narrator.requests.at(-1)!.ephemeral, true, '反问不得进会话/记忆/纪要')
+  assert.equal(finishSentence(), '还有其他问题吗？')
+  await new Promise(resolve => setTimeout(resolve, 5600))
   await nextTurn()
-  assert.equal(narrator.requests.length, before + 2, '回答播完自动继续原讲解')
+  assert.equal(narrator.requests.length, before + 4, '窗口结束自动继续原讲解')
   assert.match(narrator.requests.at(-1)!.utteranceId, /^doc:/, '续讲的是原文档，不是新问题')
   finishSentence()
   send('speech-stop')
@@ -2605,6 +2741,9 @@ test('没点名成员时，讲解与追问自动交给会议+文档子助理', a
   } }] }
   const result = await invoke('doc-explain', documentPath, 0, true)
   assert.equal(result.ok, true, result.error)
+  assert.match(result.reply ?? '', /小会/u, '回复要点名交给哪个子助理')
+  assert.equal(outline().assistantId, 'member-bailongma')
+  assert.equal(outline().assistantName, '小会')
   finishSentence()
   const chat = await chatAt(0)
   assert.equal(chat.assistantId, 'member-bailongma', '讲解默认交给会议+文档子助理')
@@ -2616,10 +2755,489 @@ test('没点名成员时，讲解与追问自动交给会议+文档子助理', a
   assert.equal((await asking).ok, true)
 })
 
+test('委派讲解先演交接：叫人→应声→成员开口，不重复总助交代、不写死称谓', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  await invoke('save-settings', { memberHandover: true })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(result.ok, true, result.error)
+    const texts = narrator.requests.map(request => request.text)
+    assert.ok(texts.some(text => text.includes('来一下，这边需要你')), '总助叫人')
+    assert.ok(texts.some(text => text.includes('我这就来')), '成员应声')
+    assert.ok(texts.some(text => text.includes('接下来由我来给你讲')), '成员开口')
+    assert.ok(!texts.some(text => text.includes('老板')), '用户没设置过"老板"，不能写死称谓')
+    assert.ok(!texts.some(text => text.includes('这件事我交给')), '总助真实回复已交代过，不重复念固定台词')
+  } finally {
+    await invoke('save-settings', { memberHandover: false })
+  }
+})
+
+test('独立讲解回执与面板状态点名委派成员', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  const reply = await independentCommand('点名回执', 'document.presentation.start', { documentPath })
+  assert.equal(reply.ok, true, reply.error)
+  assert.match((reply.result as { notice: string }).notice, /小会/u, '等待回执也要说交给谁')
+  for (let i = 0; i < 100 && !playing; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.ok(playing)
+  assert.equal(outline().assistantId, 'member-bailongma')
+  assert.equal(outline().assistantName, '小会')
+})
+
 test('没点名视图且没装 WPS 时，讲解照常进行且不尝试打开 WPS', async () => {
   const result = await invoke('doc-explain', documentPath, 0, true)
   assert.equal(result.ok, true, result.error)
   assert.equal(wpsOpens.length, 0, '没装 WPS 时不应尝试打开 WPS')
   finishSentence()
   await prompt('结束讲解')
+})
+
+test('原文朗读+成员：打开静默预读，提问只发问题走独立文档会话，结束扔会话', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  docPreloadOk = true
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(result.ok, true, result.error)
+    // 打开文档就后台静默预读：走独立文档会话通道，带文档路径与预读提示。
+    await until(() => docPreloads.length > 0, '打开文档触发静默预读')
+    assert.equal(docPreloads[0].assistantId, 'member-bailongma')
+    assert.ok(docPreloads[0].docKey.includes('讲解样本.txt'), '预读按文档路径建会话')
+    assert.ok(docPreloads[0].text.includes('收到'), '预读只要求回收到')
+    const docKey = docPreloads[0].docKey
+    // 照原文念稿不产生模型请求（预读走 companionRequest，不算 chat）。
+    finishSentence()
+    await until(() => narrator.requests.some(request => /^doc:/.test(request.utteranceId)), '第一段原文开口')
+    assert.equal(chats.length, 0, '念稿不调模型')
+    // 提问：只发问题、不重发原文，且带上同一条文档会话标识。
+    const asking = invoke('doc-ask', documentPath, 0, '为什么限制目录？')
+    const question = await chatAt(0)
+    assert.equal(question.assistantId, 'member-bailongma', '追问沿用讲解成员')
+    assert.equal(question.docKey, docKey, '提问与预读同一条独立文档会话')
+    assert.ok(question.text.includes('为什么限制目录？'), '问题本身要在')
+    assert.ok(!question.text.includes('该段原文：'), '预读成功后不再附该段原文')
+    assert.ok(!question.text.includes('整份文档全文'), '不重发全文')
+    await answer(question, '避免误读。')
+    assert.equal((await asking).ok, true)
+    // 结束讲解不再清会话绑定：scope 由 (成员, 工作区, 文档) 持久复用，用户培训保留。
+    await prompt('结束讲解')
+    await new Promise(resolve => setTimeout(resolve, 300))
+    assert.equal(docCloses.length, 0, '结束讲解不再扔会话绑定')
+    // 重开同一份文档：再预读一次喂进同一条会话，提问仍复用该会话（培训还在）。
+    const preloadsBefore = docPreloads.length
+    const chatsBefore = chats.length
+    const reopen = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(reopen.ok, true, reopen.error)
+    await until(() => docPreloads.length > preloadsBefore, '重开再次预读进同一条会话')
+    assert.equal(docPreloads[preloadsBefore].docKey, docKey, '预读仍按同一文档路径')
+    const asking2 = invoke('doc-ask', documentPath, 0, '培训过的名词是什么意思？')
+    const question2 = await chatAt(chatsBefore)
+    assert.equal(question2.docKey, docKey, '重开后提问仍复用同一条文档会话')
+    assert.ok(!question2.text.includes('该段原文：'), '复用会话后仍只发问题')
+    await answer(question2, '按培训口径解释。')
+    assert.equal((await asking2).ok, true)
+  } finally {
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
+})
+
+test('原文朗读+成员：预读失败时提问退回附原文，仍走独立文档会话', async () => {
+  presentationMembers = { enabled: true, members: [{ profile: {
+    assistantId: 'member-bailongma', displayName: '小会', enabled: true, capabilities: ['meeting', 'document'],
+  } }] }
+  docPreloadOk = false
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true)
+    assert.equal(result.ok, true, result.error)
+    await until(() => docPreloads.length > 0, '预读发起')
+    finishSentence()
+    const asking = invoke('doc-ask', documentPath, 0, '为什么限制目录？')
+    const question = await chatAt(0)
+    assert.equal(question.docKey, docPreloads[0].docKey, '兜底也走独立文档会话')
+    assert.ok(question.text.includes(paragraphs[0]), '预读失败兜底附当前段原文')
+    await answer(question, '避免误读。')
+    assert.equal((await asking).ok, true)
+  } finally {
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
+})
+/**
+ * 推进链是异步的（每次换段还要重新校验文档与授权），断言"下一段开口了"不能靠一次 nextTurn：
+ * 这里用 setImmediate 轮询。刻意不用 setTimeout —— 表格用例要开假定时器快进 10 秒停留，
+ * 那时测试自己也不能依赖真定时器。
+ */
+async function until(check: () => boolean, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 2000; attempt++) {
+    if (check()) return
+    await new Promise<void>(resolve => setImmediate(resolve))
+  }
+  assert.fail(`等不到：${label}`)
+}
+
+/**
+ * 原文朗读（docSpeechMode='source'，产品默认）：这条分支不向模型要讲解，直接把原文交给
+ * 合成器；跳过类段落只念一句提示，然后停一会儿让投屏停住。
+ * beforeEach 把模式钉在 ai 了，所以这里显式切回 source，结束时再切回去。
+ */
+test('原文朗读模式：不向模型要讲解，念的就是这一段原文，屏幕同步同一句', async () => {
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  try {
+    const result = await invoke('doc-explain', documentPath, 0, true, '讲解助理')
+    assert.equal(result.ok, true, result.error)
+    assert.match(narrator.requests.at(-1)!.utteranceId, /^doc-outline:/, '开场仍是本地的范围说明')
+    const before = narrator.requests.length
+    finishSentence()
+    await until(() => narrator.requests.length > before, '第一段原文开口')
+    assert.equal(chats.length, 0, '照原文念稿不该产生任何模型请求')
+    const spoken = narrator.requests.at(-1)!
+    assert.match(spoken.utteranceId, /^doc:/)
+    assert.equal(spoken.text, paragraphs[0])
+    assert.equal(sent<{ index: number; text: string }>('doc-reply').at(-1)?.text, paragraphs[0], '屏幕显示的必须和念的是同一句')
+    // 普通段之间不留停留：念完接着念下一段。
+    finishSentence()
+    await until(() => narrator.requests.at(-1)!.text === paragraphs[1], '第二段原文开口')
+    assertProgress(1, [0])
+  } finally {
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
+})
+
+test('原文朗读模式：表格段照念格子内容（不念竖线），念完接着下一段', async () => {
+  const tablePath = path.join(authorized, '表格样本.md')
+  writeFileSync(tablePath, '## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n\n## 结尾\n\n最后一段正文。\n', 'utf8')
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const result = await invoke('doc-explain', tablePath, 0, true, '讲解助理')
+    assert.equal(result.ok, true, result.error)
+    const before = narrator.requests.length
+    finishSentence()
+    await until(() => narrator.requests.length > before, '表格段开口')
+    assert.equal(chats.length, 0, '原文朗读不请求模型')
+    const spoken = narrator.requests.at(-1)!
+    assert.match(spoken.text, /姓名/)
+    assert.match(spoken.text, /张三/)
+    assert.doesNotMatch(spoken.text, /\|/, '竖线等格式符号不念')
+    assert.doesNotMatch(spoken.text, /这段是表格/, '表格不再跳过')
+    assert.equal(sent<{ index: number; text: string }>('doc-reply').at(-1)?.text, spoken.text, '屏幕显示与念的一致')
+    const requests = narrator.requests.length
+    finishSentence()
+    await until(() => outline().next === 1, '位置推进到下一段')
+    await until(() => narrator.requests.length > requests, '表格念完接着念下一段（无停留）')
+    assert.equal(narrator.requests.at(-1)!.text, '最后一段正文。')
+  } finally {
+    mock.timers.reset()
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
+})
+
+test('原文朗读模式：纯代码段（正文为空）也要念一句跳过提示并停住', async () => {
+  const codePath = path.join(authorized, '代码样本.md')
+  writeFileSync(codePath, '## 实现\n\n```ts\nconst x = 1\n```\n\n## 结尾\n\n最后一段正文。\n', 'utf8')
+  await invoke('save-settings', { docSpeechMode: 'source' })
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const result = await invoke('doc-explain', codePath, 0, true, '讲解助理')
+    assert.equal(result.ok, true, result.error)
+    const before = narrator.requests.length
+    finishSentence()
+    // 这一段 body 是空串：以前会被静默跳过（听众以为文档里没这段），现在必须开口说一句。
+    await until(() => narrator.requests.length > before, '纯代码段开口')
+    assert.equal(chats.length, 0)
+    const spoken = narrator.requests.at(-1)!
+    assert.match(spoken.text, /这段是代码/)
+    assert.doesNotMatch(spoken.text, /const x/, '代码本身一个字都不念')
+    assert.equal(sent<{ index: number; text: string }>('doc-reply').at(-1)?.text, spoken.text)
+    const requests = narrator.requests.length
+    finishSentence()
+    await until(() => outline().next === 1, '位置推进到下一段')
+    assert.equal(narrator.requests.length, requests, '停留期间不许开始念下一段')
+    mock.timers.tick(10_000)
+    await until(() => narrator.requests.length > requests, '到点后接着念下一段')
+    assert.equal(narrator.requests.at(-1)!.text, '最后一段正文。')
+  } finally {
+    mock.timers.reset()
+    await invoke('save-settings', { docSpeechMode: 'ai' })
+  }
+})
+
+test('反问窗口里明确说「继续」：立刻续讲，且这句话不发给模型', async () => {
+  await answer(await startExplanation())
+  assert.equal(finishSentence(), '先说明授权范围。')
+  // 第 2 段正在播时插话打断。
+  send('barge-in-detected')
+  await nextTurn()
+  send('speech-stop', true)
+  await nextTurn()
+  const asking = prompt('这个目录为什么只读？', true)
+  const question = await chatAt(1)
+  await answer(question, '只读是为了避免误改原始资料。')
+  assert.equal((await asking).ok, true)
+  assert.equal(finishSentence(), '只读是为了避免误改原始资料。')
+  await until(() => narrator.requests.at(-1)?.text === '还有其他问题吗？', '答完先反问一句')
+  assert.equal(finishSentence(), '还有其他问题吗？', '反问念完才开始算 5 秒')
+
+  // 窗口刚开就明确说"继续"：必须立刻续讲，不等满 5 秒。
+  const chatsBefore = chats.length
+  const reply = await prompt('继续', true)
+  assert.equal(reply.ok, true)
+  assert.equal(chats.length, chatsBefore, '"继续"是给讲解链的指令，不该发给模型')
+  await until(() => narrator.requests.at(-1)!.utteranceId.startsWith('doc:'), '立刻续讲')
+  assert.equal(narrator.requests.at(-1)!.utteranceId.startsWith('doc:'), true)
+  finishSentence()
+  send('speech-stop')
+  await nextTurn()
+})
+
+/**
+ * 真机 bug 回归：一句话触发"建会议 + 开始讲解"时，模型调工具的那一刻总助理正在念
+ * "下面请小会来为大家讲这份文档"。讲解不能插进来把这句回复掐掉（那样用户只听到快嘴、
+ * 正文一个字都没有），要排队等它念完。
+ */
+test('总助理回复还在念时触发讲解：先挂起，回复念完才讲第一段', async () => {
+  const asking = prompt('这个目录为什么只读？', true)
+  const chat = await chatAt(0)
+  chat.resolve({ ok: true, reply: '下面请小会来为大家讲这份文档。' })
+  assert.equal((await asking).ok, true)
+  await nextTurn()
+  assert.equal(narrator.isSpeaking(), true, '总助理正在念介绍')
+  const before = narrator.requests.length
+
+  // 模型调工具 → 讲解被启动（这就是 installDocTalk 真实发生的那一刻）。
+  const started = await invoke<{ ok: boolean }>('doc-explain', documentPath, 0, true)
+  assert.equal(started.ok, true)
+  assert.equal(narrator.requests.length, before, '回复还在念：讲解必须先挂起，不能插进来')
+  assert.equal(narrator.isSpeaking(), true, '回复不能被讲解掐断（掐断后正文一个增量都不会播）')
+
+  // 回复念完，这才轮到开场白与第一段。
+  assert.equal(finishSentence(), '下面请小会来为大家讲这份文档。')
+  await until(() => narrator.requests.at(-1)!.utteranceId.startsWith('doc-outline:'), '回复念完才念开场白')
+  assert.equal(finishSentence(), '《讲解样本》共 3 段，讲完大约 1 分钟。')
+  await until(() => chats.length >= 2, '开场白念完才去要第一段讲解')
+  assert.equal(chats.length, 2)
+  await prompt('结束讲解')
+})
+
+test('挂起的讲解被停止后不会再自己开始', async () => {
+  const asking = prompt('这个目录为什么只读？', true)
+  const chat = await chatAt(0)
+  chat.resolve({ ok: true, reply: '下面请小会来为大家讲这份文档。' })
+  assert.equal((await asking).ok, true)
+  await nextTurn()
+  const before = narrator.requests.length
+  assert.equal((await invoke<{ ok: boolean }>('doc-explain', documentPath, 0, true)).ok, true)
+  assert.equal(narrator.requests.length, before, '先挂起')
+
+  // 用户按停（口令/按钮同一入口）：挂起项必须作废。
+  send('speech-stop')
+  await nextTurn()
+  await new Promise(resolve => setTimeout(resolve, 400))
+  assert.equal(narrator.requests.length, before, '停了就不许再自己开口念开场白')
+  assert.equal(chats.length, 1, '也不许去要第一段的讲解')
+})
+
+test('唤醒应答走 narrator（ephemeral），和回复共用同一条传输', async () => {
+  const before = narrator.requests.length
+  send('speech-local', '我在呢，说吧。')
+  await until(() => narrator.requests.length > before, '唤醒应答进 narrator 队列')
+  const request = narrator.requests.at(-1)!
+  assert.match(request.utteranceId, /^wake-/, '唤醒应答有自己的 utteranceId')
+  assert.equal(request.text, '我在呢，说吧。')
+  // 关键：它和回复走同一个播放队列（音色/音量因此一致），且不进会话 / 记忆 / 纪要。
+  assert.equal(request.ephemeral, true, '唤醒应答是过场话，不进会话')
+  finishSentence()
+  await until(() => sent('wake-greeting-finished').length > 0, '播完要解锁界面开麦')
+})
+
+test('桌面命令 workbench.open：合法页打开工作台并回执，非法页如实拒绝', async () => {
+  desktopReplies.length = 0
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '开待办页', command: 'workbench.open',
+    payload: { page: 'todo' }, expiresAt: Date.now() + 5000 } })
+  for (let i = 0; i < 30 && !desktopReplies.some(item => item.id === '开待办页'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  const ok = desktopReplies.find(item => item.id === '开待办页')
+  assert.equal(ok?.ok, true)
+  assert.deepEqual(ok?.result, { page: 'todo' })
+  // 走的是既有的 openSettings：渲染层收到 settings-open 'todo'。
+  assert.equal(sent<string>('settings-open').at(-1), 'todo')
+
+  // 非法页：拒绝并说明，窗口不该被切走。
+  const before = sent<string>('settings-open').length
+  bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id: '开错页', command: 'workbench.open',
+    payload: { page: '首页' }, expiresAt: Date.now() + 5000 } })
+  for (let i = 0; i < 30 && !desktopReplies.some(item => item.id === '开错页'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  const bad = desktopReplies.find(item => item.id === '开错页')
+  assert.equal(bad?.ok, false)
+  assert.match(bad?.error ?? '', /要打开工作台的哪一页/)
+  assert.equal(sent<string>('settings-open').length, before, '参数不对不能把窗口切走')
+})
+
+test('桌面命令 meeting.count：按 from-to 数今天的会议，没开会就是 0', async () => {
+  const send = async (id: string, payload: Record<string, unknown>): Promise<{ ok: boolean; result?: unknown } | undefined> => {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command: 'meeting.count', payload, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 50 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    return desktopReplies.find(item => item.id === id)
+  }
+  const now = Date.now()
+  const dayStart = new Date(now); dayStart.setHours(0, 0, 0, 0)
+
+  // 今天还没开过会：回 0（不是失败）。
+  const before = await send('数会议-空', { from: dayStart.getTime(), to: now + 1 })
+  assert.equal(before?.ok, true)
+  const emptyCount = (before?.result as { count: number }).count
+  assert.equal(typeof emptyCount, 'number')
+
+  // 开一场会，再数一次：正好 +1。
+  const prepared = await prepareMeetingPresentation('数会议用')
+  try {
+    const after = await send('数会议-有', { from: dayStart.getTime(), to: Date.now() + 1 })
+    assert.equal((after?.result as { count: number }).count, emptyCount + 1)
+    // 时间窗不含它：回 0，证明 from/to 真的在过滤，不是把整库数出来。
+    const windowed = await send('数会议-窗外', { from: 0, to: 1 })
+    assert.equal((windowed?.result as { count: number }).count, 0)
+  } finally { await finishAudioMeeting(prepared.meetingId) }
+})
+
+test('桌面命令 meeting.list：按时间窗列出今天的会议，含名称与状态', async () => {
+  const ask = async (id: string, payload: Record<string, unknown>): Promise<{ ok: boolean; result?: unknown } | undefined> => {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command: 'meeting.list', payload, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 50 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    return desktopReplies.find(item => item.id === id)
+  }
+  const now = Date.now()
+  const dayStart = new Date(now); dayStart.setHours(0, 0, 0, 0)
+  // limit 给到 50：本文件前面的用例可能已经开了若干场会，用默认 10 会撞上列表上限，
+  // 于是"多了一场"这件事在计数上看不出来（10 → 10）。
+  const first = await ask('列会议-空', { from: dayStart.getTime(), to: now + 1, limit: 50 })
+  assert.equal(first?.ok, true, '没开会也要成功回包，而不是报错')
+  const before = first.result as { meetings: unknown[] }
+  // 这个 e2e 文件里前面的用例可能已经开过会（共用同一个 store），所以只校验形状与增量，
+  // 不断言"一定是空数组"——那会随用例顺序变化。
+  assert.ok(Array.isArray(before.meetings))
+
+  // 会议名由 startMeeting 的 consent 决定（这个夹具里是固定的"隔离会议"），所以不按名字认，
+  // 只按"比开录前多一场"来认 —— 库里可能还有别的用例留下的会议。
+  const prepared = await prepareMeetingPresentation('列会议用')
+  try {
+    const after = (await ask('列会议-有', { from: dayStart.getTime(), to: Date.now() + 1, limit: 50 }))?.result as {
+      meetings: Array<{ startedAt: number; name: string; state: string }>
+    }
+    assert.equal(after.meetings.length, before.meetings.length + 1, '开完会列表应多一场')
+    for (const item of after.meetings) {
+      assert.equal(typeof item.startedAt, 'number')
+      assert.equal(typeof item.name, 'string')
+      assert.equal(typeof item.state, 'string')
+    }
+    // limit 生效：列表最多 1 条。
+    const limited = (await ask('列会议-限', { from: dayStart.getTime(), to: Date.now() + 1, limit: 1 }))?.result as { meetings: unknown[] }
+    assert.equal(limited.meetings.length, 1)
+  } finally { await finishAudioMeeting(prepared.meetingId) }
+})
+
+test('桌面命令 settings.summary：纯读三行真值，跑完设置一个字节都没变', async () => {
+  const settingsFile = path.join(sandbox, 'electron-userData', 'settings.json')
+  const prefsFile = path.join(sandbox, 'electron-userData', 'audio-prefs.json')
+  const snapshot = (): { settings: string | null; prefs: string | null } => ({
+    settings: existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : null,
+    prefs: existsSync(prefsFile) ? readFileSync(prefsFile, 'utf8') : null,
+  })
+  const before = snapshot()
+
+  const ask = async (id: string): Promise<{ ok: boolean; result?: unknown } | undefined> => {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command: 'settings.summary', payload: {}, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 50 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    return desktopReplies.find(item => item.id === id)
+  }
+  const first = await ask('读设置-1')
+  assert.equal(first?.ok, true)
+  const result = first.result as { wakeEnabled: boolean; readReplies: boolean; docSpeechMode: string }
+  assert.equal(typeof result.wakeEnabled, 'boolean')
+  assert.equal(typeof result.readReplies, 'boolean')
+  assert.equal(result.docSpeechMode === 'ai' || result.docSpeechMode === 'source', true)
+  assert.equal('hoverToolbar' in result, false, '主进程没有这个设置，不许编一个字段出来')
+
+  // 纯读：两次调用结果一致；跑完之后磁盘上的两份设置文件与跑之前逐字节相同。
+  const second = await ask('读设置-2')
+  assert.deepEqual(second?.result, first.result, '只读命令应当幂等')
+  assert.deepEqual(snapshot(), before, '命令不得写 settings.json / audio-prefs.json')
+})
+
+test('桌面命令 meeting.history：历史列表形状、limit 生效、空库不报错', async () => {
+  const ask = async (id: string, payload: Record<string, unknown>): Promise<{ ok: boolean; result?: unknown } | undefined> => {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command: 'meeting.history', payload, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 50 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    return desktopReplies.find(item => item.id === id)
+  }
+  const empty = await ask('历史-空库前', { limit: 20 })
+  assert.equal(empty?.ok, true, '查询本身必须成功，空库只是空数组')
+
+  const prepared = await prepareMeetingPresentation('历史列表用')
+  try {
+    const after = (await ask('历史-有', { limit: 20 }))?.result as {
+      meetings: Array<Record<string, unknown>>
+    }
+    const mine = after.meetings.find(item => item.id === prepared.meetingId)
+    assert.ok(mine !== undefined, '刚开的会议必须出现在历史里')
+    assert.deepEqual(Object.keys(mine).sort(), [
+      'endedAt', 'id', 'integrityStatus', 'name', 'retentionDays', 'sources', 'startedAt', 'transcriptStatus',
+    ].sort())
+    assert.equal(typeof mine.name, 'string')
+    assert.equal(typeof mine.startedAt, 'number')
+    assert.equal(mine.sources === 'mic' || mine.sources === 'mic+loopback', true)
+    assert.equal(typeof mine.retentionDays, 'number')
+    assert.equal(['转写失败', '未转写', '已转写', '部分转写', '状态未知'].includes(String(mine.transcriptStatus)), true)
+
+    const limited = (await ask('历史-限', { limit: 1 }))?.result as { meetings: unknown[] }
+    assert.equal(limited.meetings.length, 1, 'limit 生效')
+  } finally { await finishAudioMeeting(prepared.meetingId) }
+})
+
+test('桌面命令 settings.set：三项各写一次并回读一致，非法值一个字节都不写', async () => {
+  const settingsFile = path.join(sandbox, 'electron-userData', 'settings.json')
+  const prefsFile = path.join(sandbox, 'electron-userData', 'audio-prefs.json')
+  const snap = (): string => `${existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : ''}|${existsSync(prefsFile) ? readFileSync(prefsFile, 'utf8') : ''}`
+
+  const set = async (id: string, key: unknown, value: unknown): Promise<{ ok: boolean; result?: unknown; error?: unknown } | undefined> => {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command: 'settings.set', payload: { key, value }, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 50 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    return desktopReplies.find(item => item.id === id)
+  }
+  const read = async (id: string): Promise<Record<string, unknown>> => {
+    bridgeCallbacks.onEvent?.({ type: 'desktop/command', payload: { id, command: 'settings.summary', payload: {}, expiresAt: Date.now() + 5000 } })
+    for (let i = 0; i < 50 && !desktopReplies.some(item => item.id === id); i++) await new Promise(resolve => setTimeout(resolve, 10))
+    return desktopReplies.find(item => item.id === id)?.result as Record<string, unknown>
+  }
+
+  // broadcast=all → readReplies=true；回读一致
+  assert.equal((await set('设-播报', 'broadcast', 'all'))?.ok, true)
+  assert.equal((await read('读-播报')).readReplies, true)
+  assert.equal((await set('设-播报2', 'broadcast', 'voice'))?.ok, true)
+  assert.equal((await read('读-播报2')).readReplies, false)
+
+  // docSpeech=ai → docSpeechMode='ai'；回读一致
+  assert.equal((await set('设-讲解', 'docSpeech', 'ai'))?.ok, true)
+  assert.equal((await read('读-讲解')).docSpeechMode, 'ai')
+  assert.equal((await set('设-讲解2', 'docSpeech', 'source'))?.ok, true)
+  assert.equal((await read('读-讲解2')).docSpeechMode, 'source')
+
+  // wake=off 可写；wake=on 在隔离环境没有唤醒模型，必须如实报错而不是假装成功。
+  assert.equal((await set('设-唤醒关', 'wake', 'off'))?.ok, true)
+  assert.equal((await read('读-唤醒关')).wakeEnabled, false)
+  const wakeOn = await set('设-唤醒开', 'wake', 'on')
+  assert.equal(wakeOn?.ok, false, '唤醒起不来时不能报成功')
+  assert.match(String(wakeOn?.error ?? ''), /唤醒没能启动/)
+
+  // 非法 key / 值：拒绝，且两份设置文件逐字节未变。
+  const before = snap()
+  for (const [key, value] of [['nope', 'on'], ['wake', 'maybe'], ['broadcast', 'on'], ['docSpeech', '全部']] as const) {
+    const bad = await set(`非法-${key}-${value}`, key, value)
+    assert.equal(bad?.ok, false, `${key}=${value} 应被拒`)
+    assert.match(String(bad?.error ?? ''), /不支持的设置项/)
+  }
+  assert.equal(snap(), before, '非法值不得写盘')
 })

@@ -181,10 +181,12 @@ export class TtsEdgeEngine {
    * "每个句号后面空一大段"。有它之后，下一句音频通常已经在手边，接缝只剩播放启动时间。
    * 只缓存一句：再多就是拿内存换用不上的东西，而且用户一打断就得全丢。
    */
-  private prefetched: PrefetchedAudio | null = null
-  private prefetching: { id: string; controller: AbortController } | null = null
+  /** 预合成好的音频，按句 id 存：可以同时握着后面两三句。 */
+  private prefetched = new Map<string, Buffer>()
+  private prefetching = new Map<string, AbortController>()
   /** 下一句的文本与配置：由主进程在派发当前句时一并捎来。 */
-  private next: { id: string; text: string; api?: ResolvedVoiceApi } | null = null
+  /** 后面几句的文本与配置：主进程派发当前句时一并捎来，最多三句。 */
+  private next: Array<{ id: string; text: string; api?: ResolvedVoiceApi }> = []
   /**
    * 哪些句子是"固定话术"、值得缓存。
    *
@@ -198,15 +200,24 @@ export class TtsEdgeEngine {
     this.cacheTexts = cacheTexts === undefined ? null : new Set(cacheTexts)
   }
 
-  speak(id: string, text: string, api?: ResolvedVoiceApi, next?: { id: string; text: string; api?: ResolvedVoiceApi }, injected?: Buffer): void {
+  speak(id: string, text: string, api?: ResolvedVoiceApi, next?: { id: string; text: string; api?: ResolvedVoiceApi } | Array<{ id: string; text: string; api?: ResolvedVoiceApi }>, injected?: Buffer): void {
     if (this.session !== null) {
       this.deps.emit({ ok: false, error: 'busy' })
       return
     }
     // 下一次派发前先认一认：这个 id 是不是已经预合成好了。
-    const cached = injected ?? (this.prefetched?.id === id ? this.prefetched.audio : undefined)
-    if (this.prefetched !== null && this.prefetched.id !== id) this.prefetched = null
-    this.next = next ?? null
+    const cached = injected ?? this.prefetched.get(id)
+    /* 旧格式（单句）也认：二进制与主进程不一定同步更新。 */
+    this.next = next === undefined || next === null ? [] : Array.isArray(next) ? next : [next]
+    /*
+      只丢"已经离开前瞻窗口"的预合成，**别把还没播的成品也扔掉**。
+      以前是无条件清空到只剩当前句：每派发一句就把后面两句刚合成好的音频丢回炉，
+      重新请求一遍 —— 这就是"一到下一句又卡一下"的来源。
+    */
+    const upcoming = new Set(this.next.map(item => item.id))
+    for (const key of [...this.prefetched.keys()]) {
+      if (key !== id && !upcoming.has(key)) this.prefetched.delete(key)
+    }
     const session = new SpeakSession(id, text, this.deps, () => {
       if (this.session === session) this.session = null
     }, api, cached, this.cacheTexts?.has(text) === true)
@@ -219,12 +230,10 @@ export class TtsEdgeEngine {
     // 打断语义：用户不想再听，预取中的和已合成好的下一句都作废 —— 留着会把旧内容播到新一轮。
     // 要注意的是正常播放路径不会调 stop（主进程在 finished 之后直接派下一句），
     // 所以这里的清理只影响"被打断"这一条路，不会让预合成白做。
-    if (this.prefetching !== null) {
-      this.prefetching.controller.abort()
-      this.prefetching = null
-    }
-    this.prefetched = null
-    this.next = null
+    for (const controller of this.prefetching.values()) controller.abort()
+    this.prefetching.clear()
+    this.prefetched.clear()
+    this.next = []
     this.session?.stop()
   }
 
@@ -232,19 +241,25 @@ export class TtsEdgeEngine {
     return this.session !== null
   }
 
-  /** 后台把"下一句"合成好放进缓存。失败就算了：真派到时再合成一次，不因为预取失败而报错。 */
+  /** 后台把后面几句并行合成好放进缓存。失败就算了：真派到时再合成一次，不因为预取失败而报错。 */
   private prefetchNext(): void {
-    const next = this.next
-    if (next === null || this.prefetching !== null || this.prefetched?.id === next.id) return
-    const controller = new AbortController()
-    this.prefetching = { id: next.id, controller }
-    void this.deps.synthesize(next.text, controller.signal, next.api).then(audio => {
-      if (this.prefetching?.id !== next.id) return
-      this.prefetching = null
-      this.prefetched = { id: next.id, audio }
-    }).catch(() => {
-      if (this.prefetching?.id === next.id) this.prefetching = null
-    })
+    /*
+      并行预合成：后面三句同时发出去，谁先回来谁先待命。
+      串行那版的问题是第二句要等第一句合成完才开始，碰上慢响应就攒不出余量，
+      听感就是"隔几秒才出下一句"。
+    */
+    for (const item of this.next) {
+      if (this.prefetched.has(item.id) || this.prefetching.has(item.id)) continue
+      const controller = new AbortController()
+      this.prefetching.set(item.id, controller)
+      void this.deps.synthesize(item.text, controller.signal, item.api).then(audio => {
+        if (this.prefetching.get(item.id) !== controller) return
+        this.prefetching.delete(item.id)
+        this.prefetched.set(item.id, audio)
+      }).catch(() => {
+        if (this.prefetching.get(item.id) === controller) this.prefetching.delete(item.id)
+      })
+    }
   }
 }
 
@@ -377,6 +392,8 @@ function main(): void {
 
   let closing = false
   const handle = (line: string): void => {
+  const debugLine = line.trim()
+  if (process.env.DSH_TTS_DEBUG === '1') console.error('[tts-worker] 收到一行，长度', debugLine.length)
     const trimmed = line.trim()
     if (trimmed.length === 0) return
     let message: {
@@ -411,14 +428,20 @@ function main(): void {
         ? Buffer.from((message.speak as { audio: string }).audio, 'base64')
         : undefined
       const rawNext = message.speak.next
-      const next = rawNext && typeof rawNext.id === 'string' && typeof rawNext.b64 === 'string'
-        ? {
-            id: rawNext.id,
-            text: Buffer.from(rawNext.b64, 'base64').toString('utf8'),
-            api: rawNext.api as ResolvedVoiceApi | undefined,
-          }
-        : undefined
-      engine.speak(message.speak.id, text, api, next, cached)
+      /* 前瞻可以是单句（旧格式）也可以是数组（新格式），两种都认。 */
+      const rawList = Array.isArray(rawNext) ? rawNext : rawNext === undefined ? [] : [rawNext]
+      const next = rawList
+        .filter((item): item is { id: string; b64: string; api?: unknown } =>
+          item !== null && typeof item === 'object'
+          && typeof (item as { id?: unknown }).id === 'string'
+          && typeof (item as { b64?: unknown }).b64 === 'string')
+        .map(item => ({
+          id: item.id,
+          text: Buffer.from(item.b64, 'base64').toString('utf8'),
+          api: item.api as ResolvedVoiceApi | undefined,
+        }))
+      if (process.env.DSH_TTS_DEBUG === '1') console.error('[tts-worker] speak id=', message.speak.id, ' textLen=', text.length, ' api=', api ? 'yes' : 'no')
+    engine.speak(message.speak.id, text, api, next, cached)
     }
   }
 

@@ -32,6 +32,39 @@ export interface SpeechRequest {
    */
   readonly indexBase?: number
   /**
+/**
+   * 临时话语（快速应答旁路）：照常播出，但不算"这一轮对模型说过什么"。
+   * 它不进 DSH 会话，打断后的上下文说明里也不能出现，否则等于间接进了会话。
+   */
+  readonly ephemeral?: boolean
+  /**
+   * 整行丢弃 Markdown 引用块（`> 原文…`），只用在讲解追问的回答上。
+   *
+   * 模型常把文档原文用引用块贴回来，那是给眼睛看的资料，不是回答正文；
+   * 念出来就像在朗读提示词。文档原文朗读本身不受影响。
+   */
+  readonly stripQuotes?: boolean
+  /**
+   * 这一句用谁的音色说话：给一段**音色设计描述**，暂时覆盖当前语音服务上的描述。
+   *
+   * 用于"成员自己开口"：小张讲就用小张的描述；不传就沿用服务配置（总助理的声音）。
+   */
+  readonly voiceDesign?: string
+  /**
+   * 克隆出来的音色 ID（服务商侧）。优先于 voiceDesign：
+   * 设计是"照描述演"，克隆是"就是那个声音"，后者更硬。
+   */
+  readonly voice?: string
+  /** 语气/情绪/方言指令（走 user 消息）。 */
+  readonly voiceStyle?: string
+  /** 复刻样本文件路径（大样本走文件，不走内部管道）。 */
+  readonly voiceSampleFile?: string
+  /** 内联复刻样本（base64，不含 data: 前缀）。 */
+  readonly voiceSample?: string
+  readonly voiceSampleMime?: string
+  /** 成员级 TTS 配置 id；空＝跟随全局选中。 */
+  readonly ttsProfileId?: string
+  /**
    * 本次讲话的音色档案名（§4.6 ★④）：edge-tts 音色名（如 zh-CN-XiaoxiaoNeural）或
    * 语音设置里的自定义 TTS 档案名。未传走全局默认音色（向后兼容）。
    * 子助理自行汇报（self 模式）按成员音色播报。
@@ -45,6 +78,20 @@ export interface Segment {
   readonly index: number
   readonly text: string
   readonly origin?: SpeechOrigin
+readonly ephemeral?: boolean
+  /** 这一句的音色设计描述（来自说话人），缺省沿用服务配置。 */
+  readonly voiceDesign?: string
+  /** 克隆出来的音色 ID（服务商侧）。优先于 voiceDesign —— 克隆就是"就是那个声音"。 */
+  readonly voice?: string
+  /** 语气/情绪/方言指令（走 user 消息）。 */
+  readonly voiceStyle?: string
+  /** 复刻样本文件路径（大样本走文件，不走内部管道）。 */
+  readonly voiceSampleFile?: string
+  /** 内联复刻样本（base64，不含 data: 前缀）。 */
+  readonly voiceSample?: string
+  readonly voiceSampleMime?: string
+  /** 成员级 TTS 配置 id；空＝跟随全局选中。 */
+  readonly ttsProfileId?: string
   /** 本句的音色档案名；随请求透传，未传走全局默认音色。 */
   readonly voiceProfile?: string
 }
@@ -66,7 +113,8 @@ export const MAX_SEGMENT_CHARS = 60
 /** 硬切时往回找逗号或空格的范围，避免把英文单词或一个短语从中间劈开。 */
 const SOFT_CUT_LOOKBACK = 12
 
-const SENTENCE_ENDERS = new Set(['。', '！', '？', '；', '!', '?', ';', '\n', '…'])
+/* 换行不算句末：文档里一句话跨行排版时，按行断句会把没说完的话劈成两截播报。 */
+const SENTENCE_ENDERS = new Set(['。', '！', '？', '；', '!', '?', ';', '…'])
 const SOFT_CUT_POINTS = new Set(['，', '、', ',', ' ', ':', '：'])
 
 /**
@@ -77,14 +125,93 @@ const SOFT_CUT_POINTS = new Set(['，', '、', ',', ' ', ':', '：'])
 const WORTH_SPEAKING = /[\p{L}\p{N}]/u
 
 /**
+ * 讲解三段标签：`【原文】` / `【解释】` / `【补充】`，以及带后缀的变体（`【原文·第 3 页】`、
+ * `【解释：这里说的是…】`）。
+ *
+ * `document.ts` 的 `explainPrompt` 要求模型分三段并各自标明，但模型经常连整块方括号一起吐
+ * 出来。送进合成器就念成"方括号原文方括号"，听起来就是一台朗读器。
+ *
+ * **只删这三个词开头的方括号块，不无差别删所有 `【…】`**：`【会议结论】`、`【工作事项】`
+ * 这类标签在耳朵里是有信息量的分隔，删掉会让后面那句话失去主语；而讲解三段标签的作用只是
+ * 给屏幕排版，念出来纯属噪音。这是**白名单**——将来加新的讲解标签得往这里加，
+ * 别图省事改成 `【[^】]*】`。
+ *
+ * 屏幕为什么不清洗：结构标签在屏幕上正是导航（用户一眼看出哪句是原文、哪句是补充），
+ * 只有声音这一路需要口语化。所以清洗只发生在 `splitIntoSegments` 里，原文原样留在界面上。
+ */
+const EXPLAIN_LABEL = /【(?:原文|解释|补充)[^】]*】/gu
+
+/**
+ * 行首 / 句首的圆点与短横列表符号。
+ *
+ * `*` 后面必须跟空白才算列表，否则 `*斜体*` 会被吃掉星号、只剩半截记号；
+ * `+` 不收 —— 正文里的加号（`A + B`）比列表更常见。
+ */
+const BULLET_MARK = /(?:^|(?<=[。！？；!?;\n]))[ \t]*[-*•][ \t]+/gmu
+
+/**
+ * 有序列表序号：`1. `、`1) `、`1、`。
+ *
+ * **点号后面必须有空白**，这是 `3.5 版本` 不被误伤的唯一依据：小数点的后面是数字，
+ * 不是空格。用行首/句首锚点再加一层保险，避免把正文里的 "版本 1. 2" 之类当成列表。
+ */
+const ORDERED_MARK = /(?:^|(?<=[。！？；!?;\n]))[ \t]*(?:\d+[.)][ \t]+|\d+、[ \t]*)/gmu
+
+/** 引用符号只在行首成立：正文中间的 `>` 多半是箭头（`->`），不该吃。 */
+const QUOTE_MARK = /^[ \t]*>[ \t]?/gmu
+
+/** Markdown 标题号。只在行首；正文中间的 `#` 是井号或标签。 */
+const HEADING_MARK = /^[ \t]*#{1,6}[ \t]*/gmu
+
+/** 成对的粗体 / 斜体记号：只去记号，里面的字要留下。 */
+const EMPHASIS_MARK = /\*\*|__/gu
+
+/**
+ * 朗读前的文本清洗：去掉机器编号、讲解用的结构标签与列表符号。
+ *
+ * 两条原则：
+ * - **只清洗声音这一路**。屏幕上保留原文（编号、标签、列表都是有用的结构），
+ *   `splitIntoSegments` 在切句前调用本函数，界面从不经过这里。
+ * - **只删能确定是"排版给眼睛看的"东西**。删不准的（所有方括号、正文里的星号与大于号）
+ *   一律留着 —— 多念一个符号只是难听，少念一个字是信息丢失。
+ *
+ * 清洗后只剩空白时不做特殊处理：`splitIntoSegments` 的 `WORTH_SPEAKING` 会把这样的片段丢掉，
+ * 在这里再造一套判断只会多一处会漂移的规则。
+ */
+export function cleanForSpeech(raw: string, options: { readonly stripQuotes?: boolean } = {}): string {
+  // 追问回答里的引用块整行不念；文档原文朗读（没有这个开关）保持原样。
+  const source = options.stripQuotes === true ? raw.replace(/^[ \t]*>[^\r\n]*(?:\r?\n|$)/gmu, '') : raw
+  return source
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu, '')
+    .replace(/\b[0-9a-f]{32}\b/giu, '')
+    .replace(/([：:])\s*([，,、。])/gu, '$2')
+    .replace(/\s+([，,、。！？!?；;…])/gu, '$1')
+    // 结构性的东西先摘掉，再统一收拢留下的空格（顺序不能反：先收空格的话，
+    // 标签被删掉后原地会留下两个空格，而那时已经没有收拢规则兜着了）。
+    .replace(EXPLAIN_LABEL, '')
+    .replace(BULLET_MARK, '')
+    .replace(ORDERED_MARK, '')
+    .replace(QUOTE_MARK, '')
+    .replace(HEADING_MARK, '')
+    .replace(EMPHASIS_MARK, '')
+    // 列表/标题清洗依赖行首锚点，必须等它们跑完再把换行归一成空格，
+    // 否则跨行的同一句会被合成器念出两次停顿。
+    .replace(/\r?\n/gu, ' ')
+    .replace(/[ \t]{2,}/gu, ' ')
+    .trim()
+}
+
+/**
  * 把一次讲话请求切成正好由合成器一口吃掉的那些句子。
  *
  * 标点留在句尾（合成器要靠它决定停顿），空白段直接丢掉，序号从 0 递增 ——
  * 序号是"播放位置"的一部分，续讲要靠它接着往下走。
  */
 export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
-  const { sentences, rest } = drainSentences(request.text)
-  const pieces = rest.length > 0 ? [...sentences, rest] : sentences
+  const { sentences, rest } = drainSentences(cleanForSpeech(request.text, { stripQuotes: request.stripQuotes === true }))
+  /* 相邻短句先并段再合成，减少"两三个字就发一次请求"造成的句间卡顿。 */
+  const raw = rest.length > 0 ? [...sentences, rest] : sentences
+  const pieces = shortMergeEnabled ? mergeShortPieces(raw) : raw
 
   const base = request.indexBase ?? 0
   const segments: Segment[] = []
@@ -96,6 +223,14 @@ export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
       index: base + segments.length,
       text: trimmed,
       ...(request.origin ? { origin: request.origin } : {}),
+...(request.ephemeral ? { ephemeral: true } : {}),
+    ...(request.voiceDesign === undefined ? {} : { voiceDesign: request.voiceDesign }),
+    ...(request.voice === undefined ? {} : { voice: request.voice }),
+    ...(request.voiceStyle === undefined ? {} : { voiceStyle: request.voiceStyle }),
+    ...(request.voiceSampleFile === undefined ? {} : { voiceSampleFile: request.voiceSampleFile }),
+    ...(request.voiceSample === undefined ? {} : { voiceSample: request.voiceSample }),
+    ...(request.voiceSampleMime === undefined ? {} : { voiceSampleMime: request.voiceSampleMime }),
+    ...(request.ttsProfileId === undefined ? {} : { ttsProfileId: request.ttsProfileId }),
       ...(request.voiceProfile ? { voiceProfile: request.voiceProfile } : {}),
     })
   }
@@ -108,6 +243,43 @@ export function splitIntoSegments(request: SpeechRequest): readonly Segment[] {
  * 流式朗读靠它一段一段地推进：只有完整的句子才值得送去合成，半句送过去会切在词中间。
  * `splitIntoSegments` 与 `Narrator.feed` 共用这一份切法 —— 两处各写一套，接缝处迟早会吞字或重念。
  */
+/** 是否合并相邻短句。默认关闭：它会改变播报与打断的粒度，由用户在设置里打开。 */
+let shortMergeEnabled = false
+
+export function configureSpeech(options: { mergeShortSentences?: boolean }): void {
+  shortMergeEnabled = options.mergeShortSentences === true
+}
+
+const MERGE_MIN_CHARS = 10
+const MERGE_MAX_CHARS = 90
+
+/**
+ * 把相邻的短句并成一段。
+ *
+ * 以前一句一次合成请求：碰上"好。""嗯。""行。"这种两三个字的句子，
+ * 网络往返的开销远大于音频本身，听感就是每句之间卡一下。
+ * 合并只改**发请求的粒度**：不换顺序、不跨两个长句硬粘。
+ */
+function mergeShortPieces(pieces: readonly string[]): string[] {
+  const merged: string[] = []
+  let buffer = ''
+  for (const raw of pieces) {
+    const piece = raw.trim()
+    if (piece === '') continue
+    /*
+      短句一律并掉：累计到 MERGE_MIN_CHARS 个字才发出去，
+      超过 MERGE_MAX_CHARS 才强制断（一次塞太多，首字延迟反而更长）。
+    */
+    buffer = buffer === '' ? piece : buffer + piece
+    if (buffer.length >= MERGE_MIN_CHARS) {
+      merged.push(buffer)
+      buffer = ''
+    }
+  }
+  if (buffer !== '') merged.push(buffer)
+  return merged
+}
+
 export function drainSentences(text: string): { sentences: readonly string[]; rest: string } {
   const sentences: string[] = []
   let current = ''
@@ -177,6 +349,8 @@ export type SpeechEvent =
   /** 合成器报 cancelled：这一句只播了一半。 */
   | { readonly type: 'cut' }
   | { readonly type: 'interrupt'; readonly level: InterruptLevel }
+  /** 只丢指定话语（快答交棒）：队列里其他句子不受影响。 */
+  | { readonly type: 'drop-utterance'; readonly utteranceId: string }
 
 export type SpeechEffect = 'stop-audio' | 'cancel-generation' | 'request-task-cancel'
 
@@ -246,6 +420,19 @@ export function nextSpeech(state: SpeechState, event: SpeechEvent): SpeechTransi
         playing: null,
         spoken: [...state.spoken, { segment: state.playing, complete: false }],
       })
+    }
+
+    case 'drop-utterance': {
+      const queue = state.queue.filter(segment => segment.utteranceId !== event.utteranceId)
+      if (state.playing !== null && state.playing.utteranceId === event.utteranceId) {
+        return at({
+          ...state,
+          queue,
+          playing: null,
+          spoken: [...state.spoken, { segment: state.playing, complete: false }],
+        }, ['stop-audio'])
+      }
+      return at({ ...state, queue })
     }
 
     case 'interrupt':

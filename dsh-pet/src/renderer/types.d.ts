@@ -39,11 +39,24 @@ import type { FirstRunReport, FirstRunStep } from '../main/first-run.js'
 import type { SessionCommand, SessionResult, SessionUpdate } from '../session-types.js'
 import type { Box } from './stage-layout.js'
 import type { AssistantSettingsPage, AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
+import type { AssistantMailAnalysesResult, AssistantMailInput, AssistantMailResult } from '../main/assistant-mail.js'
 import type { MemberAction, MemberApi, MemberCommandInputs, MemberDraft, MemberEditorContext, MemberResult } from '../member-types.js'
 
 export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?: string }
 
-export type SettingsPage = 'general' | 'team' | 'doc' | 'meeting' | Exclude<AssistantSettingsPage, 'agent'>
+/**
+ * 设置面板的页面。
+ *
+ * 前九个是导航上的九项，按「工作 / 设置」两组排布（顺序见 `settings-nav.ts`，那里是单一真源）。
+ * 末两个 `agent`（总助理）与 `reminders`（提醒）**不在导航里**：总助理从「通用」页的入口进去，
+ * 提醒的内容并入了「待办提醒」。保留它们在联合类型里，是因为 `AssistantSettings` 仍按 section
+ * 渲染这两块内容 —— 删掉就等于把功能藏起来。
+ */
+export type SettingsPage =
+  | 'chat' | 'todo' | 'mail' | 'wecom' | 'report' | 'meeting'
+  | 'team' | 'doc' | 'general'
+  | 'agent' | 'reminders'
+  | AssistantSettingsPage
 
 export type { CompanionState, MeetingConsentInput, MeetingRuntimeState, MinutesRecord, SkinOverrides, TranscriptSegment }
 
@@ -93,7 +106,41 @@ export interface PetState {
   positions?: Record<string, PetPosition>
   /** 用户在本机为每个角色挑的形象，键是 assistantId。 */
   characters?: SkinOverrides
+  /** 总助理自己的音色设计描述（按性格生成，可手改）。 */
+  agentVoiceDesign?: string
+  /** 总助理用的克隆音色 ID。 */
+  agentVoiceId?: string
+  /** 音色复刻样本（base64）。 */
+  agentVoiceStyle?: string
+  agentVoiceSample?: string
+  agentVoiceSampleMime?: string
+  /** 手动退下的成员名单；持久化，召唤/重启不自动复活。 */
+  stepDownMembers?: string[]
   layoutVersion?: number
+  /**
+   * 讲解形态：`source` 按文档原文逐段念稿（默认），`ai` 每段让模型生成解释与补充。
+   *
+   * **不要与演示隐私模式的 `presentationMode` 混淆**：那个是布尔、挂在 companion 快照上，
+   * 管的是"藏起历史与预览"；这个是讲解形态、挂在 settings 上。同叫 presentation 的两件事
+   * 完全不同义，所以这一侧刻意叫 `docSpeechMode`。
+   */
+  docSpeechMode?: 'source' | 'ai'
+  /** 讲解快捷键回读（设置页靠它回显）：打断 / 休息 / 继续。 */
+  docHotkeys?: { interrupt: string; rest: string; resume: string }
+  /** 总助理音色的三项回读（设置页靠它回显）。 */
+  agentVoiceDesign?: string
+  agentVoiceId?: string
+  agentVoiceStyle?: string
+  agentVoiceSample?: string
+  agentVoiceSampleMime?: string
+  /** 角色大小档位：0.8 / 1 / 1.2，默认 1。 */
+  petScale?: 0.8 | 1 | 1.2
+  /** 角色透明度档位：0.6 / 0.8 / 1，默认 1；只作用于角色图。 */
+  petOpacity?: 0.6 | 0.8 | 1
+  /** 拖到屏幕边缘时是否吸附并收起成停靠态，默认 true。 */
+  petDock?: boolean
+  /** 上次停靠在哪个边；null = 没停靠。 */
+  dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null
 }
 
 export interface PetSettingsPatch {
@@ -108,6 +155,33 @@ export interface PetSettingsPatch {
   positions?: Record<string, PetPosition>
   chatDock?: 'top' | 'auto'
   chatSize?: { width: number; height: number }
+  stepDownMembers?: string[]
+  /** 角色形象覆盖：总助理设置页改形象走这里（主进程按内置/自定义皮肤白名单校验）。 */
+  characters?: SkinOverrides
+  /** 总助理自己的音色设计描述（按性格生成，可手改）。 */
+  agentVoiceDesign?: string
+  /** 总助理用的克隆音色 ID。 */
+  agentVoiceId?: string
+  /** 音色复刻样本（base64）。 */
+  agentVoiceStyle?: string
+  agentVoiceSample?: string
+  agentVoiceSampleMime?: string
+  /** 讲解形态；写进 patch 是为了让设置页能改（主进程 `save-settings` 是白名单式的）。 */
+  docSpeechMode?: 'source' | 'ai'
+  /** 讲解快捷键（Electron accelerator，如 Ctrl+Alt+D）；设置页可改，主进程注册时验占用。 */
+  docInterruptHotkey?: string
+  docRestHotkey?: string
+  docResumeHotkey?: string
+  /** 总助理音色的三项回读（设置页靠它回显）。 */
+  agentVoiceDesign?: string
+  agentVoiceId?: string
+  agentVoiceStyle?: string
+  agentVoiceSample?: string
+  agentVoiceSampleMime?: string
+  petScale?: 0.8 | 1 | 1.2
+  petOpacity?: 0.6 | 0.8 | 1
+  petDock?: boolean
+  dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null
 }
 
 /**
@@ -287,6 +361,11 @@ export type DocState =
       readonly estMinutes: number
       readonly total: number
       readonly next: number
+      /** 讲解委派给的成员；null 表示总助理自己讲。 */
+      readonly assistantId?: string | null
+      readonly assistantName?: string
+      /** 正在出声讲解且未讲完才为 true；讲完/暂停/停止为 false（委派成员据此下台）。 */
+      readonly active?: boolean
       readonly sections: readonly DocSectionBrief[]
     }
 
@@ -374,6 +453,8 @@ export interface ResidencyState {
       readonly createdAt: number | null
       readonly problem: string | null
     }
+    /** 播报中是否也响应唤醒；默认 false（播报中安静）。讲解中始终可打断。 */
+    readonly wakeDuringSpeech: boolean
     readonly engines: ReadonlyArray<'system' | 'kws'>
     /** 仲裁器当前是否把麦克风交给了唤醒。 */
     readonly listening: boolean
@@ -398,6 +479,8 @@ export interface ResidencyPatch {
   readonly wakeVoiceprint?: boolean
   /** 声纹相似度阈值（0.5–0.9）。 */
   readonly wakeVoiceprintThreshold?: number
+  /** 播报中是否也响应唤醒（默认关）。与声纹是两个开关：声纹管"只认谁"，这个管"什么时候应"。 */
+  readonly wakeDuringSpeech?: boolean
   readonly launchAtLogin?: boolean
   readonly bargeIn?: boolean
   /** 唤醒失败后用户手动重试。 */
@@ -457,6 +540,8 @@ export interface MemberEditorApi {
   membersState(): Promise<MemberResult>
   memberCommand<A extends MemberAction>(action: A, input: MemberCommandInputs[A]): Promise<MemberResult>
   memberAssist(input: { request: string; current?: MemberDraft }): Promise<MemberResult>
+  /** 按成员性格生成音色描述（复用主进程的主助理模型调用）。 */
+  voiceDesignAssist(input: { name?: string; personality: string }): Promise<{ ok: true; description: string; style: string } | { ok: false; error: string }>
   onContext(callback: (context: MemberEditorContext) => void): () => void
   onChanged(callback: () => void): () => void
 }
@@ -466,6 +551,8 @@ export interface PetApi extends MemberApi {
   memberAssist(input: { request: string; current?: MemberDraft }): Promise<MemberResult>
   /** 打开独立的成员编辑窗口；null 表示新建。 */
   openMemberEditor(memberId?: string | null): Promise<{ ok: boolean }>
+  /** 只读窗口展示该成员的独立会话（宿主持久化会话文件）。 */
+  viewMemberSession(memberId: string): Promise<{ ok: boolean; error?: string }>
   onMembersChanged(callback: () => void): () => void
   getState(includeOperations?: boolean): Promise<PetState>
   getSession(beforeSeq?: number, bindingId?: string): Promise<SessionResult>
@@ -475,18 +562,65 @@ export interface PetApi extends MemberApi {
   onSessionUpdate(callback: (update: SessionUpdate) => void): () => void
   onSessionConnection(callback: (status: string) => void): () => void
   onSettingsOpen(callback: (page: SettingsPage) => void): () => void
+  /** 主进程在讲解开讲等时机收起管理面板，避免挡屏。 */
+  onSettingsClose(callback: () => void): () => void
+  /** 右键"让TA退下"：单独请某个非总助理成员下台，不退出应用。 */
+  onMemberStepDown(callback: (assistantId: string) => void): () => void
+  /** 右键"请TA上台"：把之前手动退下的成员请回舞台。 */
+  onMemberStepUp(callback: (assistantId: string) => void): () => void
   onOverlayDismiss(callback: () => void): () => void
   onOverlayError(callback: (message: string) => void): () => void
   overlayState(open: boolean, boxes: Box[], settingsOpen: boolean): void
   saveSettings(patch: PetSettingsPatch): Promise<{ ok: boolean }>
   assistantSettingsState(): Promise<AssistantSettingsResult>
+  /** 讲解口令打断后的提问窗口超时：把被暂停的讲解接回去（没有待续讲时返回失败）。 */
+  docResume(reason?: 'timeout' | 'continue'): Promise<{ ok: boolean; error?: string }>
+  /** 口令打断后的即时应答：讲解人音色的预合成短句（"好的，你说"）。 */
+  docAck(kind: 'stop'): void
+  /** 讲解全局快捷键按下：interrupt 打断提问 / rest 休息 / resume 继续。 */
+  onDocHotkey(callback: (payload: { action: 'interrupt' | 'rest' | 'resume' }) => void): () => void
+  /** 讲解快捷键注册状态（false = 被占用或非法），设置页据此提示改键。 */
+  onDocHotkeyStatus(callback: (status: { interrupt: boolean; rest: boolean; resume: boolean }) => void): () => void
+  /** 邮件页：读取邮箱配置（授权码只回 hasPassword，永不回显明文）。 */
+  assistantMailState(): Promise<AssistantMailResult>
+  /** 邮件页：保存邮箱配置；password 留空＝沿用已保存的授权码。 */
+  assistantMailSave(input: AssistantMailInput): Promise<AssistantMailResult>
+  /** 邮件页：最近的值守分析结果（只读，含已通知的）。 */
+  assistantMailAnalyses(limit?: number): Promise<AssistantMailAnalysesResult>
+  /** 技能证据：本人确认（verify）或撤回（retract）；只作用于还没形成技能的样本。 */
+  skillsEvidence(action: 'verify' | 'retract', assistantId: string, shape: string): Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; pending?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; unverified?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; verified?: number; removed?: number; message?: string }>
+  /** 工作时间线：缺省查今天；只含解释过的工作事项。 */
+  timelineState(from?: number, to?: number): Promise<{ ok: boolean; items?: Array<{ id: string; start: number; end: number; action: string; outcome: string; project: string | null; status: string }>; message?: string }>
+  /** 技能：读取列表（每个助理最新一版）。 */
+  skillsState(): Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; pending?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; unverified?: Array<{ assistantId: string; assistantName: string; shape: string; count: number }>; message?: string }>
+  /** 技能操作：晋升为生效 / 回滚到指定版本 / 退役。回滚必须带 version。 */
+  skillsUpdate(action: 'promote' | 'rollback' | 'retire', id: string, version?: number): Promise<{ ok: boolean; skills?: Array<{ id: string; assistantId: string; assistantName: string; name: string; body: string; version: number; status: string; createdAt: number }>; message?: string }>
+  /** 最近产出过的文件；state='missing' 表示文件已经不在了，界面上要如实标出来。 */
+  artifactsState(): Promise<{ ok: boolean; artifacts?: Array<{ path: string; label: string; kind: string; state: 'ok' | 'missing'; createdAt: number }>; message?: string }>
+  /** 专属词库：读取列表（行话 → 它指的是什么）。 */
+  glossaryState(): Promise<{ ok: boolean; terms?: Array<{ term: string; expansion: string }>; message?: string }>
+  /** 新增或删除术语；remove=true 时只按 term 删。返回最新列表。 */
+  glossaryUpdate(term: string, expansion?: string, remove?: boolean): Promise<{ ok: boolean; terms?: Array<{ term: string; expansion: string }>; message?: string }>
   assistantSettingsSave(section: AssistantSettingsSection, input: unknown): Promise<AssistantSettingsResult>
   /** 打开已有任务与提醒窗口；各项操作仍沿用窗口内的确认与审批。 */
   openCompanionTasks(): Promise<{ ok: boolean }>
   voiceApiState(): Promise<VoiceApiResult>
   voiceApiSave(input: VoiceApiInput): Promise<VoiceApiResult>
   voiceApiRemove(id: string): Promise<VoiceApiResult>
+  /** 交接台词：四方各一句（按各自性格生成；只用于朗读，不进会话）。 */
+  handoverLines(input: { chiefName?: string; chiefPersona?: string; memberName?: string; memberPersona?: string; task: string }): Promise<{ ok: true; lines: Record<string, string> } | { ok: false; error: string }>
+  /** 按性格生成音色描述（交给主助理模型；产出可手改）。 */
+  voiceDesignAssist(input: { name?: string; personality: string }): Promise<{ ok: true; description: string; style: string } | { ok: false; error: string }>
+  /** 试听：用已保存且已选中的语音配置合成样例；每次都会真实调用一次语音服务。 */
+  agentVoiceState(): Promise<{ design: string; style: string; voiceId: string; sampleLength: number; mime: string; sample: string }>
+  voiceApiPreview(id: string, voiceDesign?: string, voice?: string, sample?: { data: string; mime: string }, style?: string): Promise<{ ok: true; audio: string; mime: string } | { ok: false; error: string }>
   voiceApiSelect(kind: VoiceApiKind, id: string | null): Promise<VoiceApiResult>
+  /** 快速应答（快嘴旁路）：读配置（不含密钥）。 */
+  fastReplyState(): Promise<import('../main/fast-reply.js').FastReplySnapshot | null>
+  fastReplySave(input: import('../main/fast-reply.js').FastReplyInput): Promise<{ ok: boolean; state?: import('../main/fast-reply.js').FastReplySnapshot; error?: string }>
+  fastReplyTest(): Promise<{ ok: boolean; sample?: string; error?: string }>
+  /** 快嘴短应答：主进程已用 TTS 念出，界面只显示在宠物气泡，不进会话流水。 */
+  onFastAck(callback: (payload: { text: string }) => void): () => void
   /** 首次使用检查：环境清单 + 模型下载计划（只读，不发请求）。 */
   firstRunReport(): Promise<FirstRunReportResult>
   /** 按用户确认的那一项下载模型。确认三要素由计划视图原样带回，不能自己拼。 */
@@ -509,6 +643,8 @@ export interface PetApi extends MemberApi {
   speakLocal(text: string): void
   /** 拉一次团队快照。未连接或未开启团队模式时返回 null。 */
   getTeam(): Promise<TeamSnapshot | null>
+  /** 本人复核确认一个等待中的团队任务（等你点头/等复核/等你回话 → 已完成）。 */
+  confirmTeamTask(taskId: string): Promise<{ ok: boolean; message: string }>
   /**
    * 请求主进程打开专用审批窗口。
    *
@@ -537,6 +673,8 @@ export interface PetApi extends MemberApi {
   /** 声纹注册状态（不返回 embedding 本身）。 */
   voiceprintStatus(): Promise<{ registered: boolean; count: number; createdAt: number | null; problem: string | null }>
   /** 用 2–5 段 16k 单声道 WAV（base64）注册声纹；只存 embedding，不存原始录音。 */
+  /** 声纹环境自检：逐步返回原始报错。 */
+  voiceprintDiagnose(): Promise<{ ok: boolean; steps: Array<{ name: string; ok: boolean; detail: string }> }>
   voiceprintEnroll(wavs: string[]): Promise<{ ok: boolean; count?: number; error?: string }>
   voiceprintClear(): Promise<{ ok: boolean; removed?: boolean; error?: string }>
   /** 流式喂数：一帧 16kHz Int16 PCM（base64），返回当前累积的识别文本（实时回显）。 */
@@ -562,6 +700,11 @@ export interface PetApi extends MemberApi {
   setPresentationMode(on: boolean): void
   /** 某个角色的形象被改了（右键菜单）：主进程广播整张表，界面据此立刻换图。 */
   onCharactersChanged(callback: (characters: SkinOverrides) => void): void
+  /** 生成流水线登记的自定义皮肤（id+动作清单，启动时读一次）。 */
+  customSkins(): Promise<{ id: string; actions?: string[] }[]>
+  /** 自定义皮肤登记变化：渲染层注册 id/动作并清素材缓存后重挂舞台。 */
+  onCustomSkins(callback: (skins: { id: string; actions?: string[] }[]) => void): void
+  openAssetStudio(): Promise<{ ok: boolean }>
   /** 主进程请求退场（会话销毁或用户右键退出）：渲染层播完退场动画后调用 exitDone。 */
   onExitRequested(callback: () => void): void
   /** 全局快捷键唤起输入模式。 */
@@ -595,8 +738,10 @@ export interface PetApi extends MemberApi {
    * 与 `chat` 的返回值分工：流水负责「发生了什么」（含网页侧发起的轮次），
    * 返回值负责「这条回复归属谁、有没有出错」。宿主不吐增量时一次都不会触发，
    * 界面必须能接受整段回复一次到达。
+   *
+   * 返回退订函数；卸载时必须调用，否则 effect 重挂会堆监听（同一进程里可能不止一个订阅方）。
    */
-  onChatDelta(callback: (delta: BridgeEventPayload) => void): void
+  onChatDelta(callback: (delta: BridgeEventPayload) => void): () => void
   /**
    * 语音识别的流式增量。
    *

@@ -224,6 +224,11 @@ export class CompanionHost {
     await this.terminateOwnRuntime()
   }
 
+  /** 只读状态快照：桌面命令（如宠物配置回读）要如实回答"角色现在显示没有"。 */
+  getState(): CompanionState {
+    return { ...this.state }
+  }
+
   setStageVisible(visible: boolean): void {
     if (this.state.stageVisible === visible) return
     this.state = { ...this.state, stageVisible: visible }

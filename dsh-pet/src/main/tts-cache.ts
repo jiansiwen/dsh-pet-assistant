@@ -34,13 +34,53 @@ export function voiceFingerprint(parts: {
   readonly voice?: string
   readonly provider?: string
   readonly endpoint?: string
+  readonly design?: string
+  readonly style?: string
+  readonly sample?: string
 }): string {
   return createHash('sha256').update(JSON.stringify([
     parts.provider ?? '',
     parts.endpoint ?? '',
     parts.model ?? '',
     parts.voice ?? '',
+    parts.design ?? '',
+    parts.style ?? '',
+    parts.sample ?? '',
   ])).digest('hex').slice(0, 16)
+}
+
+/**
+ * 自定义服务的缓存键：预热写入与 Narrator 派发读取必须用同一个函数，
+ * 否则写进去的音频永远查不到（之前两处各拼各的键，唤醒缓存形同虚设）。
+ * 样本只记路径/长度指纹，不把几十 MB base64 塞进键里。
+ */
+export function ttsVoiceKey(api: {
+  readonly provider?: string
+  readonly endpoint?: string
+  readonly model?: string
+  readonly voice?: string
+  readonly voiceDesign?: string
+  readonly voiceStyle?: string
+  readonly voiceSampleFile?: string
+  readonly voiceSample?: string
+}): string {
+  return voiceFingerprint({
+    provider: api.provider, endpoint: api.endpoint, model: api.model, voice: api.voice,
+    design: api.voiceDesign, style: api.voiceStyle,
+    sample: sampleFingerprint(api.voiceSampleFile, api.voiceSample),
+  })
+}
+
+/** 样本内容指纹：换样本文件必须让缓存失效，否则唤醒会一直播旧嗓子的音频。 */
+export function sampleFingerprint(sampleFile?: string, sample?: string): string {
+  if (sampleFile) {
+    try {
+      const s = statSync(sampleFile)
+      return `${sampleFile}:${s.mtimeMs}:${s.size}`
+    } catch { return sampleFile }
+  }
+  if (sample) return `inline:${createHash('sha256').update(sample).digest('hex').slice(0, 12)}`
+  return ''
 }
 
 function digestOf(key: TtsCacheKey): string {

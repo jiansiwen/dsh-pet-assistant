@@ -61,6 +61,13 @@ interface Options {
   active(): boolean
   now?: () => number
   publish?: typeof publishRevisionFile
+  /**
+   * 文件真的写进磁盘之后回调一次（只在这条路径上，用来登记产物指针）。
+   *
+   * 放在"发布成功之后"而不是"批准之后"：写文件可能失败、也可能冲突，
+   * 那个时刻并没有产物。回调里抛错不能影响发布结果，所以调用方内部要自己吞。
+   */
+  onPublished?(record: { reportId: string; targetPath: string | null; digest: string; revision: number; content: string }, now: number): void
 }
 
 export interface ReportDecisionRecord {
@@ -127,9 +134,16 @@ export class ReportApprovalService {
   private now(): number { return this.options.now?.() ?? Date.now() }
 
   private targetFor(reportId: string): string {
-    const date = /^daily:(\d{4}-\d{2}-\d{2})$/.exec(reportId)?.[1]
-    if (!date) throw new Error('只接受日期明确的日报，不接受模型指定发布路径')
-    return path.resolve(this.options.reportDir, `${date}.md`)
+    /*
+     * 只认两种主体：日报 `daily:YYYY-MM-DD`、周报 `weekly:YYYY-MM-DD`（该周周一）。
+     * 仍然是**白名单**，不接受模型指定发布路径 —— 周报的文件名也只由日期键推出来，
+     * 与日报分开命名，同一天的两份报告互不覆盖。
+     */
+    const daily = /^daily:(\d{4}-\d{2}-\d{2})$/.exec(reportId)?.[1]
+    if (daily) return path.resolve(this.options.reportDir, `${daily}.md`)
+    const weekly = /^weekly:(\d{4}-\d{2}-\d{2})$/.exec(reportId)?.[1]
+    if (weekly) return path.resolve(this.options.reportDir, `${weekly}-周报.md`)
+    throw new Error('只接受日期明确的日报或周报，不接受模型指定发布路径')
   }
 
   submit(reportId: string): ReportProposal {
@@ -327,6 +341,11 @@ export class ReportApprovalService {
         this.reports.finishJob(operationId, 'succeeded', this.now())
         this.reports.setReportState(record.reportId, record.revision, 'archived')
       })
+      // 文件已经落盘：登记产物指针。回调里抛错只影响"记不记得住"，不影响"发没发出去"。
+      try {
+        this.options.onPublished?.({ reportId: record.reportId, targetPath: record.targetPath ?? null,
+          digest: record.digest, revision: record.revision, content: record.content }, this.now())
+      } catch { /* 指针登记失败不改变发布结果；下一版发布会覆盖同路径 */ }
       let stopError: string | undefined
       try { await this.options.stop() } catch (error) { stopError = String(error) }
       const modeExited = !this.options.active() && !stopError

@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import type { MailSuggestion } from './mail-suggestions.ts'
 import type { CompanionBlocker, CompanionCommand, CompanionHttpResult, CompanionInput, CompanionTaskKind, DesktopReminderDelivery, ReminderSchedule } from './companion-contract.ts'
 import { MemberDirectory, migrateMemberDirectory } from './member-directory.ts'
 
@@ -22,10 +23,16 @@ export interface CompanionTaskMeta {
   blocker: CompanionBlocker
 }
 
+/** 受管执行器任务的输入：kind 限契约内的非内置类型，字段由注册执行器自己的校验器逐项验证。 */
+export interface ManagedTaskInput {
+  kind: Exclude<CompanionTaskKind, 'agent' | 'reminder'>
+  [field: string]: unknown
+}
+
 export interface CompanionInputRecord {
   inputRef: string
   principalId: string
-  input: CompanionInput
+  input: CompanionInput | ManagedTaskInput
   digest: string
   createdAt: number
 }
@@ -54,6 +61,41 @@ export interface CompanionScheduleRecord {
   generation: number
   missedPolicy: 'coalesce'
   grantRef: string
+}
+
+/**
+ * 成员定时任务：到点**自主跑成员**（memberRuntime.chat）真干活，再把结果投递到桌面/企微。
+ * 与提醒（schedules）刻意分开：提醒到点只发一条固定通知；这里让成员抓数据/整理日报后推真实结果。
+ * spec 复用 ReminderSchedule（daily/once/interval），nextRunAt 由 scheduler.ts 计算。
+ */
+export interface MemberScheduleRecord {
+  scheduleId: string
+  assistantId: string
+  title: string
+  prompt: string
+  spec: ReminderSchedule
+  channel: 'desktop' | 'wecom'
+  /** wecom 收件会话标识（wecom:single:<id>）；desktop 为 null（以成员形象播报给本人）。 */
+  recipientId: string | null
+  enabled: boolean
+  nextRunAt: number | null
+  generation: number
+  createdAt: number
+  lastRunAt: number | null
+  lastStatus: 'succeeded' | 'failed' | null
+  lastText: string | null
+}
+
+export interface MemberScheduleRunRecord {
+  runId: string
+  scheduleId: string
+  assistantId: string
+  generation: number
+  triggerAt: number
+  state: 'running' | 'succeeded' | 'failed'
+  text: string | null
+  startedAt: number
+  finishedAt: number | null
 }
 
 export interface ReminderGrantRecord {
@@ -131,9 +173,12 @@ export interface CompanionContextRecord {
  * v11：邮件分析通知的桌面领取、回执与结果不明状态。
  * v12：邮件发送意图、服务回执及人工核对状态。
  * v13：渠道消息执行与回复的持久状态，不保存消息正文。
- * v15：子助理分派账本（subassistant_runs）——先落账再执行，回执驱动状态推进；不保存任务正文，仅存摘要。
+* v14：待办优先级与来源列（仅新建库走到）。
+ * v15：老库按列名补 tasks.priority/source——v14 的补列被版本闸门挡住，老库永远走不到；
+ *     子助理分派账本（subassistant_runs）——先落账再执行，回执驱动状态推进；不保存任务正文，仅存摘要。
+ * v16：合并两路 v15 后版本顺延，让旧库重跑一次幂等迁移——只看版本号会漏建另一分支的表/列。
  */
-export const TEAM_SCHEMA_VERSION = 15
+export const TEAM_SCHEMA_VERSION = 17
 
 export interface ChannelInboundRecord {
   id: string
@@ -193,6 +238,11 @@ export interface MailWatchAnalysis {
   memberId: string
   uids: number[]
   result: string
+  /**
+   * 结构化建议。空数组表示这次分析只给了文字摘要（模型没按格式回），
+   * 而不是"没有邮件需要处理" —— 后者会是一条 `kind: 'none'` 的建议。
+   */
+  suggestions: MailSuggestion[]
   createdAt: number
   notifiedAt: number | null
 }
@@ -304,6 +354,32 @@ export const TASK_STATUSES = [
 ] as const
 export type TaskStatus = (typeof TASK_STATUSES)[number]
 
+/** 待办优先级。列表按它排序（high 在前），同优先级再按 updatedAt 倒序。 */
+export const TASK_PRIORITIES = ['high', 'normal', 'low'] as const
+export type TaskPriority = (typeof TASK_PRIORITIES)[number]
+export const DEFAULT_TASK_PRIORITY: TaskPriority = 'normal'
+
+/**
+ * 待办来源。**创建时就定**，之后不改：它回答的是"这条是怎么来的"，
+ * 不是"现在归谁管"——所以不做可编辑字段。
+ * - manual：用户手输 / 手点
+ * - meeting：会议里产生的
+ * - enterprise：邮件、企业微信等企业侧产生的
+ * - ai：模型主动建的
+ */
+export const TASK_SOURCES = ['manual', 'meeting', 'enterprise', 'ai'] as const
+export type TaskSource = (typeof TASK_SOURCES)[number]
+export const DEFAULT_TASK_SOURCE: TaskSource = 'manual'
+
+/** 库里的值可能是老的/手改的：认不出的按默认处理，绝不让它变成 undefined 冒到界面上。 */
+export function normalizePriority(raw: unknown): TaskPriority {
+  return (TASK_PRIORITIES as readonly string[]).includes(String(raw)) ? String(raw) as TaskPriority : DEFAULT_TASK_PRIORITY
+}
+
+export function normalizeSource(raw: unknown): TaskSource {
+  return (TASK_SOURCES as readonly string[]).includes(String(raw)) ? String(raw) as TaskSource : DEFAULT_TASK_SOURCE
+}
+
 /** 终态：不再接受新的执行步骤，只接受复核或重新开任务。 */
 export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ['done', 'failed', 'cancelled']
 
@@ -326,6 +402,10 @@ export interface Task {
   readonly originChannel: string | null
   readonly createdAt: number
   readonly updatedAt: number
+  /** 缺省按 {@link DEFAULT_TASK_PRIORITY}；老记录在库里迁移时已补齐。 */
+  readonly priority?: TaskPriority
+  /** 缺省按 {@link DEFAULT_TASK_SOURCE}；老记录在库里迁移时已补齐。 */
+  readonly source?: TaskSource
 }
 
 export const RUN_STATES = ['running', 'succeeded', 'failed', 'cancelled', 'unknown'] as const
@@ -614,6 +694,20 @@ function bool(value: boolean): number {
 
 function json(value: unknown): string {
   return JSON.stringify(value ?? null)
+}
+
+/**
+ * 读回存着的结构化建议。任何解析失败都退成空数组而不是抛错：
+ * 一条建议坏了不该让整条通知读不出来 —— 摘要仍然要能送到用户眼前。
+ */
+function parseStoredSuggestions(raw: unknown): MailSuggestion[] {
+  if (raw === null || raw === undefined || raw === '') return []
+  try {
+    const parsed = JSON.parse(String(raw)) as unknown
+    return Array.isArray(parsed) ? parsed as MailSuggestion[] : []
+  } catch {
+    return []
+  }
 }
 
 /** action_proposals 行 → ActionProposal。getProposal / listProposals / findGateProposal 共用一份映射。 */
@@ -1028,6 +1122,10 @@ export class TeamStore {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications (task_id, created_at)`)
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_operation ON operation_reviews (operation_id, created_at)`)
 
+    // 待办的优先级与来源：老库的 tasks 表已经存在，CREATE TABLE IF NOT EXISTS 不会补列，
+    // 所以在建完核心表之后按列名补齐（幂等，见 migrateTaskColumns）。
+    this.migrateTaskColumns()
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS companion_identity (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1235,7 +1333,35 @@ export class TeamStore {
         CHECK((status = 'dispatched') = (completed_at IS NULL))
       );
       CREATE INDEX IF NOT EXISTS idx_subassistant_runs_assistant ON subassistant_runs(assistant_id, created_at);
+      CREATE TABLE IF NOT EXISTS member_schedules (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
+      CREATE TABLE IF NOT EXISTS member_schedule_runs (
+        run_id TEXT PRIMARY KEY,
+        schedule_id TEXT NOT NULL,
+        assistant_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        trigger_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('running', 'succeeded', 'failed')),
+        text TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_member_schedule_runs ON member_schedule_runs(schedule_id, started_at);
     `)
+    /*
+     * 邮件分析的结构化建议：老库没有这一列，用 PRAGMA + ALTER 幂等补上。
+     *
+     * **必须放在建表之后**：放在 migrateMemberDirectory 后面会先于 mail_watch_analyses 建表，
+     * 新库上 PRAGMA 查不到表、ALTER 直接报 "no such table"，整个插件起不来。
+     * 默认 '[]' 表示"这次分析只给了文字摘要"，与"给了一条空建议"不是一回事。
+     */
+    {
+      const columns = (this.db.prepare('PRAGMA table_info(mail_watch_analyses)').all() as Array<Record<string, unknown>>)
+        .map(row => String(row.name))
+      if (!columns.includes('suggestions')) this.db.exec("ALTER TABLE mail_watch_analyses ADD COLUMN suggestions TEXT NOT NULL DEFAULT '[]'")
+    }
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
       .prepare('INSERT OR IGNORE INTO migrations (version, applied_at) VALUES (?, ?)')
@@ -1338,13 +1464,39 @@ export class TeamStore {
     }
   }
 
+  /**
+   * 幂等迁移：给 tasks 补 `priority` / `source` 两列。
+   *
+   * 为什么用 PRAGMA + ALTER 而不是改 CREATE TABLE：老库的 `tasks` 已经存在，
+   * `CREATE TABLE IF NOT EXISTS` 不会补列。ALTER 带 `DEFAULT` 时 SQLite 会把**已有行**
+   * 一并填成默认值，所以老任务不会变成 NULL / undefined；重复执行因为先查了列名，不会报错。
+   */
+  private migrateTaskColumns(): void {
+    const columns = new Set((this.db.prepare('PRAGMA table_info(tasks)').all() as Row[]).map(row => String(row.name)))
+    if (!columns.has('priority')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT '${DEFAULT_TASK_PRIORITY}'`)
+    }
+    if (!columns.has('source')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN source TEXT NOT NULL DEFAULT '${DEFAULT_TASK_SOURCE}'`)
+    }
+  }
+
+  /** 改优先级。只动 priority 与 updatedAt/revision —— 不碰状态、不碰审批。 */
+  setTaskPriority(taskId: string, priority: TaskPriority, now: number): Task | null {
+    const current = this.getTask(taskId)
+    if (current === null) return null
+    this.db.prepare('UPDATE tasks SET priority = ?, updated_at = ?, revision = revision + 1 WHERE task_id = ?')
+      .run(priority, now, taskId)
+    return this.getTask(taskId)
+  }
+
   insertTask(task: Task): void {
     this.db
       .prepare(
         `INSERT INTO tasks (task_id, team_id, owner_id, goal, input_evidence, acceptance, tool_scope, budget_tokens,
                             deadline_at, status, revision, artifacts, origin_request_id, origin_channel,
-                            created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            created_at, updated_at, priority, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.taskId,
@@ -1363,6 +1515,8 @@ export class TeamStore {
         text(task.originChannel),
         task.createdAt,
         task.updatedAt,
+        task.priority ?? DEFAULT_TASK_PRIORITY,
+        task.source ?? DEFAULT_TASK_SOURCE,
       )
     for (const dep of task.dependsOn) {
       this.db.prepare('INSERT OR IGNORE INTO task_dependencies (task_id, depends_on) VALUES (?, ?)').run(task.taskId, dep)
@@ -1420,6 +1574,8 @@ export class TeamStore {
       artifacts: parseList(text(row.artifacts as string | null)),
       originRequestId: text(row.origin_request_id as string | null),
       originChannel: text(row.origin_channel as string | null),
+      priority: normalizePriority(row.priority),
+      source: normalizeSource(row.source),
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
     }
@@ -1432,7 +1588,7 @@ export class TeamStore {
   updateTask(
     taskId: string,
     expectedRevision: number,
-    patch: Partial<Pick<Task, 'status' | 'ownerId' | 'artifacts' | 'budgetTokens' | 'deadlineAt'>>,
+    patch: Partial<Pick<Task, 'status' | 'ownerId' | 'artifacts' | 'budgetTokens' | 'deadlineAt' | 'goal'>>,
   ): Task | null {
     const current = this.getTask(taskId)
     if (!current || current.revision !== expectedRevision) return null
@@ -1443,12 +1599,13 @@ export class TeamStore {
       artifacts: patch.artifacts ?? current.artifacts,
       budgetTokens: patch.budgetTokens ?? current.budgetTokens,
       deadlineAt: patch.deadlineAt === undefined ? current.deadlineAt : patch.deadlineAt,
+      goal: patch.goal === undefined ? current.goal : patch.goal,
       revision: current.revision + 1,
       updatedAt: Date.now(),
     }
     const result = this.db
       .prepare(
-        `UPDATE tasks SET owner_id = ?, status = ?, revision = ?, artifacts = ?, budget_tokens = ?, deadline_at = ?, updated_at = ?
+        `UPDATE tasks SET owner_id = ?, status = ?, revision = ?, artifacts = ?, budget_tokens = ?, deadline_at = ?, goal = ?, updated_at = ?
          WHERE task_id = ? AND revision = ?`,
       )
       .run(
@@ -1458,6 +1615,7 @@ export class TeamStore {
         json(next.artifacts),
         next.budgetTokens,
         num(next.deadlineAt),
+        next.goal,
         next.updatedAt,
         taskId,
         expectedRevision,
@@ -2230,6 +2388,35 @@ export class TeamStore {
   getCompanionSchedule(scheduleId: string): CompanionScheduleRecord | null { return this.companionRecord('schedules', scheduleId) }
   listCompanionSchedules(): CompanionScheduleRecord[] { return this.companionRecords('schedules') }
   saveCompanionSchedule(schedule: CompanionScheduleRecord): void { this.saveCompanionRecord('schedules', schedule.scheduleId, schedule) }
+  getMemberSchedule(scheduleId: string): MemberScheduleRecord | null {
+    const row = this.db.prepare('SELECT data FROM member_schedules WHERE id = ?').get(scheduleId) as Row | undefined
+    return row ? JSON.parse(String(row.data)) as MemberScheduleRecord : null
+  }
+  listMemberSchedules(): MemberScheduleRecord[] {
+    return (this.db.prepare('SELECT data FROM member_schedules ORDER BY rowid').all() as Row[])
+      .map(row => JSON.parse(String(row.data)) as MemberScheduleRecord)
+  }
+  saveMemberSchedule(schedule: MemberScheduleRecord): void {
+    this.db.prepare('INSERT INTO member_schedules(id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data')
+      .run(schedule.scheduleId, json(schedule))
+  }
+  deleteMemberSchedule(scheduleId: string): void { this.db.prepare('DELETE FROM member_schedules WHERE id = ?').run(scheduleId) }
+  insertMemberScheduleRun(run: MemberScheduleRunRecord): void {
+    this.db.prepare(`INSERT INTO member_schedule_runs(run_id, schedule_id, assistant_id, generation, trigger_at, state, text, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(run.runId, run.scheduleId, run.assistantId, run.generation, run.triggerAt, run.state, run.text, run.startedAt, run.finishedAt)
+  }
+  finishMemberScheduleRun(runId: string, state: 'succeeded' | 'failed', text: string | null, at: number): void {
+    this.db.prepare('UPDATE member_schedule_runs SET state = ?, text = ?, finished_at = ? WHERE run_id = ? AND state = ?')
+      .run(state, text, at, runId, 'running')
+  }
+  listMemberScheduleRuns(scheduleId: string, limit = 20): MemberScheduleRunRecord[] {
+    return (this.db.prepare('SELECT * FROM member_schedule_runs WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?').all(scheduleId, limit) as Row[])
+      .map(row => ({ runId: String(row.run_id), scheduleId: String(row.schedule_id), assistantId: String(row.assistant_id),
+        generation: Number(row.generation), triggerAt: Number(row.trigger_at), state: String(row.state) as MemberScheduleRunRecord['state'],
+        text: row.text === null ? null : String(row.text), startedAt: Number(row.started_at),
+        finishedAt: row.finished_at === null ? null : Number(row.finished_at) }))
+  }
   getReminderGrant(grantRef: string): ReminderGrantRecord | null { return this.companionRecord('reminder_grants', grantRef) }
   saveReminderGrant(grant: ReminderGrantRecord): void { this.saveCompanionRecord('reminder_grants', grant.grantRef, grant) }
   getReminderCycle(cycleId: string): ReminderCycleRecord | null { return this.companionRecord('reminder_cycles', cycleId) }
@@ -2391,13 +2578,15 @@ export class TeamStore {
 
   /** 分析成功与待通知一起落库；通知失败或重启不能让已完成分析再次花费额度。 */
   completeMailWatchAnalysis(scopeId: string, memberId: string,
-    messages: readonly { uid: number; sourceDigest: string; truncated: boolean }[], result: string, at: number): MailWatchAnalysis {
+    messages: readonly { uid: number; sourceDigest: string; truncated: boolean }[], result: string, at: number,
+    suggestions: readonly MailSuggestion[] = []): MailWatchAnalysis {
     if (!result.trim() || messages.length === 0) throw new Error('不能保存空邮件分析')
     return this.transaction(() => {
       const analysis: MailWatchAnalysis = { analysisId: randomUUID(), scopeId, memberId,
-        uids: messages.map(message => message.uid), result, createdAt: at, notifiedAt: null }
-      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)`).run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result, at)
+        uids: messages.map(message => message.uid), result, suggestions: [...suggestions], createdAt: at, notifiedAt: null }
+      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, suggestions, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result,
+        json(analysis.suggestions), at)
       const update = this.db.prepare(`UPDATE mail_watch_messages SET state = 'analyzed', analysis_id = ?,
         source_digest = ?, truncated = ?, detail = NULL WHERE scope_id = ? AND uid = ? AND state = 'pending'`)
       for (const message of messages) {
@@ -2409,6 +2598,21 @@ export class TeamStore {
     })
   }
 
+  /**
+   * 最近的分析结果（倒序、只读投影）：页面展示值守成果与结构化建议。
+   *
+   * 与 pendingMailWatchNotifications 的区别：这个按"最近"取，不限是否已通知 ——
+   * 已确认送达的分析仍然要能在页面里回看，否则用户点掉通知就再也找不到建议了。
+   */
+  listMailWatchAnalyses(limit = 20): MailWatchAnalysis[] {
+    const capped = Math.max(1, Math.min(50, Math.trunc(limit)))
+    const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(capped) as Row[]
+    return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at),
+      notifiedAt: row.notified_at === null ? null : Number(row.notified_at) }))
+  }
+
   /** 尚未确认送达的分析；结果未知或本人已核对的不一定允许重发。 */
   pendingMailWatchNotifications(scopeId: string, limit = 5, deliverableOnly = false): MailWatchAnalysis[] {
     const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses WHERE scope_id = ? AND notified_at IS NULL
@@ -2416,7 +2620,8 @@ export class TeamStore {
         WHERE d.analysis_id = mail_watch_analyses.analysis_id AND d.state != 'pending'))
       ORDER BY created_at, rowid LIMIT ?`).all(scopeId, deliverableOnly ? 1 : 0, limit) as Row[]
     return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), createdAt: Number(row.created_at), notifiedAt: null }))
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at), notifiedAt: null }))
   }
 
   markMailWatchNotified(analysisId: string, at: number): void {
@@ -2433,7 +2638,8 @@ export class TeamStore {
       WHERE s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL AND (d.analysis_id IS NULL OR d.state = 'pending')
       ORDER BY a.created_at, a.rowid LIMIT ?`).all(accountKey, memberId, limit) as Row[]
     return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), createdAt: Number(row.created_at), notifiedAt: null }))
+      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at), notifiedAt: null }))
   }
 
   mailNoticeAttention(accountKey: string, memberId: string | null, limit = 20): MailNoticeAttention[] {

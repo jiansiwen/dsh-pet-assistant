@@ -321,6 +321,15 @@ export interface PlannedSpan {
   readonly kind: 'speech' | 'assistant'
   /** 逐块兜底时这段正好是整块 seq（可复用录音中的临时转写）；被裁剪/切分过的段没有它。 */
   readonly chunkSeq?: number
+  /**
+   * 麦克风段被标成助理播报时保留的原说话人身份。
+   *
+   * 时间重叠只能证明"这段音频里混着助理的声音"，不能证明"说话的是助理"：
+   * 用户在播报途中插话时，整段也会落在播报区间里。转写完成后用文字与助理原文比对，
+   * 不像回声就把身份恢复成这里保留的人（见 `looksLikeAssistantEcho`）。
+   */
+  readonly echoSpeaker?: string
+  readonly echoLabel?: string
 }
 
 type Range = readonly [number, number]
@@ -525,7 +534,11 @@ export function applyAssistantSpeech(
       out.push(span)
     } else if (overlap / duration >= ratio) {
       marked++
-      out.push({ ...span, speaker: ASSISTANT_SPEAKER, label: ASSISTANT_LABEL, kind: 'assistant' })
+      // 麦克风轨上的"助理播报"可能是用户的插话（播报期间整段都在区间里）：
+      // 先保留原说话人身份，转写完成后按文字内容复核，见 looksLikeAssistantEcho。
+      out.push(span.track === 'mic'
+        ? { ...span, speaker: ASSISTANT_SPEAKER, label: ASSISTANT_LABEL, kind: 'assistant', echoSpeaker: span.speaker, echoLabel: span.label }
+        : { ...span, speaker: ASSISTANT_SPEAKER, label: ASSISTANT_LABEL, kind: 'assistant' })
     } else {
       trimmed++
       for (const [from, to] of subtractRanges([span.startMs, span.endMs], zones)) {
@@ -536,6 +549,42 @@ export function applyAssistantSpeech(
     }
   }
   return { spans: out, marked, trimmed }
+}
+
+/**
+ * 这条转写文本像不像助理播报的回声。
+ *
+ * 时间重叠分不清"麦克风录到了助理的外放"和"用户插话"；文字可以：
+ * 回声的文字与助理原文高度相似（ASR 可能丢字/错字），真提问则完全不同。
+ * 太短的文本无法判断，按回声处理（保守：宁可少给一条参会者发言，不把噪声塞进纪要）。
+ */
+export function looksLikeAssistantEcho(text: string, assistantText: string): boolean {
+  const normalize = (value: string): string => value.replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase()
+  const a = normalize(text)
+  if (a.length < 4) return true
+  const ratio = (long: string, short: string): boolean => long.includes(short) && short.length / long.length >= 0.5
+  const grams = (value: string): Map<string, number> => {
+    const map = new Map<string, number>()
+    for (let i = 0; i < value.length - 1; i += 1) {
+      const gram = value.slice(i, i + 2)
+      map.set(gram, (map.get(gram) ?? 0) + 1)
+    }
+    return map
+  }
+  const dice = (leftText: string, rightText: string): number => {
+    if (rightText.length < 4) return 0
+    if (ratio(leftText, rightText) || ratio(rightText, leftText)) return 1
+    const left = grams(leftText)
+    const right = grams(rightText)
+    let shared = 0
+    for (const [gram, count] of left) shared += Math.min(count, right.get(gram) ?? 0)
+    const total = Math.max(0, leftText.length - 1) + Math.max(0, rightText.length - 1)
+    return total > 0 ? (2 * shared) / total : 0
+  }
+  // 助理播报常被合成一大段：逐句比对，短回声才能在同义的句子里被认出来。
+  const sentences = assistantText.split(/[。！？!?\n；;]/u).map(normalize).filter(sentence => sentence.length >= 4)
+  if (sentences.some(sentence => dice(a, sentence) >= 0.5)) return true
+  return dice(a, normalize(assistantText)) >= 0.5
 }
 
 /**
@@ -691,6 +740,7 @@ parentPort.once('message', (msg) => {
     parentPort.postMessage({ ok: false, stage: 'process', error: String((error && error.message) || error) })
   }
 })
+parentPort.on('message', (m) => { if (m && m.type === 'shutdown') parentPort.close() })
 `
 
 /**
@@ -713,7 +763,12 @@ function runInWorker(samples: Float32Array, config: OfflineSpeakerDiarizationCon
       if (settled) return
       settled = true
       clearTimeout(timer)
-      void worker.terminate().catch(() => undefined)
+      // 超时路径上 worker 可能还在原生分人里：先请它自己退，兜底 terminate 延后，
+      // 避免强杀原生线程崩掉整个进程。
+      try { worker.postMessage({ type: 'shutdown' }) } catch { /* 已退出 */ }
+      const fallback = setTimeout(() => { void worker.terminate().catch(() => undefined) }, 3000)
+      fallback.unref?.()
+      worker.on('exit', () => clearTimeout(fallback))
       resolve(outcome)
     }
     const timer = setTimeout(() => done({ ok: false, stage: 'timeout', error: `分人超过 ${Math.round(timeoutMs / 1000)} 秒没有完成` }), timeoutMs)

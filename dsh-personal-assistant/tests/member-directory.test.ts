@@ -93,10 +93,10 @@ test('扩展 JSON 不复制基础字段，会话独立且权限变动强制换�
   dir.setSession(b.assistantId, '会话乙')
   assert.equal(dir.get(a.assistantId)!.revision, 1)
   assert.throws(() => dir.setSession(b.assistantId, '会话甲'), /独立会话/)
-  let next = dir.update(a.assistantId, 1, draft({ description: '新的职责说明', provider: '新提供方' }))
+  let next = dir.update(a.assistantId, 1, draft({ description: '新的职责说明' }))
   assert.equal(next.sessionId, '会话甲', '普通修改不代替调用方决定会话轮换')
-  next = dir.update(a.assistantId, next.revision, draft({ capabilities: ['mail'] }))
-  assert.equal(next.sessionId, null)
+  next = dir.update(a.assistantId, next.revision, draft({ description: '新的职责说明', provider: '新提供方' }))
+  assert.equal(next.sessionId, null, '换提供方/模型必须重建会话，宿主不允许轮次中途换模型')
   dir.setSession(a.assistantId, '新会话')
   next = dir.update(a.assistantId, next.revision, draft({ capabilities: ['mail'], allowedTools: ['read'] }))
   assert.equal(next.sessionId, null)
@@ -134,6 +134,22 @@ test('渠道会话引用不可跨成员复用，配置权限变化时失效而�
   assert.doesNotThrow(() => dir.delete(a.assistantId, changed.revision))
 })
 
+test('clearChannelSession 扔文档临时会话绑定：验范围、幂等、不伤其他会话', t => {
+  const dir = memory(t).directory
+  const a = dir.create(draft())
+  const scopeA = 'a'.repeat(64)
+  const scopeB = 'b'.repeat(64)
+  dir.setChannelSession(a.assistantId, scopeA, '文档甲会话')
+  dir.setChannelSession(a.assistantId, scopeB, '文档乙会话')
+  assert.throws(() => dir.clearChannelSession(a.assistantId, '无效范围'), /范围无效/u)
+  dir.clearChannelSession(a.assistantId, scopeA)
+  assert.equal(dir.getChannelSession(a.assistantId, scopeA), null)
+  assert.equal(dir.getChannelSession(a.assistantId, scopeB), '文档乙会话', '只扔甲会话')
+  assert.doesNotThrow(() => dir.clearChannelSession(a.assistantId, scopeA), '重复清不报错')
+  dir.setChannelSession(a.assistantId, scopeA, '文档甲新会话')
+  assert.equal(dir.getChannelSession(a.assistantId, scopeA), '文档甲新会话', '清掉绑定后下次打开可重建')
+})
+
 test('v13 迁移失败时回滚；成功后保留已有成员和会话，渠道引用可跨连接恢复', t => {
   const fixture = file(t)
   const original = fixture.open()
@@ -143,8 +159,8 @@ test('v13 迁移失败时回滚；成功后保留已有成员和会话，渠道�
   assert.equal(original.beginMailSend({ intentId: '旧邮件', accountKey: '账户', digest: '摘要', subject: '主题',
     recipients: ['a@example.com'], epoch: '旧代次' }, beforeMidnight), true)
   const raw = fixture.raw()
-  raw.exec(`DROP TABLE member_channel_sessions; DROP TABLE meeting_mail_followups; DELETE FROM migrations WHERE version = 14; PRAGMA user_version = 13;
-    CREATE TRIGGER fail_member_scope_migration BEFORE INSERT ON migrations WHEN NEW.version = 14
+  raw.exec(`DROP TABLE member_channel_sessions; DROP TABLE meeting_mail_followups; DELETE FROM migrations WHERE version = ${TEAM_SCHEMA_VERSION}; PRAGMA user_version = 13;
+    CREATE TRIGGER fail_member_scope_migration BEFORE INSERT ON migrations WHEN NEW.version = ${TEAM_SCHEMA_VERSION}
     BEGIN SELECT RAISE(ABORT, '模拟渠道会话迁移失败'); END;`)
   assert.throws(() => fixture.open(), /模拟渠道会话迁移失败/u)
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, 13)
@@ -250,7 +266,7 @@ test('总预算预留跨日约束，新日不能逃逸上一日仍在途的请�
 
 test('结算幂等、冲突拒绝，请求编号全局唯一，未知用量绝不按零放行', t => {
   const dir = memory(t).directory
-  const a = dir.create(draft({ dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  const a = dir.create(draft({ dailyTokenLimit: 1000, totalTokenLimit: 3000 }))
   const b = dir.create(draft({ displayName: '第二成员' }))
   spend(dir, a.assistantId, '全局编号', 120)
   dir.finishUsage('全局编号', 120, afterMidnight)
@@ -275,7 +291,7 @@ test('结算幂等、冲突拒绝，请求编号全局唯一，未知用量绝�
 test('文件 SQLite 重启将 pending 转未知，修改模型、停启与跨日均不清账', t => {
   const fixture = file(t)
   const first = new TeamStore(fixture.dbPath)
-  const member = first.directory.create(draft({ dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  const member = first.directory.create(draft({ dailyTokenLimit: 500, totalTokenLimit: 1000 }))
   first.directory.setSession(member.assistantId, '持久会话')
   first.directory.beginUsage(member.assistantId, '进程中断请求', beforeMidnight)
   first.close()
@@ -287,8 +303,8 @@ test('文件 SQLite 重启将 pending 转未知，修改模型、停启与跨日
   assert.equal(dir.quota(member.assistantId, afterMidnight).unknown, true)
   assert.throws(() => dir.beginUsage(member.assistantId, '进程中断请求', afterMidnight), /重复/)
   assert.throws(() => dir.beginUsage(member.assistantId, '重启续跑', afterMidnight), /未知/)
-  dir.update(member.assistantId, 1, draft({ dailyTokenLimit: 0, totalTokenLimit: 0, model: '新模型', enabled: false }))
-  dir.update(member.assistantId, 2, draft({ dailyTokenLimit: 0, totalTokenLimit: 0, model: '新模型' }))
+  dir.update(member.assistantId, 1, draft({ dailyTokenLimit: 500, totalTokenLimit: 1000, model: '新模型', enabled: false }))
+  dir.update(member.assistantId, 2, draft({ dailyTokenLimit: 500, totalTokenLimit: 1000, model: '新模型' }))
   assert.throws(() => dir.checkAvailable(member.assistantId, afterMidnight), /未知/)
   assert.equal(fixture.raw().prepare('SELECT state FROM member_usage WHERE request_id = ?').get('进程中断请求')!.state, 'unknown')
 })
@@ -385,6 +401,29 @@ test('明确加额经双修订校验，配置修订增长但实际用量不清�
   assert.equal(dir.requests().find(item => item.state === 'pending')!.quotaRevision, 2)
 })
 
+test('改模型或提供方会清掉成员会话，避免带着旧模型继续请求', t => {
+  const dir = memory(t).directory
+  const member = dir.create(draft())
+  dir.setSession(member.assistantId, '旧会话')
+  const renamed = dir.update(member.assistantId, member.revision, draft({ displayName: '只改名' }))
+  assert.equal(renamed.sessionId, '旧会话', '只改无关字段不动会话')
+  const remodelled = dir.update(member.assistantId, renamed.revision, draft({ displayName: '只改名', provider: '新提供方', model: '新模型' }))
+  assert.equal(remodelled.sessionId, null, '换模型要重建会话，否则宿主会拒绝 request 阶段的模型变更')
+})
+
+test('日额度与总额度都为 0 = 不限：用量未知也不拦请求、不生成额度申请', t => {
+  const dir = memory(t).directory
+  const member = dir.create(draft({ displayName: '不限额度成员', dailyTokenLimit: 0, totalTokenLimit: 0 }))
+  const now = Date.now()
+  dir.beginUsage(member.assistantId, '未知用量-不限成员', now)
+  dir.finishUsage('未知用量-不限成员', null, now)
+  const view = dir.quota(member.assistantId, now)
+  assert.equal(view.unknown, true)
+  assert.equal(view.blocked, false)
+  assert.doesNotThrow(() => dir.checkAvailable(member.assistantId, now))
+  assert.equal(dir.requests().length, 0)
+})
+
 test('批准重置未知只接受 both；单纯加额不能清除未知', t => {
   const dir = memory(t).directory
   const member = dir.create(draft())
@@ -453,7 +492,7 @@ test('迁移 v8 到当前版本保留身份，当前版本再次打开不重跑�
   raw.prepare('INSERT INTO assistants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(old.assistantId, old.roleId, old.displayName,
     old.skinId, old.persona, old.voiceProfile, JSON.stringify(old.toolPolicy), 1, old.revision)
   const store = fixture.open()
-  assert.equal(TEAM_SCHEMA_VERSION, 14)
+  assert.equal(TEAM_SCHEMA_VERSION, 17)
   assert.equal(raw.prepare('PRAGMA user_version').get()!.user_version, TEAM_SCHEMA_VERSION)
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_notice_deliveries'").get())
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_send_intents'").get())

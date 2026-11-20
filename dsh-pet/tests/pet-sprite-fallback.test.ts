@@ -5,6 +5,7 @@ import { test, type TestContext } from 'node:test'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import ts from 'typescript'
 import * as interaction from '../src/renderer/pet-interaction.ts'
+import * as registry from '../src/renderer/custom-skin-registry.ts'
 
 const source = readFileSync(new URL('../src/renderer/PetSprite.tsx', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX,
@@ -60,6 +61,7 @@ function fixture(t: TestContext) {
   new Function('require', 'module', 'exports', compiled)((name: string) => {
     if (name === 'react') return hooks
     if (name === './pet-interaction.js') return interaction
+    if (name === './custom-skin-registry.js') return registry
     return require(name)
   }, module, module.exports)
   t.after(() => {

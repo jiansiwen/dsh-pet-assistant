@@ -32,6 +32,7 @@
  * 于是编排逻辑能在纯 Node 下单测。
  */
 import type { AudioEvent, AudioTransition } from './audio.ts'
+import { matchRecordStopCommand } from './record-stop-command.ts'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -54,6 +55,7 @@ import {
   sliceTimeline,
   splitLongSpans,
   spansFromTurns,
+  looksLikeAssistantEcho,
   trackDisplayName,
   trackUnknownSpeakerId,
   uncoveredVoicedSpans,
@@ -460,6 +462,8 @@ function composeRefineNote(input: {
   corrupted: number
   assistantMarked: number
   assistantTrimmed: number
+  /** 与助理播报重叠、但文字内容不同，已恢复为参会者发言的段数。 */
+  assistantReverted: number
   recovered: number
 }): { mode: TranscriptMode; note: string } {
   const parts: string[] = []
@@ -497,6 +501,7 @@ function composeRefineNote(input: {
   if (input.corrupted > 0) parts.push(`${input.corrupted} 块录音解不开（已损坏），对应时间按缺口处理`)
   if (input.recovered > 0) parts.push(`${input.recovered} 段有声片段分人模型没覆盖到，归为「未分人」单独转写`)
   if (input.assistantMarked > 0) parts.push(`${input.assistantMarked} 段与助理播报高度重叠，已标为“小潘（AI 助理）”的发言`)
+  if (input.assistantReverted > 0) parts.push(`${input.assistantReverted} 段虽与助理播报重叠，但内容不同，已保留为参会者发言`)
   if (input.assistantTrimmed > 0) parts.push(`${input.assistantTrimmed} 段裁掉了与助理播报重叠的部分`)
   return { mode, note: `${parts.join('。')}。` }
 }
@@ -537,6 +542,13 @@ export class MeetingRecorder {
   private closed = false
   // ===== 临时字幕（只在内存） =====
   private liveMeetingId: string | null = null
+  /**
+   * 本场会议是否已经因为语音指令请求过停录。
+   *
+   * 同一句话可能被相邻两块各识别一次（切块边界），而 `requestStop` 是"请求一次"语义：
+   * 重复调用会让渲染层重复收到停流通知，所以这里只放行一次。
+   */
+  private stopByVoiceRequested = false
   private liveAccepting = false
   private readonly liveEntries = new Map<number, LiveEntry>()
   private readonly liveQueue: Array<{ storeSeq: number; pcm: Buffer }> = []
@@ -657,6 +669,7 @@ export class MeetingRecorder {
     this.note = null
     this.liveEntries.clear()
     this.liveQueue.length = 0
+    this.stopByVoiceRequested = false
     this.liveMeetingId = this.deps.liveCaptions === true ? started.meetingId : null
     this.liveAccepting = this.deps.liveCaptions === true
     // 通知渲染层开始流：它收到后用 getUserMedia 采音并逐块推 meetingChunk。startedAt 是
@@ -821,6 +834,17 @@ export class MeetingRecorder {
       }
       // 精修已经把临时字幕清掉了（或换了会议）：结果作废，不写回。
       if (this.liveEntries.get(item.storeSeq) !== entry) continue
+      // 语音停录：录音期间麦克风被会议占着，唤醒进程拿不到音频（见 record-stop-command.ts），
+      // 所以"停"这件事只能在转写文本上判。命中就当指令处理，不把它当发言：
+      // 字幕里立刻抹掉（状态记 skipped），精修阶段还会用同一判据再剔一次（那块音频会被重转）。
+      if (outcome.kind === 'ok' && matchRecordStopCommand(outcome.text)) {
+        entry.caption = { ...entry.caption, status: 'skipped', text: undefined }
+        console.log(`[dsh-pet] 会议转写命中语音停录指令（${entry.caption.startMs}-${entry.caption.endMs}ms，${entry.caption.track}）：「${outcome.text}」`)
+        this.requestVoiceStop(this.liveMeetingId ?? '', outcome.text, entry.caption.startMs, entry.caption.endMs)
+        this.broadcast()
+        await yieldToEventLoop()
+        continue
+      }
       entry.caption = outcome.kind === 'ok'
         ? { ...entry.caption, status: 'ok', text: outcome.text }
         : { ...entry.caption, status: outcome.kind }
@@ -868,6 +892,21 @@ export class MeetingRecorder {
     if (!active.missingTracks.includes(kind)) active.missingTracks.push(kind)
     if (typeof reason === 'string' && reason.trim() !== '') active.missingTrackReasons[kind] = reason.trim()
     this.broadcast()
+  }
+
+  /**
+   * 录音中从语音指令停录。
+   *
+   * 与按钮、口令走**同一条** `requestStop`：停流、冲刷、结算、还设备都在那里面，这里不另造
+   * 停止逻辑。只负责两件事：同一场会议只请求一次（相邻两块可能把同一句话各识别一次），
+   * 以及把"哪一句、哪一段时间触发的"写进日志（排查时这是唯一的证据）。
+   */
+  private requestVoiceStop(meetingId: string, heard: string, startMs: number, endMs: number): void {
+    if (this.stopByVoiceRequested) return
+    this.stopByVoiceRequested = true
+    const result = this.requestStop(meetingId === '' ? undefined : meetingId)
+    console.log(`[dsh-pet] 语音停录：${result.ok ? '已请求停止录音' : `停止请求被拒（${result.error}）`}`
+      + `；触发句 ${startMs}-${endMs}ms「${heard}」`)
   }
 
   /**
@@ -1187,6 +1226,8 @@ export class MeetingRecorder {
     const transcribe = this.transcriber()
     const live = this.liveMeetingId === meetingId ? this.liveEntries : new Map<number, LiveEntry>()
     const segments: TranscriptSegment[] = []
+    /** 与 segments 同下标：麦克风"助理播报"段保留的原说话人身份；其余为 null。 */
+    const echoOrigins: Array<{ speaker: string; label: string } | null> = []
     let failed = 0
     for (const span of planned) {
       const timeline = timelines.get(span.track)
@@ -1221,6 +1262,49 @@ export class MeetingRecorder {
         source: outcome.kind === 'failed' ? 'failed' : span.kind === 'assistant' ? 'assistant' : 'asr',
         track: span.track,
       })
+      echoOrigins.push(span.kind === 'assistant' && span.track === 'mic'
+        && span.echoSpeaker !== undefined && span.echoLabel !== undefined
+        ? { speaker: span.echoSpeaker, label: span.echoLabel } : null)
+    }
+    /*
+     * 时间重叠只证明"这段音频里混着助理的声音"，不能证明说话的是助理。
+     * 用 loopback 上的助理原文复核：文字不像回声（用户在播报途中插话提问）就恢复原说话人，
+     * 否则提问会被算到小潘头上（真机复现：评委提问整句被标成"小潘（AI 助理）"）。
+     */
+    let assistantReverted = 0
+    {
+      const references = segments.filter(segment => segment.source === 'assistant' && segment.track === 'loopback'
+        && segment.startMs !== null && segment.endMs !== null)
+      for (let index = 0; index < segments.length; index += 1) {
+        const origin = echoOrigins[index]
+        const segment = segments[index]
+        if (origin === null || origin === undefined || segment.source !== 'assistant' || segment.track !== 'mic') continue
+        const from = segment.startMs ?? 0
+        const to = segment.endMs ?? 0
+        const overlaps = references.filter(item => (item.startMs ?? 0) <= to && (item.endMs ?? 0) >= from)
+        // 没有 loopback 参照（只录了麦克风）：保守按回声处理，不恢复身份。
+        if (overlaps.length === 0) continue
+        if (overlaps.some(item => looksLikeAssistantEcho(segment.text, item.text))) continue
+        segments[index] = { ...segment, speaker: origin.speaker, label: origin.label, source: 'asr' }
+        assistantReverted += 1
+      }
+    }
+    // 语音停录的指令句不是发言，不能进纪要和转写。
+    // 精修会把那一块音频**重新转写一遍**（临时字幕那层抹掉的不够），所以写库前用同一个判据
+    // 再剔一次。判据很窄（见 record-stop-command.ts）：只有"整句就是指令"或"带唤醒词且指令
+    // 在句尾"才命中，评审说"我们停止录音的流程要改一下"不会被误剔。
+    const kept: TranscriptSegment[] = []
+    for (const segment of segments) {
+      if (segment.source !== 'failed' && matchRecordStopCommand(segment.text)) {
+        console.log(`[dsh-pet] 会议转写剔除语音停录指令句（${segment.startMs}-${segment.endMs}ms，${segment.track ?? '未知音轨'}）：「${segment.text}」`)
+        continue
+      }
+      kept.push(segment)
+    }
+    if (kept.length !== segments.length) {
+      segments.length = 0
+      // idx 是只读的：重建一份，保证写库的段号连续（纪要按 idx 排版）。
+      kept.forEach((segment, index) => segments.push({ ...segment, idx: index }))
     }
     const unknownIds = new Set(TRACK_ORDER.map(trackUnknownSpeakerId))
     const { mode, note } = composeRefineNote({
@@ -1228,6 +1312,7 @@ export class MeetingRecorder {
       corrupted,
       assistantMarked: assistant.marked,
       assistantTrimmed: assistant.trimmed,
+      assistantReverted,
       recovered: segments.filter(segment => segment.source === 'asr' && unknownIds.has(segment.speaker)).length,
     })
     const usable = segments.filter(segment => segment.source !== 'failed').length
@@ -1474,6 +1559,21 @@ export class MeetingRecorder {
    */
   meetingName(meetingId: string): string | null {
     return this.store.getMeeting(meetingId)?.name ?? null
+  }
+
+  /**
+   * 列出最近的会议（按开始时间倒序）。
+   *
+   * 只给"读一眼"的调用方用（例如插件工作台上的"今天几场会"）：不碰录音、不改状态，
+   * 也不解密会议名 —— 需要名字的地方自己走 `meetingName`，各有各的授权口径。
+   */
+  listMeetings(limit = 20): MeetingRow[] {
+    return this.store.listMeetings(limit)
+  }
+
+  /** 重命名会议：只改名字，不碰录音/转写/纪要；密封与长度校验在 store 里。 */
+  renameMeeting(meetingId: string, name: string): { ok: true } | { ok: false; error: string } {
+    return this.store.renameMeeting(meetingId, name)
   }
 
   /** 删除整场会议；录音或转写进行中的那场拒绝删除，避免与后台写入交错。 */

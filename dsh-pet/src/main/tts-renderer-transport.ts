@@ -227,11 +227,35 @@ export function createSwitchingTransport<M extends string>(
     let ready = false
     let queued: string | null = null
     let closed = false
+    let lastSpeakLine: string | null = null
+    let lastSpeakId: string | null = null
+    const retried = new Set<string>()
+    // 渲染层一旦起播/解码失败，本次录音期间改走进程传输，避免每句都先失败再回退。
+    let rendererBroken = false
+    const effectiveSelect = (): M => {
+      const want = select()
+      if (want !== 'renderer') rendererBroken = false
+      return (want === 'renderer' && rendererBroken ? 'process' : want) as M
+    }
     const open = (): TtsTransport => {
       const mine = ++generation
       ready = false
       return openers[mode]((event) => {
         if (closed || mine !== generation) return
+        // 渲染层播放失败（解码/起播超时等）：换进程传输把这一句重念，不让整轮回复哑巴。
+        // 只在该句还没回退过时做，避免进程传输也失败时来回循环。
+        if (mode === 'renderer' && 'ok' in event && event.ok === false
+          && lastSpeakLine !== null && lastSpeakId !== null && !retried.has(lastSpeakId)) {
+          retried.add(lastSpeakId)
+          rendererBroken = true
+          mode = 'process' as M
+          console.log('[dsh-pet] 渲染层播放失败，回退进程传输重念这一句')
+          const old = inner
+          queued = lastSpeakLine
+          inner = open()
+          old.close()
+          return
+        }
         if ('ready' in event) {
           const first = !ready
           ready = true
@@ -259,7 +283,9 @@ export function createSwitchingTransport<M extends string>(
           if (message.speak && typeof message.speak.id === 'string') speakId = message.speak.id
         } catch { /* 原样转发 */ }
         if (speakId !== null) {
-          const wanted = select()
+          lastSpeakLine = line
+          lastSpeakId = speakId
+          const wanted = effectiveSelect()
           if (wanted !== mode) {
             mode = wanted
             const old = inner

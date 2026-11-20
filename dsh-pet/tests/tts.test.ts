@@ -250,7 +250,7 @@ describe('自定义 TTS 服务的派发', () => {
     const transport = new FakeTransport()
     const api = {
       id: 'p1', kind: 'tts' as const, name: '我的服务', endpoint: 'https://example.com/v1',
-      model: 'tts-1', voice: 'alloy', apiKey: 'sk-test', provider: 'openai' as const,
+      model: 'tts-1', voice: 'alloy', voiceDesign: '', apiKey: 'sk-test', provider: 'openai' as const,
     }
     let deliver: (event: TtsWorkerEvent) => void = () => { throw new Error('worker 未就绪') }
     const narrator = new Narrator(

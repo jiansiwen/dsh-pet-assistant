@@ -20,6 +20,8 @@ import {
   loadSkinImages,
   petAssetCacheStats,
 } from '../src/renderer/usePetImage.ts'
+import { registerCustomSkins, customActionsFor } from '../src/renderer/custom-skin-registry.ts'
+import { manifestFor, DEFAULT_RANDOM_ACTIONS } from '../src/renderer/character-manifest.ts'
 
 const ACTION_COUNT = FRAME_ACTIONS.length
 
@@ -147,5 +149,31 @@ describe('loadSkinImages：静态图的去重与失败恢复', () => {
     // 真实渲染层拿到空表后由 PetSprite 落到内联 SVG。
     const images = await loadSkinImages('panda')
     assert.deepEqual(images, {})
+  })
+})
+
+describe('自定义动作与随机动作勾选', () => {
+  afterEach(() => registerCustomSkins([]))
+
+  test('自定义皮肤登记的动作会被序列帧探测（不受固定动作表限制）', async () => {
+    registerCustomSkins([{ id: 'custom-cat', actions: ['dance', 'tai-chi'] }])
+    assert.deepEqual(customActionsFor('custom-cat'), ['dance', 'tai-chi'])
+    await loadSkinFrames('custom-cat')
+    assert.ok(requests.some(u => u.includes('/custom-cat/dance/f001.png')), '自定义动作 dance 应被探测')
+    assert.ok(requests.some(u => u.includes('/custom-cat/tai-chi/f001.png')), '自定义动作 tai-chi 应被探测')
+  })
+
+  test('未登记动作的自定义皮肤不额外探测', async () => {
+    registerCustomSkins(['custom-empty'])
+    await loadSkinFrames('custom-empty')
+    assert.ok(!requests.some(u => u.includes('/dance/')), '没有登记的动作不该探测')
+  })
+
+  test('manifest 透传用户勾选的随机动作；缺省用默认集合', () => {
+    const withSel = manifestFor({ assistantId: 'member-tangseng' }, { 'member-tangseng': { randomActions: ['read', 'play'] } })
+    assert.deepEqual(withSel.randomActions, ['read', 'play'])
+    const plain = manifestFor({ assistantId: 'member-tangseng' })
+    assert.equal(plain.randomActions, undefined)
+    assert.ok(DEFAULT_RANDOM_ACTIONS.includes('walk'))
   })
 })

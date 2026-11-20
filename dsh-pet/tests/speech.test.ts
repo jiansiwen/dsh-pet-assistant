@@ -14,6 +14,7 @@ import { describe, test } from 'node:test'
 import {
   INITIAL_SPEECH_STATE,
   MAX_SEGMENT_CHARS,
+  cleanForSpeech,
   describeSpoken,
   nextSpeech,
   pendingDispatch,
@@ -296,5 +297,175 @@ describe('续讲接得上播放位置', () => {
     }).state
     const dispatched = nextSpeech(state, { type: 'dispatched' }).state
     assert.deepEqual(dispatched.playing?.origin, { docPath: 'D:/doc/设计说明.pdf', paragraph: 3 })
+  })
+})
+
+describe('朗读清洗', () => {
+  test('UUID 编号不进入声音，回复里的正文保留', () => {
+    const cleaned = cleanForSpeech('会议编号 0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3 已开始录音。')
+    assert.equal(cleaned, '会议编号 已开始录音。')
+  })
+
+  test('编号后的悬空标点收拢，念出来不成乱码', () => {
+    assert.equal(cleanForSpeech('会议编号：0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3，已完成。'), '会议编号，已完成。')
+    assert.equal(cleanForSpeech('编号 0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3。'), '编号。')
+  })
+
+  test('三十二位十六进制串同样不念', () => {
+    assert.equal(cleanForSpeech('摘要 d41d8cd98f00b204e9800998ecf8427e 已核验。'), '摘要 已核验。')
+  })
+
+  test('普通文本与数字不受影响', () => {
+    assert.equal(cleanForSpeech('从第 3 段开始讲，共 6 段。'), '从第 3 段开始讲，共 6 段。')
+  })
+
+  test('追问回答的引用块整行不念，正文照常；文档原文朗读不受影响', () => {
+    const cleaned = cleanForSpeech('结论是提醒做成周期。\n> 原文：到点提醒你。\n继续说明。', { stripQuotes: true })
+    assert.equal(cleaned, '结论是提醒做成周期。 继续说明。')
+    assert.equal(cleanForSpeech('> 引用一句原文。'), '引用一句原文。', '没有开关时保持原样（文档朗读）')
+    const segments = splitIntoSegments({ utteranceId: 'u9', text: '> 原文引用。\n正文回答。', stripQuotes: true })
+    assert.deepEqual(segments.map(segment => segment.text), ['正文回答。'])
+  })
+
+  test('切句入口统一清洗：纯编号句子整句丢掉', () => {
+    const segments = splitIntoSegments(request('0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3。第二句正文。'))
+    assert.deepEqual(segments.map(segment => segment.text), ['第二句正文。'])
+  })
+})
+
+/**
+ * 讲解文本的清洗（C1）。
+ *
+ * 这一组钉的是「讲解听起来像朗读器」的具体成因：`explainPrompt` 要求模型分三段并各自标明
+ * `【原文】/【解释】/【补充】`，模型经常连整块方括号、列表符号、Markdown 记号一起吐出来；
+ * 这些给眼睛看的结构如果原样送进合成器，就会念成"方括号原文方括号"。
+ *
+ * 同时钉住**不该删的东西**：别的方括号标签（`【会议结论】`）、小数（`3.5`）、正文里的
+ * `+` 与 `->`。多念一个符号只是难听，少念一个字是信息丢失 —— 后者的用例同样是这一组的主体。
+ */
+/**
+ * 这一行/这一句开头还像不像列表、标题或引用。
+ *
+ * 必须和被测实现用同一条判据（`- ` 有空格、`1.` 后面必须是空白）—— 否则 `3.5 版本`
+ * 这种正文会被自己的断言误判成"列表没洗干净"。
+ */
+function looksLikeMarker(line: string): boolean {
+  return /^[ \t]*(?:[-*•][ \t]|\d+[.)][ \t]|\d+、|#{1,6}[ \t]|>)/u.test(line)
+}
+
+describe('讲解文本的清洗：只去眼睛用的结构，不动信息', () => {
+  test('【原文】连同方括号一起摘掉，正文留下', () => {
+    const cleaned = cleanForSpeech('【原文】接口约定要求返回 200。')
+    assert.equal(cleaned, '接口约定要求返回 200。')
+    assert.ok(!cleaned.includes('原文'), '标签词不该被念出来')
+    assert.ok(!cleaned.includes('【') && !cleaned.includes('】'), '方括号本身就是噪音')
+  })
+
+  test('带后缀的标签变体同样摘掉：【解释：…】/【原文·第 3 页】/【补充 …】', () => {
+    assert.equal(cleanForSpeech('【解释：这里说的是重试次数】最多重试三次。'), '最多重试三次。')
+    assert.equal(cleanForSpeech('【原文·第 3 页】这一段讲限流。'), '这一段讲限流。')
+    assert.equal(cleanForSpeech('【补充】这和上次会议结论一致。'), '这和上次会议结论一致。')
+  })
+
+  test('其它方括号标签原样保留：这是白名单，不是无条件删方括号', () => {
+    // 删掉"下面是会议结论"这句提示，后面的话就没有主语了；它们不是讲解三段标签。
+    for (const input of ['【会议结论】下周三上线。', '【工作事项】整理需求。', '【待办】补测试。']) {
+      assert.equal(cleanForSpeech(input), input)
+    }
+  })
+
+  test('行首的列表、引用、标题符号去掉，文字留下', () => {
+    assert.equal(cleanForSpeech('- 需求一\n- 需求二'), '需求一 需求二')
+    assert.equal(cleanForSpeech('* 需求一'), '需求一')
+    assert.equal(cleanForSpeech('• 需求一'), '需求一')
+    assert.equal(cleanForSpeech('1. 需求一\n2. 需求二'), '需求一 需求二')
+    assert.equal(cleanForSpeech('1、需求一\n2、需求二'), '需求一 需求二')
+    assert.equal(cleanForSpeech('> 引用一句原文。'), '引用一句原文。')
+    assert.equal(cleanForSpeech('## 标题一'), '标题一')
+  })
+
+  test('换行不拆句：跨行的同一句合成一段完整播报', () => {
+    const segments = splitIntoSegments(request('小潘同学会帮你记录会议，\n并在结束后生成纪要。'))
+    assert.deepEqual(segments.map(segment => segment.text), ['小潘同学会帮你记录会议， 并在结束后生成纪要。'])
+  })
+
+  test('句首（同一行里跟在句号后面）的列表符号也去掉', () => {
+    assert.equal(cleanForSpeech('第一点讲完了。 - 第二点的补充'), '第一点讲完了。第二点的补充')
+  })
+
+  test('小数不被当成有序列表：3.5 版本 不能变成 5 版本', () => {
+    // 判据是"点号后面必须跟空白"：3.5 的点后面是数字，列表 1. 的点后面是空格。
+    assert.equal(cleanForSpeech('3.5 版本要兼容。'), '3.5 版本要兼容。')
+    assert.equal(cleanForSpeech('占用率 3.14，延迟 5.67。'), '占用率 3.14，延迟 5.67。')
+    assert.equal(cleanForSpeech('从第 3 段开始讲，共 6 段。'), '从第 3 段开始讲，共 6 段。')
+  })
+
+  test('成对粗体/斜体记号去掉，里面的字留下', () => {
+    assert.equal(cleanForSpeech('**重点**要靠前。'), '重点要靠前。')
+    assert.equal(cleanForSpeech('__重点__ 也要。'), '重点 也要。')
+  })
+
+  test('正文里的加号与箭头不动：A + B 与 x -> y 不是列表', () => {
+    assert.equal(cleanForSpeech('使用 A + B 的形式。'), '使用 A + B 的形式。')
+    assert.equal(cleanForSpeech('把 x -> y 记下来。'), '把 x -> y 记下来。')
+  })
+
+  test('原有清洗规则一条都不回归', () => {
+    assert.equal(cleanForSpeech('会议编号 0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3 已开始录音。'), '会议编号 已开始录音。')
+    assert.equal(cleanForSpeech('会议编号：0f29f82c-b3ad-4de5-bd1e-16c55a9d96e3，已完成。'), '会议编号，已完成。')
+    assert.equal(cleanForSpeech('摘要 d41d8cd98f00b204e9800998ecf8427e 已核验。'), '摘要 已核验。')
+    assert.equal(cleanForSpeech('  多  余 \t 空 格  '), '多 余 空 格')
+  })
+
+  test('摘掉标签与列表后留下的空行/空格被收拢，不会念出连串停顿', () => {
+    const cleaned = cleanForSpeech('- 需求一\n\n- 需求二')
+    assert.equal(cleaned, '需求一 需求二')
+    assert.ok(!cleaned.includes('- '))
+  })
+
+  test('整段只剩标签时清洗后为空：切句入口会按原规则丢掉它', () => {
+    assert.equal(cleanForSpeech('【原文】'), '')
+    assert.equal(cleanForSpeech('【解释：只在屏幕上排版】'), '')
+    // 不做特殊处理：`WORTH_SPEAKING` 那一层照旧把空片段筛掉。
+    assert.deepEqual(splitIntoSegments(request('【原文】。第二句正文。')).map(segment => segment.text), ['第二句正文。'])
+  })
+
+  test('一段真实的三段式讲解：念出来没有方括号、没有列表符号，信息一个字不丢', () => {
+    const answer = [
+      '【原文】',
+      '- 接口默认超时 3 秒。',
+      '- 失败后最多重试 3 次。',
+      '【解释】这里说的是重试预算：**总耗时**不会超过 9 秒。',
+      '【补充】',
+      '1. 官方文档建议把重试放在幂等接口上。',
+      '2. 3.5 版本之后默认值改成了 5 秒。',
+    ].join('\n')
+
+    const cleaned = cleanForSpeech(answer)
+    assert.ok(!cleaned.includes('【') && !cleaned.includes('】'), `还留着方括号：${cleaned}`)
+    assert.ok(!cleaned.includes('**'), '粗体记号不该被念出来')
+    for (const line of cleaned.split(/\s+/)) {
+      assert.ok(!looksLikeMarker(line), `行首还留着列表符号：${line}`)
+    }
+    // 信息不丢：三段的正文、小数、数字都在。
+    for (const piece of ['接口默认超时 3 秒。', '失败后最多重试 3 次。', '重试预算', '总耗时', '不会超过 9 秒。',
+      '幂等接口上。', '3.5 版本', '改成了 5 秒。']) {
+      assert.ok(cleaned.includes(piece), `丢了「${piece}」：${cleaned}`)
+    }
+
+    // 送进合成器的每一句同样干净，且没有空片段混进去。
+    const segments = splitIntoSegments(request(answer))
+    assert.ok(segments.length > 0)
+    for (const segment of segments) {
+      assert.ok(!segment.text.includes('【'), segment.text)
+      assert.ok(!looksLikeMarker(segment.text), `句首还留着列表符号：${segment.text}`)
+    }
+  })
+
+  test('清洗只作用于声音路：切句用的清洗不改写入参原文', () => {
+    const raw = '【原文】接口约定要求返回 200。'
+    const segments = splitIntoSegments(request(raw))
+    assert.deepEqual(segments.map(segment => segment.text), ['接口约定要求返回 200。'])
+    assert.equal(raw, '【原文】接口约定要求返回 200。', '屏幕那一份必须原样保留结构标签')
   })
 })

@@ -89,6 +89,25 @@ describe('win-actions：参数作为数据传递', () => {
     assert.equal(r.ok, false)
   })
 
+  test('窗口找到了但读不到 PDF 视图（pdfView:false）→ 仍然采信这个窗口', async () => {
+    // WPS 12.x 是 Qt5 渲染，UIA 树里没有 KxPdfView / 页码控件。脚本这时只报 pdfView:false，
+    // 不该被当成"窗口不存在"：窗口能激活、能收键盘，翻页走键盘退路。
+    const { actions } = actionsWith(() => ({ ok: true, identity: ID, pdfView: false }))
+    const r = await actions.findWindow({ processDir: 'D:\\WPS Office\\12.1.0.28505\\office6', titleIncludes: DOC }, { documentName: DOC, profile: 'wps-pdf' })
+    assert.equal(r.ok, true)
+    if (r.ok) assert.equal(r.value.windowId, ID.windowId)
+  })
+
+  test('键盘退路的跳页回执（keyboard-relative + assumed）按成功处理', async () => {
+    // 没有页码可读时脚本只发一屏 PageDown，并如实标 assumed：页码是目标值，不是读回的。
+    const { actions, seen } = actionsWith(() => ({ ok: true, page: 3, total: 3, before: ID, after: ID,
+      foregroundAfter: fgTarget, method: 'keyboard-relative', keys: 1, assumed: true }))
+    const r = await actions.gotoPage(ID, 3, 'wps-pdf')
+    assert.equal(r.ok, true)
+    assert.equal(seen[0].op, 'goto-page')
+    if (r.ok) assert.equal(r.value.page, 3)
+  })
+
   test('辅助脚本返回的窗口在安装目录下 → 得到身份', async () => {
     const { actions } = actionsWith(() => ({ ok: true, identity: { ...ID, component: { pid: 46652, windowId: '9576178', processPath: 'D:\\WPS Office\\12.1.0.28505\\office6\\wpspdf.exe' } } }))
     const r = await actions.findWindow({ processDir: 'D:\\WPS Office\\12.1.0.28505\\office6', titleIncludes: DOC }, { documentName: DOC, profile: 'wps-pdf' })
@@ -281,10 +300,17 @@ describe('win-uia.ps1：静态约束', () => {
     assert.deepEqual([...script.subarray(0, 3)], [0xef, 0xbb, 0xbf])
   })
 
-  test('只允许导航键：没有 SendKeys / 字符输入 / Unicode 键入', () => {
+  test('只允许导航键 + 白名单组合键 + 纯数字：脚本永远不能输入任意文本', () => {
     assert.match(text, /NavKeys = \{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28 \}/)
     assert.match(text, /only navigation keys are allowed/)
-    for (const banned of ['SendKeys', 'keybd_event', 'KEYEVENTF_UNICODE', 'SetValue(', 'WM_CHAR']) {
+    // Ctrl 只放 A / C / G（全选 / 复制 / 页码定位）；Enter / Esc 单独放开（页码框确认与放弃）。
+    assert.match(text, /ComboLetters = \{ 0x41, 0x43, 0x47 \}/)
+    assert.match(text, /only A\/C\/G may be combined with Ctrl/)
+    assert.match(text, /only Enter and Esc are allowed/)
+    // 唯一允许的字符输入是**页码数字**：KEYEVENTF_UNICODE 只出现在 TypeDigit 里，且只接受 0-9。
+    assert.match(text, /only digits may be typed/)
+    assert.equal((text.match(/dwFlags = 4u/g) ?? []).length, 2, 'Unicode 键入只能出现在 TypeDigit 的两个事件里')
+    for (const banned of ['SendKeys', 'keybd_event', 'SetValue(', 'WM_CHAR']) {
       assert.equal(text.includes(banned), false, banned)
     }
   })

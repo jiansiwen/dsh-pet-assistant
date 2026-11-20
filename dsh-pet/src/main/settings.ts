@@ -3,9 +3,10 @@
  * 说明：不再保存 API 密钥与模型——宠物的对话全部走主会话桥接，凭据与模型由 dsh 统一管理。
  */
 import { app } from 'electron'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { MAX_RECENT_DIRS } from './document.ts'
+import { MAX_RECENT_DIRS, type PresentationMode } from './document.ts'
+import { isCustomSkin } from './custom-skins.ts'
 import { isSafeProfileName } from './runtime-launch.ts'
 
 export type PetId = 'panda' | 'girl-glasses' | 'boy-glasses'
@@ -53,7 +54,11 @@ export interface PetSettings {
    * 只有 `skin`：人设、语音、模型与工具权限都是职责，归插件侧的团队配置管，桌面壳不碰 ——
    * 换个皮肤不该顺带改掉谁能写文件（design.md §2.2「换形象不换身份和记忆」）。
    */
-  characters?: Record<string, { skin: PetId }>
+  characters?: Record<string, { skin: string; randomActions?: string[] }>
+  /** 用户手动"让TA退下"的成员 assistantId 列表；持久化，召唤/重启不自动复活，直到手动请回。 */
+  stepDownMembers?: string[]
+  /** 每个成员的音色（键是 assistantId）：克隆样本 > 设计描述 > 预置音色；成员编辑窗写入。 */
+  memberVoices?: Record<string, { voiceId?: string; design?: string; style?: string; sampleFile?: string; sampleMime?: string; profileId?: string }>
   /**
    * 允许查找并讲解文档的目录（design.md §2.10："先在授权目录和用户最近选择范围内查找"）。
    *
@@ -72,23 +77,143 @@ export interface PetSettings {
    * 镜像只负责转发，不能因为它"看起来是自家的"就跳过校验。
    */
   modelMirror?: string
-  /** 会话框停靠：auto = 按屏幕空间避开宠物选上/下/左/右；top = 固定挂在头顶。 */
+  /** 会话框固定挂在头顶；auto = 按屏幕剩余空间自动选上/下/左/右。 */
   chatDock?: 'top' | 'auto'
   /** 会话框尺寸（CSS 像素），由右下角拖拽调整后保存。 */
   chatSize?: { width: number; height: number }
+  /**
+   * 文档讲解形态。
+   *
+   * - `source`（默认）：按原文念稿 —— 逐段念正文，解释与补充只在用户提问时产生。
+   * - `ai`：每段先让模型写【原文+解释+补充】再念。
+   *
+   * 默认 source 的理由：用户要的讲解形态就是"跟真人开会一样照着稿子讲" —— 念原文最快、
+   * 不跑题、不烧模型调用；AI 讲解每段都要等模型回话，更慢也更费，留作主动选择的增强模式。
+   *
+   * **不要与演示隐私模式的 `presentationMode` 混淆**：那个是布尔、挂在 companion 状态快照上
+   * （`companion-host.ts`，渲染层据此隐藏历史与预览）；这里是讲解形态、挂在 settings 上，
+   * 两个同样叫"presentation"的东西完全不同义，所以这一侧刻意叫 `docSpeechMode`。
+   */
+  docSpeechMode?: PresentationMode
+  /**
+   * 讲解全局快捷键（Electron accelerator，如 `Ctrl+Alt+D`），可在文档设置页改。
+   *
+   * - interrupt：打断提问（= 说"停一下"，停下开 10 秒提问窗口）；
+   * - rest：休息（= 说"休息一下"，无限期停、不听提问，只认整句"继续"）；
+   * - resume：继续（= 说"继续演讲"，从打断或休息恢复）。
+   *
+   * 默认刻意避开 Ctrl+空格（中文输入法切换）与 Ctrl+Z/X（全局撤销/剪切），
+   * 用 Ctrl+Alt+字母 这类不易冲突的组合；注册时被占用会如实提示，用户可自行改键。
+   */
+  docInterruptHotkey?: string
+  docRestHotkey?: string
+  docResumeHotkey?: string
+  /**
+   * 总助理自己的音色设计描述（按性格生成，可手改）。
+   *
+   * 音色属于"这个人怎么说"，不属于"接哪家语音服务"——所以存在这里，
+   * 合成时由说话人带进 narrator.speak 的 voiceDesign，覆盖服务配置里那份。
+   */
+  agentVoiceDesign?: string
+  /** 总助理用的克隆音色 ID；填了它就用克隆声音，优先于设计描述。 */
+  agentVoiceId?: string
+  /** 总助理的音色复刻样本（base64，不含 data: 前缀）；有它就用 voiceclone 模型。 */
+  /** 语气/情绪/方言/角色扮演的自然语言指令。 */
+  agentVoiceStyle?: string
+  agentVoiceSample?: string
+  agentVoiceSampleMime?: string
+  /** 样本落盘路径：大样本不走内部管道，改走文件。 */
+  /**
+   * 讲解交给成员时是否先演一段交接（总助交棒 → 成员接棒）。
+   *
+   * 默认关闭：它会往播报序列里插入两句台词，属于听感改动，
+   * 由用户自己打开，而不是默认替所有人改掉。
+   */
+  memberHandover?: boolean
+  /**
+   * 相邻短句是否并成一段再合成。
+   *
+   * 打开后"好。""嗯。"这种两三个字的句子不再各发一次请求，句间卡顿会明显减少；
+   * 代价是打断粒度变粗（以合并组为单位）。默认关闭，由用户自己开。
+   */
+  mergeShortSentences?: boolean
+  agentVoiceSampleFile?: string
+  /**
+   * 角色大小：0.8 / 1 / 1.2 三档，默认 1。
+   *
+   * 只存档位不存任意数值：缩放和命中盒、悬停工具栏的定位是同一件事，允许连续值等于允许
+   * 出现一个"点不中自己"的尺寸。归一化在 `normalize()` 里做，脏数据一律退回默认。
+   */
+  petScale?: number
+  /** 角色透明度：0.6 / 0.8 / 1 三档，默认 1。下限 0.6 —— 再低用户会找不到宠物。 */
+  petOpacity?: number
+  /** 拖到屏幕边缘时是否吸附并收起成停靠态。默认开。 */
+  petDock?: boolean
+  /**
+   * 上次停靠在哪个边；null = 没停靠。
+   *
+   * 只存"边"不存坐标：停靠位置由那条边 + 原位置算出来（`dockPosition`），存坐标等于把
+   * 同一份事实记两处，屏幕一变就打架。原位置仍在 `positions` 里，取消停靠据此回到原处。
+   */
+  dockedAt?: 'left' | 'right' | 'top' | 'bottom' | null
 }
 
-const DEFAULTS: PetSettings = { pet: 'panda', layoutVersion: LAYOUT_VERSION, runtimeProfile: 'web', trayResident: false, chatDock: 'auto' }
+const DEFAULTS: PetSettings = {
+  pet: 'panda',
+  layoutVersion: LAYOUT_VERSION,
+  runtimeProfile: 'web',
+  trayResident: false,
+  chatDock: 'top',
+  // 讲解默认按原文念稿：真人会议优先，AI 逐段讲解要等模型、更慢也更费。
+  docSpeechMode: 'source',
+  // 讲解快捷键默认避开输入法切换（Ctrl+空格）与撤销/剪切（Ctrl+Z/X）。
+  docInterruptHotkey: 'Ctrl+Alt+D',
+  docRestHotkey: 'Ctrl+Alt+R',
+  docResumeHotkey: 'Ctrl+Alt+C',
+  // 默认原大、不透明：任何"一装上就变了样子"的默认值都会让用户以为是 bug。
+  petScale: 1,
+  petOpacity: 1,
+  petDock: true,
+  dockedAt: null,
+}
 
 let cache: PetSettings | null = null
+/**
+ * 缓存对应文件的修改时间。
+ *
+ * 以前 loadSettings 一缓存就是永远 —— 外部（另一个窗口、运维脚本、备份还原）
+ * 改了 pet-settings.json，进程里还是老值，一保存又把老值写回去，等于把别人的修改吃掉。
+ */
+let cacheMtimeMs = 0
 
 function settingsPath(): string {
   return path.join(app.getPath('userData'), 'pet-settings.json')
 }
 
+/** 快捷键 accelerator 归一化：非空、≤60 字、含修饰键组合（'+'）才认，否则退回默认。 */
+function normalizeHotkey(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.length > 60 || !trimmed.includes('+')) return fallback
+  return trimmed
+}
+
 function normalize(raw: Partial<PetSettings>): PetSettings {
   const merged: PetSettings = { ...DEFAULTS, ...raw }
   if (!VALID_PETS.includes(merged.pet)) merged.pet = DEFAULTS.pet
+  // 音色描述：只接受字符串，超长截到 2000（与成员那边同一口径）。
+  merged.agentVoiceDesign = typeof merged.agentVoiceDesign === 'string' ? merged.agentVoiceDesign.slice(0, 2000) : ''
+  merged.agentVoiceId = typeof merged.agentVoiceId === 'string' ? merged.agentVoiceId.slice(0, 200) : ''
+  /*
+    复刻样本：只留 base64，上限 4MB 字符串（约 3MB 音频）。
+    超了就丢掉 —— 存进设置会把整份配置撑爆，读写都会变慢。
+  */
+  merged.agentVoiceStyle = typeof merged.agentVoiceStyle === 'string' ? merged.agentVoiceStyle.slice(0, 500) : ''
+  merged.agentVoiceSample = typeof merged.agentVoiceSample === 'string' ? merged.agentVoiceSample.slice(0, 4 * 1024 * 1024) : ''
+  merged.agentVoiceSampleMime = typeof merged.agentVoiceSampleMime === 'string' ? merged.agentVoiceSampleMime.slice(0, 100) : ''
+  merged.memberHandover = merged.memberHandover !== false
+  merged.mergeShortSentences = merged.mergeShortSentences === true
+  merged.agentVoiceSampleFile = typeof merged.agentVoiceSampleFile === 'string' ? merged.agentVoiceSampleFile.slice(0, 500) : ''
 
   // profile 名会拼进 $DSH_HOME/profiles/<name>，而设置文件是用户可以直接改的。
   // 越界的值退回默认，别让一个手改的 "../../" 变成读任意目录。
@@ -119,12 +244,34 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.positions = positions
 
   // 形象同理逐个校验：皮肤名不认识就丢掉那一条。丢掉之后角色回落到插件下发的 skinId
-  // 或编制默认，而不是变成一只探测不到素材的空白角色。
-  const characters: Record<string, { skin: PetId }> = {}
+  // 或编制默认，而不是变成一只探测不到素材的空白角色。自定义皮肤以登记簿为准。
+  const characters: Record<string, { skin: string; randomActions?: string[] }> = {}
   for (const [key, value] of Object.entries(merged.characters ?? {})) {
-    if (key && value && VALID_PETS.includes(value.skin)) characters[key] = { skin: value.skin }
+    if (key && value && (VALID_PETS.includes(value.skin as PetId) || isCustomSkin(app.getPath('userData'), value.skin))) {
+      const randomActions = Array.isArray((value as { randomActions?: unknown }).randomActions)
+        ? [...new Set(((value as { randomActions?: unknown[] }).randomActions ?? []).filter((a): a is string => typeof a === 'string' && a !== ''))].slice(0, 16)
+        : undefined
+      characters[key] = { skin: value.skin, ...(randomActions ? { randomActions } : {}) }
+    }
   }
   merged.characters = characters
+
+  // 手动退下名单：只留非空字符串、去重、限量，防止手改设置塞进任意内容。
+  merged.stepDownMembers = [...new Set((Array.isArray(merged.stepDownMembers) ? merged.stepDownMembers : [])
+    .filter((id): id is string => typeof id === 'string' && id.trim() !== ''))].slice(0, 32)
+
+  // 成员音色逐字段限长：设置文件用户可直接改，样本路径与描述都不能无限长。
+  const memberVoices: Record<string, { voiceId?: string; design?: string; style?: string; sampleFile?: string; sampleMime?: string; profileId?: string }> = {}
+  for (const [key, value] of Object.entries(merged.memberVoices ?? {})) {
+    if (!key || !value || typeof value !== 'object') continue
+    const v = value as Record<string, unknown>
+    const str = (x: unknown, max: number): string => (typeof x === 'string' ? x.slice(0, max) : '')
+    memberVoices[key] = {
+      voiceId: str(v.voiceId, 200), design: str(v.design, 2000), style: str(v.style, 500),
+      sampleFile: str(v.sampleFile, 500), sampleMime: str(v.sampleMime, 100), profileId: str(v.profileId, 64),
+    }
+  }
+  merged.memberVoices = memberVoices
 
   // 目录逐个校验：设置文件是用户可以直接改的，相对路径会随进程的工作目录漂移 ——
   // 那意味着同一份设置在双击启动和命令行启动下授权了不同的目录，这种事不能靠猜。
@@ -135,6 +282,21 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.layoutVersion = LAYOUT_VERSION
   // 会话框停靠与尺寸：设置文件可手改，越界的值退回安全范围，别让面板一开就整块跑到屏幕外。
   if (merged.chatDock !== 'auto') merged.chatDock = 'top'
+  // 讲解形态同理：设置文件是用户可以手改的，认不出的值一律退回 source（照稿念，最保守），
+  // 而不是留一个 undefined 让调用方各自猜默认值。
+  if (merged.docSpeechMode !== 'ai' && merged.docSpeechMode !== 'source') merged.docSpeechMode = 'source'
+  // 快捷键：只接受带修饰键的组合（含 '+'），长度受限；认不出退回默认，注册时再验占用。
+  merged.docInterruptHotkey = normalizeHotkey(merged.docInterruptHotkey, DEFAULTS.docInterruptHotkey!)
+  merged.docRestHotkey = normalizeHotkey(merged.docRestHotkey, DEFAULTS.docRestHotkey!)
+  merged.docResumeHotkey = normalizeHotkey(merged.docResumeHotkey, DEFAULTS.docResumeHotkey!)
+  // 档位制：不在枚举里的一律退回默认（用户手改过、旧版本、或将来缩减档位）。
+  if (merged.petScale !== 0.8 && merged.petScale !== 1 && merged.petScale !== 1.2) merged.petScale = 1
+  if (merged.petOpacity !== 0.6 && merged.petOpacity !== 0.8 && merged.petOpacity !== 1) merged.petOpacity = 1
+  merged.petDock = merged.petDock !== false
+  // 非法边名一律当没停靠：宁可恢复到原位，也别把角色放到算不出来的地方。
+  if (merged.dockedAt !== 'left' && merged.dockedAt !== 'right' && merged.dockedAt !== 'top' && merged.dockedAt !== 'bottom') {
+    merged.dockedAt = null
+  }
   const chatSize = merged.chatSize
   if (!chatSize || !Number.isFinite(chatSize.width) || !Number.isFinite(chatSize.height)) {
     merged.chatSize = undefined
@@ -175,10 +337,13 @@ function defaultDocRoots(): string[] {
 }
 
 export function loadSettings(): PetSettings {
-  if (cache) return cache
   try {
     if (existsSync(settingsPath())) {
+      const mtime = statSync(settingsPath()).mtimeMs
+      /* 文件被别人改过就重新读一次；否则直接用缓存。 */
+      if (cache !== null && mtime === cacheMtimeMs) return cache
       cache = normalize(JSON.parse(readFileSync(settingsPath(), 'utf8')) as Partial<PetSettings>)
+      cacheMtimeMs = mtime
       return cache
     }
   } catch {
@@ -193,6 +358,7 @@ export function saveSettings(patch: Partial<PetSettings>): PetSettings {
   mkdirSync(path.dirname(settingsPath()), { recursive: true })
   writeFileSync(settingsPath(), JSON.stringify(current, null, 2), 'utf8')
   cache = current
+  try { cacheMtimeMs = statSync(settingsPath()).mtimeMs } catch { cacheMtimeMs = 0 }
   return current
 }
 

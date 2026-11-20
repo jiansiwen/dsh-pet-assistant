@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 工作室只加载本目录脚本样式；provider 请求全部在主进程发出，页面 connect-src 保持 none。 -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: pet-asset:; media-src 'self' pet-asset: data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  />
+  <title>形象与音色工作室</title>
+  <link rel="stylesheet" href="./asset-studio.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script src="./asset-studio.js"></script>
+</body>
+</html>

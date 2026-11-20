@@ -24,6 +24,7 @@ import type { HealthBody } from './runtime-launch.ts'
 import type { CancelReceipt, SessionCommand, SessionResult, SessionSnapshot, SessionUpdate } from '../session-types.ts'
 import type { EvidenceIntakeOutcome, EvidenceIntakeRequest } from '../evidence-types.ts'
 import type { DesktopMailNotice, DesktopMailNoticeAttention, DesktopReminderDelivery } from '../companion-types.ts'
+import type { DesktopExecutionCommand, DesktopExecutionReceipt } from './desktop-task-executor.ts'
 import { parseMeetingMailOutcome } from './approval-policy.ts'
 
 export interface BridgeInfo {
@@ -254,7 +255,8 @@ export class BridgeClient {
    * `signal` 只停止本地等待（静音、换话题、暂停讲解都走它），**不向后台发取消**：后台可能仍在跑。
    * 要停掉后台运行用 {@link cancelChat}（按请求 id 定向取消），回执如实区分未执行 / 取消中 / 已终止 / 未知。
    */
-  async chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string): Promise<ChatReply> {
+  async chat(text: string, assistantId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, bindingId?: string,
+    options: { readonly cancelOnAbort?: boolean; readonly docKey?: string } = {}): Promise<ChatReply> {
     const info = this.info
     if (!info) return { ok: false, error: '未连接到助理运行时：请先从托盘启动团队，或在 dsh 里说"召唤宠物"' }
     const interrupted = (): ChatReply => ({ ok: false, error: signal?.aborted
@@ -265,7 +267,15 @@ export class BridgeClient {
     const abortSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
     const id = `pet-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const replyPromise = new Promise<ChatReply>(resolve => this.pending.set(id, { resolve, onDelta }))
-    const onAbort = (): void => { this.pending.get(id)?.resolve(interrupted()) }
+    const onAbort = (): void => {
+      this.pending.get(id)?.resolve(interrupted())
+      /*
+       * 讲解/成员问答显式要求时，按请求 id 定向取消这一轮：成员会话的写句柄才会尽快释放，
+       * 否则紧接着的提问会撞上宿主的 "already owned by an active write handle"。
+       * 普通回复保持原语义（只停本地等待，后台照常运行，结果仍需核对）——那条契约有测试守着。
+       */
+      if (options.cancelOnAbort === true) void this.cancelChat(id).catch(() => undefined)
+    }
     abortSignal.addEventListener('abort', onAbort, { once: true })
     const timer = setTimeout(() => controller.abort(), 320_000)
     this.outstanding.set(id, { assistantId, startedAt: Date.now() })
@@ -275,7 +285,7 @@ export class BridgeClient {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         signal: abortSignal,
-        body: JSON.stringify({ id, text, assistantId, epoch: info.epoch, bindingId }),
+        body: JSON.stringify({ id, text, assistantId, epoch: info.epoch, bindingId, ...(options.docKey === undefined ? {} : { docKey: options.docKey }) }),
       })
       if (!response.ok) {
         // 明确没受理：后台没有这条请求，不必再取消。
@@ -329,6 +339,23 @@ export class BridgeClient {
   /** 按团队任务 id 定向取消插件持有的子代理（POST /team/cancel）。 */
   cancelTeamTask(taskId: string): Promise<CancelReceipt> {
     return this.postCancel('/team/cancel', { taskId }, { taskId })
+  }
+
+  /** 本人复核确认一个等待中的团队任务（POST /team/confirm）：用户是可信验收方。 */
+  async confirmTeamTask(taskId: string): Promise<{ ok: boolean; message: string }> {
+    const info = this.info
+    if (!info || this.stopped) return { ok: false, message: '未连接到助理运行时，无法确认任务' }
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/team/confirm?token=${encodeURIComponent(info.token)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId }),
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]),
+      })
+      const body = await response.json().catch(() => ({})) as { ok?: unknown; message?: unknown; error?: unknown }
+      const message = typeof body.message === 'string' ? body.message : typeof body.error === 'string' ? body.error : `确认请求返回 ${response.status}`
+      return { ok: body.ok === true, message }
+    } catch (error) {
+      return { ok: false, message: `确认没有送达：${error instanceof Error ? error.message : String(error)}` }
+    }
   }
 
   /** 暂停 / 恢复团队后续步骤（POST /team/pause）：只挡新的领取，不中止在跑的运行。 */
@@ -603,6 +630,82 @@ export class BridgeClient {
     } catch { return false }
   }
 
+  /**
+   * 受管执行器命令通道（4.6 切片1）：与提醒同一执行器凭据，领取 kinds 从 reminders
+   * 扩展到 /executor/v1/commands。这里只取 kind=desktop-action 的第一条；
+   * 命令形状只做最低限度核验，能力与授权由 desktop-task-executor 逐项校验。
+   */
+  async nextDesktopCommand(): Promise<DesktopExecutionCommand | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/commands`, {
+        headers: { 'x-dsh-companion-token': token },
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      const body = await response.json() as { commands?: unknown }
+      if (!Array.isArray(body.commands)) return null
+      const first = body.commands.find(item => item !== null && typeof item === 'object'
+        && (item as Record<string, unknown>).kind === 'desktop-action'
+        && typeof (item as Record<string, unknown>).commandId === 'string'
+        && typeof (item as Record<string, unknown>).executorEpoch === 'string')
+      return first ? first as DesktopExecutionCommand : null
+    } catch { return null }
+  }
+
+  async claimDesktopCommand(commandId: string): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token || this.stopped) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/commands/${encodeURIComponent(commandId)}/claim`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ executorEpoch: info.epoch ?? '' }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
+  }
+
+  /** 回执只发一次；没送达也不重放动作，由插件侧对账。 */
+  async receiptDesktopCommand(commandId: string, receipt: DesktopExecutionReceipt): Promise<boolean> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token) return false
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/commands/${encodeURIComponent(commandId)}/receipt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify(receipt),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      return response.ok
+    } catch { return false }
+  }
+
+  /**
+   * 消费已批准的一次性电脑动作（4.6 切片2）：核验与消费在插件 computer 模块内完成。
+   * 网络失败返回 null，由执行器记 unknown 并对账，绝不重放动作。
+   */
+  async applyComputerAction(actionId: string): Promise<Record<string, unknown> | null> {
+    const info = this.info
+    const token = this.companionCredential('executor')
+    if (!info || !token) return null
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/executor/v1/computer-apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-companion-token': token },
+        body: JSON.stringify({ actionId }),
+        signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
+      })
+      if (!response.ok) return null
+      return await response.json() as Record<string, unknown>
+    } catch { return null }
+  }
+
   /** 邮件分析结果只由本机可信执行器领取；聊天令牌不能签发投递回执。 */
   async desktopMailNotices(): Promise<{ deliveries: DesktopMailNotice[]; attention: DesktopMailNoticeAttention[] } | null> {
     const info = this.info
@@ -676,7 +779,7 @@ export class BridgeClient {
   }
 
   /** 上报桌面状态（专注 / 可见），插件侧的提醒评估靠它实现"会议与免打扰不提醒"。 */
-  async reportPetState(state: { focus: boolean; visible: boolean; meeting: boolean }): Promise<void> {
+  async reportPetState(state: { focus: boolean; visible: boolean; meeting: boolean; locked?: boolean; screenSharing?: boolean }): Promise<void> {
     const info = this.info
     if (!info) return
     try {

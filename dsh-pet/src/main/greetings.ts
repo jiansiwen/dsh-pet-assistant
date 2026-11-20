@@ -31,6 +31,31 @@ export const INTERRUPT_ACKS: readonly string[] = [
   '停了，你说吧。',
 ]
 
+/**
+ * 文档讲解里的即时反馈短句（全部按讲解人音色预合成，打开文档时预热）。
+ *
+ * 这些句子在"停下/提问/继续"的节骨眼上播放：必须立刻出声，不能等一次云端合成；
+ * 也全部是固定话术，缓存键 = 音色 + 文本，换音色自然失效重合成。
+ */
+export const DOC_STOP_ACKS: readonly string[] = [
+  '好的，你说。',
+  '好，我在听，请讲。',
+  '请问有什么问题？',
+]
+
+export const DOC_THINKING_ACKS: readonly string[] = [
+  '稍等，我想一下。',
+  '稍等，我看看。',
+]
+
+export const DOC_RESUME_ACKS: readonly string[] = [
+  '没其他问题，那我就继续了。',
+]
+
+export const DOC_CONTINUE_ACKS: readonly string[] = [
+  '好的，我这就继续。',
+]
+
 /** 一条应答最长多少字。超过它说明这不该是"应答"，而是回答正文。 */
 export const MAX_GREETING_CHARS = 20
 
@@ -60,5 +85,8 @@ export function pickPhrase(list: readonly string[], random: () => number = Math.
  * 缓存按音色分组：换音色时旧音频对不上，必须重新合成——这正是调用方要拿它当键的原因。
  */
 export function fixedPhrases(): string[] {
-  return [...new Set([...WAKE_GREETINGS, ...INTERRUPT_ACKS, ...LOCAL_ACKS])]
+  return [...new Set([
+    ...WAKE_GREETINGS, ...INTERRUPT_ACKS, ...LOCAL_ACKS,
+    ...DOC_STOP_ACKS, ...DOC_THINKING_ACKS, ...DOC_RESUME_ACKS, ...DOC_CONTINUE_ACKS,
+  ])]
 }

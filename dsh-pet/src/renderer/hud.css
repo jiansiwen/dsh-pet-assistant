@@ -500,358 +500,118 @@
   background: transparent;
 }
 
-/* 管理区独立留在可见工作区；不套用会话暗色到文档、会议与语音授权组件。 */
-.pet-management {
-  position: absolute;
-  right: 16px;
-  top: 16px;
-  z-index: 90;
-  width: 430px;
-  max-width: calc(100vw - 32px);
-  max-height: calc(100vh - 32px);
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
-  border: 1px solid #91bbce;
-  border-radius: 12px;
-  background: rgba(245, 249, 252, 0.98);
-  box-shadow: 0 8px 28px rgba(16, 35, 51, 0.2);
-  color: #243b4b;
-  font: 13px/1.6 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
-  color-scheme: light;
-  user-select: text;
-}
-
-.pet-management .management-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex: none;
-  gap: 10px;
-  padding: 12px 14px;
-  border-bottom: 1px solid #d6e5ed;
-  background: #eaf3f8;
-}
-
-.pet-management .management-header h2 {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.pet-management .management-header button {
-  width: 28px;
-  height: 28px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: #466173;
-  cursor: pointer;
-  font-size: 21px;
-}
-
-.pet-management .management-tabs {
-  flex: none;
-  display: flex;
-  gap: 4px;
-  padding: 6px 12px;
-  border-bottom: 1px solid #d6e5ed;
-}
-
-.pet-management .management-tabs button {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 0;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: #536d7e;
-  font: inherit;
-  cursor: pointer;
-}
-
-.pet-management .management-tabs button[aria-current='page'] {
-  background: #dcecf4;
-  border-color: #a5c8d9;
-  color: #194b65;
-  font-weight: 600;
-}
-
-.pet-management .management-content {
-  flex: 1 1 auto;
-  min-width: 0;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-  scrollbar-width: thin;
-  scrollbar-color: #9eb4c2 transparent;
-}
-
-.pet-management .management-general {
-  padding: 14px;
-}
-
-.pet-management .management-section {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.pet-management .management-section:last-child {
-  margin-bottom: 0;
-}
-
-.pet-management .management-section h3,
-.pet-management .management-page-title {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.pet-management .management-page-title {
-  padding: 10px 12px 4px;
-}
-
-.pet-management .management-hint,
-.pet-management .management-diagnostic {
-  color: #526c7b;
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.pet-management .management-content > .management-hint {
-  padding: 8px 12px;
-}
-
-.pet-management .management-diagnostic code {
-  font: 12px 'Cascadia Code', Consolas, monospace;
-  color: #243b4b;
-  user-select: text;
-}
-
-.pet-management .management-quick {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
+/*
+ * 设置面板（.pet-management）的全部样式已迁到 settings-surface.css。
+ *
+ * 这里原来还有一整套 .pet-management 规则，是上一版「浅蓝 + 细描边」的配色；它和
+ * settings-surface.css 抢同一个面板，谁赢取决于两个文件谁后加载。那种情况下改一行样式
+ * 要先猜到底是哪个文件生效，是最难查的一类 bug。现在这个面板只有一个 owner。
+ *
+ * 需要改设置面板，请改 settings-surface.css；不要在这里重新加 .pet-management 规则。
+ */
 
 /*
- * 环境检查（M5-06）：按"运行时 / 模型 / 权限"分组，每组一张清单。
+ * 悬停快捷工具栏（3.7.1）。
  *
- * 用带左边框的列表而不是卡片：这一页要同时列出十几条（含数据去向），卡片间距会把
- * "还有几项要处理"这句话挤到看不见。左边框 + 状态色让"哪几条要动手"一眼能扫出来。
+ * 视觉要"轻"：半透明底 + 圆角 + 小阴影，和头顶的说话气泡是一族，不用新颜色体系。
+ * `pointer-events: auto` 是必须的 —— 舞台根节点平时是穿透的，工具栏若继承穿透就点不到。
+ * `pointer-events` 与 `data-interactive` 一起管：后者让主进程把这块区域算进命中盒。
  */
-.pet-management .management-group {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.pet-management .management-group > h4 {
-  font-size: 12px;
-  font-weight: 600;
-  color: #24526b;
-}
-
-.pet-management .management-checklist {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.pet-management .management-checklist > li {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 6px;
-  padding: 6px 8px;
-  border-left: 3px solid #cfe0e9;
-  background: #f7fbfd;
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-/* 状态色：要处理的红、装不了的红加粗、可选与读不到的中性灰。 */
-.pet-management .management-checklist > li[data-status='action'] {
-  border-left-color: #c9584b;
-}
-
-.pet-management .management-checklist > li[data-status='blocked'] {
-  border-left-color: #a3271b;
-  background: #fdf3f2;
-}
-
-.pet-management .management-checklist > li[data-status='ready'] {
-  border-left-color: #3f8f66;
-}
-
-.pet-management .management-checklist > li[data-status='optional'],
-.pet-management .management-checklist > li[data-status='unknown'] {
-  border-left-color: #b9c9d2;
-}
-
-.pet-management .management-checklist > li > strong {
-  font-weight: 600;
-  color: #243b4b;
-}
-
-.pet-management .management-checklist > li > p {
-  flex-basis: 100%;
-  margin: 0;
-  color: #40596b;
-}
-
-.pet-management .management-status {
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: #e6eef3;
-  color: #40596b;
-  font-size: 11px;
-}
-
-.pet-management .management-checklist > li[data-status='action'] .management-status {
-  background: #f7e3e0;
-  color: #a3271b;
-}
-
-.pet-management .management-checklist > li[data-status='ready'] .management-status {
-  background: #e2f1e8;
-  color: #2f7357;
-}
-
-.pet-management .management-button {
-  align-self: flex-start;
-  padding: 5px 10px;
-  border: 1px solid #adc7d5;
-  border-radius: 6px;
-  background: #fff;
-  color: #24526b;
-  font: inherit;
-  cursor: pointer;
-}
-
-.pet-management .management-button.danger {
-  border-color: #d9a6a1;
-  color: #a63c35;
-}
-
-.pet-management .management-button.danger:hover:not(:disabled) {
-  background: #fdf0ef;
-}
-
-.pet-management .management-sleep,
-.pet-management .management-voice {
+.hover-bar {
+  position: absolute;
+  z-index: 60;
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-width: 0;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 12px;
+  background: rgba(40, 44, 60, 0.82);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+  /* 横向居中、纵向底边贴在 top 上：定位只给 left/top，尺寸由内容决定，
+     所以必须靠 transform 自己往回挪半个宽度、一整个高度。 */
+  transform: translate(-50%, -100%);
 }
-
-.pet-management .management-sleep span {
-  flex: 1;
-  min-width: 0;
+/* 上方空间不足时翻到角色脚下：顶边贴在 bottom 上，不再往上挪一整个高度。 */
+.hover-bar-below {
+  transform: translate(-50%, 0);
 }
-
-.pet-management .management-sleep input {
-  width: 64px;
-  min-width: 0;
-  padding: 4px 6px;
-  border: 1px solid #adc7d5;
-  border-radius: 5px;
-  background: #fff;
-  color: #243b4b;
-  font: inherit;
-}
-
-.pet-management .management-voice input {
-  flex: none;
-  accent-color: #337b9a;
-}
-
-.pet-management .management-doc-results {
-  margin: 8px 12px 12px;
-  padding: 10px;
-  border: 1px solid #d6e5ed;
-  border-radius: 8px;
-  background: #fff;
-}
-
-.pet-management .management-doc-results h4 {
-  font-size: 12px;
-  margin-bottom: 4px;
-}
-
-.pet-management .management-doc-log {
-  max-height: 160px;
-  overflow-y: auto;
-  margin-top: 8px;
-  scrollbar-width: thin;
-  user-select: text;
-}
-
-.pet-management .management-doc-log p {
-  padding: 6px 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  border-bottom: 1px solid #e3edf3;
-}
-
-.pet-management .management-doc-log p:last-child {
-  border-bottom: none;
-}
-
-.pet-management .management-doc-log .is-error {
-  color: #98400f;
-}
-
-/* 整页由管理容器滚动，保留业务组件内部的提纲、转写和纪要滚动区。 */
-.pet-management .management-content > :is(.team-page, .doc-page, .meeting-page) {
-  min-height: 0;
-  overflow: visible;
-}
-
-.pet-management .runtime-row {
-  border: 1px solid #d6e5ed;
-  border-radius: 7px;
-}
-
-.pet-management select option,
-.pet-management select optgroup {
-  background: #fff;
-  color: #243b4b;
-}
-
-.pet-management :is(.management-header button, .management-tabs button, .management-button):hover:not(:disabled) {
-  background: #dcecf4;
-  border-color: #91bbce;
-}
-
-.pet-management :is(button, input, select, textarea, summary):focus-visible {
-  outline: 2px solid #337b9a;
-  outline-offset: 2px;
-}
-
-.pet-management .management-button:disabled,
-.pet-management .management-sleep input:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.pet-management ::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
-}
-
-.pet-management ::-webkit-scrollbar-thumb {
-  background: #9eb4c2;
-  border-radius: 3px;
-}
-
-.pet-management ::-webkit-scrollbar-track {
+.hover-bar-btn {
+  appearance: none;
+  border: 0;
   background: transparent;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  padding: 7px 9px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.hover-bar-btn:hover { background: rgba(255, 255, 255, 0.16); }
+.hover-bar-btn:focus-visible { outline: 2px solid #8fd3c7; outline-offset: 1px; }
+
+/*
+ * 停靠态：屏幕边上的 48×48 小圆。
+ *
+ * 视觉上比角色安静得多，但仍要"看得出它在"：一层浅底 + 1px 描边 + 一个状态点。
+ * 呼吸动画只给"录音中"用 —— 与"出错"同为红点，靠动/不动区分，不靠两个相近的红。
+ */
+.docked-pet {
+  position: absolute;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(128, 128, 140, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.docked-pet:hover { background: #fff; }
+/*
+ * 圆形的宠物头像。裁切放在这一层：button 本身不裁，好让右下角的徽标能压到边外一点。
+ * object-fit: contain —— 素材是方图、角色居中偏下，contain 比 cover 更不容易切掉耳朵。
+ */
+.docked-pet-face {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 40%, #ffffff 0%, #f1f2f5 100%);
+}
+.docked-pet-img { display: block; width: 100%; height: 100%; object-fit: contain; }
+/* 拿不到素材时的退路：剪影，不是圆点 —— 圆点会让用户以为宠物丢了（这次报障的本体）。 */
+.docked-pet-silhouette {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 58%;
+  height: 58%;
+  fill: #9aa0ad;
+}
+/* 状态徽标：12px，2px 白边压在右下角，不遮脸。 */
+.docked-pet-dot {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  box-sizing: content-box;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #fff;
+  border-radius: 999px;
+  display: block;
+}
+.docked-pet.is-breathing .docked-pet-dot { animation: docked-breathe 1.8s ease-in-out infinite; }
+@keyframes docked-breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .docked-pet.is-breathing .docked-pet-dot { animation: none; }
 }

@@ -43,6 +43,8 @@ export class WpsViewTarget implements DocViewTarget {
   private timer: ReturnType<typeof setInterval> | null = null
   private chain: Promise<void> = Promise.resolve()
   private readonly listeners = new Set<(action: DocViewUserAction) => void>()
+  /** plan 里每段的原文：跳页后拿它和 WPS 读回的文字比对（判"跳对没跳对"）。 */
+  private sections: readonly { readonly text: string }[] = []
 
   constructor(options: WpsViewTargetOptions) {
     this.options = options
@@ -55,12 +57,23 @@ export class WpsViewTarget implements DocViewTarget {
     const opened = await this.options.wps().open(target.realPath)
     if (generation !== this.generation) throw new Error('讲解已切换，WPS 打开结果作废')
     if (!opened.ok) throw new Error(`WPS 没能打开：${opened.error.guidance ?? opened.error.message}`)
-    if (opened.value.profile === null || opened.value.position === undefined) {
-      throw new Error('WPS 已打开文件，但读不到页码，不能同步翻页')
+    if (opened.value.profile === null) {
+      throw new Error('WPS 已打开文件，但这类文件没有可靠的页码控制，不能同步翻页')
     }
     this.session = opened.value
+    this.sections = target.plan.sections
+    if (opened.value.position === undefined) {
+      // 窗口能用但**读不到页码**（WPS 12.x 的 Qt5 窗口没有 KxPdfView / 页码控件）。
+      // 这时不放弃 WPS：翻页走键盘退路（见 win-uia.ps1 的 Goto-PageByKeyboard），
+      // 也**不轮询** —— 没有页码可读，轮询只会每几秒把讲解误判成"暂停"。
+      this.page = null
+      this.expected = null
+      console.log('[dsh-pet] wps window ok but no pdf view (keyboard fallback)')
+      return
+    }
     this.page = opened.value.position.page
     this.expected = this.page
+    console.log('[dsh-pet] wps window ok')
     this.timer = setInterval(() => this.poll(), this.options.pollMs ?? WPS_POLL_MS)
     this.timer.unref?.()
   }
@@ -69,11 +82,15 @@ export class WpsViewTarget implements DocViewTarget {
   goto(anchor: DocAnchor, _options: { readonly highlight: boolean }): void {
     const session = this.session
     if (session === null) return
+    // 键盘模式（`show()` 里读不到页码）也照样跳：每一段都有确定的物理页码，目标是已知的，
+    // 由 win-uia.ps1 的绝对跳页（Ctrl+G 输页码）完成，跳完读回文字交给 syncTo 比对。
+    // "对不上"就由 apply(status) 把讲解暂停并说明原因 —— 这才对，不是"宁可不翻"。
+    const expectText = this.sections[anchor.sectionIndex]?.text ?? undefined
     const generation = this.generation
     this.enqueue(async () => {
       if (generation !== this.generation) return
       this.expected = anchor.page
-      const status = await this.options.wps().syncTo(session, anchor.page)
+      const status = await this.options.wps().syncTo(session, anchor.page, expectText)
       if (generation === this.generation) this.apply(status)
     })
   }

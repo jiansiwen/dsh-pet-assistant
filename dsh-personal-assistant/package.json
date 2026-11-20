@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Personal computer assistant plugin for DeepSeek Harness: tracks daily computer activity, answers what the user did today, and generates daily reports with long-term preference memory",
   "type": "module",
-  "main": "dist/index-1105094252.js",
+  "main": "dist/index-1120034225.js",
   "license": "MIT",
   "engines": {
     "node": ">=22"
@@ -35,9 +35,11 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "check": "npm run typecheck && npm run check:client",
+    "check:client": "tsc --noEmit --jsx preserve --target ES2022 --module NodeNext --moduleResolution NodeNext --strict false --noImplicitAny false --skipLibCheck --allowImportingTsExtensions scripts/react-ambient.d.ts src/client/index.tsx",
     "clean": "node -e \"const fs=require('fs'),p=require('./package.json');const keep=p.main;for(const f of fs.readdirSync('dist')){if(f.endsWith('.js')&&'dist/'+f!==keep){try{fs.renameSync('dist/'+f,'dist/'+f+'.stale');console.log('archived',f)}catch(e){console.log('skip',f,e.code)}}}\"",
     "dev": "node scripts/build.mjs --watch",
-    "test": "node --test --disable-warning=ExperimentalWarning \"tests/**/*.test.ts\"",
+    "test": "node --test --disable-warning=ExperimentalWarning --experimental-test-module-mocks \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
@@ -64,7 +66,7 @@
     "zod": "4.4.3"
   },
   "exports": {
-    ".": "./dist/index-1105094252.js",
+    ".": "./dist/index-1120034225.js",
     "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },

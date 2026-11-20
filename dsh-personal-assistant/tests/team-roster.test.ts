@@ -156,14 +156,26 @@ describe('ensureRoster：新库按配置建，老库保留本人持久配置', (
     assert.equal(table.get('member-tangseng')?.enabled, true)
   })
 
-  test('旧库缺少席位时，只按当前名单初始化缺失成员', () => {
+  test('老库已有成员时缺失席位不补回：本人删除的成员重启不复活', () => {
     const existing = stored('member-tangseng', { enabled: false, persona: '本人配置' })
     const { team, table, writes } = makeTeam([existing], ['tangseng', 'wukong'])
     team.ensureRoster()
-    assert.equal(writes.length, 4)
-    assert.deepEqual(table.get(existing.assistantId), existing)
-    assert.equal(table.get('member-wukong')?.enabled, true)
-    assert.equal(table.get('member-bajie')?.enabled, false)
+    assert.deepEqual(writes, [], '删除必须永久生效，启动不再补种子')
+    assert.deepEqual([...table.values()], [existing])
+  })
+
+  test('删除种子成员后再次启动，删掉的不会复活', () => {
+    const { team, table } = makeTeam()
+    team.ensureRoster()
+    assert.equal(table.size, 5)
+    table.delete('member-wukong')
+    table.delete('member-bajie')
+    table.delete('member-shaseng')
+    team.ensureRoster()
+    assert.equal(table.size, 2, '总助理与剩下的成员保留，删掉的三个不回来')
+    assert.equal(table.has('member-wukong'), false)
+    assert.equal(table.has('member-bajie'), false)
+    assert.equal(table.has('member-shaseng'), false)
   })
 
   test('名单里认不出的名字会留一条 warn，而不是悄悄少一个人', () => {

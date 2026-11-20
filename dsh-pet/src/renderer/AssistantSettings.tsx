@@ -5,7 +5,7 @@ import {
   type AssistantSettingsSection, type AssistantSettingsSnapshot,
 } from '../assistant-settings-types.ts'
 
-const TITLES: Partial<Record<AssistantSettingsPage, string>> = { wecom: '企业微信渠道', reminders: '新提醒默认间隔' }
+const TITLES: Partial<Record<AssistantSettingsPage, string>> = { wecom: '企业微信渠道', reminders: '新提醒默认间隔', agent: '总助理' }
 
 export default function AssistantSettings({ section }: { section: AssistantSettingsPage }) {
   const [state, setState] = useState<AssistantSettingsSnapshot | null>(null)
@@ -17,6 +17,8 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
   const [botId, setBotId] = useState('')
   const [secret, setSecret] = useState('')
   const [minutes, setMinutes] = useState('')
+  const [agentName, setAgentName] = useState('')
+  const [agentPersona, setAgentPersona] = useState('')
   const inFlight = useRef(false)
   const mounted = useRef(false)
   const opening = useRef(false)
@@ -27,6 +29,8 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
     setEnabled(next.wecom.enabled)
     setBotId(next.wecom.botId)
     setMinutes(String(next.reminder.repeatEverySeconds / 60))
+    setAgentName(next.agent.name)
+    setAgentPersona(next.agent.persona)
     setNeedsRefresh(false)
   }, [])
 
@@ -50,6 +54,7 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
       // 刷新不清掉尚未提交的密钥；渠道写入成功后立即清空，绝不落入浏览器存储。
       if (write === 'wecom') setSecret('')
       setNotice(result.message || (write === 'reminders' ? '已保存，仅影响以后新建的提醒。'
+        : write === 'agent' ? '已保存，总助理与快速应答按新性格说话。'
         : write ? (result.state.wecom.connected ? '配置已确认，企业微信已连接。' : '配置已确认，企业微信尚未连接，请稍后刷新状态。')
         : '已读取最新配置。'))
     } catch {
@@ -96,6 +101,18 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
         return
       }
       input = { expectedRevision, repeatEverySeconds }
+    } else if (target === 'agent') {
+      if (!agentName.trim()) {
+        setError('总助理名字不能为空。')
+        return
+      }
+      if (agentName.length > LIMITS.name || agentPersona.length > LIMITS.persona) {
+        setError('名字或性格超出长度上限，请精简后保存。')
+        return
+      }
+      input = { expectedRevision, name: agentName.trim(), persona: agentPersona,
+        provider: state.agent.provider, model: state.agent.model,
+        maxTokens: state.agent.maxTokens, tokenBudget: state.agent.tokenBudget }
     } else if (target === 'wecom/reconnect') input = { expectedRevision }
     else return
     void run(() => window.petApi.assistantSettingsSave(target, input), target)
@@ -157,6 +174,17 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
               </label>
               <p id="assistant-reminder-hint" className="management-hint">最少 1 分钟，最多 10080 分钟（7 天），换算后的秒数必须是整数。只影响以后新建提醒；旧任务可在“任务与提醒”内单独修改。</p>
               <button className="management-button" type="submit">{pending ? '正在保存…' : '保存提醒配置'}</button>
+            </> : section === 'agent' ? <>
+              <label className="assistant-settings-field">名字
+                <input type="text" maxLength={LIMITS.name} value={agentName} onChange={event => setAgentName(event.target.value)} />
+              </label>
+              <label className="assistant-settings-field">性格与说话风格
+                <textarea rows={6} maxLength={LIMITS.persona} value={agentPersona}
+                  placeholder="例如：稳重简洁，先给结论再给理由；口语化，不用客套话。留空用默认性格。"
+                  onChange={event => setAgentPersona(event.target.value)} />
+              </label>
+              <p className="management-hint">性格喂给总助理的正式回复与快速应答；团队成员的性格在“团队 → 成员编辑”里单独设置。</p>
+              <button className="management-button" type="submit">{pending ? '正在保存…' : '保存总助理配置'}</button>
             </> : null}
           </fieldset>
         </form>}

@@ -11,7 +11,11 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { OFFICE_EXTENSIONS, OUTLINE_EXTENSIONS } from '../main/doc-formats.js'
-import { formatDate, formatSize, progressLabel, sectionLabel, shortenDir } from './doc-panel.js'
+import {
+  DOC_SPEECH_CODE_HINT, DOC_SPEECH_SWITCH_HINT, docSpeechModeOf, docSpeechOptions,
+  formatDate, formatSize, presenterLabel, progressLabel, sectionLabel, shortenDir,
+  type DocSpeechMode,
+} from './doc-panel.js'
 import type { DocRoots, DocState } from './types.js'
 import './doc.css'
 
@@ -25,6 +29,8 @@ interface DocPanelProps {
   readonly busy: boolean
   /** 正在出声。停止按钮只在有声可停的时候才有意义。 */
   readonly speaking: boolean
+  /** 休息模式：无限期停讲、不听提问，只认整句"继续演讲"恢复。 */
+  readonly resting?: boolean
   readonly onOpen: (path: string) => void
   readonly onRead: (path: string) => void
   readonly onExplain: (path: string, from: number) => void
@@ -35,6 +41,13 @@ interface DocPanelProps {
   readonly onAddRoot: () => void
   readonly onRemoveRoot: (path: string) => void
   readonly onForgetDir: (path: string) => void
+  /** 讲解形态：`source` 照原文念稿（默认），`ai` 每段让模型生成解释。 */
+  readonly docSpeechMode?: DocSpeechMode
+  readonly onDocSpeechModeChange: (mode: DocSpeechMode) => void
+  /** 讲解快捷键（打断/休息/继续）回读与注册状态；false = 被占用或无效。 */
+  readonly docHotkeys?: { interrupt: string; rest: string; resume: string }
+  readonly docHotkeyStatus?: { interrupt: boolean; rest: boolean; resume: boolean } | null
+  readonly onDocHotkeysChange: (hotkeys: { interrupt: string; rest: string; resume: string }) => void
 }
 
 export default function DocPanel({
@@ -42,6 +55,7 @@ export default function DocPanel({
   roots,
   busy,
   speaking,
+  resting,
   onOpen,
   onRead,
   onExplain,
@@ -51,10 +65,17 @@ export default function DocPanel({
   onAddRoot,
   onRemoveRoot,
   onForgetDir,
+  docSpeechMode,
+  onDocSpeechModeChange,
+  docHotkeys,
+  docHotkeyStatus,
+  onDocHotkeysChange,
 }: DocPanelProps) {
   const outline = state.kind === 'outline' ? state : null
   const [selected, setSelected] = useState(0)
   const [question, setQuestion] = useState('')
+  const [hotkeyDraft, setHotkeyDraft] = useState(docHotkeys ?? { interrupt: 'Ctrl+Alt+D', rest: 'Ctrl+Alt+R', resume: 'Ctrl+Alt+C' })
+  useEffect(() => { if (docHotkeys) setHotkeyDraft(docHotkeys) }, [docHotkeys])
 
   const docPath = outline?.path ?? null
   useEffect(() => {
@@ -123,10 +144,14 @@ export default function DocPanel({
               {outline.title}
             </span>
             {speaking && <span className="doc-live">正在讲</span>}
+            {resting && <span className="doc-live">休息中</span>}
           </h3>
           <p className="doc-hint" role="status">
             {progressLabel(outline.next, outline.total, outline.estMinutes)}
           </p>
+          {presenterLabel(outline.assistantName) !== '' && (
+            <p className="doc-hint" role="status">{presenterLabel(outline.assistantName)}</p>
+          )}
 
           {/*
             提纲是目录，不是正文：一行只有标题和状态，正文在对话页里。
@@ -257,6 +282,55 @@ export default function DocPanel({
             添加目录…
           </button>
         </div>
+      </section>
+
+      <section className="doc-section" aria-label="讲解模式">
+        <h3 className="doc-section-title">讲解模式</h3>
+        {/*
+          放在"允许目录"之后、"讲得了什么"之前：它回答的是"怎么讲"，不是"讲什么"。
+          切换只写设置，不调用任何讲解控制命令 —— 正在播的那一段不该因为改个偏好被打断。
+        */}
+        {docSpeechOptions().map(option => (
+          <label className="doc-hint" key={option.value}>
+            <input type="radio" name="doc-speech-mode" checked={docSpeechModeOf(docSpeechMode) === option.value}
+              disabled={busy} onChange={() => onDocSpeechModeChange(option.value)} />
+            {' '}<strong>{option.label}</strong>：{option.detail}
+          </label>
+        ))}
+        <p className="doc-hint">{DOC_SPEECH_SWITCH_HINT}</p>
+        <p className="doc-hint">{DOC_SPEECH_CODE_HINT}</p>
+      </section>
+
+      <section className="doc-section" aria-label="讲解快捷键">
+        <h3 className="doc-section-title">讲解快捷键</h3>
+        <p className="doc-hint">
+          全局生效，讲解时随时可按（口令识别不准或外放嘈杂时的确定性兜底）。格式如 Ctrl+Alt+D（修饰键+字母）；
+          请避开 Ctrl+空格（中文输入法切换）与 Ctrl+Z/X（撤销/剪切）。被其他程序占用的键会标红，改一个即可。
+        </p>
+        {([['interrupt', '打断提问', '停下并开 10 秒提问窗口（= 说"停一下"）'],
+          ['rest', '休息', '无限期停、不听提问，只认整句"继续演讲"（= 说"休息一下"）'],
+          ['resume', '继续', '从打断或休息恢复讲解（= 说"继续演讲"）']] as const).map(([key, label, detail]) => (
+          <label className="doc-hint" key={key} style={{ display: 'block', marginTop: 6 }}>
+            <strong>{label}</strong>：{detail}
+            <input
+              type="text"
+              value={hotkeyDraft[key]}
+              disabled={busy}
+              spellCheck={false}
+              style={{ display: 'block', width: '100%', marginTop: 4, padding: '4px 6px', boxSizing: 'border-box' }}
+              onChange={event => setHotkeyDraft({ ...hotkeyDraft, [key]: event.target.value })}
+            />
+            {docHotkeyStatus && docHotkeyStatus[key] === false && (
+              <span style={{ color: '#c0392b' }}>此键被占用或无效，请换一个</span>
+            )}
+          </label>
+        ))}
+        <div className="doc-actions">
+          <button type="button" className="doc-btn primary" disabled={busy} onClick={() => onDocHotkeysChange(hotkeyDraft)}>
+            保存快捷键
+          </button>
+        </div>
+        <p className="doc-hint">语音同样可用：说"停一下"打断提问、"休息一下"进入休息、整句"继续演讲"恢复。</p>
       </section>
 
       <section className="doc-section">

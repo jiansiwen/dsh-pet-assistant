@@ -33,6 +33,8 @@ import {
 import type { ResolvedVoiceApi } from '../voice-api-types.ts'
 import { fixedPhrases } from './greetings.ts'
 import type { TtsCache } from './tts-cache.ts'
+import { ttsVoiceKey } from './tts-cache.ts'
+import { hasSpeakerVoice, speakerOverlay, speakerRequestFields, type SpeakerVoice } from '../shared/speaker-voice.ts'
 
 /** 固定话术集合：只对这些句子做缓存，回答正文每次都不同，缓存它没有意义。 */
 const FIXED_PHRASES = new Set(fixedPhrases())
@@ -72,6 +74,8 @@ export interface NarratorHooks {
  *
  * 一台机器上只该有一个：两个驱动就是两个合成进程同时出声。
  */
+const PREFETCH_LOOKAHEAD = 3
+
 export class Narrator {
   private readonly open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport
   private readonly hooks: NarratorHooks
@@ -79,6 +83,9 @@ export class Narrator {
   /** 按音色档案名解析本次音色（§4.6 ★④）；null = 未配置，走全局默认。 */
   private readonly voiceProfileApi: ((voiceProfile: string) => ResolvedVoiceApi | null) | null
   private readonly cache: TtsCache | null
+  private readonly fixedVoiceKey: () => string | null
+  private readonly defaultVoice: () => SpeakerVoice | null
+  private readonly resolveProfile: (id: string) => ResolvedVoiceApi | null
   /** 本次派发用的音色指纹（缓存键的一半）；由 cachedAudio 顺带记下。 */
   private cachedVoiceKey: string | null = null
   private state: SpeechState = INITIAL_SPEECH_STATE
@@ -97,20 +104,35 @@ export class Narrator {
   private speaking = false
   private disposed = false
   /** 流式朗读的攒句缓冲，按 utteranceId 分开：一轮回答一个。 */
-  private feeds = new Map<string, { buffer: string; nextIndex: number }>()
+  private feeds = new Map<string, { buffer: string; nextIndex: number; voice?: SpeakerVoice | null }>()
 
   constructor(open: (deliver: (event: TtsWorkerEvent) => void) => TtsTransport, hooks: NarratorHooks = {}, options: {
     /** 当前选中的自定义 TTS 服务；null 走默认合成。派发时才取，用户中途换服务不用重启播放器。 */
     ttsApi?: () => ResolvedVoiceApi | null
-    /** 按音色档案名解析本次音色（§4.6 ★④）：返回 null 表示解析不出（回退全局默认音色）。 */
+/** 按音色档案名解析本次音色（§4.6 ★④）：返回 null 表示解析不出（回退全局默认音色）。 */
     voiceProfileApi?: (voiceProfile: string) => ResolvedVoiceApi | null
-    /** 固定话术的音频缓存；null = 不缓存（默认 edge-tts 路径）。 */
+    /** 固定话术的音频缓存；null = 不缓存。 */
     cache?: TtsCache | null
+    /**
+     * 默认合成（没配自定义服务）时，固定话术该用哪个音色键查缓存。
+     *
+     * 缓存是按音色分组的，而默认合成那条路上的音色指纹只有主进程知道（见 index.ts 的
+     * `greetingVoiceKey`）。不注入的话，唤醒应答在默认配置下永远查不到缓存 ——
+     * 每喊一次都要现场联网合成，用户听到的就是"有时候要等一秒才回话"。
+     */
+    fixedVoiceKey?: () => string | null
+    /** 没自带音色的句子（唤醒/快答/讲解）默认用谁的嗓子；null 沿用服务配置。 */
+    defaultVoice?: () => SpeakerVoice | null
+    /** 成员级 TTS 配置：按 id 取语音设置里配好的某条；取不到回落全局。 */
+    resolveProfile?: (id: string) => ResolvedVoiceApi | null
   } = {}) {
     this.open = open
     this.hooks = hooks
     this.ttsApi = options.ttsApi ?? (() => null)
-    this.voiceProfileApi = options.voiceProfileApi ?? null
+this.voiceProfileApi = options.voiceProfileApi ?? null
+    this.fixedVoiceKey = options.fixedVoiceKey ?? (() => null)
+    this.defaultVoice = options.defaultVoice ?? (() => null)
+    this.resolveProfile = options.resolveProfile ?? (() => null)
     this.cache = options.cache ?? null
   }
 
@@ -127,13 +149,14 @@ export class Narrator {
    * 这是"边收边合成"的入口：第一个句子一凑齐就开始念，用户不用等整段回答算完。
    * 半句不派给合成器 —— 切在词中间念出来是断的。
    */
-  feed(utteranceId: string, chunk: string): void {
+  feed(utteranceId: string, chunk: string, voice?: SpeakerVoice | null): void {
     if (this.disposed || chunk.length === 0) return
     const entry = this.feeds.get(utteranceId) ?? { buffer: '', nextIndex: 0 }
+    if (voice !== undefined) entry.voice = voice
     const { sentences, rest } = drainSentences(entry.buffer + chunk)
     entry.buffer = rest
     for (const sentence of sentences) {
-      this.speak({ utteranceId, text: sentence, indexBase: entry.nextIndex })
+      this.speak({ utteranceId, text: sentence, indexBase: entry.nextIndex, ...speakerRequestFields(entry.voice) })
       entry.nextIndex += 1
     }
     this.feeds.set(utteranceId, entry)
@@ -156,6 +179,13 @@ export class Narrator {
   /** 这一轮不念了（被打断/出错）：把缓冲丢掉，之后迟到的增量不会再开口。 */
   dropFeed(utteranceId: string): void {
     this.feeds.delete(utteranceId)
+  }
+
+  /** 只丢指定话语（快答交棒主回复）：不像 interrupt 那样连主回复的队列一起丢。 */
+  dropUtterance(utteranceId: string): void {
+    if (this.disposed) return
+    this.apply({ type: 'drop-utterance', utteranceId })
+    this.pump()
   }
 
   generationStarted(): void {
@@ -224,7 +254,9 @@ export class Narrator {
     const turn = nextSpeech(this.state, event)
     // spoken 只增不减，按旧长度切出来的正好是这次新增的记录。必须在覆盖 this.state 之前算。
     const records = turn.state.spoken.slice(this.state.spoken.length)
-    this.roundSpoken.push(...records)
+    // 临时话语（快速应答）不进本轮播出记录：打断后要告诉模型的只有正式回答，
+    // 旁路内容一旦混进去就等于间接进了会话。
+    for (const record of records) if (!record.segment.ephemeral) this.roundSpoken.push(record)
     this.state = turn.state
     for (const record of records) this.hooks.onSpoken?.(record)
     for (const effect of turn.effects) {
@@ -275,10 +307,35 @@ export class Narrator {
       this.fail(error instanceof Error ? error.message : String(error))
       return
     }
+    /*
+      说话人音色统一仲裁：句子自带（成员回复）优先，否则默认说话人（总助理）。
+      模型与互斥字段由 speakerOverlay 裁决 —— 唤醒/快答/回复不会再各叠各的。
+    */
+    const segmentSpeaker: SpeakerVoice = {
+      voiceId: segment.voice, design: segment.voiceDesign, style: segment.voiceStyle,
+      sampleFile: segment.voiceSampleFile, sampleMime: segment.voiceSampleMime, sample: segment.voiceSample,
+      profileId: segment.ttsProfileId,
+    }
+    const speaker = hasSpeakerVoice(segmentSpeaker) ? segmentSpeaker : this.defaultVoice()
+    // 成员选了某条 TTS 配置（如 MiMo 三模型之一）就用那条；没选/取不到回落全局选中。
+    const profileId = segment.ttsProfileId ?? speaker?.profileId
+    if (profileId) {
+      const alt = this.resolveProfile(profileId)
+      if (alt !== null) api = alt
+    }
+    if (api !== null && speaker !== null) {
+      api = { ...api, ...speakerOverlay(api.provider, api.model, speaker) }
+    }
     // 配置随这句传进 worker：用户中途换服务，下一句就走新的；密钥只走 stdin，不上命令行。
     // 同时捎上"下一句"：worker 会在当前句播放期间预合成它，把句号后的静默压到最小。
-    const next = this.state.queue[1]
-    const nextId = next === undefined ? null : `${next.utteranceId}#${next.index}`
+    /*
+      先回到**单句前瞻**。
+      三句前瞻那版上线后出现了"一句话都不出声、也没有报错"的卡死：
+      日志里 speaking=true 之后再没有 false。在没查清 worker 与 narrator
+      谁卡住之前，不能让你一直失声 —— 宁可句子间偶尔等，也不能整段没声音。
+    */
+    const lookahead = this.state.queue.slice(1, 1 + PREFETCH_LOOKAHEAD)
+    const nextIds = lookahead.map(item => `${item.utteranceId}#${item.index}`)
     const cached = this.cachedAudio(segment.text, api)
     this.transport.write(JSON.stringify({
       speak: {
@@ -287,24 +344,34 @@ export class Narrator {
         ...(api === null ? {} : { api }),
         // 命中缓存就把现成音频直接交给 worker，省掉这一整次合成往返。
         ...(cached === null ? {} : { audio: cached.toString('base64') }),
-        ...(next === undefined ? {} : {
-          next: {
-            id: nextId,
-            b64: Buffer.from(next.text, 'utf8').toString('base64'),
+        /* 前瞻数组：worker 会按顺序把它们合成好，短句才不会每句都等一次往返。 */
+        ...(lookahead.length === 0 ? {} : {
+          next: lookahead.map(item => ({
+            id: `${item.utteranceId}#${item.index}`,
+            b64: Buffer.from(item.text, 'utf8').toString('base64'),
             ...(api === null ? {} : { api }),
-            ...(this.cachedAudio(next.text, api) === null ? {} : { audio: (this.cachedAudio(next.text, api) as Buffer).toString('base64') }),
-          },
+            ...(this.cachedAudio(item.text, api) === null ? {} : { audio: (this.cachedAudio(item.text, api) as Buffer).toString('base64') }),
+          })),
         }),
       },
     }))
     this.apply({ type: 'dispatched' })
   }
 
-  /** 查固定话术缓存。只在启用缓存且有自定义语音服务时生效（默认 edge-tts 不缓存，它本身很快）。 */
+  /**
+   * 查固定话术缓存。
+   *
+   * 自定义服务用"服务+端点+模型+音色"当键；默认合成用调用方注入的 `fixedVoiceKey`
+   * （主进程知道默认音色是什么）。固定话术之外的文本绝不查缓存：每句回答都不同，
+   * 查了也只是空转，还会让缓存无限长大。
+   */
   private cachedAudio(text: string, api: ResolvedVoiceApi | null): Buffer | null {
-    if (this.cache === null || api === null) return null
+    if (this.cache === null) return null
     if (!FIXED_PHRASES.has(text)) return null
-    const voiceKey = `${api.provider}|${api.endpoint}|${api.model}|${api.voice}`
+    const voiceKey = api === null
+      ? this.fixedVoiceKey()
+      : ttsVoiceKey(api)
+    if (voiceKey === null) return null
     this.cachedVoiceKey = voiceKey
     return this.cache.get({ voiceKey, text })
   }

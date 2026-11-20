@@ -544,11 +544,18 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       '',
       '成员编制（只有 enabled 的席位能接单）：',
       '{{desktop_team_roster}}',
+      '{{desktop_team_reports}}',
       '',
       '协作规则：',
       '- 用户说"开启团队模式"、"叫上专家"：调用 desktop_team_start。',
       '- 请求与已启用成员职责匹配时，自动选择其 assistantId 调用 desktop_team_assign，不要让用户手工挑选，也不要只口头说已分派。把必要材料写进 evidence、可核验要求写进 acceptance；不转发总助理全局偏好或其他成员记忆。拿到真实 summary/artifacts/blockers 后再汇总，并保留证据与阻碍。',
       '- 使用目录中的准确身份。成员不存在、停用、忙碌或额度不足时如实解释；不静默换人，不替用户启用成员。',
+      /*
+       * 汇报方式：目录里标了「自己汇报」的成员，结论要由他自己说一遍。
+       * 这一段是为了让"不重复汇报"变成总助理的明确纪律 —— 否则它拿到 summary 之后
+       * 复述一遍，用户会听到同一件事说两次，而第二次还顶着别人的名字。
+       */
+      '- 目录里标了「自己直接向用户汇报」的成员：它的结论由它本人对用户说，**你不要再复述一遍**。你只负责说一句"已经交给 X，他会直接跟你说"，然后等他自己报。标了「由你汇总」的成员才由你汇总。',
       '- 成员只拥有目录配置的能力与三档权限；企业微信能力仅表示绑定路由，会议/文档工具只接受桌面本人指令，邮件发送与普通任务仍走各自原有审批。不得在普通主会话改用其他工具绕过成员拒绝；命令、权限配置、全局记忆和再委派不向成员开放。',
       '- 模型与单次输出上限、日额度、总额度都由本人配置。工具不能设置预算，不能自行增额、重置或批准申请。额度按真实用量累计，达到阈值生成待批申请，触线或用量未知后停止请求；首请求输入无法预知，不能承诺计费硬上限。无可信成果核验器的任务保留 review，不能把 artifacts 非空当成完成。',
       '- 被门禁拒绝时按拒绝理由改正提案，不要换个工具、换个路径或拆成小步绕过去 —— 那只会让用户看到一堆被拦下的尝试。',
@@ -576,8 +583,14 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     // 空值会被宿主当成装配错误直接炸（真机实测过），空态必须给字符串。
     if (members.length === 0) return '（还没有成员。需要时引导用户到宠物设置的团队管理中添加，不要虚构成员。）'
     return members
-      .map(member => `- ${member.displayName}（${member.assistantId}）：${member.enabled ? '已启用' : '未启用'}；职责：${member.description || member.persona}；能力：${member.capabilities?.map(capability => CAPABILITY_LABELS[capability] ?? capability).join('、') || '无外部能力'}；只读工具：${member.allowedTools?.join('、') || '无额外工具'}${member.roleId === 'tangseng' ? '；当前总助理，不向自身委派' : ''}`)
+      .map(member => `- ${member.displayName}（${member.assistantId}）：${member.enabled ? '已启用' : '未启用'}；职责：${member.description || member.persona}；能力：${member.capabilities?.map(capability => CAPABILITY_LABELS[capability] ?? capability).join('、') || '无外部能力'}；只读工具：${member.allowedTools?.join('、') || '无额外工具'}；汇报方式：${member.reportMode === 'self' ? '自己直接向用户汇报' : '由你汇总'}${member.roleId === 'tangseng' ? '；当前总助理，不向自身委派' : ''}`)
       .join('\n')
+  })
+  ctx.systemPrompt.variable('desktop_team_reports', () => {
+    const reports = team.latestReports()
+    // 空值会被宿主当成装配错误直接炸，空态必须给字符串。
+    if (reports === '') return '（暂无成员汇报。）'
+    return `成员最新工作汇报（成员已亲自向老板汇报过，你知悉即可，不要向老板复述）：\n${reports}`
   })
   return dispose
 }

@@ -4,6 +4,7 @@ import { init as initPptx } from 'pptx-preview'
 import type { OfficeSession } from '../main/office-view-window.ts'
 import type { OfficeViewApi } from '../preload/office-view.ts'
 import { markdownBlocks } from './markdown-view.ts'
+import { renderMarkdown } from './markdown.ts'
 
 declare global {
   interface Window { readonly officeView: OfficeViewApi }
@@ -32,6 +33,11 @@ export default function OfficeViewer() {
   const docxPages = useRef<HTMLElement[]>([])
   const docxSectionPages = useRef<number[]>([])
   const markdownSections = useRef<HTMLElement[]>([])
+  /** 用户手动滚动后暂停自动跟随；点击「回到讲解位置」恢复。 */
+  const pausedRef = useRef(false)
+  const [paused, setPaused] = useState(false)
+  /** 程序化滚动的保护窗：窗口内的 scroll 事件不是用户滚的，不能据此暂停跟随。 */
+  const programmaticUntil = useRef(0)
   const pptx = useRef<PptxViewer | null>(null)
   const imageUrls = useRef<string[]>([])
   const sessionRef = useRef<OfficeSession | null>(null)
@@ -122,7 +128,15 @@ export default function OfficeViewer() {
       if (!checked.ok) { setError(checked.error); return }
       if (sessionRef.current !== current) return
     }
-    nodes[target - 1].scrollIntoView({ block: 'start', behavior: 'smooth' })
+    // 用户自己滚动过就先不抢：只把页码对齐，等用户点「回到讲解位置」再跟。
+    if (!pausedRef.current) {
+      programmaticUntil.current = Date.now() + 700
+      nodes[target - 1].scrollIntoView({ block: 'start', behavior: 'smooth' })
+    }
+    for (const [index, node] of nodes.entries()) {
+      if (index === target - 1) node.dataset.current = 'true'
+      else delete node.dataset.current
+    }
     setPage(target)
     pageRef.current = target
   }, [])
@@ -181,9 +195,14 @@ export default function OfficeViewer() {
         const container = document.createElement('div')
         container.className = 'office-markdown'
         const blocks = markdownBlocks(new TextDecoder().decode(bytes), current.sections)
-        markdownSections.current = blocks.map(text => {
-          const block = document.createElement('pre')
-          block.textContent = text
+        // 每段渲染成真 HTML（标题是 h1–h6、表格是 table），而不是把原文塞进 <pre>：
+        // 用户看到的 `#`、`|表格|` 就是"只显示不渲染"留下的。渲染器全量转义，文档里的
+        // HTML 不会被执行。
+        markdownSections.current = blocks.map((text, sectionIndex) => {
+          const block = document.createElement('section')
+          block.className = 'md-section'
+          block.dataset.sectionIndex = String(sectionIndex)
+          block.innerHTML = renderMarkdown(text)
           container.appendChild(block)
           return block
         })
@@ -268,6 +287,25 @@ export default function OfficeViewer() {
     return () => window.removeEventListener('keydown', onKey)
   }, [next, prev, toggleFullscreen])
 
+  /**
+   * Markdown 讲解跟随：用户自己一滚就暂停自动跟随，并在工具栏给出「回到讲解位置」。
+   *
+   * 为什么需要"保护窗"：讲解推进是我们自己 `scrollIntoView` 触发的，那也会冒 scroll 事件。
+   * 不设一个短窗，程序每滚一次就会把自己判成"用户滚了"，从此再也不跟随。
+   */
+  useEffect(() => {
+    const stage = stageRef.current
+    if (!stage || session?.format !== 'markdown') return
+    const onScroll = (): void => {
+      if (Date.now() < programmaticUntil.current) return
+      if (pausedRef.current) return
+      pausedRef.current = true
+      setPaused(true)
+    }
+    stage.addEventListener('scroll', onScroll, { passive: true })
+    return () => stage.removeEventListener('scroll', onScroll)
+  }, [session?.format])
+
   const close = (): void => { void api.close() }
   const pageLabel = pageCount === null ? '正在排版…' : `第 ${page} / ${pageCount} ${session?.format === 'pptx' ? '张' : session?.format === 'markdown' ? '段' : '页'}`
 
@@ -277,6 +315,13 @@ export default function OfficeViewer() {
       <span className="office-page" role="status">{pageLabel}</span>
       <button type="button" className="office-btn" onClick={prev} disabled={loading || page <= 1}>{session?.format === 'markdown' ? '上一段' : '上一页'}</button>
       <button type="button" className="office-btn" onClick={next} disabled={loading || pageCount === null || page >= pageCount}>{session?.format === 'markdown' ? '下一段' : '下一页'}</button>
+      {session?.format === 'markdown' && paused && (
+        <button type="button" className="office-btn" onClick={() => {
+          pausedRef.current = false
+          setPaused(false)
+          void gotoPage(pageRef.current, false)
+        }}>回到讲解位置</button>
+      )}
       <button type="button" className="office-btn" onClick={() => void toggleFullscreen()}>{fullscreen ? '退出全屏' : '全屏演示'}</button>
       <button type="button" className="office-btn ghost" onClick={close}>关闭</button>
     </header>

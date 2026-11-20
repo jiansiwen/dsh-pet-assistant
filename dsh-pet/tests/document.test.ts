@@ -8,16 +8,22 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import {
   askPrompt,
+  askPromptLite,
   buildOutline,
   canOpenWithApp,
   canOutline,
   describeOutline,
   detectDocIntent,
+  detectSectionMarkers,
+  DOC_SKIP_HOLD_MS,
+  docPreloadPrompt,
+  docSpeechPlan,
   DocumentLibrary,
   explainPrompt,
   extensionOf,
   findMentionedDocs,
   isInsideAuthorized,
+  isShortOutline,
   looksLikePath,
   MAX_DOC_BYTES,
   MAX_DOC_CHARS,
@@ -513,6 +519,156 @@ describe('结构化提取', () => {
   })
 })
 
+describe('表格与公式的段落标记', () => {
+  test('真表格判得出来，且格子仍然用逗号进正文（不回归）', () => {
+    const outline = outlineOf(buildOutline('表.md', '## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n'))
+    const section = outline.sections[0]
+    assert.equal(section.hasTable, true)
+    assert.equal(section.hasFormula, false)
+    assert.equal(section.hasCode, false)
+    // plainSpeech 的老行为不变：竖线换成逗号，AI 讲解模式下模型仍能看到表格内容。
+    assert.match(section.text, /姓名，部门/)
+  })
+
+  test('正文里孤立的竖线不算表格', () => {
+    // 行首行尾都没有竖线：这只是随手写的"甲 | 乙"，判成表格会让整段不被朗读。
+    const inline = outlineOf(buildOutline('a.md', '## 选择\n\n甲 | 乙 是两种做法。\n'))
+    assert.equal(inline.sections[0].hasTable, false)
+    // 只有一行的竖线排版同理：至少 2 行才算表格。
+    const single = outlineOf(buildOutline('a.md', '## 只有一行\n\n| 只有一列 |\n'))
+    assert.equal(single.sections[0].hasTable, false)
+  })
+
+  test('代码块里的表格不另算表格：代码段只由 hasCode 表示', () => {
+    const outline = outlineOf(buildOutline('a.md', '## 代码\n\n```\n| a | b |\n| --- | --- |\n```\n'))
+    assert.equal(outline.sections[0].hasCode, true)
+    assert.equal(outline.sections[0].hasTable, false, '围栏里的内容不进正文，也不该冒出额外的标记')
+  })
+
+  test('块级与行内公式都判得出来', () => {
+    const block = outlineOf(buildOutline('a.md', '## 公式\n\n$$\nE = mc^2\n$$\n'))
+    assert.equal(block.sections[0].hasFormula, true)
+    const inline = outlineOf(buildOutline('a.md', '## 公式\n\n质能方程 $E=mc^2$ 说明了质量与能量等价。\n'))
+    assert.equal(inline.sections[0].hasFormula, true)
+    const latex = outlineOf(buildOutline('a.md', '## 公式\n\n\\[\na^2 + b^2 = c^2\n\\]\n'))
+    assert.equal(latex.sections[0].hasFormula, true)
+  })
+
+  test('金额不误判成公式', () => {
+    // 单个 $：只有一个定界符，配不成对。
+    assert.equal(outlineOf(buildOutline('a.md', '## 报价\n\n成本 $50。\n')).sections[0].hasFormula, false)
+    // 一行里两个 $，但后面都紧跟数字：这是两笔金额，不是 `$…$` 公式。
+    assert.equal(
+      outlineOf(buildOutline('a.md', '## 报价\n\n成本 $50，收入 $80。\n')).sections[0].hasFormula,
+      false,
+      '朴素两两配对会把 $50，收入 $ 当成公式，于是整段被跳过、用户一个字都听不到',
+    )
+  })
+
+  test('detectSectionMarkers 吃的是原始行：竖线与 $ 都还没被处理', () => {
+    assert.deepEqual(detectSectionMarkers(['| a | b |', '| --- | --- |']), { hasTable: true, hasFormula: false })
+    assert.deepEqual(detectSectionMarkers(['甲 | 乙 是两种做法。']), { hasTable: false, hasFormula: false })
+    assert.deepEqual(detectSectionMarkers(['成本 $50，收入 $80。']), { hasTable: false, hasFormula: false })
+    assert.deepEqual(detectSectionMarkers(['$$', 'x = 1', '$$']), { hasTable: false, hasFormula: true })
+    assert.deepEqual(detectSectionMarkers(['公式 $x$ 成立。']), { hasTable: false, hasFormula: true })
+  })
+
+  test('代码段的其他标记不回归', () => {    const outline = outlineOf(buildOutline('a.md', '## 实现\n\n说明一句。\n\n```ts\nconst x = 1\n```\n'))
+    assert.equal(outline.sections[0].hasCode, true)
+    assert.equal(outline.sections[0].hasTable, false)
+    assert.equal(outline.sections[0].hasFormula, false)
+  })
+
+  test('提纲如实标出不朗读的部分（表格现在照念，不标不朗读）', () => {
+    const table = outlineOf(buildOutline('a.md', '## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n'))
+    assert.doesNotMatch(describeOutline(table), /不朗读/, '表格照念，提纲不应标不朗读')
+    const code = outlineOf(buildOutline('b.md', '## 实现\n\n说明。\n\n```\ncode()\n```\n'))
+    assert.match(describeOutline(code), /1\. 实现（含代码，不朗读）/, '只有代码时文案与原来逐字一致')
+    const formula = outlineOf(buildOutline('c.md', '## 推导\n\n$$\nx = 1\n$$\n'))
+    assert.match(describeOutline(formula), /1\. 推导（含公式，不朗读）/)
+  })
+})
+
+describe('原文朗读：念什么、停多久', () => {
+  const sectionOf = (markdown: string) => outlineOf(buildOutline('a.md', markdown)).sections[0]
+
+  test('普通段直接念原文，不停', () => {
+    const section = sectionOf('## 背景\n\n这段是要念的正文。\n')
+    const plan = docSpeechPlan(section, 'source')
+    assert.equal(plan.mode, 'source')
+    assert.equal(plan.text, section.text)
+    assert.equal(plan.holdMs, 0)
+  })
+
+  test('代码/公式段只念一句跳过提示，并留 10 秒给屏幕', () => {
+    for (const [markdown, kind] of [
+      ['## 实现\n\n说明。\n\n```ts\nconst x = 1\n```\n', '代码'],
+      ['## 推导\n\n$$\nx = 1\n$$\n', '公式'],
+    ] as const) {
+      const plan = docSpeechPlan(sectionOf(markdown), 'source')
+      assert.match(plan.text, new RegExp(`这段是${kind}`))
+      assert.match(plan.text, /看屏幕/)
+      assert.equal(plan.holdMs, DOC_SKIP_HOLD_MS)
+      assert.doesNotMatch(plan.text, /const x|E = |x = 1/, '跳过就是跳过，不能把要跳过的内容念出来')
+    }
+  })
+
+  test('表格段照念：格子进正文、不念竖线，不停留', () => {
+    const plan = docSpeechPlan(sectionOf('## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n'), 'source')
+    assert.match(plan.text, /姓名/)
+    assert.match(plan.text, /张三/)
+    assert.match(plan.text, /音频/)
+    assert.doesNotMatch(plan.text, /\|/, '竖线等格式符号不念')
+    assert.doesNotMatch(plan.text, /这段是表格/, '表格不再跳过')
+    assert.equal(plan.holdMs, 0)
+  })
+
+  test('多类同时出现时只说一次，优先说代码', () => {
+    const plan = docSpeechPlan(sectionOf('## 混合\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```\ncode()\n```\n'), 'source')
+    assert.match(plan.text, /这段是代码/)
+    assert.doesNotMatch(plan.text, /表格/)
+  })
+
+  test('纯代码段：正文是空串，但必须念一句跳过提示并留 10 秒', () => {
+    // 这段最需要说一句：不说的话听众会以为文档里根本没这段内容。
+    const section = sectionOf('## 实现\n\n```ts\nconst x = 1\n```\n')
+    assert.equal(section.text, '', '代码不进正文')
+    assert.equal(section.hasCode, true)
+    const plan = docSpeechPlan(section, 'source')
+    assert.match(plan.text, /这段是代码/)
+    assert.ok(plan.text.trim() !== '', '有标记就不能返回空串，否则调用方会静默跳段')
+    assert.equal(plan.holdMs, DOC_SKIP_HOLD_MS)
+  })
+
+  test('只有表头+分隔行的表格：表头照念，分隔行不念', () => {
+    const section = sectionOf('## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n')
+    const plan = docSpeechPlan(section, 'source')
+    assert.match(plan.text, /姓名/)
+    assert.doesNotMatch(plan.text, /---/, '分隔行不念')
+    assert.doesNotMatch(plan.text, /这段是表格/)
+    assert.equal(plan.holdMs, 0)
+  })
+
+  test('真空段（没正文、也没任何标记）：空串 + 不停，由调用方静默跳段', () => {
+    // 只有标题、没有正文的段落：念一句什么都很奇怪，直接咽掉。
+    const section = sectionOf('## 只有标题\n')
+    assert.equal(section.text, '')
+    assert.equal(section.hasCode, false)
+    assert.equal(section.hasTable, false)
+    assert.equal(section.hasFormula, false)
+    const plan = docSpeechPlan(section, 'source')
+    assert.equal(plan.text, '')
+    assert.equal(plan.holdMs, 0)
+  })
+
+  test('ai 模式不产出文本：那段讲解仍由模型生成，停留也不归它管', () => {
+    const plan = docSpeechPlan(sectionOf('## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n'), 'ai')
+    assert.equal(plan.mode, 'ai')
+    assert.equal(plan.text, '')
+    assert.equal(plan.holdMs, 0)
+  })
+})
+
 describe('提纲与提示词', () => {
   const sample = (): Outline =>
     outlineOf(buildOutline('设计.md', '# 设计\n\n开头。\n\n## 音频\n\n音频正文比较长的一段。\n\n## 桥接\n\n桥接正文。\n'))
@@ -805,5 +961,41 @@ describe('阅读视图快照（不走缓存，每次重查授权与指纹）', (
     roots = ['D:/docs']
     fs.tree.delete('D:/docs/a.pdf')
     assert.equal((await library.snapshot('D:/docs/a.pdf')).kind, 'missing')
+  })
+})
+
+describe('文档预读与只发问题的追问', () => {
+  const shortOutline = outlineOf(buildOutline('短.md', '# 标题\n\n第一段正文。\n\n第二段正文。'))
+  const longOutline = outlineOf(buildOutline('长.md',
+    Array.from({ length: 10 }, (_, i) => `## 章节${i + 1}\n\n这是第${i + 1}章的正文内容。`).join('\n\n')))
+
+  test('短文档判定沿用既有规模上限', () => {
+    assert.equal(isShortOutline(shortOutline), true)
+    assert.equal(isShortOutline(longOutline), false, '段数超上限就算长文档')
+  })
+
+  test('预读只给文档名/路径与工作区提示，不灌正文，让模型自己用工具读', () => {
+    const prompt = docPreloadPrompt('短.md', 'D:/ws/docs/短.md')
+    assert.ok(prompt.includes('D:/ws/docs/短.md'), '文档路径必须在')
+    assert.ok(prompt.includes('companion_document_read'), '让模型自己读文档')
+    assert.ok(prompt.includes('工作区'), '工作区由会话上下文给出')
+    assert.ok(prompt.includes('收到'), '读完只回收到')
+    assert.ok(!prompt.includes('第一段正文'), '不灌正文')
+    assert.ok(!prompt.includes('章节'), '也不附机械提纲')
+  })
+
+  test('预读成功后追问只发问题，并带文档路径供必要时补读', () => {
+    const prompt = askPromptLite('短.md', shortOutline, 0, '为什么限制目录？', 'D:/ws/docs/短.md')
+    assert.ok(prompt.includes('为什么限制目录？'), '问题本身要在')
+    assert.ok(prompt.includes('D:/ws/docs/短.md'), '带文档路径，没读过时可补读')
+    assert.ok(prompt.includes('companion_document_read'), '按需补读的提示保留')
+    assert.ok(!prompt.includes('第一段正文'), '不再重发该段原文')
+    assert.ok(!prompt.includes('整份文档全文'), '不再重发全文')
+  })
+
+  test('预读失败的兜底仍用附原文的旧追问', () => {
+    const prompt = askPrompt('短.md', shortOutline, 0, '为什么限制目录？')
+    assert.ok(prompt.includes('第一段正文'), '兜底附当前段原文')
+    assert.ok(prompt.includes('整份文档全文'), '短文档兜底附全文')
   })
 })

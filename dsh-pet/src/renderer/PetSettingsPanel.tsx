@@ -1,7 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { arrayBufferToBase64, recordDictation } from './dictation.js'
 import type { ResidencyPatch, ResidencyState, SettingsPage } from './types.js'
+import type { FastReplyInput, FastReplySnapshot } from '../main/fast-reply.js'
 import { registerCharacterHitbox, unregisterCharacterHitbox } from './stage-layout.js'
+import { settingsNavGroups, settingsPageMeta } from './settings-nav.js'
 
 interface Props {
   page: SettingsPage
@@ -14,7 +16,17 @@ interface Props {
 export default function PetSettingsPanel({ page, onPage, onClose, children, quotaPending = 0 }: Props) {
   const panel = useRef<HTMLDivElement | null>(null)
   const content = useRef<HTMLDivElement | null>(null)
-  useLayoutEffect(() => { if (content.current) content.current.scrollTop = 0 }, [page])
+  /**
+   * 切页时把滚动位置归零。
+   *
+   * 两处都要归零：`.management-content` 带 `scroll-padding`，在某些窗口尺寸下自身会成为滚动
+   * 容器；而更常见的情况是外层 `.pet-management` 在滚。只清前者时，切到内容更短的一页会
+   * 出现"停在半空"——用户看到的是空白，以为页面没加载。
+   */
+  useLayoutEffect(() => {
+    if (content.current) content.current.scrollTop = 0
+    if (panel.current) panel.current.scrollTop = 0
+  }, [page])
   useLayoutEffect(() => {
     const element = panel.current
     if (!element) return
@@ -29,31 +41,41 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__settings__') }
   }, [])
 
-  const pages = [
-    ['general', '通用', '调整桌面伙伴的行为、语音与隐私。'],
-    ['team', '团队', '管理成员、额度与等待处理的任务。'],
-    ['doc', '文档', '管理授权目录、阅读和讲解。'],
-    ['meeting', '会议', '查看录音状态，整理并核对会议纪要。'],
-    ['wecom', '渠道', '配置企业微信连接和已配对会话。'],
-    ['reminders', '提醒', '设置默认催办间隔，查看任务与提醒。'],
-  ] as const
-  const current = pages.find(([id]) => id === page)!
+  const groups = settingsNavGroups()
+  const meta = settingsPageMeta(page)
 
+  /*
+   * 标题区只留三样：方印、当前页标题、一句话说明。
+   *
+   * 上一版这里是「小潘 · 桌面伙伴 / 设置与管理 / 一句说明」三行堆叠，正文开头又重复一遍
+   * 「第 N 项 / 页名 + 页名」——同一个页名在一屏里出现两次，中间夹着一个 10px 加字距的眉标。
+   * 眉标与序号都不编码信息（九项是菜单不是序列），一并删掉；标题层级靠字号差就能立住。
+   */
   return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台">
     <header className="management-header">
       <div className="management-brand" aria-hidden="true">潘</div>
-      <div className="management-brand-copy"><span>小潘 · 桌面伙伴</span><h2>设置与管理</h2></div>
+      <div className="management-brand-copy">
+        <h2>{meta.title}</h2>
+        <p className="management-header-sub">{meta.summary}</p>
+      </div>
       <button type="button" onClick={onClose} aria-label="关闭设置">×</button>
     </header>
-    <nav className="management-tabs" aria-label="设置分类">
-      {pages.map(([id, title], index) =>
-        <button key={id} id={`panel-tab-${id}`} type="button" aria-current={page === id ? 'page' : undefined} onClick={() => onPage(id)}>
-          <span className="management-tab-index" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span><span>{title}</span>
-          {id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
-        </button>)}
+    <nav className="management-tabs" aria-label="功能与设置">
+      {groups.map(group => (
+        <Fragment key={group.id}>
+          {/* 组标题只是分组，不可点：它不是页面，点它没有去处。 */}
+          <div className="management-nav-group" role="presentation">{group.label}</div>
+          {group.items.map(item => (
+            <button key={item.id} id={`panel-tab-${item.id}`} type="button"
+              aria-current={page === item.id ? 'page' : undefined} onClick={() => onPage(item.id)}>
+              <span>{item.title}</span>
+              {item.id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
+            </button>
+          ))}
+        </Fragment>
+      ))}
     </nav>
-    <div className="management-content" ref={content}>
-      <div className="management-intro"><span className="management-eyebrow">设置 / {current[1]}</span><h3>{current[1]}</h3><p>{current[2]}</p></div>
+    <div className="management-content" ref={content} key={page}>
       {children}
     </div>
   </section>
@@ -105,6 +127,8 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
   const wakeNameProblem = /^[\u4e00-\u9fff]{2,5}$/u.test(wakeNameDraft.trim())
     ? null : '唤醒词只能是 2–5 个汉字'
   const [enrolling, setEnrolling] = useState(false)
+  const [diagnosing, setDiagnosing] = useState(false)
+  const [diagnosis, setDiagnosis] = useState<Array<{ name: string; ok: boolean; detail: string }>>([])
   const [enrollStep, setEnrollStep] = useState(0)
 
   /** 录 3 次唤醒词；每次说完停一下自动收尾。录音只在内存里，交给主进程提取后即丢弃。 */
@@ -229,8 +253,38 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
           ? `已注册 ${wake.voiceprint.count} 段声纹；只有你的声音喊「${wake.name}」才会应。`
           : '未注册：先录 3 次唤醒词，才能打开“只认我的声纹”。')}
       </p>
+      <div className="management-sleep">
+        <span>播报中也响应唤醒</span>
+        <input
+          type="checkbox"
+          checked={wake.wakeDuringSpeech}
+          disabled={saving}
+          onChange={event => void apply({ wakeDuringSpeech: event.target.checked }, '播报中响应唤醒未保存')}
+        />
+      </div>
+      <p className="management-hint">
+        关闭时，正在回答或讲解时喊它不会被响应；讲解文档时始终可以打断提问。
+      </p>
       {enrollStep > 0 && (
         <p className="management-hint" role="status">第 {enrollStep}/3 次：请说「{wake.name}」，说完停一下。</p>
+      )}
+      {/*
+        声纹自检：把"注册失败"背后的英文原始报错逐层暴露出来。
+        注册可能死在模型文件 / 原生模块 / 系统密钥 / 推理四处，只给一句"注册失败"分不出是哪层。
+      */}
+      <button className="management-button" disabled={diagnosing} onClick={() => {
+        setDiagnosing(true)
+        void window.petApi.voiceprintDiagnose().then(result => setDiagnosis(result.steps))
+          .catch(() => setDiagnosis([{ name: '自检', ok: false, detail: '无法调用自检' }]))
+          .finally(() => setDiagnosing(false))
+      }}>{diagnosing ? '正在自检…' : '声纹自检'}</button>
+      {diagnosis.length > 0 && (
+        <ul className="management-checklist" aria-label="声纹自检结果">
+          {diagnosis.map(step => <li key={step.name}>
+            <strong>{step.ok ? '✅' : '❌'} {step.name}</strong>
+            <span className="management-hint">{step.detail}</span>
+          </li>)}
+        </ul>
       )}
       <button className="management-button" disabled={saving || enrolling} onClick={() => void enrollVoice(wake.name)}>
         {enrolling ? '正在录制…' : wake.voiceprint.registered ? '重新录制声纹（3 次）' : '录制声纹（3 次）'}
@@ -282,6 +336,132 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
         <p className="management-diagnostic">最近插话：{state.bargeIn.lastMetrics.slice(-3).map(item =>
           `开口→检出 ${item.onsetToDetectMs}ms / 检出→静音 ${item.detectToSilenceMs ?? '—'}ms`).join('；')}</p>
       )}
+    </section>
+  )
+}
+
+/**
+ * 快速应答（快嘴旁路）。
+ *
+ * 用户说完话，主脑跑长任务时先应一声短应答，避免几分钟静默。接什么模型完全由用户配置
+ * （DeepSeek / 豆包 / 千问 / 自建端点），只服务于这一条旁路：短应答用现有音色朗读、
+ * 只显示在宠物气泡，不进会话与记忆。开启要过主进程的原生隐私确认，这里不替用户决定。
+ */
+export function FastReplySettings({ showToast }: { readonly showToast: (text: string) => void }) {
+  const [state, setState] = useState<FastReplySnapshot | null>(null)
+  const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [timeoutMs, setTimeoutMs] = useState(2500)
+  const [maxChars, setMaxChars] = useState(40)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [sample, setSample] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    void window.petApi.fastReplyState().then(snapshot => {
+      if (cancelled || snapshot === null) return
+      setState(snapshot)
+      setBaseUrl(snapshot.baseUrl)
+      setModel(snapshot.model)
+      setTimeoutMs(snapshot.timeoutMs)
+      setMaxChars(snapshot.maxChars)
+    }).catch(() => { /* 主进程未就绪时保持空表单 */ })
+    return () => { cancelled = true }
+  }, [])
+
+  const save = async (patch: FastReplyInput, failure: string): Promise<void> => {
+    setSaving(true)
+    try {
+      const result = await window.petApi.fastReplySave(patch)
+      if (result.state) {
+        setState(result.state)
+        if (patch.apiKey) setApiKey('')
+      }
+      if (!result.ok) showToast(result.error ?? failure)
+    } catch {
+      showToast(failure)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const test = async (): Promise<void> => {
+    setTesting(true)
+    setSample(null)
+    try {
+      const result = await window.petApi.fastReplyTest()
+      if (result.ok && result.sample) setSample(result.sample)
+      else showToast(result.error ?? '测试失败')
+    } catch {
+      showToast('测试失败')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  if (state === null) {
+    return <section className="management-section" aria-label="快速应答"><h3>快速应答（即时回应）</h3><p className="management-hint">正在读取配置…</p></section>
+  }
+
+  return (
+    <section className="management-section" aria-label="快速应答">
+      <h3>快速应答（即时回应）</h3>
+      <p className="management-hint">
+        你说完话后，主脑思考或执行长任务期间，先用这里配置的模型应一句短话（按总助理性格生成，用当前音色朗读），
+        不再干等几分钟。短应答只显示在宠物气泡，不进会话与记忆；主回复一开口就自动接管。仅对语音发起的对话生效。
+      </p>
+      <label className="management-voice">
+        <input type="checkbox" checked={state.enabled} disabled={saving}
+          onChange={event => void save({ enabled: event.target.checked }, '快速应答开关未保存')} />
+        开启快速应答（开启前需原生确认：你的原话会发给下方配置的接口）
+      </label>
+      <label className="management-sleep">
+        <span>接口地址</span>
+        <input type="text" value={baseUrl} maxLength={500} disabled={saving}
+          placeholder="OpenAI 兼容地址，如 https://api.deepseek.com/v1"
+          onChange={event => setBaseUrl(event.target.value)} />
+      </label>
+      <label className="management-sleep">
+        <span>模型名称</span>
+        <input type="text" value={model} maxLength={200} disabled={saving}
+          placeholder="如 deepseek-chat（建议选响应快的小模型）"
+          onChange={event => setModel(event.target.value)} />
+      </label>
+      <label className="management-sleep">
+        <span>API 密钥</span>
+        <input type="password" value={apiKey} maxLength={500} disabled={saving}
+          placeholder={state.secretConfigured ? '已保存（留空保持不变）' : '本地无鉴权端点可不填'}
+          onChange={event => setApiKey(event.target.value)} />
+      </label>
+      <label className="management-sleep">
+        <span>超时（毫秒）</span>
+        <input type="number" value={timeoutMs} min={500} max={10000} step={100} disabled={saving}
+          onChange={event => setTimeoutMs(Number(event.target.value))} />
+      </label>
+      <label className="management-sleep">
+        <span>最长字数</span>
+        <input type="number" value={maxChars} min={10} max={100} disabled={saving}
+          onChange={event => setMaxChars(Number(event.target.value))} />
+      </label>
+      <div>
+        <button className="management-button" disabled={saving}
+          onClick={() => void save({
+            baseUrl, model, timeoutMs, maxChars,
+            ...(apiKey.trim() !== '' ? { apiKey: apiKey.trim() } : {}),
+          }, '快速应答配置未保存')}>
+          保存配置
+        </button>
+        <button className="management-button" disabled={saving || testing || baseUrl.trim() === '' || model.trim() === ''}
+          onClick={() => void test()}>
+          {testing ? '正在测试…' : '测试连接'}
+        </button>
+      </div>
+      {sample !== null && <p className="management-hint" role="status">测试样例应答：{sample}</p>}
+      <p className="management-hint">
+        密钥只加密保存在本机，配置与日志都不含明文。超时或失败时静默跳过，不影响主回答。
+      </p>
     </section>
   )
 }

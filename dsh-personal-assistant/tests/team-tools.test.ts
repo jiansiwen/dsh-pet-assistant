@@ -35,7 +35,7 @@ test('关闭团队会撤销工具和提示词，再次开启不会留下旧注�
   assert.equal(f.tools.size, 7)
   assert.ok(f.tools.has('desktop_team_review_unknown'))
   assert.equal(f.tools.has('desktop_team_propose_change'), false)
-  assert.equal(f.prompts.size, 2)
+  assert.equal(f.prompts.size, 3)
   f.dispose()
   f.dispose()
   assert.equal(f.tools.size, 0)

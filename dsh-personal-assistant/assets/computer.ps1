@@ -223,7 +223,43 @@ function Check-Control($expected, $actual) {
       [int]$expected.width -ne $actual.width -or [int]$expected.height -ne $actual.height) { throw '目标控件已变化，未继续操作' }
 }
 
+<#
+ 按 runtimeId 在目标窗口里找回控件。
+
+ 为什么不用坐标：坐标会随滚动/布局变化，而且点坐标必然要抢鼠标。
+ runtimeId 是 UIA 给出的稳定身份，同一个控件在多次调用之间不变。
+ 代价是要走一遍控件树（有节点上限），但几百个节点通常在几十毫秒量级。
+#>
+function Find-Control($identity, $expected) {
+  $h = [IntPtr][long]$identity.windowId
+  $root = $AE::FromHandle($h)
+  if (-not $root) { throw '目标窗口不支持读取控件' }
+  $want = (@($expected.runtimeId) -join ',')
+  if (-not $want) { throw '缺少控件身份，请先 look 取得编号' }
+  $seen = 0
+  $stack = New-Object 'System.Collections.Generic.Stack[object]'
+  $stack.Push($root)
+  while ($stack.Count -gt 0 -and $seen -lt 6000) {
+    $node = $stack.Pop()
+    $seen = $seen + 1
+    try { $ids = @($node.GetRuntimeId()) } catch { continue }
+    if (($ids -join ',') -ceq $want) {
+      if (-not (Element-InWindow $node $h)) { throw '控件不在目标窗口内，未操作' }
+      $c = $node.Current
+      if ($c.IsOffscreen -or -not $c.IsEnabled) { throw '目标控件不可见或不可用' }
+      return $node
+    }
+    try {
+      $child = $walker.GetFirstChild($node)
+      while ($null -ne $child) { $stack.Push($child); $child = $walker.GetNextSibling($child) }
+    } catch { }
+  }
+  throw '找不到这个控件：界面可能已经变了，请重新 look'
+}
+
 $script:tree = New-Object 'System.Collections.Generic.List[string]'
+# 与 tree 逐行对齐的控件身份，供"不动鼠标"的元素级操作按编号引用。
+$script:elements = New-Object 'System.Collections.Generic.List[object]'
 $script:truncated = $false
 function Walk($element, [int]$depth, [int]$maxDepth, [int]$limit) {
   if ($depth -gt $maxDepth) {
@@ -240,7 +276,26 @@ function Walk($element, [int]$depth, [int]$maxDepth, [int]$limit) {
         if ($name.Length -gt 120) { $name = $name.Substring(0, 120) + '…'; $script:truncated = $true }
         $r = $c.BoundingRectangle
         if (-not $r.IsEmpty -and $r.Width -gt 0 -and $r.Height -gt 0) {
-          $script:tree.Add(('{0}{1} "{2}" @({3},{4},{5}x{6})' -f ('  ' * $depth), $c.ControlType.ProgrammaticName, $name, [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height))
+          <#
+            编号只在**真的进了身份表**时分配。
+
+            曾经的写法是先取 `$script:elements.Count` 当编号、再判断要不要入表，
+            于是密码控件（不入表）也占掉一个编号 —— 之后按编号操作会落到**另一个控件**上。
+            这种错位不会报错，只会点错东西，所以没拿到身份时统一标 `[-]`。
+          #>
+          $ids = @($child.GetRuntimeId())
+          $label = '[-]'
+          if ($ids.Count -gt 0 -and -not $c.IsPassword) {
+            $shortName = ([string]$c.Name).Trim()
+            if ($shortName.Length -gt 200) { $shortName = $shortName.Substring(0, 200) }
+            $label = '[' + $script:elements.Count + ']'
+            # 带上位置与密码标记：与 probe 返回的控件身份同形，执行前的 Check-Control 才能逐字段比对。
+            $script:elements.Add(@{ runtimeId = @($ids); name = $shortName
+              type = [string]$c.ControlType.ProgrammaticName; className = [string]$c.ClassName
+              left = [int]$r.X; top = [int]$r.Y; width = [int]$r.Width; height = [int]$r.Height
+              isPassword = [bool]$c.IsPassword })
+          }
+          $script:tree.Add(('{0}{1} {2} "{3}" @({4},{5},{6}x{7})' -f ('  ' * $depth), $label, $c.ControlType.ProgrammaticName, $name, [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height))
           if (-not $c.IsPassword) { Walk $child ($depth + 1) $maxDepth $limit }
         }
       }
@@ -270,11 +325,29 @@ try {
       $identity = Check-Target $req.target
       $root = $AE::FromHandle([IntPtr][long]$identity.windowId)
       if (-not $root) { throw '目标窗口不支持读取控件' }
+      <#
+        网页页面模式：直接把根定位到网页文档（Document），跳过浏览器自己的工具栏、标签栏、地址栏。
+
+        作用不止"少几行"：页面内容的控件是网页元素（按钮/输入框/链接），
+        模型按名字就能认出"提交按钮"，不必再根据坐标猜。
+
+        仍然走 UIA，而不是 CDP —— Chrome/Edge 只有在**带 --remote-debugging-port 启动**时才有调试端口，
+        对着一个已经在跑的浏览器我们接不上；而 UIA 对正在跑的页面本来就能读到结构。
+      #>
+      if ($req.webOnly -eq $true) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+          [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Document)
+        $doc = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if (-not $doc) { throw '这个窗口里没有网页文档区域：可能不是浏览器、页面还没加载完，或该应用的网页内容没有暴露无障碍结构（部分 Chromium/Electron 窗口就是这样）' }
+        $root = $doc
+      }
+      if (-not $root) { throw '目标窗口不支持读取控件' }
       $depth = [int]$req.maxDepth; $limit = [int]$req.limit
       if ($depth -lt 1 -or $depth -gt 8 -or $limit -lt 1 -or $limit -gt 150) { throw '读取范围无效' }
       Walk $root 0 $depth $limit
       $identity = Check-Target $req.target
-      $result = @{ ok = $true; action = $action; target = $identity; tree = @($script:tree.ToArray()); truncated = $script:truncated }
+      $result = @{ ok = $true; action = $action; target = $identity; tree = @($script:tree.ToArray())
+        elements = @($script:elements.ToArray()); truncated = $script:truncated }
     }
     'probe' {
       $identity = Check-Target $req.target
@@ -331,6 +404,45 @@ try {
       $after = $null
       try { $after = Probe $identity $action } catch { }
       $result = @{ ok = $true; action = $action; target = $identity; before = $before; after = $after; verified = $false }
+    }
+    { $_ -in @('invoke', 'setvalue') } {
+      <#
+        元素级操作：**不移动鼠标、不抢键盘焦点**。
+
+        这是"操作电脑"里质量最高的一层：UIA 直接让控件执行它自己的动作，
+        失败会抛异常（不像点坐标那样"点了没反应也不知道"）。
+        代价是只有支持对应 Pattern 的控件才行 —— 不支持就如实拒绝，
+        并告诉调用方改用 click，而不是偷偷降级成点坐标。
+      #>
+      $identity = Check-Target $req.target
+      $element = Find-Control $identity $req.control
+      if ([NativeInput]::ModifierHeld()) { throw '用户正按着修饰键，未操作' }
+      $c = $element.Current
+      $pattern = ''
+      if ($action -eq 'invoke') {
+        $mayHaveExecuted = $true
+        try { $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); $pattern = 'InvokePattern' }
+        catch {
+          try { $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle(); $pattern = 'TogglePattern' }
+          catch {
+            try { $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select(); $pattern = 'SelectionItemPattern' }
+            catch { throw '这个控件不支持无鼠标操作（没有 Invoke/Toggle/Select 模式），请改用 click 按坐标点击' }
+          }
+        }
+      } else {
+        if ($c.IsPassword) { throw '受保护的密码控件不能写入' }
+        if ($c.IsReadOnly) { throw '这个控件是只读的，不能写入' }
+        $text = [string]$req.text
+        if ($text.Length -gt 4000 -or $text -match '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]') { throw '写入内容无效' }
+        $mayHaveExecuted = $true
+        $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($text)
+        $pattern = 'ValuePattern'
+      }
+      $identity = Check-Target $req.target
+      # 明确指出鼠标没动：调用方与用户都能据此判断"没抢你的桌面"。
+      $result = @{ ok = $true; action = $action; target = $identity; pattern = $pattern
+        mouseMoved = $false; control = @{ runtimeId = @($req.control.runtimeId); name = [string]$c.Name
+          type = [string]$c.ControlType.ProgrammaticName }; verified = $false }
     }
     default { throw '不支持的电脑操作' }
   }

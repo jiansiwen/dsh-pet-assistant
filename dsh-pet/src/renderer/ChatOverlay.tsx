@@ -4,6 +4,7 @@ import type { TeamStageHandle } from './TeamStage.js'
 import { PET_WIDTH } from './pet-metrics.js'
 import { registerPanelHitbox } from './stage-layout.js'
 import { entriesForPresentation, overlayPosition } from './session-view.js'
+import type { ChatDeltaView } from './useChatDelta.js'
 
 interface Props {
   session: SessionSnapshot | null
@@ -37,6 +38,15 @@ interface Props {
    * 演示期间新产生的消息照常可见，用户正在演示它们。
    */
   readonly hiddenThroughSeq?: number | null
+  /**
+   * 尚未被权威条目覆盖的临时逐字尾；null / 未传 = 没有。
+   *
+   * 它画在 `visibleEntries` **之后**，是唯一的临时行：权威条目一到，上游把这里置空，
+   * 同一个字不会同时出现两份。宿主不吐增量时它恒为 null，界面与本轮之前完全一致。
+   */
+  liveTurn?: ChatDeltaView['live']
+  /** 排队中的条数；0 或未传不显示。 */
+  queuedCount?: number
   /** top = 固定头顶；auto = 按屏幕空间自动换到上/下/左/右。 */
   dock: 'top' | 'auto'
   size: { width: number; height: number }
@@ -107,10 +117,11 @@ export default function ChatOverlay(props: Props) {
     return () => { stop?.(); observer.disconnect(); window.removeEventListener('resize', place); registerPanelHitbox(null) }
   }, [stageRef, props.dock])
 
+  // 贴底跟随：除了权威条目，临时尾每长一个字也要跟下来 —— 否则逐字效果全发生在可视区外面。
   useEffect(() => {
     const element = list.current
     if (element && followBottom.current) element.scrollTop = element.scrollHeight
-  }, [session?.entries])
+  }, [session?.entries, props.liveTurn?.text.length])
 
   /** 右下角拖拽改尺寸：拖动过程只改本地尺寸，松手才落盘。 */
   const startResize = (event: React.PointerEvent<HTMLDivElement>): void => {
@@ -208,6 +219,16 @@ export default function ChatOverlay(props: Props) {
           <p>{hiddenCount > 0 ? '关闭演示隐私模式后恢复显示。' : session?.sessionId ? '这里与原生 dsh 共享同一段会话。' : '在 dsh 会话中召唤宠物，即可在这里继续对话。'}</p>
         </div>}
         {visibleEntries.map(entry => <Entry key={entry.id} entry={entry} />)}
+        {/* 临时逐字尾：只画在权威条目之后。上游一旦提交权威条目，`liveTurn` 立刻变 null，
+            所以这里永远不可能与同一条消息的第二份并存。复用既有 .hud-message/.is-streaming。 */}
+        {props.liveTurn && (
+          <div className="hud-message hud-message-assistant is-streaming" key={`live-${props.liveTurn.turnKey}`}>
+            {props.liveTurn.think && !props.liveTurn.text
+              ? <span className="hud-process-preview">思考中…</span>
+              : props.liveTurn.text}
+            {props.liveTurn.overflowed && <span className="hud-process-preview">（内容较长，正在整理）</span>}
+          </div>
+        )}
       </div>
       {showLatest && <button className="hud-latest" onClick={() => {
         followBottom.current = true
@@ -221,6 +242,9 @@ export default function ChatOverlay(props: Props) {
       {!session?.capabilities.prompt && props.onStartSession && <div className="hud-speech" role="status">助理会话未开启 <button disabled={props.sending} onClick={props.onStartSession}>开启助理会话</button></div>}
       {props.speaking && <div className="hud-speech">正在朗读 <button onClick={props.onStopSpeech}>停止朗读</button></div>}
       {props.continuous && <div className="hud-speech" role="status">连续对话中，说“先这样”也可结束 <button onClick={props.onEndContinuous}>结束连续对话</button></div>}
+      {!!props.queuedCount && props.queuedCount > 0 && (
+        <div className="hud-speech" role="status">排队中 {props.queuedCount} 条 · 停止生成可拿回</div>
+      )}
       <div className="hud-composer">
         <textarea ref={inputRef} value={input} onChange={event => setInput(event.target.value)} rows={2}
           aria-label="会话输入" placeholder={props.listening ? '正在聆听…' : '输入消息，Enter 发送'}

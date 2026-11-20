@@ -23,6 +23,12 @@ const compiled = await build({
   bundle: true, write: false, platform: 'node', format: 'cjs', jsx: 'automatic',
   external: ['react', 'react/jsx-runtime', './audio-capture.ts'],
 })
+// 采音生命周期已从会议页上移到常驻安装模块；测试同样安装它，而不是靠页面订阅。
+const compiledSession = await build({
+  entryPoints: [fileURLToPath(new URL('../src/renderer/meeting-capture-session.ts', import.meta.url))],
+  bundle: true, write: false, platform: 'node', format: 'cjs',
+  external: ['./audio-capture.ts'],
+})
 const require = createRequire(import.meta.url)
 
 interface Integrity {
@@ -218,6 +224,13 @@ function panelFixture(options: {
         : require(name),
     component, component.exports,
   )
+  const notes: string[] = []
+  const session = { exports: {} as { installMeetingSession: (api: unknown, note: (message: string) => void) => void } }
+  new Function('require', 'module', 'exports', compiledSession.outputFiles[0]!.text)(
+    (name: string) => name === './audio-capture.ts' ? { ...captureModule, sharedCapture: () => capture } : require(name),
+    session, session.exports,
+  )
+  session.exports.installMeetingSession(api, message => notes.push(message))
   function render(): void {
     cursor = 0
     tree = component.exports.default({})
@@ -227,7 +240,8 @@ function panelFixture(options: {
   return {
     h, mic, loop, capture, flush,
     render,
-    text: () => textContent(tree),
+    // 采集异常现在经 toast 报给用户（不再依赖设置页是否打开）；与页面文本一起断言。
+    text: () => `${textContent(tree)}\n${notes.join('\n')}`,
     get contextsClosed() { return contextsClosed },
     get loopOpens() { return loopOpens },
     async start(both = false, wait = true) {

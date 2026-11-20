@@ -16,54 +16,54 @@
 
 :root {
   /* 名牌底色就是角色身份色标，由 TeamStage 用行内 --mark 注入。 */
-  --mark: #5e6ad2;
+  --mark: var(--indigo);
   /* 名牌文字色：按色标亮度自动挑黑或白，保证 chip 内对比 ≥4.5:1。 */
-  --mark-fg: #ffffff;
+  --mark-fg: var(--paper-raised);
 
   /* 面板内（浅色底） */
-  --approval-zone-bg: #fbfbfd;
-  --approval-card-bg: #ffffff;
-  --approval-border: #e4e7ee;
-  --approval-heading: #4a5060;
-  --approval-summary: #3a3f4d;
-  --approval-meta: #5a6070;
-  --approval-target-bg: #f3f4f8;
-  --approval-target-fg: #555b6b;
-  --approve-bg: #4f5ac0;
-  --reject-fg: #4a5060;
+  --approval-zone-bg: var(--paper);
+  --approval-card-bg: var(--paper-raised);
+  --approval-border: var(--rule);
+  --approval-heading: var(--ink);
+  --approval-summary: var(--ink-2);
+  --approval-meta: var(--ink-3);
+  --approval-target-bg: var(--paper-sunken);
+  --approval-target-fg: var(--ink-3);
+  --approve-bg: var(--indigo);
+  --reject-fg: var(--ink-2);
 
   /* 风险色。三档都用足够深的色值，在白卡上文字对比 5.02 / 5.02 / 6.47，全部 AA。 */
-  --risk-low: #15803d;
-  --risk-medium: #b45309;
-  --risk-high: #b91c1c;
+  --risk-low: var(--win-green-ink);
+  --risk-medium: var(--win-amber-ink);
+  --risk-high: var(--danger);
 
   /*
     任务语气色。五档在白底上的对比是 6.5 / 5.02 / 5.02 / 6.47 / 4.83，全部 AA。
     `waiting` 用琥珀而不是和 `active` 同族的蓝：这两档的区别是**要不要用户动手**，
     进行中的任务用户只能等，等你点头/等你回话的任务用户不做就永远停在那儿。
   */
-  --task-active: #1d4ed8;
-  --task-waiting: #b45309;
-  --task-ok: #15803d;
-  --task-bad: #b91c1c;
-  --task-idle: #6b7280;
-  --task-waiting-bg: #fdf8ef;
-  --task-bad-bg: #fdf3f3;
+  --task-active: var(--indigo);
+  --task-waiting: var(--win-amber-ink);
+  --task-ok: var(--win-green-ink);
+  --task-bad: var(--danger);
+  --task-idle: var(--ink-3);
+  --task-waiting-bg: var(--win-amber-wash);
+  --task-bad-bg: var(--danger-wash);
 
   /* 面板标签页。选中项在浅色面板上用一条底部色标 + 加粗文字表达，不靠底色。 */
-  --tab-fg: #6b7280;
-  --tab-active-fg: #3a3f4d;
+  --tab-fg: var(--ink-3);
+  --tab-active-fg: var(--ink);
 
   /* 运行时状态行（浅色面板内）。语气色与风险色同族但语义不同，不共用变量。 */
-  --runtime-bg: #fbfbfd;
-  --runtime-label: #3a3f4d;
-  --runtime-detail: #5a6070;
-  --runtime-ok: #15803d;
-  --runtime-busy: #b45309;
-  --runtime-idle: #6b7280;
-  --runtime-error: #b91c1c;
-  --runtime-busy-bg: #fdf8ef;
-  --runtime-error-bg: #fdf3f3;
+  --runtime-bg: var(--paper);
+  --runtime-label: var(--ink-2);
+  --runtime-detail: var(--ink-3);
+  --runtime-ok: var(--win-green-ink);
+  --runtime-busy: var(--win-amber-ink);
+  --runtime-idle: var(--ink-3);
+  --runtime-error: var(--danger);
+  --runtime-busy-bg: var(--win-amber-wash);
+  --runtime-error-bg: var(--danger-wash);
 
   --easing: cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -109,8 +109,8 @@
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: #f59e0b;
-  color: #1a1206;
+  background: var(--win-amber);
+  color: var(--ink);
   font-size: 14px;
   font-weight: 800;
   line-height: 22px;
@@ -204,7 +204,7 @@
   padding: 0 4px;
   border-radius: 8px;
   background: var(--task-waiting);
-  color: #fff;
+  color: var(--paper-raised);
   font-size: 10.5px;
   font-weight: 700;
   line-height: 16px;
@@ -256,7 +256,7 @@
   border: none;
   border-radius: 7px;
   background: var(--approve-bg);
-  color: #fff;
+  color: var(--paper-raised);
   font-size: 11.5px;
   font-weight: 700;
   cursor: pointer;
@@ -349,7 +349,7 @@
   padding: 0 5px;
   border-radius: 9px;
   background: var(--task-waiting);
-  color: #fff;
+  color: var(--paper-raised);
   font-size: 11px;
   font-weight: 700;
   line-height: 18px;
@@ -359,7 +359,7 @@
 
 /* 任务数是背景信息不是待办，用中性灰，不和"等你点头"抢注意力。 */
 .team-count.quiet {
-  background: #dfe3ec;
+  background: var(--rule-strong);
   color: var(--approval-heading);
 }
 
@@ -439,8 +439,8 @@
   white-space: nowrap;
   padding: 1px 7px;
   border-radius: 6px;
-  background: #eef0fb;
-  color: #3d4595;
+  background: var(--indigo-wash);
+  color: var(--indigo);
   font-family: 'Cascadia Code', Consolas, monospace;
   font-size: 11px;
   font-weight: 700;
@@ -536,7 +536,7 @@
   padding: 1px 6px;
   border: 1px dashed var(--approval-border);
   border-radius: 6px;
-  background: #fff;
+  background: var(--paper-raised);
   font-size: 10.5px;
   color: var(--approval-meta);
 }
@@ -549,7 +549,7 @@
   border: none;
   border-radius: 8px;
   background: var(--approve-bg);
-  color: #fff;
+  color: var(--paper-raised);
   font-size: 11.5px;
   font-weight: 700;
   cursor: pointer;
@@ -690,7 +690,7 @@
   flex: none;
   padding: 0 5px;
   border-radius: 5px;
-  background: #e6e9f0;
+  background: var(--rule);
   color: var(--approval-heading);
   font-size: 10.5px;
   font-weight: 700;
@@ -779,7 +779,7 @@
   border: none;
   border-radius: 8px;
   background: var(--approve-bg);
-  color: #fff;
+  color: var(--paper-raised);
   font-size: 11.5px;
   font-weight: 700;
   cursor: pointer;
@@ -789,7 +789,7 @@
 /* 停止是带后果的次要操作，视觉上退一级。 */
 .runtime-btn.ghost {
   border: 1px solid var(--approval-border);
-  background: #fff;
+  background: var(--paper-raised);
   color: var(--reject-fg);
 }
 
@@ -797,7 +797,7 @@
   filter: brightness(1.08);
 }
 .runtime-btn.ghost:hover {
-  background: #f5f6f9;
+  background: var(--paper-sunken);
   filter: none;
 }
 .runtime-btn:active {
@@ -845,15 +845,13 @@
   }
 }
 
-/* 伙伴配置沿用管理面板的浅蓝底、字号和间距，不改变原有页面布局。 */
-.pet-management nav.management-tabs {
-  flex-wrap: wrap;
-}
-
-.pet-management nav.management-tabs button {
-  flex: 1 0 44px;
-  white-space: nowrap;
-}
+/* 伙伴配置沿用管理面板的字号与间距，不改变原有页面布局。 */
+/*
+ * 这里原来还有两条 `.pet-management nav.management-tabs` 规则（横排 6 列时代的
+ * `flex-wrap: wrap` 与 `button { flex: 1 0 44px }`）。导航改成竖排之后它们没有意义，
+ * 却仍在生效：`flex: 1 0 44px` 会把九个导航项在竖栏里等分拉伸，
+ * 真机表现就是"导航项之间空出一大片"。删掉，不再从这里碰导航布局。
+ */
 
 .pet-management .assistant-settings-fields {
   display: flex;
@@ -885,10 +883,10 @@
   width: 100%;
   min-width: 0;
   padding: 7px 9px;
-  border: 1px solid #a5c8d9;
-  border-radius: 6px;
-  background: #ffffff;
-  color: #243b4b;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-control);
+  background: var(--paper-raised);
+  color: var(--ink);
   font: inherit;
 }
 
@@ -951,11 +949,11 @@
 .member-management select {
   max-width: 100%;
   min-width: 0;
-  border: 1px solid #a5c8d9;
-  border-radius: 6px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-control);
   padding: 6px;
-  background: #fff;
-  color: #243b4b;
+  background: var(--paper-raised);
+  color: var(--ink);
   font: inherit;
 }
 .member-usage { display: flex; flex-direction: column; gap: 4px; font-variant-numeric: tabular-nums; }
@@ -980,7 +978,7 @@
   border-radius: 8px;
   pointer-events: auto;
 }
-.pet-management .management-tabs .panel-tab-badge { margin-left: 4px; }
+.pet-management .management-tabs .panel-tab-badge { margin-left: auto; }
 @media (max-width: 430px) {
   .member-management .member-grid { grid-template-columns: minmax(0, 1fr); }
   .member-management .member-editor, .member-management .member-memories { padding: 8px; }

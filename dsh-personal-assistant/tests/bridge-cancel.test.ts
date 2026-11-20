@@ -342,6 +342,23 @@ describe('桥接：团队委派请求取消与 HTTP 路由', () => {
     await bridge.dispose()
   })
 
+  test('未注入 teamAgent 时委派仍建成员独立会话，不落回总助理会话', async t => {
+    const f = teamFixture(t)
+    const events: BridgeEvent[] = []
+    const bridge = new SessionBridge({ dshHome: dir, onEvent: event => events.push(event) })
+    const agent = sharedAgent()
+    await bridge.bind(agent)
+    bridge.attachTeam(f.team, f.approvals)
+    // 刻意不调用 bindTeamAgent：委派仍应走成员独立会话，而不是注入总助理。
+    bridge.enqueueChat('req-member', '讲解这份文档', 'member-wukong')
+    await tick()
+    assert.ok(events.some(e => e.type === 'task/created' && e.id === 'req-member'), '应创建成员任务/独立会话')
+    assert.ok(f.requests.length >= 1, '成员子代理应被启动')
+    assert.equal(agent.followed.length, 0, '委派不注入总助理会话')
+    f.result().resolve(completed)
+    await bridge.dispose()
+  })
+
   test('路由鉴权、未绑定 503 unbound，已绑定返回 { state, evidence, message }', async t => {
     const f = teamFixture(t)
     const bridge = new SessionBridge({ dshHome: dir })

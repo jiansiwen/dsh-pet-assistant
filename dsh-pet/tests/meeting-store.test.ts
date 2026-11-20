@@ -148,6 +148,21 @@ describe('dpapi：密钥的生成、解包与丢失', () => {
     }
   })
 
+  test('关库后读方法如实返回空，退出窗口的轮询不崩进程', () => {
+    const store = newStore()
+    const started = store.startMeeting(CONSENT)
+    assert.equal(started.ok, true, started.ok ? '' : started.error)
+    if (!started.ok) return
+    store.close()
+    assert.equal(store.getMeeting(started.meetingId), null)
+    assert.deepEqual(store.listMeetings(), [])
+    assert.deepEqual(store.listChunks(started.meetingId), [])
+    assert.deepEqual(store.getSegments(started.meetingId), [])
+    assert.equal(store.getTranscriptMeta(started.meetingId), null)
+    assert.equal(store.getMinutes(started.meetingId), null)
+    assert.deepEqual(store.getEgress(started.meetingId), { events: [], active: null })
+  })
+
   test('没有系统密钥库时返回 unsupported，不碰磁盘', () => {
     const dir = freshDir()
     // 没注入 safeStorage 就说明这条实现拿不到（纯 Node 测试、Electron 未 ready 等）。
@@ -1009,5 +1024,37 @@ describe('meeting-store：密钥丢失/不对时读取明确失败（M4-01）', 
     assert.equal(restored.getMeeting(meetingId)?.name, '评审 M4MARK-NAME')
     assert.equal(restored.getMinutes(meetingId)?.content, '# 纪要 M4MARK-MINUTES\n')
     restored.close()
+  })
+})
+
+describe('会议重命名：只改密封名字，不碰录音与完整性', () => {
+  test('改名后读回新名字，重开库仍在（说明是密封落盘而非内存）', () => {
+    const dir = freshDir()
+    const store = newStore(dir)
+    const started = store.startMeeting(CONSENT)
+    assert.equal(started.ok, true)
+    if (!started.ok) return
+    const id = started.meetingId
+    assert.equal(store.renameMeeting(id, '  评审改名  ').ok, true)
+    assert.equal(store.getMeeting(id)?.name, '评审改名', '去首尾空白后落库')
+    store.close()
+    const reopened = new MeetingStore(dir, { keyProvider: (): DpapiKeyOk => ({ status: 'ok', key: FAKE_KEY }) })
+    assert.equal(reopened.getMeeting(id)?.name, '评审改名', '重开库仍读得到新名字')
+    reopened.close()
+  })
+
+  test('空名 / 超长 / 不存在的会议一律拒绝，原名不变', () => {
+    const store = newStore()
+    const started = store.startMeeting(CONSENT)
+    assert.equal(started.ok, true)
+    if (!started.ok) return
+    const id = started.meetingId
+    for (const bad of ['', '   ', 'x'.repeat(201)]) {
+      const result = store.renameMeeting(id, bad)
+      assert.equal(result.ok, false)
+    }
+    assert.equal(store.renameMeeting('no-such-meeting', '新名').ok, false)
+    assert.equal(store.getMeeting(id)?.name, CONSENT.name, '拒绝后原名不变')
+    store.close()
   })
 })

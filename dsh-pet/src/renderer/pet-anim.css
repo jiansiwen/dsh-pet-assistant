@@ -40,6 +40,33 @@
 .pose-layer[data-pose-action='grab'] .pet-video {
   transform: translate(-11px, -4px) scale(1.08);
 }
+/* 念诗成片画幅留白比静图多，角色显小：渲染层等比放大对齐静图角色高度/水平中心，
+   不改素材（不压扁、诗字保留）。origin 取角色头顶附近，放大后脚底与静图接近。 */
+.pose-layer[data-pose-action='recite-poem'] .pet-video {
+  transform: translateX(-8px) scale(1.38);
+  transform-origin: 50% 40%;
+}
+/* swagger 侧身走路：角色重心在素材里从 0.486 漂到 0.443，用线性漂移补偿把
+   起步/循环尾/收步尾三个边界都对齐静图重心（±0.5px），过渡不闪不跳。 */
+.pose-layer[data-pose-action='swagger'] .pet-video {
+  transform-origin: 50% 100%;
+  animation: swagger-drift 3500ms linear forwards;
+}
+@keyframes swagger-drift {
+  from { transform: translateX(-7px) scale(1); }
+  to { transform: translateX(-1px) scale(1); }
+}
+.pose-layer[data-pose-action='swagger-stop'] .pet-video {
+  transform: translateX(-1px) scale(1);
+  transform-origin: 50% 100%;
+}
+/* 左瞧右看 / 睡觉 / 变身：站姿首尾与静图等大对齐；睡觉躺卧中段、变身火焰向上延伸自然不强行对齐。 */
+.pose-layer[data-pose-action='look-around'] .pet-video,
+.pose-layer[data-pose-action='sleep'] .pet-video,
+.pose-layer[data-pose-action='transform'] .pet-video {
+  transform: translateX(-2px) scale(1);
+  transform-origin: 50% 100%;
+}
 .pose-layer[data-pose-action='drop'] .pet-video {
   transform: translate(-8px, -6.5px) scale(1.22);
 }
@@ -342,3 +369,21 @@
   background-repeat: repeat-x;
   filter: drop-shadow(0 0 7px rgba(150, 200, 255, 0.5));
 }
+
+/*
+ * 角色透明度：只作用于**角色图**。
+ *
+ * 气泡、提醒徽标、悬停工具栏不在此列 —— 它们是交互元素，变淡就看不清按钮，等于把
+ * "可配置"变成"不能用"。变量由角色容器（.character-slot）下发，默认 1。
+ */
+.pet-svg, .pet-img, .pet-video, .pet-walk-strip { opacity: var(--pet-opacity, 1); }
+
+/*
+ * 交接登场/退场：退场的淡出上移，登场的从下方弹入。
+ * 用独立的 translate/opacity 属性，不与容器 transform（大小档位缩放）打架；
+ * 也不依赖皮肤帧素材 —— 静态图皮肤（如眼镜女生）一样有完整的登退场动效。
+ */
+.character-slot.entering { animation: pa-enter 0.9s cubic-bezier(0.34, 1.56, 0.64, 1); }
+.character-slot.leaving { animation: pa-leave 0.85s ease-in forwards; pointer-events: none; }
+@keyframes pa-enter { from { opacity: 0; translate: 0 32px; } to { opacity: 1; translate: 0 0; } }
+@keyframes pa-leave { from { opacity: 1; translate: 0 0; } to { opacity: 0; translate: 0 -24px; } }

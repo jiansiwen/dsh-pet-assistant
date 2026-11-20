@@ -212,6 +212,13 @@ export interface RecordOptions {
   maxDurationMs?: number
   /** 输出的 WAV 采样率；目前只支持 16000（声纹模型只吃 16k）。不传保持设备原始采样率。 */
   outputSampleRate?: 16000
+  /**
+   * 是否用"静音多久算说完"来收尾。默认 true（听写就该这样）。
+   *
+   * 录**音色样本**时必须关掉：真人念一段话中间一定有停顿，
+   * 按静音收尾会把句子拦腰截断，样本就废了。关掉后只按 maxDurationMs 或手动停。
+   */
+  endOnSilence?: boolean
 }
 
 export async function recordDictation(options: RecordOptions = {}): Promise<DictationResult> {
@@ -269,7 +276,7 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
     if (hasSpoken) {
       if (rms < threshold) {
         silenceMs += frame.durationMs
-        if (silenceMs >= END_SILENCE_MS) finished = true
+        if ((options.endOnSilence ?? true) && silenceMs >= END_SILENCE_MS) finished = true
       } else {
         silenceMs = 0
       }
@@ -282,6 +289,12 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
     subscription = await capture.subscribe({
       kind: 'dictation',
       onFrame: (frame) => {
+        /*
+          不是插话交接的普通听写：朗读期间的帧仍然跳过（避免把助理自己的声音转成提问）。
+          插话交接例外 —— 用户就是在讲解声中开口的，整段丢弃会把问题后半句吞掉
+          （真机复现：只识别出"い下。"/"さ？"）。回声由 echoCancellation 处理。
+        */
+        if (frame.assistantSpeaking && !takenOver) return
         if (!takenOver && options.takeHandover) {
           // 交接还没取走时先攒着，取走后按序号去重再处理。
           live.push(frame)
