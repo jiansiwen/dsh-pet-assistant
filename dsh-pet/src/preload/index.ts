@@ -157,6 +157,8 @@ contextBridge.exposeInMainWorld('petApi', {
   /** 只在本机念一句（不进会话、不调模型）。用于"又只喊了一句名字"的本地应答。 */
   speakLocal: (text: string) => ipcRenderer.send('speech-local', text),
   getTeam: () => ipcRenderer.invoke('team-get') as Promise<TeamSnapshot | null>,
+  /** 本人复核确认一个等待中的团队任务（等你点头/等复核/等你回话 → 已完成）。 */
+  confirmTeamTask: (taskId: string) => ipcRenderer.invoke('team-confirm', taskId) as Promise<{ ok: boolean; message: string }>,
   // 舞台只能请求打开专用审批窗口，不能直接签发批准：决定要从那个窗口回来，
   // 回执还要过主进程的 checkSender。这条通道留在这里就等于把核验全绕过去了。
   openApproval: (proposalId: string) =>

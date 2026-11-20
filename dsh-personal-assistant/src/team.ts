@@ -1125,6 +1125,23 @@ export class TeamService {
     this.paused = paused
   }
 
+  /**
+   * 本人复核确认：把"等你点头/等复核/等你回话"的任务标记完成。
+   * 模型自报"做完了"不构成成功，但**用户本人**是可信验收方——他在面板上核对产物后点确认，
+   * 才允许 done。只接受 waiting 三态，其余状态拒绝，避免把在跑/已终止的任务误改。
+   */
+  confirmTask(taskId: string): { ok: boolean; status?: TaskStatus; message: string } {
+    const task = this.getTask(taskId)
+    if (!task) return { ok: false, message: `任务 ${taskId} 不存在` }
+    if (!['awaiting-approval', 'awaiting-user', 'review'].includes(task.status)) {
+      return { ok: false, status: task.status, message: `任务当前状态（${task.status}）不需要确认，或已终止` }
+    }
+    const updated = this.setStatus(task, 'done')
+    if (!updated) return { ok: false, status: task.status, message: '任务状态已变化，请刷新后重试' }
+    this.store.appendEvent('task/updated', { taskId, by: 'user', note: '本人复核产物后确认完成', status: 'done' }, { taskId, assistantId: task.ownerId })
+    return { ok: true, status: updated.status, message: '已按你的确认标记完成' }
+  }
+
   /** 等待自有启动、运行及释放全部结束后，调用方才可关闭业务库。 */
   dispose(): Promise<void> {
     this.disposed = true

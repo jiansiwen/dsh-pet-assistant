@@ -15,6 +15,7 @@ const CAPABILITY_HINTS: Record<MemberCapability, string> = {
   activity: '读取已授权的活动与日报',
   reminders: '创建提醒和待办',
   computer: '看屏幕、点按钮、填表单；每一次真实动作都要你在桌面批准，不会静默执行',
+  platform: '对接外部智能助理平台：查询信息、上传知识库等（连接参数在配置里，代码不绑定公司）',
 }
 const EXAMPLES = ['每天帮我整理工作日报', '专门接收企业微信消息并提醒我', '帮我管理邮件，发送前先问我']
 const SKINS: Array<[string, string]> = [['panda', '熊猫'], ['boy-glasses', '眼镜男生'], ['girl-glasses', '眼镜女生']]

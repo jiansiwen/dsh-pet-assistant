@@ -27,6 +27,8 @@ const EXPECTED_COMMANDS = [
   'assistant-on',
   'assistant-pet-config',
   'assistant-pet-set',
+  'assistant-platform-get',
+  'assistant-platform-set',
   'assistant-report-list',
   'assistant-set-option',
   'assistant-skill-set',

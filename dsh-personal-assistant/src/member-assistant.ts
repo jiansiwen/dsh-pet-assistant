@@ -354,7 +354,7 @@ function instructions(): string {
     '"notes":"一句中文说明你替用户做了哪些默认选择"}',
     '规则：',
     '- permissionMode 默认 ask（每次询问）；只有用户明确说“不用问我/自动执行”才用 auto，“完全访问/不要限制”才用 full。',
-    '- capabilities 只绑定用户明确需要的能力：企业微信接收=wecom，邮件收发与分析=mail，会议录音与纪要=meeting，授权文档讲解=document，读取活动/日报=activity，创建提醒=reminders。不确定就留空。',
+    '- capabilities 只绑定用户明确需要的能力：企业微信接收=wecom，邮件收发与分析=mail，会议录音与纪要=meeting，授权文档讲解=document，读取活动/日报=activity，创建提醒=reminders，操作电脑=computer，对接外部智能助理平台=platform。不确定就留空。',
     '- “每天/定期”只描述工作频率，不等于创建提醒；只有用户明确要提醒或待办时才绑定 reminders。',
     '- 不要输出模型名、密钥、额度或输出上限；这些由用户在高级设置里决定。',
     '- skinId 默认沿用基准形象。',

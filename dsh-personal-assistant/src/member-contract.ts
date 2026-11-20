@@ -9,7 +9,7 @@ import type { MemberConfig } from './team-domain.ts'
  * `computer` 之所以单列一项而不是默认开放：它触碰的是本人正在用的这台机器，
  * 误操作代价比读邮件大得多。默认不给，谁需要谁开。
  */
-export const MEMBER_CAPABILITIES = ['wecom', 'mail', 'meeting', 'document', 'activity', 'reminders', 'computer'] as const
+export const MEMBER_CAPABILITIES = ['wecom', 'mail', 'meeting', 'document', 'activity', 'reminders', 'computer', 'platform'] as const
 export type MemberCapability = typeof MEMBER_CAPABILITIES[number]
 /** 与宿主工具层三态一致：每次询问（ask）/ 自动审批（allow）/ 完全访问（无限制）。 */
 export const MEMBER_PERMISSION_MODES = ['ask', 'auto', 'full'] as const

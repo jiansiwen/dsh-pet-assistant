@@ -201,6 +201,8 @@ export interface BridgeEvent {
   voiceProfile?: string
   /** subassistant-report：汇报模式（self=子助理直接播报）。 */
   reportMode?: 'chief' | 'self'
+  /** subassistant-report：事件产生时刻；桌宠据此只念新鲜汇报，重连重放的旧汇报不念。 */
+  at?: number
 }
 
 interface PendingRequest {
@@ -665,6 +667,11 @@ export class SessionBridge {
     return this.desktopBinding(this.agent)
   }
 
+  /** 当前绑定的主会话 agent（总助理）。供成员 spawn 继承宿主工具时作 parent；未绑定为 null。 */
+  sessionAgent(): unknown {
+    return this.closed ? null : this.agent
+  }
+
   get teamEnabled(): boolean {
     return this.team !== null
   }
@@ -1009,7 +1016,7 @@ export class SessionBridge {
     text: string; runId: number | string; reportMode: 'chief' | 'self'
   }): void {
     const { assistantId, displayName, skinId, voiceProfile, text, runId, reportMode } = report
-    this.push({ type: 'subassistant-report', assistantId, displayName, skinId, voiceProfile, text: text.slice(0, 8000), runId: String(runId), reportMode })
+    this.push({ type: 'subassistant-report', assistantId, displayName, skinId, voiceProfile, text: text.slice(0, 8000), runId: String(runId), reportMode, at: Date.now() })
   }
 
   private teamSnapshot(): {
@@ -2060,7 +2067,7 @@ export class SessionBridge {
       }
       return
     }
-    if (request.method === 'POST' && (url.pathname === '/chat/cancel' || url.pathname === '/team/cancel' || url.pathname === '/team/pause')) {
+    if (request.method === 'POST' && (url.pathname === '/chat/cancel' || url.pathname === '/team/cancel' || url.pathname === '/team/pause' || url.pathname === '/team/confirm')) {
       await this.handleCancelRoute(request, response, url.pathname)
       return
     }
@@ -2146,6 +2153,21 @@ export class SessionBridge {
         }
         const { status, receipt } = await this.cancelTeamTask(taskId)
         this.respond(response, status, { ok: status === 200, ...receipt })
+        return
+      }
+      if (pathname === '/team/confirm') {
+        const taskId = text(body.taskId) ?? text(body.id)
+        if (!taskId) {
+          this.respond(response, 400, { ok: false, error: '必须指定 taskId' })
+          return
+        }
+        const team = this.team
+        if (!team) {
+          this.respond(response, 503, { ok: false, error: '团队模式没有开启' })
+          return
+        }
+        const result = team.confirmTask(taskId)
+        this.respond(response, result.ok ? 200 : 409, result)
         return
       }
       const requestId = text(body.id) ?? text(body.requestId)

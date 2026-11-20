@@ -341,6 +341,23 @@ export class BridgeClient {
     return this.postCancel('/team/cancel', { taskId }, { taskId })
   }
 
+  /** 本人复核确认一个等待中的团队任务（POST /team/confirm）：用户是可信验收方。 */
+  async confirmTeamTask(taskId: string): Promise<{ ok: boolean; message: string }> {
+    const info = this.info
+    if (!info || this.stopped) return { ok: false, message: '未连接到助理运行时，无法确认任务' }
+    try {
+      const response = await fetch(`http://127.0.0.1:${info.port}/team/confirm?token=${encodeURIComponent(info.token)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId }),
+        signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]),
+      })
+      const body = await response.json().catch(() => ({})) as { ok?: unknown; message?: unknown; error?: unknown }
+      const message = typeof body.message === 'string' ? body.message : typeof body.error === 'string' ? body.error : `确认请求返回 ${response.status}`
+      return { ok: body.ok === true, message }
+    } catch (error) {
+      return { ok: false, message: `确认没有送达：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
   /** 暂停 / 恢复团队后续步骤（POST /team/pause）：只挡新的领取，不中止在跑的运行。 */
   async pauseTeam(paused: boolean): Promise<{ ok: boolean; paused: boolean; message: string }> {
     const info = this.info

@@ -431,7 +431,7 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'report-workbench-open', 'report-workbench:load', 'report-workbench:edit', 'report-workbench:edit-memory', 'report-workbench:request-publish',
     'report-workbench:deletion-preview', 'report-workbench:request-deletion', 'report-workbench:import-material',
     'report-workbench:request-share',
-    'team-get', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
+    'team-get', 'team-confirm', 'runtime-start', 'runtime-stop', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
     'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines',
     // 环境检查（M5-06）：只查、只按用户确认执行，不主动下载、不主动改系统设置。
@@ -504,7 +504,7 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
   const exposed = [
     'get-state', 'save-settings', 'mouse-state', 'context-menu', 'chat-send', 'speech-stop', 'speech-local',
     'session-get', 'session-command', 'session-start', 'overlay-state', 'report-workbench-open',
-    'team-get', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
+    'team-get', 'team-confirm', 'approval-open', 'asr-begin', 'asr-transcribe', 'asr-record-fallback',
     'asr-stream-feed', 'asr-stream-stop', 'open-report-dir',
     'voice-api-state', 'voice-api-save', 'voice-api-remove', 'voice-api-select', 'voice-api-preview', 'voice-design-assist', 'agent-voice-state', 'handover-lines', 'runtime-start', 'runtime-stop',
     'stage-set-visible', 'stage-set-focus',

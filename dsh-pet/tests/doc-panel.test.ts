@@ -179,9 +179,10 @@ describe('讲解模式（docSpeechMode）', () => {
     assert.ok(DOC_SPEECH_SWITCH_HINT.includes('不会被打断'))
   })
 
-  it('代码/表格/公式的说明写明会停 10 秒，用户不会以为漏讲了一段', () => {
-    assert.equal(DOC_SPEECH_CODE_HINT, '原文朗读遇到代码、表格、公式时不会逐行念，会提示一句并停 10 秒，方便大家看屏幕。')
+  it('表格照念、代码/公式停 10 秒的说明写清楚，用户不会以为漏讲了一段', () => {
+    assert.equal(DOC_SPEECH_CODE_HINT, '原文朗读会把表格照念（格子之间稍作停顿，不念竖线等格式符号）；遇到代码、公式不逐行念，会提示一句并停 10 秒，方便大家看屏幕。')
     assert.ok(DOC_SPEECH_CODE_HINT.includes('10 秒'))
+    assert.ok(DOC_SPEECH_CODE_HINT.includes('表格照念'))
   })
 
   it('文案里不出现实现词', () => {

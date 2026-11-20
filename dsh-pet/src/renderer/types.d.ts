@@ -643,6 +643,8 @@ export interface PetApi extends MemberApi {
   speakLocal(text: string): void
   /** 拉一次团队快照。未连接或未开启团队模式时返回 null。 */
   getTeam(): Promise<TeamSnapshot | null>
+  /** 本人复核确认一个等待中的团队任务（等你点头/等复核/等你回话 → 已完成）。 */
+  confirmTeamTask(taskId: string): Promise<{ ok: boolean; message: string }>
   /**
    * 请求主进程打开专用审批窗口。
    *

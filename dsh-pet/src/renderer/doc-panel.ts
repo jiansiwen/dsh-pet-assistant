@@ -85,7 +85,7 @@ export const DEFAULT_DOC_SPEECH_MODE: DocSpeechMode = 'source'
 export const DOC_SPEECH_SWITCH_HINT = '切换后从下一段生效，正在播的这一段不会被打断。'
 
 /** 原文朗读遇到非正文块时的行为说明：不解释清楚，用户会以为它跳过了一段。 */
-export const DOC_SPEECH_CODE_HINT = '原文朗读遇到代码、表格、公式时不会逐行念，会提示一句并停 10 秒，方便大家看屏幕。'
+export const DOC_SPEECH_CODE_HINT = '原文朗读会把表格照念（格子之间稍作停顿，不念竖线等格式符号）；遇到代码、公式不逐行念，会提示一句并停 10 秒，方便大家看屏幕。'
 
 /**
  * 两个选项的文案。

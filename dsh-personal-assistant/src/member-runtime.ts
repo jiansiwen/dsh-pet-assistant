@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
@@ -8,6 +9,7 @@ import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subage
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { hostAgentRegistry } from './host-agents.ts'
 import { safeWebFetch } from './member-web.ts'
+import { callPlatform, platformChat, platformChatList, platformListAssistants, platformUpdateMemory, platformUploadFile, platformUploadKnowledge, type PlatformConfig, type PlatformFile } from './platform-connector.ts'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS } from './gate.ts'
 import type { MemberProfile, MemberQuotaView } from './member-contract.ts'
 import { MEMORY_KINDS, type MemoryKind } from './memory.ts'
@@ -101,6 +103,15 @@ export interface MemberRuntimeOptions {
   desktop?: { binding?(): string | null; request(command: string, payload: Record<string, unknown>, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> }
   /** 只读未读邮件；手动检查用，不标记已读、不发送。 */
   mailUnread?(limit?: number): Promise<{ uidValidity: string; messages: Array<{ uid: number; subject: string; from: string; date: string; text: string }> }>
+  /** 通用外部平台对接配置（配置驱动，代码不绑定公司）。授予 platform 能力时注册对接工具。 */
+  platform?: { config(): PlatformConfig }
+  /** 可选注入的 DSH 子代理运行时（spawn 继承宿主工具用）；未提供时回退插件会话。 */
+  subagents?: () => unknown
+  /** 成员改自己的定时任务（企微绑定本人也可用，方便离开桌面时调整）。未提供时不注册该工具。 */
+  memberSchedule?: {
+    list(assistantId: string): Array<{ scheduleId: string; title: string; prompt: string; channel: string; enabled: boolean; localTime?: string; repeatKind?: string }>
+    update(assistantId: string, scheduleId: string, patch: { prompt?: string; localTime?: string; repeatKind?: string; everySeconds?: number; channel?: string }): { ok: boolean; message: string }
+  }
   onChange?: () => void
 }
 
@@ -123,6 +134,8 @@ const CAPABILITY_TOOLS = {
   computer: ['personal_assistant_computer_look', 'personal_assistant_computer_click', 'personal_assistant_computer_type',
     'personal_assistant_computer_key', 'personal_assistant_computer_scroll', 'personal_assistant_computer_apply',
     'personal_assistant_computer_cancel'],
+  platform: ['companion_platform_chat', 'companion_platform_list_assistants', 'companion_platform_chat_list',
+    'companion_platform_upload_knowledge', 'companion_platform_upload_file', 'companion_platform_update_memory', 'companion_platform_call'],
 } as const
 const LOCAL_TOOLS = ['companion_member_remember', 'companion_member_request_quota']
 const MEETING_TOOLS = ['companion_meeting_start', 'companion_meeting_stop', 'companion_meeting_minutes', 'companion_meeting_status'] as const
@@ -297,6 +310,10 @@ export class MemberRuntime {
     // 不建立无界等待队列；所有入口共用这把成员锁，其他成员仍可并发。
     if (this.busy(memberId)) throw new Error('该成员正在处理其他请求，请稍后重试')
     let previousSession = sessionScope ? this.options.directory.getChannelSession(memberId, sessionScope) : profile.sessionId
+    // spawn 模式：经 DSH 子代理工厂创建/冷续会话（继承宿主工具），提示词由工厂投递，
+    // 收件箱消息 id 与本地 createUserMessage 不同，需放宽来源校验。
+    let spawnMode = false
+    let spawnClaimedOnce = false
     let ready!: () => void
     const lease: Lease = { controller: new AbortController(), ready: new Promise(resolve => { ready = resolve }) }
     this.live.set(memberId, lease)
@@ -385,8 +402,8 @@ export class MemberRuntime {
       if (!ctx.tools?.restrict || !ctx.tools?.guard || !ctx.systemPrompt?.section || !ctx.systemPrompt?.variable) {
         throw new Error('宿主缺少成员隔离门禁或系统提示词接口')
       }
-      // 恢复只允许静止会话；禁止宿主把崩溃遗留的收件箱当成新请求重放。
-      if (agent.inbox.nextTurn.length || agent.inbox.nextStep.length) throw new Error('成员旧会话有未结输入，不可自动恢复执行，请人工核查')
+      // 恢复只允许静止会话；禁止宿主把崩溃遗留的收件箱当成新请求重放。spawn 冷续的待投提示词除外。
+      if (!spawnMode && (agent.inbox.nextTurn.length || agent.inbox.nextStep.length)) throw new Error('成员旧会话有未结输入，不可自动恢复执行，请人工核查')
       const owns = (subject?: Agent): boolean => subject === agent && subject.ctx === ctx
       const allowed = new Set(profile.allowedTools.filter(name => READ_ONLY_ALLOW_TOOLS.includes(name) && !CHILD_LOCAL_TOOLS.includes(name)))
       const sideEffect = new Set<string>()
@@ -396,6 +413,8 @@ export class MemberRuntime {
         for (const name of SIDE_EFFECT_ALLOW_TOOLS) if (ctx.tools.get(name, agent)) sideEffect.add(name)
       }
       for (const capability of profile.capabilities) for (const name of CAPABILITY_TOOLS[capability]) allowed.add(name)
+      // 成员可改自己的定时任务（含企微绑定本人），方便离开桌面时调整查询/频率。
+      if (this.options.memberSchedule) allowed.add('companion_member_schedule')
       const meetingAllowed = profile.capabilities.includes('meeting') && effectiveOrigin === 'desktop' && !!this.options.desktop
       const documentAllowed = profile.capabilities.includes('document') && effectiveOrigin === 'desktop' && !!this.options.desktop
       /*
@@ -554,6 +573,61 @@ export class MemberRuntime {
         }))
         allowed.add('companion_web_fetch')
       }
+      // 通用外部平台对接：仅授予 platform 能力且装配了配置源时注册。配置驱动，代码不绑定公司。
+      if (profile.capabilities.includes('platform') && this.options.platform) {
+        const pcfg = () => this.options.platform!.config()
+        const live = (exec: { agent?: Agent; signal: AbortSignal }) => {
+          if (!owns(exec.agent) || !admitted || ended !== undefined || runSignal.aborted || exec.signal.aborted) throw new Error('成员请求已停止')
+          return exec.signal
+        }
+        const fileFrom = (p: unknown): PlatformFile => {
+          const fp = String(p ?? '')
+          const buf = readFileSync(fp)
+          const ext = path.extname(fp).replace(/^\./, '') || 'txt'
+          return { base64: buf.toString('base64'), file_ext: ext, file_name: path.basename(fp) }
+        }
+        ctx.tools.register(defineTool({ name: 'companion_platform_chat', description: '向外部智能助理平台提问/查询（实时聊天）。返回平台应答。', parameters: { question: { type: 'string', required: true }, chatId: { type: 'string' }, assistId: { type: 'string' } }, output: toolOutput,
+          execute: async (a: { question?: unknown; chatId?: unknown; assistId?: unknown }, exec) => JSON.stringify(await platformChat(pcfg(), String(a.question ?? ''), { chatId: a.chatId ? String(a.chatId) : undefined, assistId: a.assistId ? String(a.assistId) : undefined }, live(exec))) }))
+        ctx.tools.register(defineTool({ name: 'companion_platform_list_assistants', description: '列出外部平台可用智能体。', parameters: {}, output: toolOutput,
+          execute: async (_a, exec) => JSON.stringify(await platformListAssistants(pcfg(), live(exec))) }))
+        ctx.tools.register(defineTool({ name: 'companion_platform_chat_list', description: '分页查询外部平台聊天记录，可按关键词搜索。', parameters: { keyword: { type: 'string' }, chatId: { type: 'string' } }, output: toolOutput,
+          execute: async (a: { keyword?: unknown; chatId?: unknown }, exec) => JSON.stringify(await platformChatList(pcfg(), { keyword: a.keyword ? String(a.keyword) : undefined, chatId: a.chatId ? String(a.chatId) : undefined }, live(exec))) }))
+        ctx.tools.register(defineTool({ name: 'companion_platform_upload_knowledge', description: '把本地文件上传到外部平台知识库（指定智能体）。', parameters: { path: { type: 'string', required: true, description: '本地文件绝对路径' }, assistId: { type: 'string' } }, output: toolOutput,
+          execute: async (a: { path?: unknown; assistId?: unknown }, exec) => { try { return JSON.stringify(await platformUploadKnowledge(pcfg(), [fileFrom(a.path)], a.assistId ? String(a.assistId) : undefined, live(exec))) } catch (e) { return JSON.stringify({ ok: false, error: String(e instanceof Error ? e.message : e) }) } } }))
+        ctx.tools.register(defineTool({ name: 'companion_platform_upload_file', description: '上传本地文件到外部平台，返回 fileCode 供聊天引用。', parameters: { path: { type: 'string', required: true } }, output: toolOutput,
+          execute: async (a: { path?: unknown }, exec) => { try { return JSON.stringify(await platformUploadFile(pcfg(), [fileFrom(a.path)], live(exec))) } catch (e) { return JSON.stringify({ ok: false, error: String(e instanceof Error ? e.message : e) }) } } }))
+        ctx.tools.register(defineTool({ name: 'companion_platform_update_memory', description: '更新外部平台长期记忆（用户信息/偏好，JSON 字符串）。', parameters: { data: { type: 'string', required: true } }, output: toolOutput,
+          execute: async (a: { data?: unknown }, exec) => JSON.stringify(await platformUpdateMemory(pcfg(), String(a.data ?? ''), live(exec))) }))
+        ctx.tools.register(defineTool({ name: 'companion_platform_call', description: '通用调用外部平台任意 service（高级）。data 为对象。', parameters: { service: { type: 'string', required: true }, data: { type: 'object', additionalProperties: true } }, output: toolOutput,
+          execute: async (a: { service?: unknown; data?: unknown }, exec) => JSON.stringify(await callPlatform(pcfg(), String(a.service ?? ''), (a.data as Record<string, unknown>) ?? {}, live(exec))) }))
+      }
+      // 成员改自己的定时任务：list 看自己的定时安排；update 改查询/频率/渠道。企微绑定本人同样可用。
+      if (this.options.memberSchedule) {
+        const ms = this.options.memberSchedule
+        ctx.tools.register(defineTool({
+          name: 'companion_member_schedule',
+          description: '管理你自己的定时任务。action=list 列出你的定时安排；action=update 改某个任务的查询内容(prompt)/每日时刻(localTime)/频率(repeatKind=daily|interval|once)/间隔秒(everySeconds)/渠道(channel)。用户在你这边（含企业微信）要求调整定时查询时用它。',
+          parameters: { action: { type: 'string', required: true, enum: ['list', 'update'] }, scheduleId: { type: 'string' },
+            prompt: { type: 'string' }, localTime: { type: 'string' }, repeatKind: { type: 'string' }, everySeconds: { type: 'number' }, channel: { type: 'string' } },
+          output: toolOutput,
+          execute: async (a: { action?: unknown; scheduleId?: unknown; prompt?: unknown; localTime?: unknown; repeatKind?: unknown; everySeconds?: unknown; channel?: unknown }, exec) => {
+            if (!owns(exec.agent) || !admitted || ended !== undefined || runSignal.aborted || exec.signal.aborted) throw new Error('成员请求已停止')
+            if (a.action === 'list') return JSON.stringify({ ok: true, schedules: ms.list(memberId) })
+            if (a.action === 'update') {
+              const id = String(a.scheduleId ?? '')
+              if (!id) return JSON.stringify({ ok: false, message: 'update 需要 scheduleId（先 list 查看）' })
+              return JSON.stringify(ms.update(memberId, id, {
+                ...(a.prompt !== undefined ? { prompt: String(a.prompt) } : {}),
+                ...(a.localTime !== undefined ? { localTime: String(a.localTime) } : {}),
+                ...(a.repeatKind !== undefined ? { repeatKind: String(a.repeatKind) } : {}),
+                ...(a.everySeconds !== undefined ? { everySeconds: Number(a.everySeconds) } : {}),
+                ...(a.channel !== undefined ? { channel: String(a.channel) } : {}),
+              }))
+            }
+            return JSON.stringify({ ok: false, message: 'action 必须是 list 或 update' })
+          },
+        }))
+      }
       const desktop = this.options.desktop
       if (allowed.has(DOCUMENT_PRESENTATION_TOOL) && desktop && desktopBinding) {
         registerMeetingPresentationTools(ctx as never, {
@@ -676,6 +750,12 @@ export class MemberRuntime {
       }))
       ctx.on('agent/inbox/claimed', ({ agent: subject, message: claimed, turn: number }) => {
         if (!owns(subject)) return
+        if (spawnMode) {
+          // spawn 的提示词由工厂投递，id 与本地 message 不同；只认首个认领，其余视为混入。
+          if (!spawnClaimedOnce && admitted) { spawnClaimedOnce = true; turn = number }
+          else if (spawnClaimedOnce) rememberError(new Error('成员请求混入其他来源输入，已停止'))
+          return
+        }
         if (claimed.id === message.id && admitted) turn = number
         else rememberError(new Error('成员请求混入其他来源输入，已停止'))
       })
@@ -683,7 +763,7 @@ export class MemberRuntime {
         if (!owns(subject)) return next()
         try {
           check()
-          if (messages.some(item => item.id !== message.id)) throw new Error('成员请求不能混入其他来源输入')
+          if (!spawnMode && messages.some(item => item.id !== message.id)) throw new Error('成员请求不能混入其他来源输入')
           if (pending || preparing) throw new Error('成员模型请求用量尚未结算，禁止继续请求')
           return await next()
         } catch (cause) { throw rememberError(cause) }
@@ -804,7 +884,35 @@ export class MemberRuntime {
         }
         const createFresh = (): Promise<AgentHandle> =>
           agents.create({ sessionId, signal: runSignal, agentOptions, setup, ...(meta === undefined ? {} : { meta }) })
-        if (!previousSession) {
+        /*
+         * 沿用宿主工具正路：经 DSH 子代理工厂 spawn 创建/冷续成员会话（childId=成员会话 id），
+         * 继承 parent（总助理）的活跃组合→自带宿主默认工具；冷续恢复子会话组合→定时沿用不丢工具。
+         * 成员 setup 无 spawn 参数钩子，改在 subagent/start 事件里装到子会话 agent.ctx（首个模型请求前）。
+         * 失败回退插件 create/resume（不破坏现有架构）。
+         */
+        const subagents = (this.options.subagents?.() ?? (() => { try { return (this.options.ctx as unknown as { get?: (n: string) => unknown }).get?.('subagents') } catch { return undefined } })()) as { startActivation(spec: unknown): Promise<{ childId: string; dispose(): Promise<void> }> } | undefined
+        if (parentAgent && subagents && !sessionScope) {
+          spawnMode = true
+          admitted = true // 子会话可能在 startActivation 内即开始首轮，guard 需已放行
+          const onStart = (info: { id?: unknown }) => {
+            if (String(info?.id) !== String(sessionId)) return
+            const child = agents.get(SessionId(String(info.id)))
+            if (child) setup(child.ctx, child)
+          }
+          const offStart = (this.options.ctx as unknown as { on(ev: string, fn: (i: { id?: unknown }) => void): () => void }).on('subagent/start', onStart)
+          try {
+            const activation = await subagents.startActivation({ provider: 'spawn', label: String(sessionId), signal: runSignal,
+              delivery: 'caller', childId: sessionId, request: { prompt, parent: parentAgent, agentOptions } })
+            const child = agents.get(SessionId(activation.childId))
+            if (!child) throw new Error('spawn 未返回成员子会话')
+            handle = { agent: child, dispose: () => activation.dispose() }
+          } catch (cause) {
+            spawnMode = false
+            admitted = false
+            this.log(`成员 spawn 沿用宿主工具失败，回退插件会话：${cause instanceof Error ? cause.message : String(cause)}`)
+            handle = previousSession ? await resumeAgent() : await createFresh()
+          } finally { offStart?.() }
+        } else if (!previousSession) {
           handle = await createFresh()
         } else {
           try {
@@ -840,7 +948,7 @@ export class MemberRuntime {
       admitted = true
       runSignal.addEventListener('abort', abort, { once: true })
       runSignal.throwIfAborted()
-      owner.followup(message)
+      if (!spawnMode) owner.followup(message) // spawn 的提示词已由工厂投递，不重复发送
       const result = owner.whenIdle().then((): SubagentResult => {
         settleUnknown()
         const streamed = replyEvents.map(event => (event.data.chunk as { text: string }).text).join('')

@@ -1,5 +1,5 @@
 /** 宿主 member-contract.ts / memory.ts 的本地镜像，不跨包加载运行时代码。 */
-export const MEMBER_CAPABILITIES = ['wecom', 'mail', 'meeting', 'document', 'activity', 'reminders', 'computer'] as const
+export const MEMBER_CAPABILITIES = ['wecom', 'mail', 'meeting', 'document', 'activity', 'reminders', 'computer', 'platform'] as const
 export type MemberCapability = typeof MEMBER_CAPABILITIES[number]
 export const MEMBER_PERMISSION_MODES = ['ask', 'auto', 'full'] as const
 export type MemberPermissionMode = typeof MEMBER_PERMISSION_MODES[number]
@@ -26,6 +26,7 @@ export const MEMBER_CAPABILITY_LABELS: Record<MemberCapability, string> = {
   activity: '读取已授权活动 / 日报', reminders: '创建提醒',
   /* 底座能力：看屏幕、点、输入。默认关闭——它碰的是本人正在用的这台机器。 */
   computer: '操作电脑与浏览器（每次动作都要你批准）',
+  platform: '对接外部智能助理平台（查询/上传知识库，配置驱动）',
 }
 /** 仅普通观测工具，镜像宿主 gate.ts；不包含子代理控制、脚本和写入工具。 */
 export const MEMBER_READ_TOOLS = ['read', 'read_image', 'glob', 'grep', 'web_fetch', 'web_search'] as const

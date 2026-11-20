@@ -2908,12 +2908,10 @@ test('原文朗读模式：不向模型要讲解，念的就是这一段原文�
   }
 })
 
-test('原文朗读模式：表格段只念一句跳过提示，念完先停住，到点才念下一段', async () => {
+test('原文朗读模式：表格段照念格子内容（不念竖线），念完接着下一段', async () => {
   const tablePath = path.join(authorized, '表格样本.md')
   writeFileSync(tablePath, '## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n\n## 结尾\n\n最后一段正文。\n', 'utf8')
   await invoke('save-settings', { docSpeechMode: 'source' })
-  // 停留是 10 秒，真等会把这条 e2e 拖成十秒级；开假定时器快进。
-  // 必须在停留定时器被创建之前打开，否则它挂在真定时器上，tick 对它没用。
   mock.timers.enable({ apis: ['setTimeout'] })
   try {
     const result = await invoke('doc-explain', tablePath, 0, true, '讲解助理')
@@ -2921,18 +2919,17 @@ test('原文朗读模式：表格段只念一句跳过提示，念完先停住�
     const before = narrator.requests.length
     finishSentence()
     await until(() => narrator.requests.length > before, '表格段开口')
-    assert.equal(chats.length, 0, '表格段同样不该请求模型')
+    assert.equal(chats.length, 0, '原文朗读不请求模型')
     const spoken = narrator.requests.at(-1)!
-    assert.match(spoken.text, /这段是表格/)
-    assert.doesNotMatch(spoken.text, /张三|姓名，部门/, '要跳过的东西一个字都不能念出来')
-    assert.equal(sent<{ index: number; text: string }>('doc-reply').at(-1)?.text, spoken.text, '屏幕显示的就是这句跳过提示')
+    assert.match(spoken.text, /姓名/)
+    assert.match(spoken.text, /张三/)
+    assert.doesNotMatch(spoken.text, /\|/, '竖线等格式符号不念')
+    assert.doesNotMatch(spoken.text, /这段是表格/, '表格不再跳过')
+    assert.equal(sent<{ index: number; text: string }>('doc-reply').at(-1)?.text, spoken.text, '屏幕显示与念的一致')
     const requests = narrator.requests.length
     finishSentence()
     await until(() => outline().next === 1, '位置推进到下一段')
-    // 念完跳过提示后先停：屏幕要靠这段停留停在这一页，不能立刻翻到下一段。
-    assert.equal(narrator.requests.length, requests, '停留期间不许开始念下一段')
-    mock.timers.tick(10_000)
-    await until(() => narrator.requests.length > requests, '到点后接着念下一段')
+    await until(() => narrator.requests.length > requests, '表格念完接着念下一段（无停留）')
     assert.equal(narrator.requests.at(-1)!.text, '最后一段正文。')
   } finally {
     mock.timers.reset()

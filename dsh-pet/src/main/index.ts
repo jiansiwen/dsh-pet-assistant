@@ -1827,6 +1827,8 @@ async function maybeStartIndependentDocument(): Promise<void> {
     超时的时候用户只会听到总助说"交给小会了"，从头到尾没有小会登场。
     所以这里先播交接台词，播完下一拍再判断能不能开讲。
   */
+  // 交接的"成员应声/开口"要用成员自己的嗓子：先暖音色缓存，避免冷缓存回退总助理嗓子。
+  if (presentation.assistantId) { try { await memberDisplayName(presentation.assistantId) } catch { /* 读不到退回默认 */ } }
   if (!narrator.isSpeaking() && !spokenRound && submissionCount === 0
     && speakMemberHandover(presentation.assistantId ?? undefined, presentation.id)) return
   if (Date.now() >= presentation.waitUntil || sessionState?.bindingId !== presentation.bindingId || sessionState.status === 'disconnected'
@@ -5691,6 +5693,12 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
     }
   })
 
+  // 本人复核确认等待中的团队任务（用户是可信验收方）；只改状态，不产生外部副作用。
+  ipcMain.handle('team-confirm', async (_event, taskId: unknown) => {
+    if (typeof taskId !== 'string' || !taskId) return { ok: false, message: '任务 id 无效' }
+    return bridge.confirmTeamTask(taskId)
+  })
+
   // 舞台不再有"直接批准"这条通道：它只能请求打开专用审批窗口。
   // approval-open / approval-card-read / approval-card-decide / approval-card-close
   // 都在 ApprovalWindow 里注册，回执核验也在那边（checkSender）。
@@ -6565,6 +6573,10 @@ if (!gotLock) {
         if (event.type === 'subassistant-report') {
           // runId 幂等去重：断线重连会重放事件环里的旧事件，重播会吓到人。
           const runId = typeof event.runId === 'string' ? event.runId : ''
+          // 时间守卫：只念"新鲜"汇报。召唤/重连会重放事件环旧汇报，at 久远的一律不念，
+          // 避免一召唤就重播旧内容（含英文工具回显）；无 at 的旧版事件同样不念。
+          const reportAt = typeof (event as { at?: unknown }).at === 'number' ? (event as unknown as { at: number }).at : 0
+          if (!reportAt || Date.now() - reportAt > 60_000) return
           const text = typeof event.text === 'string'
             ? event.text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, ' ').slice(0, 8000) : ''
           if (!runId || !text || subAssistantSpokenRunIds.has(runId)) return

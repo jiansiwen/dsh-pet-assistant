@@ -1,8 +1,8 @@
 // src/index.ts
-import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync6, readFileSync as readFileSync16, statSync as statSync9, writeFileSync as writeFileSync6 } from "node:fs";
-import { randomUUID as randomUUID28 } from "node:crypto";
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync7, readFileSync as readFileSync18, statSync as statSync9, writeFileSync as writeFileSync7 } from "node:fs";
+import { randomUUID as randomUUID29 } from "node:crypto";
 import os2 from "node:os";
-import path28 from "node:path";
+import path29 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/approval.ts
@@ -344,7 +344,7 @@ function installApprovalGate(agent, options) {
 }
 
 // src/member-contract.ts
-var MEMBER_CAPABILITIES = ["wecom", "mail", "meeting", "document", "activity", "reminders", "computer"];
+var MEMBER_CAPABILITIES = ["wecom", "mail", "meeting", "document", "activity", "reminders", "computer", "platform"];
 var MEMBER_PERMISSION_MODES = ["ask", "auto", "full"];
 var MEMBER_REPORT_MODES = ["chief", "self"];
 var MEMBER_SPEECH_BY = ["self", "chief"];
@@ -4016,16 +4016,17 @@ ${JSON.stringify(submission.snapshot, null, 2)}
 
 // src/bridge.ts
 import http from "node:http";
-import { randomUUID as randomUUID9, timingSafeEqual as timingSafeEqual3 } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync as mkdirSync3, readFileSync as readFileSync2, rmSync, writeFileSync } from "node:fs";
+import { randomUUID as randomUUID10, timingSafeEqual as timingSafeEqual3 } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync as mkdirSync4, readFileSync as readFileSync4, rmSync, writeFileSync as writeFileSync2 } from "node:fs";
 import os from "node:os";
-import path5 from "node:path";
+import path6 from "node:path";
 import { spawn } from "node:child_process";
 import { createUserMessage as createUserMessage3 } from "@deepseek-ai/dsh-llm";
 
 // src/member-runtime.ts
-import { createHash as createHash5, randomUUID as randomUUID6 } from "node:crypto";
-import path4 from "node:path";
+import { createHash as createHash6, randomUUID as randomUUID7 } from "node:crypto";
+import { readFileSync as readFileSync3 } from "node:fs";
+import path5 from "node:path";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool as defineTool2 } from "@deepseek-ai/dsh-tools";
@@ -4106,13 +4107,101 @@ async function safeWebFetch(rawUrl, maxChars, signal, fetchImpl = fetch, timeout
   }
 }
 
+// src/platform-connector.ts
+import { createHash as createHash4, randomUUID as randomUUID5 } from "node:crypto";
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync } from "node:fs";
+import path3 from "node:path";
+var PLATFORM_DEFAULT_TEMPLATE = "{appid}{timestamp}{sid}{secret}";
+function platformConfigPath(home) {
+  return path3.join(home, "personal-assistant", "platform-connector.json");
+}
+function defaultPlatformConfig() {
+  return { enabled: false, endpoint: "", appid: "", channel: "PC", secret: "", signTemplate: PLATFORM_DEFAULT_TEMPLATE, userId: "", assistId: "", timeoutMs: 15e3 };
+}
+function readPlatformConfig(home) {
+  try {
+    const raw = JSON.parse(readFileSync2(platformConfigPath(home), "utf8"));
+    return { ...defaultPlatformConfig(), ...raw };
+  } catch {
+    return defaultPlatformConfig();
+  }
+}
+function writePlatformConfig(home, patch) {
+  const next = { ...readPlatformConfig(home), ...patch };
+  mkdirSync2(path3.dirname(platformConfigPath(home)), { recursive: true });
+  writeFileSync(platformConfigPath(home), `${JSON.stringify(next, null, 2)}
+`, "utf8");
+  return next;
+}
+function md5Upper(value) {
+  return createHash4("md5").update(value, "utf8").digest("hex").toUpperCase();
+}
+function platformTimestamp(now = /* @__PURE__ */ new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+}
+function buildSign(cfg, fields) {
+  const template = cfg.signTemplate || PLATFORM_DEFAULT_TEMPLATE;
+  const raw = template.replace(/\{appid\}/g, cfg.appid).replace(/\{channel\}/g, cfg.channel).replace(/\{sid\}/g, fields.sid).replace(/\{timestamp\}/g, fields.timestamp).replace(/\{bizid\}/g, fields.bizid ?? "").replace(/\{secret\}/g, cfg.secret);
+  return md5Upper(raw);
+}
+async function callPlatform(cfg, service, data, signal) {
+  if (!cfg.enabled) return { ok: false, error: "\u5E73\u53F0\u5BF9\u63A5\u672A\u542F\u7528\uFF08\u914D\u7F6E enabled=false\uFF09" };
+  if (!cfg.endpoint || !cfg.appid) return { ok: false, error: "\u5E73\u53F0\u5BF9\u63A5\u672A\u914D\u7F6E endpoint/appid" };
+  const sid = randomUUID5().replace(/-/g, "").toUpperCase();
+  const timestamp3 = platformTimestamp();
+  const envelope = { service, appid: cfg.appid, channel: cfg.channel, sid, timestamp: timestamp3, sign: buildSign(cfg, { sid, timestamp: timestamp3 }), data };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1e3, cfg.timeoutMs));
+  try {
+    const res = await fetch(cfg.endpoint, {
+      method: "POST",
+      signal: AbortSignal.any([controller.signal, signal ?? controller.signal]),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(envelope)
+    });
+    const json5 = await res.json().catch(() => null);
+    if (!json5) return { ok: false, error: `\u5E73\u53F0\u8FD4\u56DE\u975E JSON\uFF08HTTP ${res.status}\uFF09` };
+    const code = typeof json5.code === "number" ? json5.code : void 0;
+    return { ok: code === 0, code, desc: json5.desc, data: json5.data };
+  } catch (error) {
+    return { ok: false, error: `\u5E73\u53F0\u8BF7\u6C42\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function platformChat(cfg, question, opts = {}, signal) {
+  const assist = opts.assistId ?? cfg.assistId;
+  return callPlatform(cfg, "openplatform.realtimeChat", {
+    question,
+    user_id: cfg.userId,
+    ...opts.chatId ? { chat_id: opts.chatId } : assist ? { chat_id: `${cfg.userId}_${assist}` } : {},
+    ...opts.sessionId ? { session_id: opts.sessionId } : {}
+  }, signal);
+}
+function platformListAssistants(cfg, signal) {
+  return callPlatform(cfg, "openplatform.getAssistantList", { user_id: cfg.userId, page: 1, limit: 20 }, signal);
+}
+function platformChatList(cfg, opts = {}, signal) {
+  return callPlatform(cfg, "openplatform.getChatList", { user_id: cfg.userId, page: 1, limit: 10, ...opts.keyword ? { keyword: opts.keyword } : {}, ...opts.chatId ? { chat_id: opts.chatId } : {} }, signal);
+}
+function platformUploadKnowledge(cfg, files, assistId, signal) {
+  return callPlatform(cfg, "aiagent.upload.knowledge", { files, user_id: cfg.userId, assist_id: assistId ?? cfg.assistId }, signal);
+}
+function platformUploadFile(cfg, files, signal) {
+  return callPlatform(cfg, "aiagent.upload.file", { files, user_id: cfg.userId }, signal);
+}
+function platformUpdateMemory(cfg, data, signal) {
+  return callPlatform(cfg, "aiagent.long.term.memory", { user_id: cfg.userId, data }, signal);
+}
+
 // src/memory.ts
-import { randomUUID as randomUUID5 } from "node:crypto";
+import { randomUUID as randomUUID6 } from "node:crypto";
 
 // src/store.ts
-import { createHash as createHash4 } from "node:crypto";
-import { mkdirSync as mkdirSync2 } from "node:fs";
-import path3 from "node:path";
+import { createHash as createHash5 } from "node:crypto";
+import { mkdirSync as mkdirSync3 } from "node:fs";
+import path4 from "node:path";
 import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
 var ASSISTANT_SCHEMA_VERSION = 2;
 var USER_FLAGS_DDL = `
@@ -4122,7 +4211,7 @@ CREATE TABLE IF NOT EXISTS user_flags (
 ) WITHOUT ROWID
 `;
 function openAssistantStore(dbPath) {
-  mkdirSync2(path3.dirname(dbPath), { recursive: true });
+  mkdirSync3(path4.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync2(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -4147,7 +4236,7 @@ function setUserFlag(db, key, value) {
   db.prepare("INSERT OR REPLACE INTO user_flags (key, value) VALUES (?, ?)").run(key, value);
 }
 function sha256(text7) {
-  return createHash4("sha256").update(text7, "utf8").digest("hex");
+  return createHash5("sha256").update(text7, "utf8").digest("hex");
 }
 function text3(value) {
   return value === null || value === void 0 ? null : String(value);
@@ -4638,7 +4727,7 @@ var MemoryStore = class {
       const updated = this.revise(preview.memoryId, { text: preview.after, actor, expectedRevision: preview.revision }, now);
       if (!updated) return null;
       const result = {
-        tidyId: randomUUID5(),
+        tidyId: randomUUID6(),
         memoryId: preview.memoryId,
         appliedRevision: updated.revision,
         state: "applied",
@@ -5107,7 +5196,7 @@ function registerMeetingPresentationTools(host, desktop, include) {
 
 // src/member-runtime.ts
 function documentSessionScope(docKey, cwd) {
-  return createHash5("sha256").update(JSON.stringify(["document", cwd ?? "", docKey])).digest("hex");
+  return createHash6("sha256").update(JSON.stringify(["document", cwd ?? "", docKey])).digest("hex");
 }
 var CAPABILITY_TOOLS = {
   wecom: [],
@@ -5143,6 +5232,15 @@ var CAPABILITY_TOOLS = {
     "personal_assistant_computer_scroll",
     "personal_assistant_computer_apply",
     "personal_assistant_computer_cancel"
+  ],
+  platform: [
+    "companion_platform_chat",
+    "companion_platform_list_assistants",
+    "companion_platform_chat_list",
+    "companion_platform_upload_knowledge",
+    "companion_platform_upload_file",
+    "companion_platform_update_memory",
+    "companion_platform_call"
   ]
 };
 var LOCAL_TOOLS = ["companion_member_remember", "companion_member_request_quota"];
@@ -5175,7 +5273,7 @@ function hostWorkspaceRegistry(ctx) {
 }
 function sameDirectory(left, right) {
   const normalize2 = (value) => {
-    const resolved = path4.resolve(value);
+    const resolved = path5.resolve(value);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   };
   return normalize2(left) === normalize2(right);
@@ -5284,9 +5382,11 @@ var MemberRuntime = class {
     if (channelKey && (!channelScope || !/^[a-f0-9]{64}$/u.test(channelScope))) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u6765\u6E90\u7F3A\u5C11\u53EF\u6838\u9A8C\u7684\u4F1A\u8BDD\u8303\u56F4");
     if (docScope !== void 0 && !/^[a-f0-9]{64}$/u.test(docScope)) throw new Error("\u6587\u6863\u4F1A\u8BDD\u8303\u56F4\u65E0\u6548");
     if (effectiveOrigin === "wecom" && !channelKey && !taskId) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u4EFB\u52A1\u7F3A\u5C11\u72EC\u7ACB\u4EFB\u52A1\u6807\u8BC6");
-    const sessionScope = channelKey ? channelScope : docScope ?? (effectiveOrigin === "wecom" ? createHash5("sha256").update(JSON.stringify(["wecom-task", taskId])).digest("hex") : void 0);
+    const sessionScope = channelKey ? channelScope : docScope ?? (effectiveOrigin === "wecom" ? createHash6("sha256").update(JSON.stringify(["wecom-task", taskId])).digest("hex") : void 0);
     if (this.busy(memberId)) throw new Error("\u8BE5\u6210\u5458\u6B63\u5728\u5904\u7406\u5176\u4ED6\u8BF7\u6C42\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
     let previousSession = sessionScope ? this.options.directory.getChannelSession(memberId, sessionScope) : profile.sessionId;
+    let spawnMode = false;
+    let spawnClaimedOnce = false;
     let ready;
     const lease = { controller: new AbortController(), ready: new Promise((resolve) => {
       ready = resolve;
@@ -5295,7 +5395,7 @@ var MemberRuntime = class {
     this.changed();
     const runSignal = AbortSignal.any([signal, lease.controller.signal]);
     const message = createUserMessage({ content: prompt2, source: { kind: "user" } });
-    let sessionId = SessionId(previousSession ?? `${sessionScope ? "member-channel" : "member"}-${randomUUID6()}`);
+    let sessionId = SessionId(previousSession ?? `${sessionScope ? "member-channel" : "member"}-${randomUUID7()}`);
     if (previousSession !== null && !sessionScope) {
       try {
         const expectedCwd = this.options.cwd?.();
@@ -5304,7 +5404,7 @@ var MemberRuntime = class {
           if (oldCwd !== null && !sameDirectory(oldCwd, expectedCwd)) {
             this.options.directory.setSession(memberId, null);
             previousSession = null;
-            sessionId = SessionId(`member-${randomUUID6()}`);
+            sessionId = SessionId(`member-${randomUUID7()}`);
             this.log(`\u6210\u5458\u65E7\u4F1A\u8BDD\u5DE5\u4F5C\u76EE\u5F55\uFF08${oldCwd}\uFF09\u4E0E\u603B\u52A9\u7406\u5F53\u524D\u76EE\u5F55\uFF08${expectedCwd}\uFF09\u4E0D\u4E00\u81F4\uFF0C\u5DF2\u6E05\u9664\u7ED1\u5B9A\u5E76\u91CD\u5EFA\u4F1A\u8BDD`);
           }
         }
@@ -5377,7 +5477,7 @@ var MemberRuntime = class {
       if (!ctx.tools?.restrict || !ctx.tools?.guard || !ctx.systemPrompt?.section || !ctx.systemPrompt?.variable) {
         throw new Error("\u5BBF\u4E3B\u7F3A\u5C11\u6210\u5458\u9694\u79BB\u95E8\u7981\u6216\u7CFB\u7EDF\u63D0\u793A\u8BCD\u63A5\u53E3");
       }
-      if (agent.inbox.nextTurn.length || agent.inbox.nextStep.length) throw new Error("\u6210\u5458\u65E7\u4F1A\u8BDD\u6709\u672A\u7ED3\u8F93\u5165\uFF0C\u4E0D\u53EF\u81EA\u52A8\u6062\u590D\u6267\u884C\uFF0C\u8BF7\u4EBA\u5DE5\u6838\u67E5");
+      if (!spawnMode && (agent.inbox.nextTurn.length || agent.inbox.nextStep.length)) throw new Error("\u6210\u5458\u65E7\u4F1A\u8BDD\u6709\u672A\u7ED3\u8F93\u5165\uFF0C\u4E0D\u53EF\u81EA\u52A8\u6062\u590D\u6267\u884C\uFF0C\u8BF7\u4EBA\u5DE5\u6838\u67E5");
       const owns = (subject) => subject === agent && subject.ctx === ctx;
       const allowed = new Set(profile.allowedTools.filter((name2) => READ_ONLY_ALLOW_TOOLS.includes(name2) && !CHILD_LOCAL_TOOLS.includes(name2)));
       const sideEffect = /* @__PURE__ */ new Set();
@@ -5386,6 +5486,7 @@ var MemberRuntime = class {
         for (const name2 of SIDE_EFFECT_ALLOW_TOOLS) if (ctx.tools.get(name2, agent)) sideEffect.add(name2);
       }
       for (const capability of profile.capabilities) for (const name2 of CAPABILITY_TOOLS[capability]) allowed.add(name2);
+      if (this.options.memberSchedule) allowed.add("companion_member_schedule");
       const meetingAllowed = profile.capabilities.includes("meeting") && effectiveOrigin === "desktop" && !!this.options.desktop;
       const documentAllowed = profile.capabilities.includes("document") && effectiveOrigin === "desktop" && !!this.options.desktop;
       if (documentAllowed) {
@@ -5545,6 +5646,113 @@ ${skillsText}
         }));
         allowed.add("companion_web_fetch");
       }
+      if (profile.capabilities.includes("platform") && this.options.platform) {
+        const pcfg = () => this.options.platform.config();
+        const live = (exec) => {
+          if (!owns(exec.agent) || !admitted || ended !== void 0 || runSignal.aborted || exec.signal.aborted) throw new Error("\u6210\u5458\u8BF7\u6C42\u5DF2\u505C\u6B62");
+          return exec.signal;
+        };
+        const fileFrom = (p) => {
+          const fp = String(p ?? "");
+          const buf = readFileSync3(fp);
+          const ext = path5.extname(fp).replace(/^\./, "") || "txt";
+          return { base64: buf.toString("base64"), file_ext: ext, file_name: path5.basename(fp) };
+        };
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_chat",
+          description: "\u5411\u5916\u90E8\u667A\u80FD\u52A9\u7406\u5E73\u53F0\u63D0\u95EE/\u67E5\u8BE2\uFF08\u5B9E\u65F6\u804A\u5929\uFF09\u3002\u8FD4\u56DE\u5E73\u53F0\u5E94\u7B54\u3002",
+          parameters: { question: { type: "string", required: true }, chatId: { type: "string" }, assistId: { type: "string" } },
+          output: toolOutput,
+          execute: async (a, exec) => JSON.stringify(await platformChat(pcfg(), String(a.question ?? ""), { chatId: a.chatId ? String(a.chatId) : void 0, assistId: a.assistId ? String(a.assistId) : void 0 }, live(exec)))
+        }));
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_list_assistants",
+          description: "\u5217\u51FA\u5916\u90E8\u5E73\u53F0\u53EF\u7528\u667A\u80FD\u4F53\u3002",
+          parameters: {},
+          output: toolOutput,
+          execute: async (_a, exec) => JSON.stringify(await platformListAssistants(pcfg(), live(exec)))
+        }));
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_chat_list",
+          description: "\u5206\u9875\u67E5\u8BE2\u5916\u90E8\u5E73\u53F0\u804A\u5929\u8BB0\u5F55\uFF0C\u53EF\u6309\u5173\u952E\u8BCD\u641C\u7D22\u3002",
+          parameters: { keyword: { type: "string" }, chatId: { type: "string" } },
+          output: toolOutput,
+          execute: async (a, exec) => JSON.stringify(await platformChatList(pcfg(), { keyword: a.keyword ? String(a.keyword) : void 0, chatId: a.chatId ? String(a.chatId) : void 0 }, live(exec)))
+        }));
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_upload_knowledge",
+          description: "\u628A\u672C\u5730\u6587\u4EF6\u4E0A\u4F20\u5230\u5916\u90E8\u5E73\u53F0\u77E5\u8BC6\u5E93\uFF08\u6307\u5B9A\u667A\u80FD\u4F53\uFF09\u3002",
+          parameters: { path: { type: "string", required: true, description: "\u672C\u5730\u6587\u4EF6\u7EDD\u5BF9\u8DEF\u5F84" }, assistId: { type: "string" } },
+          output: toolOutput,
+          execute: async (a, exec) => {
+            try {
+              return JSON.stringify(await platformUploadKnowledge(pcfg(), [fileFrom(a.path)], a.assistId ? String(a.assistId) : void 0, live(exec)));
+            } catch (e) {
+              return JSON.stringify({ ok: false, error: String(e instanceof Error ? e.message : e) });
+            }
+          }
+        }));
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_upload_file",
+          description: "\u4E0A\u4F20\u672C\u5730\u6587\u4EF6\u5230\u5916\u90E8\u5E73\u53F0\uFF0C\u8FD4\u56DE fileCode \u4F9B\u804A\u5929\u5F15\u7528\u3002",
+          parameters: { path: { type: "string", required: true } },
+          output: toolOutput,
+          execute: async (a, exec) => {
+            try {
+              return JSON.stringify(await platformUploadFile(pcfg(), [fileFrom(a.path)], live(exec)));
+            } catch (e) {
+              return JSON.stringify({ ok: false, error: String(e instanceof Error ? e.message : e) });
+            }
+          }
+        }));
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_update_memory",
+          description: "\u66F4\u65B0\u5916\u90E8\u5E73\u53F0\u957F\u671F\u8BB0\u5FC6\uFF08\u7528\u6237\u4FE1\u606F/\u504F\u597D\uFF0CJSON \u5B57\u7B26\u4E32\uFF09\u3002",
+          parameters: { data: { type: "string", required: true } },
+          output: toolOutput,
+          execute: async (a, exec) => JSON.stringify(await platformUpdateMemory(pcfg(), String(a.data ?? ""), live(exec)))
+        }));
+        ctx.tools.register(defineTool2({
+          name: "companion_platform_call",
+          description: "\u901A\u7528\u8C03\u7528\u5916\u90E8\u5E73\u53F0\u4EFB\u610F service\uFF08\u9AD8\u7EA7\uFF09\u3002data \u4E3A\u5BF9\u8C61\u3002",
+          parameters: { service: { type: "string", required: true }, data: { type: "object", additionalProperties: true } },
+          output: toolOutput,
+          execute: async (a, exec) => JSON.stringify(await callPlatform(pcfg(), String(a.service ?? ""), a.data ?? {}, live(exec)))
+        }));
+      }
+      if (this.options.memberSchedule) {
+        const ms = this.options.memberSchedule;
+        ctx.tools.register(defineTool2({
+          name: "companion_member_schedule",
+          description: "\u7BA1\u7406\u4F60\u81EA\u5DF1\u7684\u5B9A\u65F6\u4EFB\u52A1\u3002action=list \u5217\u51FA\u4F60\u7684\u5B9A\u65F6\u5B89\u6392\uFF1Baction=update \u6539\u67D0\u4E2A\u4EFB\u52A1\u7684\u67E5\u8BE2\u5185\u5BB9(prompt)/\u6BCF\u65E5\u65F6\u523B(localTime)/\u9891\u7387(repeatKind=daily|interval|once)/\u95F4\u9694\u79D2(everySeconds)/\u6E20\u9053(channel)\u3002\u7528\u6237\u5728\u4F60\u8FD9\u8FB9\uFF08\u542B\u4F01\u4E1A\u5FAE\u4FE1\uFF09\u8981\u6C42\u8C03\u6574\u5B9A\u65F6\u67E5\u8BE2\u65F6\u7528\u5B83\u3002",
+          parameters: {
+            action: { type: "string", required: true, enum: ["list", "update"] },
+            scheduleId: { type: "string" },
+            prompt: { type: "string" },
+            localTime: { type: "string" },
+            repeatKind: { type: "string" },
+            everySeconds: { type: "number" },
+            channel: { type: "string" }
+          },
+          output: toolOutput,
+          execute: async (a, exec) => {
+            if (!owns(exec.agent) || !admitted || ended !== void 0 || runSignal.aborted || exec.signal.aborted) throw new Error("\u6210\u5458\u8BF7\u6C42\u5DF2\u505C\u6B62");
+            if (a.action === "list") return JSON.stringify({ ok: true, schedules: ms.list(memberId) });
+            if (a.action === "update") {
+              const id = String(a.scheduleId ?? "");
+              if (!id) return JSON.stringify({ ok: false, message: "update \u9700\u8981 scheduleId\uFF08\u5148 list \u67E5\u770B\uFF09" });
+              return JSON.stringify(ms.update(memberId, id, {
+                ...a.prompt !== void 0 ? { prompt: String(a.prompt) } : {},
+                ...a.localTime !== void 0 ? { localTime: String(a.localTime) } : {},
+                ...a.repeatKind !== void 0 ? { repeatKind: String(a.repeatKind) } : {},
+                ...a.everySeconds !== void 0 ? { everySeconds: Number(a.everySeconds) } : {},
+                ...a.channel !== void 0 ? { channel: String(a.channel) } : {}
+              }));
+            }
+            return JSON.stringify({ ok: false, message: "action \u5FC5\u987B\u662F list \u6216 update" });
+          }
+        }));
+      }
       const desktop = this.options.desktop;
       if (allowed.has(DOCUMENT_PRESENTATION_TOOL) && desktop && desktopBinding) {
         registerMeetingPresentationTools(ctx, {
@@ -5696,6 +5904,13 @@ ${skillsText}
       }));
       ctx.on("agent/inbox/claimed", ({ agent: subject, message: claimed, turn: number2 }) => {
         if (!owns(subject)) return;
+        if (spawnMode) {
+          if (!spawnClaimedOnce && admitted) {
+            spawnClaimedOnce = true;
+            turn = number2;
+          } else if (spawnClaimedOnce) rememberError(new Error("\u6210\u5458\u8BF7\u6C42\u6DF7\u5165\u5176\u4ED6\u6765\u6E90\u8F93\u5165\uFF0C\u5DF2\u505C\u6B62"));
+          return;
+        }
         if (claimed.id === message.id && admitted) turn = number2;
         else rememberError(new Error("\u6210\u5458\u8BF7\u6C42\u6DF7\u5165\u5176\u4ED6\u6765\u6E90\u8F93\u5165\uFF0C\u5DF2\u505C\u6B62"));
       });
@@ -5703,7 +5918,7 @@ ${skillsText}
         if (!owns(subject)) return next();
         try {
           check();
-          if (messages.some((item) => item.id !== message.id)) throw new Error("\u6210\u5458\u8BF7\u6C42\u4E0D\u80FD\u6DF7\u5165\u5176\u4ED6\u6765\u6E90\u8F93\u5165");
+          if (!spawnMode && messages.some((item) => item.id !== message.id)) throw new Error("\u6210\u5458\u8BF7\u6C42\u4E0D\u80FD\u6DF7\u5165\u5176\u4ED6\u6765\u6E90\u8F93\u5165");
           if (pending || preparing) throw new Error("\u6210\u5458\u6A21\u578B\u8BF7\u6C42\u7528\u91CF\u5C1A\u672A\u7ED3\u7B97\uFF0C\u7981\u6B62\u7EE7\u7EED\u8BF7\u6C42");
           return await next();
         } catch (cause) {
@@ -5721,7 +5936,7 @@ ${skillsText}
             const config = await next();
             const selected = check();
             requestSignal.throwIfAborted();
-            const requestId = randomUUID6();
+            const requestId = randomUUID7();
             const reservation = this.options.directory.beginUsage(memberId, requestId);
             pending = { requestId, turn: number2, settled: false, index: -1 };
             this.changed();
@@ -5816,7 +6031,43 @@ ${skillsText}
         throw last instanceof Error ? last : new Error(String(last));
       };
       const createFresh = () => agents.create({ sessionId, signal: runSignal, agentOptions, setup, ...meta === void 0 ? {} : { meta } });
-      if (!previousSession) {
+      const subagents = this.options.subagents?.() ?? (() => {
+        try {
+          return this.options.ctx.get?.("subagents");
+        } catch {
+          return void 0;
+        }
+      })();
+      if (parentAgent && subagents && !sessionScope) {
+        spawnMode = true;
+        admitted = true;
+        const onStart = (info) => {
+          if (String(info?.id) !== String(sessionId)) return;
+          const child = agents.get(SessionId(String(info.id)));
+          if (child) setup(child.ctx, child);
+        };
+        const offStart = this.options.ctx.on("subagent/start", onStart);
+        try {
+          const activation = await subagents.startActivation({
+            provider: "spawn",
+            label: String(sessionId),
+            signal: runSignal,
+            delivery: "caller",
+            childId: sessionId,
+            request: { prompt: prompt2, parent: parentAgent, agentOptions }
+          });
+          const child = agents.get(SessionId(activation.childId));
+          if (!child) throw new Error("spawn \u672A\u8FD4\u56DE\u6210\u5458\u5B50\u4F1A\u8BDD");
+          handle = { agent: child, dispose: () => activation.dispose() };
+        } catch (cause) {
+          spawnMode = false;
+          admitted = false;
+          this.log(`\u6210\u5458 spawn \u6CBF\u7528\u5BBF\u4E3B\u5DE5\u5177\u5931\u8D25\uFF0C\u56DE\u9000\u63D2\u4EF6\u4F1A\u8BDD\uFF1A${cause instanceof Error ? cause.message : String(cause)}`);
+          handle = previousSession ? await resumeAgent() : await createFresh();
+        } finally {
+          offStart?.();
+        }
+      } else if (!previousSession) {
         handle = await createFresh();
       } else {
         try {
@@ -5825,7 +6076,7 @@ ${skillsText}
           if (sessionScope !== void 0 && ownedByWriter(cause)) {
             this.log(`\u6210\u5458 scoped \u4F1A\u8BDD\u5199\u53E5\u67C4\u88AB\u5360\u7528\uFF0C\u5DF2\u4E22\u5F03\u65E7\u7ED1\u5B9A\u5E76\u65B0\u5EFA\uFF1A${cause instanceof Error ? cause.message : String(cause)}`);
             this.options.directory.clearChannelSession(memberId, sessionScope);
-            sessionId = SessionId(`member-channel-${randomUUID6()}`);
+            sessionId = SessionId(`member-channel-${randomUUID7()}`);
             handle = await createFresh();
           } else {
             throw new Error(`\u6210\u5458\u6301\u4E45\u4F1A\u8BDD\u4E0D\u53EF\u7528\uFF0C\u672A\u521B\u5EFA\u66FF\u4EE3\u4F1A\u8BDD\uFF1A${cause instanceof Error ? cause.message : String(cause)}`);
@@ -5844,7 +6095,7 @@ ${skillsText}
       admitted = true;
       runSignal.addEventListener("abort", abort, { once: true });
       runSignal.throwIfAborted();
-      owner.followup(message);
+      if (!spawnMode) owner.followup(message);
       const result = owner.whenIdle().then(() => {
         settleUnknown();
         const streamed = replyEvents.map((event) => event.data.chunk.text).join("");
@@ -5878,7 +6129,7 @@ ${skillsText}
 };
 
 // src/session-mirror.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
+import { randomUUID as randomUUID8 } from "node:crypto";
 import { createUserMessage as createUserMessage2 } from "@deepseek-ai/dsh-llm";
 var record = (value) => value !== null && typeof value === "object" ? value : {};
 var list = (value) => Array.isArray(value) ? value : [];
@@ -6006,7 +6257,7 @@ var MODEL_CACHE_MS = 5e3;
 var PAGE_MESSAGES = 50;
 var stale = () => ({ ok: false, error: "\u4F1A\u8BDD\u7ED1\u5B9A\u5DF2\u53D8\u5316\uFF0C\u65E7\u8BF7\u6C42\u7ED3\u679C\u5DF2\u4E22\u5F03\uFF1B\u4E0D\u4F1A\u81EA\u52A8\u91CD\u53D1" });
 var SessionMirror = class {
-  bindingId = randomUUID7();
+  bindingId = randomUUID8();
   projection = new SessionProjection();
   active = true;
   cursor = 0;
@@ -6383,8 +6634,8 @@ var CompanionError = class extends Error {
 };
 
 // src/desktop-commands.ts
-import { createHash as createHash6, randomUUID as randomUUID8 } from "node:crypto";
-var scopeDigest = (command, payload, expiresAt) => createHash6("sha256").update(JSON.stringify({ command, payload, expiresAt })).digest("hex");
+import { createHash as createHash7, randomUUID as randomUUID9 } from "node:crypto";
+var scopeDigest = (command, payload, expiresAt) => createHash7("sha256").update(JSON.stringify({ command, payload, expiresAt })).digest("hex");
 var DesktopCommands = class {
   push;
   pending = /* @__PURE__ */ new Map();
@@ -6396,7 +6647,7 @@ var DesktopCommands = class {
     if (this.disposed) return Promise.reject(new Error("\u684C\u9762\u547D\u4EE4\u901A\u9053\u5DF2\u505C\u6B62"));
     if (!command.trim()) return Promise.reject(new Error("\u684C\u9762\u547D\u4EE4\u4E0D\u80FD\u4E3A\u7A7A"));
     const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 3e4, 1e3), 15 * 6e4);
-    const id = randomUUID8();
+    const id = randomUUID9();
     const expiresAt = Date.now() + timeoutMs;
     let scope;
     try {
@@ -6680,8 +6931,8 @@ var SessionBridge = class {
   team = null;
   companion = null;
   chatContextProvider = null;
-  companionOwnerToken = randomUUID9();
-  companionExecutorToken = randomUUID9();
+  companionOwnerToken = randomUUID10();
+  companionExecutorToken = randomUUID10();
   companionRequests = /* @__PURE__ */ new Set();
   /** 解析好的桌面宠物目录；null = 没找到（召唤只绑会话，提示用户手动启动）。 */
   get petDir() {
@@ -6718,7 +6969,7 @@ var SessionBridge = class {
   /** 主会话请求的取消回执：同一请求重复取消返回同一份回执，不再动队列。有上限。 */
   cancelReceipts = /* @__PURE__ */ new Map();
   closed = false;
-  epoch = randomUUID9();
+  epoch = randomUUID10();
   mirror = new SessionMirror(null, (payload) => this.push({ type: "session/update", payload }));
   /** 监听中的启动任务；失败会清空以便召唤时重试。 */
   listening = null;
@@ -6732,9 +6983,9 @@ var SessionBridge = class {
   disposal = Promise.resolve();
   constructor(options) {
     this.options = options;
-    const dir = path5.join(options.dshHome, "personal-assistant");
-    this.infoPath = path5.join(dir, "bridge.json");
-    this.approvalPath = path5.join(dir, "bridge-approval.json");
+    const dir = path6.join(options.dshHome, "personal-assistant");
+    this.infoPath = path6.join(dir, "bridge.json");
+    this.approvalPath = path6.join(dir, "bridge-approval.json");
     this.desktopCommands = new DesktopCommands((event) => this.push(event));
   }
   /** 宿主工具驱动桌宠的一次性命令；结果由 /companion/v1/desktop/result 带回。 */
@@ -6752,6 +7003,10 @@ var SessionBridge = class {
   currentDesktopBinding() {
     return this.desktopBinding(this.agent);
   }
+  /** 当前绑定的主会话 agent（总助理）。供成员 spawn 继承宿主工具时作 parent；未绑定为 null。 */
+  sessionAgent() {
+    return this.closed ? null : this.agent;
+  }
   get teamEnabled() {
     return this.team !== null;
   }
@@ -6763,7 +7018,7 @@ var SessionBridge = class {
   isCurrentDiscovery() {
     if (this.closed || !this.advertised || !this.server) return false;
     try {
-      const current = JSON.parse(readFileSync2(this.infoPath, "utf8"));
+      const current = JSON.parse(readFileSync4(this.infoPath, "utf8"));
       return current.epoch === this.epoch && current.port === this.port && current.pid === process.pid;
     } catch {
       return false;
@@ -6861,7 +7116,7 @@ var SessionBridge = class {
       }
     }
     if (handle === null) {
-      const sessionId2 = `pet-${randomUUID9()}`;
+      const sessionId2 = `pet-${randomUUID10()}`;
       try {
         handle = await agents.create({ sessionId: sessionId2, meta: { cwd: host.cwd() } });
       } catch (error) {
@@ -7066,7 +7321,7 @@ var SessionBridge = class {
   /** 子助理自行汇报（§4.6 ★①）：载荷自带身份四件套与结果文本，桌宠无需回查。 */
   notifySubAssistantReport(report) {
     const { assistantId, displayName, skinId, voiceProfile, text: text7, runId, reportMode } = report;
-    this.push({ type: "subassistant-report", assistantId, displayName, skinId, voiceProfile, text: text7.slice(0, 8e3), runId: String(runId), reportMode });
+    this.push({ type: "subassistant-report", assistantId, displayName, skinId, voiceProfile, text: text7.slice(0, 8e3), runId: String(runId), reportMode, at: Date.now() });
   }
   teamSnapshot() {
     return {
@@ -7166,16 +7421,16 @@ var SessionBridge = class {
   launchPet() {
     const petDir = this.options.petDir;
     if (!petDir) return false;
-    if (!existsSync(path5.join(petDir, "node_modules", "electron"))) {
+    if (!existsSync(path6.join(petDir, "node_modules", "electron"))) {
       this.options.logger?.info(`launch pet skipped: ${petDir} \u8FD8\u6CA1\u5B89\u88C5\u4F9D\u8D56\uFF0C\u8BF7\u5148\u5728\u8BE5\u76EE\u5F55\u8FD0\u884C pnpm install`);
       return false;
     }
     const env = { ...process.env };
     delete env.ELECTRON_RUN_AS_NODE;
-    const logPath = path5.join(this.options.dshHome, "dsh-pet", "launch.log");
+    const logPath = path6.join(this.options.dshHome, "dsh-pet", "launch.log");
     const appendLog = (text7) => {
       try {
-        mkdirSync3(path5.dirname(logPath), { recursive: true });
+        mkdirSync4(path6.dirname(logPath), { recursive: true });
         appendFileSync(logPath, text7);
       } catch {
       }
@@ -7662,7 +7917,7 @@ var SessionBridge = class {
   /** 文件内容仍是本实例（同一 epoch）写的才删；读不懂的文件宁可留着。 */
   removeIfOwn(file) {
     try {
-      const written = JSON.parse(readFileSync2(file, "utf8"));
+      const written = JSON.parse(readFileSync4(file, "utf8"));
       if (written.epoch !== this.epoch) return;
       rmSync(file, { force: true });
     } catch {
@@ -7679,7 +7934,7 @@ var SessionBridge = class {
     return this.listening;
   }
   async openServer() {
-    const token = randomUUID9();
+    const token = randomUUID10();
     const server = http.createServer((request, response) => {
       void this.handle(request, response);
     });
@@ -7709,8 +7964,8 @@ var SessionBridge = class {
   /** 写发现文件与审批凭据：宠物与桌面壳据此找到本运行时。内容不变时重写也无副作用。 */
   advertise() {
     if (this.closed || !this.server) return;
-    mkdirSync3(path5.dirname(this.infoPath), { recursive: true });
-    writeFileSync(
+    mkdirSync4(path6.dirname(this.infoPath), { recursive: true });
+    writeFileSync2(
       this.infoPath,
       `${JSON.stringify({
         port: this.port,
@@ -7732,7 +7987,7 @@ var SessionBridge = class {
   async healthyIncumbent() {
     let info;
     try {
-      info = JSON.parse(readFileSync2(this.infoPath, "utf8"));
+      info = JSON.parse(readFileSync4(this.infoPath, "utf8"));
     } catch {
       return null;
     }
@@ -7751,8 +8006,8 @@ var SessionBridge = class {
   }
   /** 凭据不经 IPC 或模型工具暴露；本地文件不是沙箱，不能防任意本地文件读取者。 */
   writeApprovalCredential(approvals = this.approvals) {
-    mkdirSync3(path5.dirname(this.approvalPath), { recursive: true });
-    writeFileSync(
+    mkdirSync4(path6.dirname(this.approvalPath), { recursive: true });
+    writeFileSync2(
       this.approvalPath,
       `${JSON.stringify({
         approvalToken: approvals?.approvalCapabilityToken,
@@ -7994,7 +8249,7 @@ var SessionBridge = class {
           this.respond(response, 409, { error: "stale epoch", epoch: this.epoch });
           return;
         }
-        const requestId = typeof body.requestId === "string" && body.requestId ? body.requestId : typeof body.id === "string" && body.id ? body.id : randomUUID9();
+        const requestId = typeof body.requestId === "string" && body.requestId ? body.requestId : typeof body.id === "string" && body.id ? body.id : randomUUID10();
         const text7 = typeof body.text === "string" ? body.text.trim() : "";
         if (!text7) {
           this.respond(response, 400, { error: "empty text" });
@@ -8033,7 +8288,7 @@ var SessionBridge = class {
       }
       return;
     }
-    if (request.method === "POST" && (url.pathname === "/chat/cancel" || url.pathname === "/team/cancel" || url.pathname === "/team/pause")) {
+    if (request.method === "POST" && (url.pathname === "/chat/cancel" || url.pathname === "/team/cancel" || url.pathname === "/team/pause" || url.pathname === "/team/confirm")) {
       await this.handleCancelRoute(request, response, url.pathname);
       return;
     }
@@ -8115,6 +8370,21 @@ var SessionBridge = class {
         }
         const { status: status2, receipt: receipt2 } = await this.cancelTeamTask(taskId);
         this.respond(response, status2, { ok: status2 === 200, ...receipt2 });
+        return;
+      }
+      if (pathname === "/team/confirm") {
+        const taskId = text7(body.taskId) ?? text7(body.id);
+        if (!taskId) {
+          this.respond(response, 400, { ok: false, error: "\u5FC5\u987B\u6307\u5B9A taskId" });
+          return;
+        }
+        const team = this.team;
+        if (!team) {
+          this.respond(response, 503, { ok: false, error: "\u56E2\u961F\u6A21\u5F0F\u6CA1\u6709\u5F00\u542F" });
+          return;
+        }
+        const result = team.confirmTask(taskId);
+        this.respond(response, result.ok ? 200 : 409, result);
         return;
       }
       const requestId = text7(body.id) ?? text7(body.requestId);
@@ -8361,7 +8631,7 @@ ${text7}` : text7 }],
     if (this.owned !== null && this.owned.handle.agent === this.agent) return this.options.sessionHost?.cwd() ?? null;
     const session = this.agent.session;
     const cwd = session?.header?.cwd ?? session?.meta?.cwd;
-    return typeof cwd === "string" && path5.isAbsolute(cwd) ? cwd : null;
+    return typeof cwd === "string" && path6.isAbsolute(cwd) ? cwd : null;
   }
   /**
    * 推一条主动提醒气泡。文案来自 proactive.ts 的固定常量，不是模型生成的 ——
@@ -8577,12 +8847,12 @@ var personalAssistantDomainSpec = defineDomain({
 });
 
 // src/legacy.ts
-import { readFileSync as readFileSync4 } from "node:fs";
+import { readFileSync as readFileSync6 } from "node:fs";
 
 // src/sampler.ts
 import { spawn as spawn2, spawnSync } from "node:child_process";
-import { closeSync, fstatSync, openSync, readSync, readdirSync, readFileSync as readFileSync3, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
-import path6 from "node:path";
+import { closeSync, fstatSync, openSync, readSync, readdirSync, readFileSync as readFileSync5, unlinkSync, writeFileSync as writeFileSync3 } from "node:fs";
+import path7 from "node:path";
 var SAMPLER_SCRIPTS = {
   win32: "sampler.ps1",
   darwin: "sampler-macos.js"
@@ -8623,7 +8893,7 @@ function describeTitleUnavailable(reason) {
   }
 }
 function pidFilePath(sampleDir) {
-  return path6.join(sampleDir, "sampler.pid");
+  return path7.join(sampleDir, "sampler.pid");
 }
 function launchSampler(scriptPath, sampleDir, intervalMs, options, platform = process.platform) {
   const launch = samplerCommand(platform, scriptPath);
@@ -8693,7 +8963,7 @@ function killSampler(pid) {
 function readSamples(filePath) {
   let content;
   try {
-    content = readFileSync3(filePath, "utf8");
+    content = readFileSync5(filePath, "utf8");
   } catch {
     return [];
   }
@@ -8713,7 +8983,7 @@ var SAMPLE_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
 function pruneSampleRange(filePath, startMs, endMs) {
   let content;
   try {
-    content = readFileSync3(filePath, "utf8");
+    content = readFileSync5(filePath, "utf8");
   } catch {
     return 0;
   }
@@ -8733,7 +9003,7 @@ function pruneSampleRange(filePath, startMs, endMs) {
     else kept.push(trimmed);
   }
   if (removed === 0) return 0;
-  writeFileSync2(filePath, kept.length > 0 ? kept.join("\n") + "\n" : "", "utf8");
+  writeFileSync3(filePath, kept.length > 0 ? kept.join("\n") + "\n" : "", "utf8");
   return removed;
 }
 var TAIL_BYTES = 8192;
@@ -8767,7 +9037,7 @@ function readLastSample(filePath) {
   }
 }
 function sampleFileOf(sampleDir, date) {
-  return path6.join(sampleDir, `${date}.jsonl`);
+  return path7.join(sampleDir, `${date}.jsonl`);
 }
 function listSampleDates(sampleDir) {
   let names;
@@ -8819,7 +9089,7 @@ function createLegacySource(deps) {
     },
     readReportFile(filePath) {
       try {
-        return readFileSync4(filePath, "utf8");
+        return readFileSync6(filePath, "utf8");
       } catch {
         return null;
       }
@@ -8866,22 +9136,22 @@ async function purgeLegacyData(tables) {
 
 // src/help-context.ts
 import { execFile } from "node:child_process";
-import { randomUUID as randomUUID10 } from "node:crypto";
+import { randomUUID as randomUUID11 } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { realpathSync as realpathSync2, statSync as statSync2 } from "node:fs";
-import path7 from "node:path";
+import path8 from "node:path";
 import { defineTool as defineTool3 } from "@deepseek-ai/dsh-tools";
 var MAX_LINES = 40;
 var MAX_ENTRIES = 50;
 var GIT_TIMEOUT_MS = 5e3;
 function normalizeHelpScope(projectDir, currentFile) {
-  if (!path7.isAbsolute(projectDir) || currentFile !== null && !path7.isAbsolute(currentFile)) throw new Error("\u5E2E\u52A9\u8303\u56F4\u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84");
+  if (!path8.isAbsolute(projectDir) || currentFile !== null && !path8.isAbsolute(currentFile)) throw new Error("\u5E2E\u52A9\u8303\u56F4\u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84");
   const dir = realpathSync2(projectDir);
   if (!statSync2(dir).isDirectory()) throw new Error("\u9879\u76EE\u8303\u56F4\u5FC5\u987B\u662F\u76EE\u5F55");
   const file = currentFile === null ? null : realpathSync2(currentFile);
   if (file !== null) {
-    const relative = path7.relative(dir, file);
-    if (!relative || relative === ".." || relative.startsWith(".." + path7.sep) || path7.isAbsolute(relative) || !statSync2(file).isFile()) throw new Error("\u5F53\u524D\u6587\u4EF6\u5B9E\u9645\u8DEF\u5F84\u4E0D\u5728\u6388\u6743\u76EE\u5F55\u5185");
+    const relative = path8.relative(dir, file);
+    if (!relative || relative === ".." || relative.startsWith(".." + path8.sep) || path8.isAbsolute(relative) || !statSync2(file).isFile()) throw new Error("\u5F53\u524D\u6587\u4EF6\u5B9E\u9645\u8DEF\u5F84\u4E0D\u5728\u6388\u6743\u76EE\u5F55\u5185");
   }
   return { projectDir: dir, currentFile: file };
 }
@@ -8926,7 +9196,7 @@ var HelpContextStore = class {
   }
   /** 先匹配已批准路径，再检查实际路径，链接改指后拒绝读取。 */
   authorizedScope(projectDir) {
-    const wanted = path7.resolve(projectDir);
+    const wanted = path8.resolve(projectDir);
     for (const item of this.list()) {
       if (item.projectDir !== wanted) continue;
       try {
@@ -8970,15 +9240,15 @@ async function readProjectEvidence(projectDir, currentFile = null) {
     changedFiles: [],
     diffStat: [],
     recentCommits: [],
-    entries: [path7.relative(dir, scope.currentFile)],
+    entries: [path8.relative(dir, scope.currentFile)],
     truncated: false
   };
   const root = await git(["rev-parse", "--show-toplevel"], dir);
   let isGit = false;
   try {
     const metadata = await git(["rev-parse", "--absolute-git-dir"], dir);
-    const relative = path7.relative(dir, realpathSync2(metadata[0] ?? ""));
-    isGit = !!root[0] && realpathSync2(root[0]) === dir && !!relative && relative !== ".." && !relative.startsWith(".." + path7.sep) && !path7.isAbsolute(relative);
+    const relative = path8.relative(dir, realpathSync2(metadata[0] ?? ""));
+    isGit = !!root[0] && realpathSync2(root[0]) === dir && !!relative && relative !== ".." && !relative.startsWith(".." + path8.sep) && !path8.isAbsolute(relative);
   } catch {
   }
   const [branch, status, diffStat, log] = isGit ? await Promise.all([
@@ -9018,8 +9288,8 @@ function helpCandidates(facts) {
     out.push({ ...candidate, id: `c${out.length + 1}` });
   };
   const cwd = facts.sessionCwd;
-  if (typeof cwd === "string" && path7.isAbsolute(cwd)) {
-    push({ kind: "session-project", label: `\u5F53\u524D\u4F1A\u8BDD\u6240\u5728\u7684\u76EE\u5F55\uFF1A${cwd}`, projectDir: path7.resolve(cwd), currentFile: null, helpContextId: null, window: null });
+  if (typeof cwd === "string" && path8.isAbsolute(cwd)) {
+    push({ kind: "session-project", label: `\u5F53\u524D\u4F1A\u8BDD\u6240\u5728\u7684\u76EE\u5F55\uFF1A${cwd}`, projectDir: path8.resolve(cwd), currentFile: null, helpContextId: null, window: null });
   }
   for (const item of facts.authorized ?? []) {
     push({
@@ -9106,7 +9376,7 @@ var HelpEpisodeStore = class {
   offer(now, idlePeriodStart) {
     return inTransaction(this.db, () => {
       this.db.prepare(`UPDATE help_episodes SET state = 'expired', updated_at = ? WHERE state = 'offered'`).run(now);
-      const id = `episode-${randomUUID10()}`;
+      const id = `episode-${randomUUID11()}`;
       this.db.prepare(`INSERT INTO help_episodes (id, origin, state, idle_period_start, candidates, created_at, updated_at)
                        VALUES (?, 'proactive', 'offered', ?, '[]', ?, ?)`).run(id, idlePeriodStart, now, now);
       return this.get(id);
@@ -9130,7 +9400,7 @@ var HelpEpisodeStore = class {
     const candidates = JSON.stringify(helpCandidates(facts()));
     const offered = this.pendingOffer(now);
     if (offered && this.update(offered.id, { state: "accepted", candidates }, now, ["offered"])) return this.get(offered.id);
-    const id = `episode-${randomUUID10()}`;
+    const id = `episode-${randomUUID11()}`;
     this.db.prepare(`INSERT INTO help_episodes (id, origin, state, idle_period_start, candidates, created_at, updated_at)
                      VALUES (?, 'proactive', 'accepted', NULL, ?, ?, ?)`).run(id, candidates, now, now);
     return this.get(id);
@@ -9213,7 +9483,7 @@ function registerHelpEpisodeTools(host, options) {
         if (!candidate) return json5({ pending: false, error: `\u6CA1\u6709\u5019\u9009 ${args.candidateId}` });
         const projectDir = candidate.projectDir ?? args.projectDir;
         if (!projectDir) return json5({ pending: false, error: "\u8FD9\u4E2A\u5019\u9009\u662F\u4E00\u4E2A\u7A97\u53E3\uFF0C\u8BF7\u8BA9\u7528\u6237\u8BF4\u51FA\u5BF9\u5E94\u7684\u9879\u76EE\u76EE\u5F55\uFF08\u7EDD\u5BF9\u8DEF\u5F84\uFF09\u540E\u518D\u63D0\u4EA4" });
-        if (candidate.projectDir && args.projectDir && path7.resolve(args.projectDir) !== path7.resolve(candidate.projectDir)) {
+        if (candidate.projectDir && args.projectDir && path8.resolve(args.projectDir) !== path8.resolve(candidate.projectDir)) {
           return json5({ pending: false, error: "\u7ED9\u51FA\u7684\u76EE\u5F55\u4E0E\u6240\u9009\u5019\u9009\u4E0D\u4E00\u81F4\uFF1B\u8BF7\u91CD\u65B0\u786E\u8BA4\u7528\u6237\u9009\u7684\u662F\u54EA\u4E00\u4E2A" });
         }
         let scope;
@@ -9234,7 +9504,7 @@ function registerHelpEpisodeTools(host, options) {
             snapshot,
             validate: () => snapshotDigest(scope) === snapshotDigest(normalizeHelpScope(projectDir, args.currentFile ?? candidate.currentFile)) && snapshotDigest(before) === snapshotDigest(options.helpContexts.list()) && ["accepted", "scope-pending"].includes(options.episodes.get(episode.id)?.state ?? ""),
             execute: () => {
-              const record3 = options.helpContexts.add(`help-${randomUUID10()}`, scope.projectDir, scope.currentFile, args.note ?? null, now(), episode.id);
+              const record3 = options.helpContexts.add(`help-${randomUUID11()}`, scope.projectDir, scope.currentFile, args.note ?? null, now(), episode.id);
               options.episodes.markScoped(episode.id, record3.id, now());
               return record3;
             }
@@ -9642,7 +9912,7 @@ function isNoteEvent(event, note) {
 
 // src/report.ts
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import path8 from "node:path";
+import path9 from "node:path";
 var REPORT_EVIDENCE_RULES = '\u65E5\u62A5\u6210\u679C\u53EA\u80FD\u6765\u81EA direct \u6216 user_confirmed \u4E8B\u9879\uFF1Binferred \u4E8B\u9879\u53EA\u80FD\u5199\u8FDB"\u5F85\u786E\u8BA4"\u90E8\u5206\u5E76\u9010\u6761\u6807\u6CE8"\uFF08\u5F85\u786E\u8BA4\uFF09"\uFF0C\u4E0D\u5F97\u5199\u6210\u5DF2\u5B8C\u6210\u6210\u679C\uFF1Bevidence_removed \u4E8B\u9879\u4E0D\u5F97\u5199\u5165\u65E5\u62A5\u4EFB\u4F55\u90E8\u5206\u3002';
 function partitionWorkItemsForReport(items) {
   const removed = items.filter((item) => item.status === "evidence_removed");
@@ -10231,7 +10501,7 @@ async function publishRevisionFile(targetPath, content, expectedDigest, revision
   }
   const tempPath = tempPathFor(targetPath, revision2);
   try {
-    await mkdir(path8.dirname(targetPath), { recursive: true });
+    await mkdir(path9.dirname(targetPath), { recursive: true });
     await writeFile(tempPath, content, "utf8");
   } catch (error) {
     return { ok: false, reason: "write_failed", message: describe(error) };
@@ -10792,7 +11062,7 @@ function rowToObservation(row) {
 }
 
 // src/pet-dir.ts
-import path9 from "node:path";
+import path10 from "node:path";
 function resolvePetDir(input) {
   const configured = input.configured?.trim();
   if (configured) {
@@ -10802,14 +11072,14 @@ function resolvePetDir(input) {
   if (fromEnv) {
     return input.exists(fromEnv) ? { dir: fromEnv, source: "env" } : { dir: null, source: "env", missing: fromEnv };
   }
-  const sibling = path9.resolve(input.pluginDir, "..", "dsh-pet");
+  const sibling = path10.resolve(input.pluginDir, "..", "dsh-pet");
   if (input.exists(sibling)) return { dir: sibling, source: "sibling" };
   return { dir: null, source: null };
 }
 
 // src/report-approval.ts
-import { randomUUID as randomUUID11, timingSafeEqual as timingSafeEqual4 } from "node:crypto";
-import path10 from "node:path";
+import { randomUUID as randomUUID12, timingSafeEqual as timingSafeEqual4 } from "node:crypto";
+import path11 from "node:path";
 function reportDecisions(db, reportId) {
   if (!tableExists(db, "report_approvals")) return [];
   const rows = db.prepare("SELECT * FROM report_approvals WHERE report_id = ? ORDER BY revision, expires_at").all(reportId);
@@ -10834,7 +11104,7 @@ var ReportApprovalService = class {
   db;
   reports;
   options;
-  token = randomUUID11();
+  token = randomUUID12();
   constructor(db, reports, options) {
     this.db = db;
     this.reports = reports;
@@ -10867,9 +11137,9 @@ var ReportApprovalService = class {
   }
   targetFor(reportId) {
     const daily = /^daily:(\d{4}-\d{2}-\d{2})$/.exec(reportId)?.[1];
-    if (daily) return path10.resolve(this.options.reportDir, `${daily}.md`);
+    if (daily) return path11.resolve(this.options.reportDir, `${daily}.md`);
     const weekly = /^weekly:(\d{4}-\d{2}-\d{2})$/.exec(reportId)?.[1];
-    if (weekly) return path10.resolve(this.options.reportDir, `${weekly}-\u5468\u62A5.md`);
+    if (weekly) return path11.resolve(this.options.reportDir, `${weekly}-\u5468\u62A5.md`);
     throw new Error("\u53EA\u63A5\u53D7\u65E5\u671F\u660E\u786E\u7684\u65E5\u62A5\u6216\u5468\u62A5\uFF0C\u4E0D\u63A5\u53D7\u6A21\u578B\u6307\u5B9A\u53D1\u5E03\u8DEF\u5F84");
   }
   submit(reportId) {
@@ -10881,7 +11151,7 @@ var ReportApprovalService = class {
       if (record3.state === "draft") this.reports.submitForConfirmation(reportId, record3.revision);
       else if (record3.state !== "pending_confirmation") throw new Error(`\u65E5\u62A5\u72B6\u6001 ${record3.state} \u4E0D\u80FD\u63D0\u4EA4\uFF0C\u8BF7\u5148\u8BFB\u53D6\u8349\u7A3F\uFF1B\u53D1\u5E03\u7ED3\u679C\u4E0D\u660E\u65F6\u4E0D\u5F97\u91CD\u53D1`);
       const target = this.targetFor(reportId);
-      const proposalId = `report-${randomUUID11()}`;
+      const proposalId = `report-${randomUUID12()}`;
       const expiresAt = this.now() + this.options.ttlMs;
       this.db.prepare("UPDATE report_approvals SET state = 'superseded' WHERE report_id = ? AND state = 'pending'").run(reportId);
       this.db.prepare("UPDATE reports SET target_path = ? WHERE report_id = ? AND revision = ?").run(target, reportId, record3.revision);
@@ -10983,7 +11253,7 @@ var ReportApprovalService = class {
         now
       );
       if (!signed.ok) throw new Error(`\u65E5\u62A5\u5F53\u524D\u72B6\u6001\u4E0D\u5141\u8BB8\u53D1\u5E03\uFF1A${signed.rejection}`);
-      const operationId = `auto-publish-${reportId}-r${prepared.revision}-${randomUUID11()}`;
+      const operationId = `auto-publish-${reportId}-r${prepared.revision}-${randomUUID12()}`;
       if (!this.reports.beginPublish(operationId, signed.record, now)) throw new Error("\u65E5\u62A5\u53D1\u5E03\u767B\u8BB0\u5931\u8D25\uFF0C\u672A\u5199\u6587\u4EF6");
       return { operationId, record: signed.record };
     });
@@ -11409,33 +11679,33 @@ function getManagedExecutor(kind) {
 }
 
 // src/team.ts
-import { randomUUID as randomUUID13 } from "node:crypto";
+import { randomUUID as randomUUID14 } from "node:crypto";
 
 // src/help-task.ts
-import { randomUUID as randomUUID12 } from "node:crypto";
+import { randomUUID as randomUUID13 } from "node:crypto";
 import { lstatSync as lstatSync3, readdirSync as readdirSync3, realpathSync as realpathSync5, statSync as statSync4 } from "node:fs";
-import path13 from "node:path";
+import path14 from "node:path";
 
 // src/change-set.ts
-import { createHash as createHash7, randomBytes } from "node:crypto";
+import { createHash as createHash8, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync as closeSync2,
   fsyncSync,
   lstatSync as lstatSync2,
   openSync as openSync2,
-  readFileSync as readFileSync5,
+  readFileSync as readFileSync7,
   readdirSync as readdirSync2,
   realpathSync as realpathSync3,
   renameSync,
   rmSync as rmSync2,
   writeSync
 } from "node:fs";
-import path11 from "node:path";
+import path12 from "node:path";
 var MAX_FILE_BYTES = 2 * 1024 * 1024;
 var MAX_CHANGE_FILES = 20;
 function sha256Hex(data) {
-  return createHash7("sha256").update(data).digest("hex");
+  return createHash8("sha256").update(data).digest("hex");
 }
 function decodeText(bytes) {
   if (bytes.includes(0)) return null;
@@ -11463,7 +11733,7 @@ function readSnapshot(target) {
   if (!stat2.isFile()) return { version: "not-a-file", bytes: null, mode: null };
   if (stat2.size > MAX_FILE_BYTES) return { version: `too-large:${stat2.size}`, bytes: null, mode: null };
   try {
-    const bytes = readFileSync5(target);
+    const bytes = readFileSync7(target);
     return { version: sha256Hex(bytes), bytes, mode: stat2.mode & 4095 };
   } catch (error) {
     return { version: `unreadable:${errorCode2(error)}`, bytes: null, mode: null };
@@ -11727,7 +11997,7 @@ function buildChangeReview(root, revision2, files, limits = REVIEW_LIMITS) {
       chars += row.length + 1;
     }
     return {
-      path: path11.relative(root, file.path).split(path11.sep).join("/"),
+      path: path12.relative(root, file.path).split(path12.sep).join("/"),
       action: file.action,
       added: file.diff.added,
       removed: file.diff.removed,
@@ -11749,7 +12019,7 @@ function buildChangeReview(root, revision2, files, limits = REVIEW_LIMITS) {
   };
 }
 function tempPathFor2(target) {
-  return path11.join(path11.dirname(target), `.${path11.basename(target)}.dsh-${randomBytes(6).toString("hex")}.tmp`);
+  return path12.join(path12.dirname(target), `.${path12.basename(target)}.dsh-${randomBytes(6).toString("hex")}.tmp`);
 }
 function writeTemp(target, bytes, mode) {
   const temp = tempPathFor2(target);
@@ -11784,7 +12054,7 @@ function renameWithRetry(from, to) {
   }
 }
 function parentIntact(target) {
-  const dir = path11.dirname(target);
+  const dir = path12.dirname(target);
   try {
     return realpathSync3.native(dir) === dir && lstatSync2(dir).isDirectory();
   } catch {
@@ -11893,7 +12163,7 @@ function snapshotTree(root, limits = { maxFiles: 5e3, maxDepth: 12 }) {
         truncated = true;
         return;
       }
-      const full = path11.join(dir, entry.name);
+      const full = path12.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (!SNAPSHOT_SKIP.has(entry.name)) walk(full, depth + 1);
         continue;
@@ -11901,7 +12171,7 @@ function snapshotTree(root, limits = { maxFiles: 5e3, maxDepth: 12 }) {
       if (!entry.isFile()) continue;
       try {
         const stat2 = lstatSync2(full);
-        files.set(path11.relative(root, full).split(path11.sep).join("/"), { size: stat2.size, mtimeMs: stat2.mtimeMs });
+        files.set(path12.relative(root, full).split(path12.sep).join("/"), { size: stat2.size, mtimeMs: stat2.mtimeMs });
       } catch {
       }
     }
@@ -11931,7 +12201,7 @@ function diffTrees(before, after, maxEach = 50) {
 // src/verify-command.ts
 import { spawn as spawn3, spawnSync as spawnSync2 } from "node:child_process";
 import { accessSync, constants, realpathSync as realpathSync4, statSync as statSync3 } from "node:fs";
-import path12 from "node:path";
+import path13 from "node:path";
 var REFUSED_PROGRAMS = [
   "cmd",
   "powershell",
@@ -12012,7 +12282,7 @@ function buildVerificationEnv(source = process.env) {
   return env;
 }
 function stemOf(file) {
-  return path12.basename(file).toLowerCase().replace(/\.(exe|com|bat|cmd)$/, "");
+  return path13.basename(file).toLowerCase().replace(/\.(exe|com|bat|cmd)$/, "");
 }
 function isRunnableFile(file, platform) {
   try {
@@ -12032,7 +12302,7 @@ function resolveProgram(program, cwd, envPath, platform = process.platform) {
     return { ok: false, error: `${program} \u662F shell \u6216\u547D\u4EE4\u8F6C\u53D1\u5668\uFF0C\u4F1A\u628A\u53C2\u6570\u91CD\u65B0\u89E3\u91CA\u6210\u547D\u4EE4\u5B57\u7B26\u4E32\uFF1B\u9A8C\u8BC1\u547D\u4EE4\u53EA\u63A5\u53D7\u76F4\u63A5\u53EF\u6267\u884C\u7684\u7A0B\u5E8F\uFF08\u5982 node\u3001python\u3001go\uFF09` };
   }
   const windows = platform === "win32";
-  const extension2 = path12.extname(program).toLowerCase();
+  const extension2 = path13.extname(program).toLowerCase();
   if (windows && extension2 !== "" && !WINDOWS_RUNNABLE.includes(extension2)) {
     return {
       ok: false,
@@ -12040,15 +12310,15 @@ function resolveProgram(program, cwd, envPath, platform = process.platform) {
     };
   }
   const candidates = (base) => windows && extension2 === "" ? WINDOWS_RUNNABLE.map((ext) => base + ext) : [base];
-  const hasSeparator = program.includes("/") || program.includes("\\") || path12.isAbsolute(program);
+  const hasSeparator = program.includes("/") || program.includes("\\") || path13.isAbsolute(program);
   let found;
   if (hasSeparator) {
-    found = candidates(path12.resolve(cwd, program)).find((file) => isRunnableFile(file, platform));
+    found = candidates(path13.resolve(cwd, program)).find((file) => isRunnableFile(file, platform));
     if (!found) return { ok: false, error: `\u627E\u4E0D\u5230\u53EF\u6267\u884C\u6587\u4EF6 ${program}\uFF08\u76F8\u5BF9\u8DEF\u5F84\u6309\u5DE5\u4F5C\u76EE\u5F55 ${cwd} \u89E3\u6790\uFF09` };
   } else {
-    const dirs = (envPath ?? "").split(path12.delimiter).filter((dir) => dir.length > 0 && path12.isAbsolute(dir));
+    const dirs = (envPath ?? "").split(path13.delimiter).filter((dir) => dir.length > 0 && path13.isAbsolute(dir));
     for (const dir of dirs) {
-      found = candidates(path12.join(dir, program)).find((file) => isRunnableFile(file, platform));
+      found = candidates(path13.join(dir, program)).find((file) => isRunnableFile(file, platform));
       if (found) break;
     }
     if (!found) return { ok: false, error: `\u5728 PATH \u91CC\u627E\u4E0D\u5230 ${program}\uFF08\u4E0D\u641C\u7D22\u5DE5\u4F5C\u76EE\u5F55\uFF09\uFF1B\u53EF\u4EE5\u6539\u5199\u6210\u7A0B\u5E8F\u7684\u7EDD\u5BF9\u8DEF\u5F84` };
@@ -12060,7 +12330,7 @@ function resolveProgram(program, cwd, envPath, platform = process.platform) {
     return { ok: false, error: `\u65E0\u6CD5\u786E\u8BA4 ${found} \u7684\u771F\u5B9E\u4F4D\u7F6E\uFF1A${error instanceof Error ? error.message : String(error)}` };
   }
   if (REFUSED_PROGRAMS.includes(stemOf(real))) return { ok: false, error: `${program} \u5B9E\u9645\u6307\u5411 ${real}\uFF0C\u90A3\u662F shell \u6216\u547D\u4EE4\u8F6C\u53D1\u5668\uFF0C\u4E0D\u652F\u6301` };
-  if (windows && !WINDOWS_RUNNABLE.includes(path12.extname(real).toLowerCase())) return { ok: false, error: `${program} \u5B9E\u9645\u6307\u5411 ${real}\uFF0C\u4E0D\u662F .exe/.com\uFF0C\u4E0D\u652F\u6301` };
+  if (windows && !WINDOWS_RUNNABLE.includes(path13.extname(real).toLowerCase())) return { ok: false, error: `${program} \u5B9E\u9645\u6307\u5411 ${real}\uFF0C\u4E0D\u662F .exe/.com\uFF0C\u4E0D\u652F\u6301` };
   return { ok: true, path: real };
 }
 var OutputTail = class {
@@ -12110,7 +12380,7 @@ function killTree(child) {
   const pid = child.pid;
   if (pid === void 0) return;
   if (process.platform === "win32") {
-    const taskkill = path12.join(process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows", "System32", "taskkill.exe");
+    const taskkill = path13.join(process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows", "System32", "taskkill.exe");
     try {
       spawnSync2(taskkill, ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: KILL_GRACE_MS, stdio: "ignore" });
     } catch {
@@ -12348,13 +12618,13 @@ var HelpTaskService = class {
    */
   openTask(input) {
     const scopes = this.requireScopes();
-    if (typeof input.projectDir !== "string" || !path13.isAbsolute(input.projectDir)) {
+    if (typeof input.projectDir !== "string" || !path14.isAbsolute(input.projectDir)) {
       throw new HelpTaskError("BAD_INPUT", "projectDir \u5FC5\u987B\u662F\u5DF2\u6388\u6743\u5E2E\u52A9\u8303\u56F4\u7684\u7EDD\u5BF9\u8DEF\u5F84");
     }
     const goal = typeof input.goal === "string" ? input.goal.trim() : "";
     if (!goal) throw new HelpTaskError("BAD_INPUT", "\u5E2E\u52A9\u4EFB\u52A1\u7684\u76EE\u6807\u4E0D\u80FD\u4E3A\u7A7A");
     const byId = typeof input.helpContextId === "string" && input.helpContextId && scopes.validById ? scopes.validById(input.helpContextId) : void 0;
-    const scope = byId === void 0 ? scopes.authorizedScope(input.projectDir) : byId !== null && byId.projectDir === path13.resolve(input.projectDir) ? byId : null;
+    const scope = byId === void 0 ? scopes.authorizedScope(input.projectDir) : byId !== null && byId.projectDir === path14.resolve(input.projectDir) ? byId : null;
     if (!scope) throw new HelpTaskError("NOT_AUTHORIZED", "\u8BE5\u76EE\u5F55\u6CA1\u6709\u6709\u6548\u7684\u5E2E\u52A9\u6388\u6743\uFF08\u672A\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u5B9E\u9645\u8DEF\u5F84\u5DF2\u6539\u6307\uFF09\uFF0C\u5148\u8BF7\u7528\u6237\u5728\u684C\u9762\u5BA1\u6279\u7A97\u53E3\u786E\u8BA4\u8BFB\u53D6\u8303\u56F4");
     const native = nativeScope(scope);
     if (!native) throw new HelpTaskError("NOT_AUTHORIZED", "\u6388\u6743\u76EE\u5F55\u5DF2\u4E0D\u53EF\u7528\uFF08\u4E0D\u5B58\u5728\u6216\u4E0D\u662F\u76EE\u5F55\uFF09\uFF0C\u4E0D\u80FD\u5F00\u5E2E\u52A9\u4EFB\u52A1");
@@ -12363,7 +12633,7 @@ var HelpTaskService = class {
       throw new HelpTaskError("BAD_INPUT", `\u4E3B\u52A8\u5E2E\u52A9\u8BB0\u5F55 ${episodeId} \u4E0D\u5B58\u5728\u6216\u5DF2\u7ED3\u675F\uFF0C\u4E0D\u80FD\u5173\u8054`);
     }
     const now = Date.now();
-    const taskId = randomUUID12();
+    const taskId = randomUUID13();
     const task = {
       taskId,
       teamId: this.options.teamId,
@@ -12479,7 +12749,7 @@ var HelpTaskService = class {
     const prepared = input.files.map((file, index) => this.prepareFile(link, file, index, seen));
     this.syncExpired(task.taskId);
     const revision2 = this.store.latestChangeRevision(task.taskId) + 1;
-    const changeId = randomUUID12();
+    const changeId = randomUUID13();
     const files = prepared.map((file, seq) => ({
       seq,
       path: file.path,
@@ -12567,7 +12837,7 @@ var HelpTaskService = class {
       if (hasDiff) throw new HelpTaskError("BAD_INPUT", `${relative} \u662F\u65B0\u5EFA\u6587\u4EF6\uFF0C\u8BF7\u76F4\u63A5\u7ED9 content`);
       let parentIsDir = false;
       try {
-        parentIsDir = statSync4(path13.dirname(target)).isDirectory();
+        parentIsDir = statSync4(path14.dirname(target)).isDirectory();
       } catch {
       }
       if (!parentIsDir) throw new HelpTaskError("BAD_INPUT", `${relative} \u7684\u4E0A\u7EA7\u76EE\u5F55\u4E0D\u5B58\u5728\uFF1B\u672C\u6D41\u7A0B\u4E0D\u65B0\u5EFA\u76EE\u5F55`);
@@ -12639,7 +12909,7 @@ var HelpTaskService = class {
     const args = [...input.args];
     this.syncExpired(task.taskId);
     const applied = this.latestApplied(task.taskId);
-    const verificationId = randomUUID12();
+    const verificationId = randomUUID13();
     const sequence = this.store.listVerifications(task.taskId).length + 1;
     const record3 = {
       verificationId,
@@ -12736,7 +13006,7 @@ var HelpTaskService = class {
     const task = this.getTask(operation.taskId);
     if (!task) throw new HelpTaskError("NOT_FOUND", `\u64CD\u4F5C\u6240\u5C5E\u7684\u4EFB\u52A1 ${operation.taskId} \u4E0D\u5B58\u5728`);
     this.syncExpired(operation.taskId);
-    const reviewId = randomUUID12();
+    const reviewId = randomUUID13();
     const snapshotDigest2 = digestOf(operationSnapshot(operation));
     const binding2 = reviewBinding({ reviewId, operationId: operation.operationId, resolution, note, snapshotDigest: snapshotDigest2 });
     const previous = this.store.listReviews(operation.operationId).filter((item) => item.state === "pending");
@@ -13502,13 +13772,13 @@ var HelpTaskService = class {
     if (link.currentFile !== null && kind !== "dir" && target !== link.currentFile) {
       throw new HelpTaskError("OUT_OF_SCOPE", `\u672C\u6B21\u53EA\u6388\u6743\u4E86\u6587\u4EF6 ${link.currentFile}`);
     }
-    if (path13.relative(link.projectRoot, target).split(path13.sep).some((segment) => segment.toLowerCase() === ".git")) {
+    if (path14.relative(link.projectRoot, target).split(path14.sep).some((segment) => segment.toLowerCase() === ".git")) {
       throw new HelpTaskError("OUT_OF_SCOPE", "\u4E0D\u8BFB\u53D6\u3001\u4E0D\u6539\u52A8\u7248\u672C\u5E93\u5143\u6570\u636E\uFF08.git\uFF09");
     }
     return target;
   }
   relative(link, target) {
-    return path13.relative(link.projectRoot, target).split(path13.sep).join("/");
+    return path14.relative(link.projectRoot, target).split(path14.sep).join("/");
   }
   latestApplied(taskId) {
     return this.store.listChangeSets(taskId).find((change) => change.state === "applied") ?? null;
@@ -13583,7 +13853,7 @@ var HelpTaskService = class {
       const verification = verdict.verificationId ? this.store.getVerification(verdict.verificationId) : null;
       const artifacts = [
         ...change ? [`\u7B2C ${change.revision} \u7248\u6539\u52A8\u5DF2\u5E94\u7528\uFF1A${change.files.map((file) => `${this.relative(link, file.path)}\uFF08+${file.added} \u2212${file.removed}\uFF09`).join("\u3001")}`] : [],
-        ...verification ? [`\u9A8C\u8BC1\u901A\u8FC7\uFF1A${displayCommand(path13.basename(verification.program), verification.args)}\uFF08\u9000\u51FA\u7801 0\uFF09`] : []
+        ...verification ? [`\u9A8C\u8BC1\u901A\u8FC7\uFF1A${displayCommand(path14.basename(verification.program), verification.args)}\uFF08\u9000\u51FA\u7801 0\uFF09`] : []
       ];
       this.setTaskStatus(taskId, "done", artifacts);
       return;
@@ -13871,7 +14141,7 @@ var TeamService = class {
     const ownerId = owner.assistantId;
     const dependsOn = input.dependsOn ?? [];
     const now = Date.now();
-    const taskId = randomUUID13();
+    const taskId = randomUUID14();
     for (const dep of dependsOn) {
       if (!this.getTask(dep)) throw new Error(`dependency ${dep} does not exist`);
       if (this.store.wouldCreateCycle(taskId, dep)) throw new Error(`dependency ${dep} would create a cycle`);
@@ -14008,7 +14278,7 @@ var TeamService = class {
     if (!this.dependenciesSatisfied(task)) return refuse("queued", "queued", "\u524D\u7F6E\u4EFB\u52A1\u5C1A\u672A\u901A\u8FC7\u9A8C\u6536");
     if (this.liveRuns.size >= this.options.maxConcurrentInference) return refuse("queued", "queued", "\u63A8\u7406\u989D\u5EA6\u5DF2\u6EE1");
     if (plan && this.sideEffectRunning() >= this.options.maxConcurrentSideEffect) return refuse("queued", "queued", "\u526F\u4F5C\u7528\u6267\u884C\u989D\u5EA6\u5DF2\u6EE1");
-    const runId = randomUUID13();
+    const runId = randomUUID14();
     const claimed = this.store.transaction(() => {
       const updated = this.setStatus(task, "running");
       if (!updated) return null;
@@ -14475,6 +14745,22 @@ ${text7}` : text7,
   setFollowupsPaused(paused) {
     this.paused = paused;
   }
+  /**
+   * 本人复核确认：把"等你点头/等复核/等你回话"的任务标记完成。
+   * 模型自报"做完了"不构成成功，但**用户本人**是可信验收方——他在面板上核对产物后点确认，
+   * 才允许 done。只接受 waiting 三态，其余状态拒绝，避免把在跑/已终止的任务误改。
+   */
+  confirmTask(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return { ok: false, message: `\u4EFB\u52A1 ${taskId} \u4E0D\u5B58\u5728` };
+    if (!["awaiting-approval", "awaiting-user", "review"].includes(task.status)) {
+      return { ok: false, status: task.status, message: `\u4EFB\u52A1\u5F53\u524D\u72B6\u6001\uFF08${task.status}\uFF09\u4E0D\u9700\u8981\u786E\u8BA4\uFF0C\u6216\u5DF2\u7EC8\u6B62` };
+    }
+    const updated = this.setStatus(task, "done");
+    if (!updated) return { ok: false, status: task.status, message: "\u4EFB\u52A1\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5" };
+    this.store.appendEvent("task/updated", { taskId, by: "user", note: "\u672C\u4EBA\u590D\u6838\u4EA7\u7269\u540E\u786E\u8BA4\u5B8C\u6210", status: "done" }, { taskId, assistantId: task.ownerId });
+    return { ok: true, status: updated.status, message: "\u5DF2\u6309\u4F60\u7684\u786E\u8BA4\u6807\u8BB0\u5B8C\u6210" };
+  }
   /** 等待自有启动、运行及释放全部结束后，调用方才可关闭业务库。 */
   dispose() {
     this.disposed = true;
@@ -14790,7 +15076,7 @@ function formatMeetingHistory(rows) {
 }
 
 // src/team-tools.ts
-import path14 from "node:path";
+import path15 from "node:path";
 import { defineTool as defineTool4 } from "@deepseek-ai/dsh-tools";
 function json2(value) {
   return JSON.stringify(value);
@@ -15058,7 +15344,7 @@ function registerTeamTools(host, options) {
       const cwd = exec?.agent?.session?.header?.cwd;
       const root = canonicalRoot(cwd);
       if (PATH_TARGET_TOOLS.includes(args.tool) && root !== void 0 && cwd !== void 0) {
-        if (args.tool === "str_replace_editor" && !path14.isAbsolute(args.target)) return json2({ ok: false, error: "str_replace_editor \u7684 path \u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84" });
+        if (args.tool === "str_replace_editor" && !path15.isAbsolute(args.target)) return json2({ ok: false, error: "str_replace_editor \u7684 path \u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84" });
         try {
           target = canonicalPath(args.target, cwd);
         } catch (error) {
@@ -15306,11 +15592,11 @@ ${reports}`;
 }
 
 // src/task-runtime.ts
-import { createHash as createHash8, randomUUID as randomUUID15 } from "node:crypto";
+import { createHash as createHash9, randomUUID as randomUUID16 } from "node:crypto";
 import { z as z4 } from "zod";
 
 // src/reminders.ts
-import { randomUUID as randomUUID14 } from "node:crypto";
+import { randomUUID as randomUUID15 } from "node:crypto";
 import { z as z3 } from "zod";
 
 // src/scheduler.ts
@@ -15400,7 +15686,7 @@ var CompanionReminders = class {
     const { store } = this.host;
     const old = store.getReminderGrant(schedule.grantRef);
     if (old) store.saveReminderGrant({ ...old, enabled: false });
-    schedule.grantRef = randomUUID14();
+    schedule.grantRef = randomUUID15();
     store.saveReminderGrant({
       grantRef: schedule.grantRef,
       taskId: schedule.taskId,
@@ -15417,7 +15703,7 @@ var CompanionReminders = class {
   create(task, operationId) {
     const input = this.input(task.taskId);
     const schedule = {
-      scheduleId: randomUUID14(),
+      scheduleId: randomUUID15(),
       taskId: task.taskId,
       revision: 1,
       spec: input.schedule,
@@ -15458,7 +15744,7 @@ var CompanionReminders = class {
         if (input.relatedBusinessTaskId && store.getTask(input.relatedBusinessTaskId)?.status === "done") continue;
         const active = store.listReminderCycles().some((cycle) => cycle.scheduleId === schedule.scheduleId && !["acknowledged", "cancelled"].includes(cycle.state));
         if (!active) {
-          const cycleId = randomUUID14();
+          const cycleId = randomUUID15();
           const child = this.host.createChild(this.host.ownedTask(schedule.taskId), cycleId);
           const cycle = {
             cycleId,
@@ -15499,8 +15785,8 @@ var CompanionReminders = class {
         };
         store.saveReminderCycle(nextCycle);
         const task = this.host.changeTask(child.taskId, "awaiting-user");
-        const deliveryId = randomUUID14();
-        const operationId = randomUUID14();
+        const deliveryId = randomUUID15();
+        const operationId = randomUUID15();
         const occurrenceId = `${cycle.cycleId}:${cycle.generation}:${cycle.revision}`;
         const input = this.input(schedule.taskId);
         const delivery = {
@@ -15739,7 +16025,7 @@ var CompanionReminders = class {
     const { store } = this.host;
     const schedule = store.listCompanionSchedules().find((item) => item.taskId === taskId);
     const input = { ...this.input(taskId), schedule: schedule.spec, repeatEverySeconds: seconds };
-    const inputRef = randomUUID14();
+    const inputRef = randomUUID15();
     store.insertCompanionInput({ inputRef, principalId: this.host.principalId, input, digest: digestOf(input), createdAt: this.host.now() });
     const parent = this.host.ownedTask(taskId);
     store.saveCompanionMeta({ ...store.getCompanionMeta(taskId), inputRef });
@@ -15934,7 +16220,7 @@ var meetingTodoSchema = z4.object({
   due: z4.string().trim().max(400).nullable(),
   sourceRefs: z4.array(z4.string().max(80)).min(1).max(40)
 }).strict().superRefine((value, context) => {
-  const tag = createHash8("sha256").update(value.meetingId, "utf8").digest("hex").slice(0, 6);
+  const tag = createHash9("sha256").update(value.meetingId, "utf8").digest("hex").slice(0, 6);
   const prefix = `M${tag}-R${value.revision}-S`;
   if (new Set(value.sourceRefs).size !== value.sourceRefs.length || value.sourceRefs.some((ref) => !ref.startsWith(prefix) || !/^\d{1,8}$/.test(ref.slice(prefix.length)))) {
     context.addIssue({ code: "custom", message: "\u884C\u52A8\u9879\u6765\u6E90\u4E0D\u5C5E\u4E8E\u8FD9\u573A\u4F1A\u8BAE\u7684\u5F53\u524D\u8F6C\u5199\u7248\u672C" });
@@ -16135,7 +16421,7 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
     const minutes = Math.min(Math.max(Math.round(reply.minutes ?? 10), 1), 24 * 60);
     const command = {
       protocolVersion: 1,
-      commandId: randomUUID15(),
+      commandId: randomUUID16(),
       taskId: task.taskId,
       expectedRevision: task.revision,
       expiresAt: new Date(this.now() + 12e4).toISOString(),
@@ -16208,7 +16494,7 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
   createManagedCommand(task, grantOperationId) {
     const meta = this.store.getCompanionMeta(task.taskId);
     const input = this.store.getCompanionInput(meta.inputRef);
-    const operationId = randomUUID15(), commandId = randomUUID15(), at = this.now();
+    const operationId = randomUUID16(), commandId = randomUUID16(), at = this.now();
     this.store.insertOperation({
       operationId,
       taskId: task.taskId,
@@ -16438,11 +16724,11 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
         channel: "wecom",
         recipientId: followup.recipientRef
       });
-      const inputRef = randomUUID15();
+      const inputRef = randomUUID16();
       const at = this.now();
       this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input, digest: digestOf(input), createdAt: at });
       const task = this.insertTask("\u67E5\u770B\u4F1A\u8BAE\u7EAA\u8981\u90AE\u4EF6", inputRef, null, [], "queued", `meeting-mail-${intentId}`, "enterprise");
-      const operationId = randomUUID15();
+      const operationId = randomUUID16();
       this.store.insertOperation({
         operationId,
         taskId: task.taskId,
@@ -16494,9 +16780,9 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
         "\u53EA\u767B\u8BB0\u4EBA\u5DE5\u5F85\u529E\uFF1B\u4F1A\u8BAE\u540E\u7EED\u4FEE\u6539\u4E0D\u4F1A\u81EA\u52A8\u8986\u76D6\u4EFB\u52A1\uFF0C\u63D0\u9192\u9700\u8981\u5355\u72EC\u8BBE\u7F6E\u3002"
       ].join("\n");
       const taskInput = companionInputSchema.parse({ kind: "agent", executionMode: "manual", description });
-      const inputRef = randomUUID15(), at = this.now();
+      const inputRef = randomUUID16(), at = this.now();
       this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input: taskInput, digest: digestOf(taskInput), createdAt: at });
-      const task = this.insertTask(input.text, inputRef, null, [], "awaiting-user", `meeting-todo-${randomUUID15()}`, "meeting");
+      const task = this.insertTask(input.text, inputRef, null, [], "awaiting-user", `meeting-todo-${randomUUID16()}`, "meeting");
       const source = {
         principalId: this.principalId,
         deviceId: this.deviceId,
@@ -16510,7 +16796,7 @@ ${pending.map((cycle, index) => `${index + 1}. ${this.store.getTask(cycle.childT
         taskId: task.taskId
       };
       this.store.saveMeetingTodoSource(source);
-      const operationId = randomUUID15();
+      const operationId = randomUUID16();
       this.store.insertOperation({
         operationId,
         taskId: task.taskId,
@@ -16647,7 +16933,7 @@ ${candidate.text}`);
     const input = this.store.getCompanionInput(inputRef);
     const at = this.now();
     const task = {
-      taskId: randomUUID15(),
+      taskId: randomUUID16(),
       teamId: "companion",
       ownerId: `executor:${input.input.kind === "agent" ? "manual" : input.input.kind === "reminder" ? "reminder" : "managed"}`,
       goal: title,
@@ -16856,7 +17142,7 @@ ${candidate.text}`);
       if (!this.accepting) throw new CompanionError("DEVICE_OFFLINE", "\u8FD0\u884C\u65F6\u5DF2\u505C\u6B62\u63A5\u5355", 503);
       if (pathname === "/companion/v1/contexts") {
         const capture = companionContextSchema.parse(body);
-        const contextId = randomUUID15();
+        const contextId = randomUUID16();
         const capturedAt = Date.parse(capture.capturedAt);
         const expiresAt = this.now() + 15 * 6e4;
         this.store.saveCompanionContext({
@@ -16882,7 +17168,7 @@ ${candidate.text}`);
       if (pathname === "/companion/v1/inputs") {
         const input = this.parseInput(body);
         if (input.kind === "reminder" && input.relatedBusinessTaskId) this.ownedTask(input.relatedBusinessTaskId);
-        const inputRef = randomUUID15();
+        const inputRef = randomUUID16();
         this.store.insertCompanionInput({ inputRef, principalId: this.principalId, input, digest: digestOf(input), createdAt: this.now() });
         return { status: 201, body: { inputRef } };
       }
@@ -17169,7 +17455,7 @@ ${candidate.text}`);
 };
 
 // src/task-tools.ts
-import { randomUUID as randomUUID16 } from "node:crypto";
+import { randomUUID as randomUUID17 } from "node:crypto";
 import { defineTool as defineTool5 } from "@deepseek-ai/dsh-tools";
 function channelKeyFromExec(exec) {
   const id = exec?.agent?.session?.header?.id;
@@ -17207,7 +17493,7 @@ function registerCompanionTools(host, runtime, desktop) {
       if (!inputRef) return JSON.stringify({ ok: false, error: "\u8F93\u5165\u767B\u8BB0\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5" });
       const command = {
         protocolVersion: 1,
-        commandId: randomUUID16(),
+        commandId: randomUUID17(),
         expiresAt: new Date(Date.now() + 12e4).toISOString(),
         payload: { kind: parsed.kind, title, inputRef, dependsOn: [] }
       };
@@ -17330,9 +17616,9 @@ function registerCompanionTools(host, runtime, desktop) {
 
 // src/mail.ts
 import { spawn as spawn4 } from "node:child_process";
-import { createHash as createHash9, randomUUID as randomUUID17 } from "node:crypto";
-import { existsSync as existsSync2, readFileSync as readFileSync6 } from "node:fs";
-import path15 from "node:path";
+import { createHash as createHash10, randomUUID as randomUUID18 } from "node:crypto";
+import { existsSync as existsSync2, readFileSync as readFileSync8 } from "node:fs";
+import path16 from "node:path";
 import { defineTool as defineTool6 } from "@deepseek-ai/dsh-tools";
 import nodemailer from "nodemailer";
 var MAIL_FILE = "mail.json";
@@ -17343,11 +17629,11 @@ var EMAIL = /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[^\s@<>(),;:"]+$/;
 var UNSAFE_HEADER = /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u;
 var validEmail = (value) => value.length <= 320 && EMAIL.test(value) && !UNSAFE_HEADER.test(value);
 function mailDir(home) {
-  return path15.join(home, "personal-assistant");
+  return path16.join(home, "personal-assistant");
 }
 function readMailConfig(home) {
   try {
-    const raw = JSON.parse(readFileSync6(path15.join(mailDir(home), MAIL_FILE), "utf8"));
+    const raw = JSON.parse(readFileSync8(path16.join(mailDir(home), MAIL_FILE), "utf8"));
     if (typeof raw.host !== "string" || !raw.host || typeof raw.user !== "string" || !validEmail(raw.user)) return null;
     if (typeof raw.port !== "number" || !Number.isInteger(raw.port) || raw.port < 1 || raw.port > 65535) return null;
     return {
@@ -17363,7 +17649,7 @@ function readMailConfig(home) {
 }
 function decryptDpapiFile(file) {
   if (!existsSync2(file)) return Promise.reject(new Error("\u52A0\u5BC6\u51ED\u636E\u6587\u4EF6\u4E0D\u5B58\u5728"));
-  const cipher = readFileSync6(file, "utf8").trim();
+  const cipher = readFileSync8(file, "utf8").trim();
   return new Promise((resolve, reject) => {
     const child = spawn4("powershell.exe", [
       "-NoProfile",
@@ -17388,15 +17674,15 @@ function decryptDpapiFile(file) {
   });
 }
 function decryptSecret(home) {
-  const file = path15.join(mailDir(home), SECRET_FILE);
+  const file = path16.join(mailDir(home), SECRET_FILE);
   if (!existsSync2(file)) return Promise.reject(new Error("\u90AE\u7BB1\u53E3\u4EE4\u8FD8\u6CA1\u6709\u914D\u7F6E\uFF0C\u5148\u8FD0\u884C scripts/setup-mail.mjs"));
   return decryptDpapiFile(file);
 }
 function mailSendAccountKey(config) {
-  return createHash9("sha256").update(JSON.stringify([config.host.trim().toLowerCase(), config.port, config.secure, comparableMailbox(config.user)])).digest("hex");
+  return createHash10("sha256").update(JSON.stringify([config.host.trim().toLowerCase(), config.port, config.secure, comparableMailbox(config.user)])).digest("hex");
 }
 function mailSendDigest(config, draft2) {
-  return createHash9("sha256").update(JSON.stringify([mailSendAccountKey(config), comparableMailbox(config.from), draft2.to.map(comparableMailbox).sort(), draft2.subject, draft2.text])).digest("hex");
+  return createHash10("sha256").update(JSON.stringify([mailSendAccountKey(config), comparableMailbox(config.from), draft2.to.map(comparableMailbox).sort(), draft2.subject, draft2.text])).digest("hex");
 }
 function comparableMailbox(address) {
   const at = address.lastIndexOf("@");
@@ -17445,7 +17731,7 @@ async function proposeMail(deps, config, draft2, extension2) {
   if (deps.store.unresolvedMailSend(accountKey, digest2)) {
     return { ok: false, error: "\u76F8\u540C\u90AE\u4EF6\u4E0A\u6B21\u53D1\u9001\u7ED3\u679C\u672A\u77E5\u6216\u90E8\u5206\u63A5\u53D7\uFF0C\u8BF7\u5148\u5728\u56E2\u961F\u9875\u6838\u67E5\uFF0C\u4E0D\u81EA\u52A8\u91CD\u53D1\u3002" };
   }
-  const intentId = randomUUID17();
+  const intentId = randomUUID18();
   const warning = deps.store.reviewedMailSend(accountKey, digest2) ? "\u76F8\u540C\u5185\u5BB9\u66FE\u6709\u7ED3\u679C\u672A\u77E5\u6216\u90E8\u5206\u63A5\u53D7\u7684\u53D1\u9001\uFF1B\u518D\u6B21\u53D1\u9001\u53EF\u80FD\u91CD\u590D\uFF0C\u5FC5\u987B\u7531\u672C\u4EBA\u91CD\u65B0\u6838\u5BF9\u3002" : void 0;
   const meetingAttention = !extension2 && deps.store.hasMeetingMailAttention(accountKey);
   const meetingReviewed = !extension2 && deps.store.hasMeetingMailAttention(accountKey, true);
@@ -17805,8 +18091,8 @@ function skillRequestBody(command) {
 }
 
 // src/mail-config.ts
-import { existsSync as existsSync3, readFileSync as readFileSync8 } from "node:fs";
-import path18 from "node:path";
+import { existsSync as existsSync3, readFileSync as readFileSync10 } from "node:fs";
+import path19 from "node:path";
 
 // src/credential-cipher.ts
 import { spawn as spawn5 } from "node:child_process";
@@ -17856,9 +18142,9 @@ function encryptWithDpapi(secret) {
 }
 
 // src/mail-watch.ts
-import { readFileSync as readFileSync7, statSync as statSync5 } from "node:fs";
-import path16 from "node:path";
-import { createHash as createHash10 } from "node:crypto";
+import { readFileSync as readFileSync9, statSync as statSync5 } from "node:fs";
+import path17 from "node:path";
+import { createHash as createHash11 } from "node:crypto";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 
@@ -17945,7 +18231,7 @@ function readMailImapConfig(home) {
   const base = readMailConfig(home);
   if (!base) return null;
   try {
-    const raw = JSON.parse(readFileSync7(path16.join(mailDir(home), "mail.json"), "utf8"));
+    const raw = JSON.parse(readFileSync9(path17.join(mailDir(home), "mail.json"), "utf8"));
     const explicit = typeof raw.imapHost === "string" ? raw.imapHost.trim() : "";
     const derived = base.host.startsWith("smtp.") ? `imap.${base.host.slice(5)}` : "";
     const imapHost = explicit || derived;
@@ -17965,7 +18251,7 @@ function readMailImapConfig(home) {
   }
 }
 function digest(value) {
-  return createHash10("sha256").update(value).digest("hex");
+  return createHash11("sha256").update(value).digest("hex");
 }
 function mailWatchAccountKey(config) {
   return digest(JSON.stringify([config.imapHost.trim().toLowerCase().replace(/\.$/, ""), config.imapPort, config.user.trim()]));
@@ -18147,10 +18433,10 @@ var MailWatcher = class {
     }
   }
   readLegacy(config, uidValidity) {
-    const file = path16.join(this.options.home, "personal-assistant", WATCH_FILE);
+    const file = path17.join(this.options.home, "personal-assistant", WATCH_FILE);
     try {
       if (statSync5(file).size > 64 * 1024) throw new Error("\u65E7\u72B6\u6001\u6587\u4EF6\u8FC7\u5927");
-      const raw = JSON.parse(readFileSync7(file, "utf8"));
+      const raw = JSON.parse(readFileSync9(file, "utf8"));
       const legacy = {
         uidValidity: typeof raw.uidValidity === "string" ? raw.uidValidity : "",
         seen: Array.isArray(raw.seen) ? [...new Set(raw.seen.filter(validUid))] : [],
@@ -18307,15 +18593,15 @@ var MailWatcher = class {
 };
 
 // src/private-file.ts
-import { randomUUID as randomUUID18 } from "node:crypto";
-import { closeSync as closeSync3, fsyncSync as fsyncSync2, mkdirSync as mkdirSync4, openSync as openSync3, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
-import path17 from "node:path";
+import { randomUUID as randomUUID19 } from "node:crypto";
+import { closeSync as closeSync3, fsyncSync as fsyncSync2, mkdirSync as mkdirSync5, openSync as openSync3, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync4 } from "node:fs";
+import path18 from "node:path";
 var PRIVATE_MODE = 384;
 function writePrivateFile(file, content) {
-  mkdirSync4(path17.dirname(file), { recursive: true, mode: 448 });
-  const temporary = `${file}.${randomUUID18()}.tmp`;
+  mkdirSync5(path18.dirname(file), { recursive: true, mode: 448 });
+  const temporary = `${file}.${randomUUID19()}.tmp`;
   try {
-    writeFileSync3(temporary, content, { encoding: "utf8", mode: PRIVATE_MODE, flag: "wx" });
+    writeFileSync4(temporary, content, { encoding: "utf8", mode: PRIVATE_MODE, flag: "wx" });
     const fd = openSync3(temporary, "r+");
     try {
       fsyncSync2(fd);
@@ -18351,7 +18637,7 @@ function readMailConfigView(home) {
     smtpPort: base.port,
     imapHost: imap?.imapHost ?? "",
     imapPort: imap?.imapPort ?? 0,
-    hasPassword: existsSync3(path18.join(mailDir(home), SECRET_FILE2)),
+    hasPassword: existsSync3(path19.join(mailDir(home), SECRET_FILE2)),
     watchEnabled: imap?.watchEnabled ?? false,
     watchIntervalSeconds: imap?.watchIntervalSeconds ?? 600
   };
@@ -18407,7 +18693,7 @@ function checkMailConfig(values) {
 }
 function previousRaw(file) {
   try {
-    const raw = JSON.parse(readFileSync8(file, "utf8"));
+    const raw = JSON.parse(readFileSync10(file, "utf8"));
     return raw !== null && typeof raw === "object" ? raw : {};
   } catch {
     return {};
@@ -18419,8 +18705,8 @@ function nextWatchInterval(previous) {
 }
 async function saveMailConfig(options, input) {
   const dir = mailDir(options.home);
-  const jsonFile2 = path18.join(dir, MAIL_FILE2);
-  const secretFile = path18.join(dir, SECRET_FILE2);
+  const jsonFile2 = path19.join(dir, MAIL_FILE2);
+  const secretFile = path19.join(dir, SECRET_FILE2);
   const previous = previousRaw(jsonFile2);
   let cipher;
   if (input.password !== "") {
@@ -18465,8 +18751,8 @@ async function saveMailConfig(options, input) {
 }
 
 // src/wecom-config.ts
-import { existsSync as existsSync4, readFileSync as readFileSync9 } from "node:fs";
-import path19 from "node:path";
+import { existsSync as existsSync4, readFileSync as readFileSync11 } from "node:fs";
+import path20 from "node:path";
 var APP_FILE = "wecom-app.json";
 var APP_SECRET_FILE = "wecom-app.secret";
 var UNSAFE2 = /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u;
@@ -18474,7 +18760,7 @@ var NO_SPACE = /^[^\s]+$/u;
 var WECOM_CONFIG_HINT = "\u7528\u6CD5\uFF1A/assistant-wecom-config \u67E5\u770B\uFF1B\u4FDD\u5B58\u5F62\u5982 corpId=ww1234 agentId=1000002 secret=\u5E94\u7528Secret toUser=@all";
 function readRaw(home) {
   try {
-    const raw = JSON.parse(readFileSync9(path19.join(mailDir(home), APP_FILE), "utf8"));
+    const raw = JSON.parse(readFileSync11(path20.join(mailDir(home), APP_FILE), "utf8"));
     return raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   } catch {
     return {};
@@ -18487,7 +18773,7 @@ function readWeComAppView(home) {
     corpId: text5(raw.corpId),
     agentId: text5(raw.agentId),
     toUser: text5(raw.toUser),
-    hasSecret: existsSync4(path19.join(mailDir(home), APP_SECRET_FILE))
+    hasSecret: existsSync4(path20.join(mailDir(home), APP_SECRET_FILE))
   };
 }
 function formatWeComAppView(view) {
@@ -18514,8 +18800,8 @@ function checkWeComAppConfig(values) {
 }
 async function saveWeComAppConfig(options, input) {
   const dir = mailDir(options.home);
-  const jsonFile2 = path19.join(dir, APP_FILE);
-  const secretFile = path19.join(dir, APP_SECRET_FILE);
+  const jsonFile2 = path20.join(dir, APP_FILE);
+  const secretFile = path20.join(dir, APP_SECRET_FILE);
   let cipher;
   if (input.secret !== "") {
     let encrypted = "";
@@ -18544,7 +18830,7 @@ async function saveWeComAppConfig(options, input) {
 }
 
 // src/channels.ts
-import { createHash as createHash11, randomUUID as randomUUID19 } from "node:crypto";
+import { createHash as createHash12, randomUUID as randomUUID20 } from "node:crypto";
 import { createUserMessage as createUserMessage4 } from "@deepseek-ai/dsh-llm";
 var ChannelReplyError = class extends Error {
   outcome;
@@ -18584,13 +18870,13 @@ function validIdentifier(value) {
   return typeof value === "string" && !!value.trim() && value.length <= 200 && !/[\u0000-\u001f\u007f\u2028-\u202e\u2066-\u2069]/u.test(value);
 }
 function channelAccountKey(channel, accountId) {
-  return createHash11("sha256").update(JSON.stringify([channel, accountId])).digest("hex");
+  return createHash12("sha256").update(JSON.stringify([channel, accountId])).digest("hex");
 }
 function accountKeyOf(message) {
   return channelAccountKey(message.channel, message.accountId ?? "");
 }
 function messageDigest(message, accountKey) {
-  return createHash11("sha256").update(JSON.stringify([
+  return createHash12("sha256").update(JSON.stringify([
     message.channel,
     accountKey,
     message.chatType,
@@ -18640,7 +18926,7 @@ var ChannelManager = class {
   constructor(options) {
     this.options = options;
     this.now = options.now ?? Date.now;
-    this.epoch = options.epoch ?? randomUUID19();
+    this.epoch = options.epoch ?? randomUUID20();
     this.settings = options.readSettings();
     options.store.recoverChannelInbound(this.epoch, this.now());
     this.pruneExpired();
@@ -18867,7 +19153,7 @@ var ChannelManager = class {
   }
   async answer(message, key, scopedKey) {
     let conversation = this.conversations.get(scopedKey);
-    const sessionScope = createHash11("sha256").update(scopedKey).digest("hex");
+    const sessionScope = createHash12("sha256").update(scopedKey).digest("hex");
     const routed = await this.options.route?.(promptFor(message), key, sessionScope);
     if (routed !== null && routed !== void 0) return routed;
     if (!conversation) {
@@ -18924,8 +19210,8 @@ var ChannelManager = class {
 };
 
 // src/meeting-mail.ts
-import { createHash as createHash12 } from "node:crypto";
-import path20 from "node:path";
+import { createHash as createHash13 } from "node:crypto";
+import path21 from "node:path";
 import { defineTool as defineTool7 } from "@deepseek-ai/dsh-tools";
 var UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu;
 var HEX = /^[a-f0-9]{64}$/u;
@@ -18933,7 +19219,7 @@ var RECIPIENT = /^wecom:single:[^\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]{
 var object2 = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 function artifactOf(value) {
   const item = object2(value);
-  if (!item || typeof item.id !== "string" || !UUID.test(item.id) || typeof item.meetingId !== "string" || !item.meetingId || item.meetingId.length > 200 || !Number.isSafeInteger(item.revision) || Number(item.revision) < 1 || typeof item.digest !== "string" || !HEX.test(item.digest) || !Number.isSafeInteger(item.confirmedAt) || !Number.isSafeInteger(item.createdAt) || typeof item.path !== "string" || !path20.isAbsolute(item.path) || item.path.length > 32e3) return null;
+  if (!item || typeof item.id !== "string" || !UUID.test(item.id) || typeof item.meetingId !== "string" || !item.meetingId || item.meetingId.length > 200 || !Number.isSafeInteger(item.revision) || Number(item.revision) < 1 || typeof item.digest !== "string" || !HEX.test(item.digest) || !Number.isSafeInteger(item.confirmedAt) || !Number.isSafeInteger(item.createdAt) || typeof item.path !== "string" || !path21.isAbsolute(item.path) || item.path.length > 32e3) return null;
   return {
     id: item.id,
     meetingId: item.meetingId,
@@ -18950,7 +19236,7 @@ async function readArtifact(deps, id, signal) {
   signal?.throwIfAborted();
   const artifact = artifactOf(result?.artifact);
   const content = result?.content;
-  if (result?.ok !== true || !artifact || artifact.id !== id || typeof content !== "string" || !content.trim() || content.length > 5e4 || createHash12("sha256").update(content, "utf8").digest("hex") !== artifact.digest) {
+  if (result?.ok !== true || !artifact || artifact.id !== id || typeof content !== "string" || !content.trim() || content.length > 5e4 || createHash13("sha256").update(content, "utf8").digest("hex") !== artifact.digest) {
     throw new Error("\u684C\u9762\u672A\u8FD4\u56DE\u53EF\u6838\u9A8C\u7684\u786E\u8BA4\u7248\u7EAA\u8981");
   }
   return { artifact, content };
@@ -19077,12 +19363,12 @@ function registerMeetingMailTools(host, deps) {
 }
 
 // src/wecom.ts
-import { existsSync as existsSync5, readFileSync as readFileSync10 } from "node:fs";
-import path21 from "node:path";
+import { existsSync as existsSync5, readFileSync as readFileSync12 } from "node:fs";
+import path22 from "node:path";
 import AiBot, { generateReqId } from "@wecom/aibot-node-sdk";
 function readWeComConfig(home) {
   try {
-    const raw = JSON.parse(readFileSync10(path21.join(home, "personal-assistant", "wecom.json"), "utf8"));
+    const raw = JSON.parse(readFileSync12(path22.join(home, "personal-assistant", "wecom.json"), "utf8"));
     if (raw.enabled !== true || typeof raw.botId !== "string" || !raw.botId.trim()) return null;
     return { enabled: true, botId: raw.botId.trim() };
   } catch {
@@ -19090,7 +19376,7 @@ function readWeComConfig(home) {
   }
 }
 function weComSecretFile(home) {
-  return path21.join(home, "personal-assistant", "wecom.secret");
+  return path22.join(home, "personal-assistant", "wecom.secret");
 }
 function objectOf(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -19204,16 +19490,16 @@ function createWeComAdapter(options) {
 }
 function weComFiles(home) {
   return {
-    config: path21.join(home, "personal-assistant", "wecom.json"),
+    config: path22.join(home, "personal-assistant", "wecom.json"),
     secret: weComSecretFile(home)
   };
 }
 
 // src/assistant-settings.ts
 import { spawn as spawn6 } from "node:child_process";
-import { randomUUID as randomUUID20 } from "node:crypto";
-import { copyFileSync, closeSync as closeSync4, fsyncSync as fsyncSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync5, openSync as openSync4, readFileSync as readFileSync11, renameSync as renameSync3, rmSync as rmSync3, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
-import path22 from "node:path";
+import { randomUUID as randomUUID21 } from "node:crypto";
+import { copyFileSync, closeSync as closeSync4, fsyncSync as fsyncSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync6, openSync as openSync4, readFileSync as readFileSync13, renameSync as renameSync3, rmSync as rmSync3, unlinkSync as unlinkSync3, writeFileSync as writeFileSync5 } from "node:fs";
+import path23 from "node:path";
 import { z as z5 } from "zod";
 var revisionSchema = z5.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 var botIdSchema = z5.string().max(200).trim();
@@ -19292,7 +19578,7 @@ function fileExists(file) {
 }
 function jsonFile(file, schema) {
   if (!fileExists(file)) return void 0;
-  return schema.parse(JSON.parse(readFileSync11(file, "utf8")));
+  return schema.parse(JSON.parse(readFileSync13(file, "utf8")));
 }
 function secretExists(file) {
   if (!fileExists(file)) return false;
@@ -19315,9 +19601,9 @@ function removeFile(file) {
   }
 }
 function atomicWrite(file, content) {
-  const temporary = `${file}.${randomUUID20()}.tmp`;
+  const temporary = `${file}.${randomUUID21()}.tmp`;
   try {
-    writeFileSync4(temporary, content, { encoding: "utf8", flag: "wx" });
+    writeFileSync5(temporary, content, { encoding: "utf8", flag: "wx" });
     syncFile(temporary);
     renameSync3(temporary, file);
   } finally {
@@ -19325,7 +19611,7 @@ function atomicWrite(file, content) {
   }
 }
 function atomicCopy(source, target) {
-  const temporary = `${target}.${randomUUID20()}.tmp`;
+  const temporary = `${target}.${randomUUID21()}.tmp`;
   try {
     copyFileSync(source, temporary);
     syncFile(temporary);
@@ -19388,8 +19674,8 @@ var AssistantSettings = class {
   fault = false;
   constructor(options) {
     this.options = options;
-    this.dir = path22.join(options.home, "personal-assistant");
-    this.transaction = path22.join(this.dir, ".assistant-settings-transaction");
+    this.dir = path23.join(options.home, "personal-assistant");
+    this.transaction = path23.join(this.dir, ".assistant-settings-transaction");
     try {
       this.recover();
       const disk = this.readDisk();
@@ -19401,10 +19687,10 @@ var AssistantSettings = class {
     }
   }
   file(name2) {
-    return path22.join(this.dir, name2);
+    return path23.join(this.dir, name2);
   }
   staged(name2) {
-    return path22.join(this.transaction, name2);
+    return path23.join(this.transaction, name2);
   }
   check() {
     if (this.fault) throw unavailable();
@@ -19498,7 +19784,7 @@ var AssistantSettings = class {
   }
   saveWeCom(next, settings, cipher) {
     this.recover();
-    mkdirSync5(this.transaction);
+    mkdirSync6(this.transaction);
     let committed = false;
     try {
       const journal = {
@@ -19618,7 +19904,7 @@ var AssistantSettings = class {
         }
         this.checkDisk();
         try {
-          mkdirSync5(this.dir, { recursive: true });
+          mkdirSync6(this.dir, { recursive: true });
           if (nextWecom) this.saveWeCom(nextWecom, next, cipher);
           else {
             this.recover();
@@ -19782,7 +20068,7 @@ function configureChannelAgent(ctx, settings, defaultModel) {
 }
 
 // src/member-memory.ts
-import { randomUUID as randomUUID21 } from "node:crypto";
+import { randomUUID as randomUUID22 } from "node:crypto";
 import { z as z6 } from "zod";
 var inputSchema = z6.object({ kind: z6.enum(MEMORY_KINDS), topic: z6.string().trim().min(1).max(120), text: z6.string().trim().min(1).max(8e3) }).strict();
 var revisionSchema2 = z6.object({ expectedRevision: z6.number().int().positive() }).strict();
@@ -19887,7 +20173,7 @@ var MemberMemory = class {
     if (action === "delete-preview") {
       for (const [key, preview] of this.previews) if (preview.expiresAt < Date.now()) this.previews.delete(key);
       const impact = this.impact(id, memoryId);
-      const previewId = randomUUID21();
+      const previewId = randomUUID22();
       this.previews.set(previewId, { memberId: id, memoryId, digest: digestOf(impact), expiresAt: Date.now() + 12e4 });
       return { previewId, impact, notice: "\u5220\u9664\u4E0D\u53EF\u6062\u590D\uFF1B\u540E\u7EED\u65B0\u4F1A\u8BDD\u4E0D\u518D\u5E26\u5165\u65E7\u8BB0\u5FC6\uFF0C\u5DF2\u7ECF\u53D1\u7ED9\u6A21\u578B\u53CA\u5BBF\u4E3B\u5386\u53F2\u65E5\u5FD7\u7684\u5185\u5BB9\u65E0\u6CD5\u8FFD\u56DE\u3002" };
     }
@@ -20279,7 +20565,7 @@ function instructions() {
     '"notes":"\u4E00\u53E5\u4E2D\u6587\u8BF4\u660E\u4F60\u66FF\u7528\u6237\u505A\u4E86\u54EA\u4E9B\u9ED8\u8BA4\u9009\u62E9"}',
     "\u89C4\u5219\uFF1A",
     "- permissionMode \u9ED8\u8BA4 ask\uFF08\u6BCF\u6B21\u8BE2\u95EE\uFF09\uFF1B\u53EA\u6709\u7528\u6237\u660E\u786E\u8BF4\u201C\u4E0D\u7528\u95EE\u6211/\u81EA\u52A8\u6267\u884C\u201D\u624D\u7528 auto\uFF0C\u201C\u5B8C\u5168\u8BBF\u95EE/\u4E0D\u8981\u9650\u5236\u201D\u624D\u7528 full\u3002",
-    "- capabilities \u53EA\u7ED1\u5B9A\u7528\u6237\u660E\u786E\u9700\u8981\u7684\u80FD\u529B\uFF1A\u4F01\u4E1A\u5FAE\u4FE1\u63A5\u6536=wecom\uFF0C\u90AE\u4EF6\u6536\u53D1\u4E0E\u5206\u6790=mail\uFF0C\u4F1A\u8BAE\u5F55\u97F3\u4E0E\u7EAA\u8981=meeting\uFF0C\u6388\u6743\u6587\u6863\u8BB2\u89E3=document\uFF0C\u8BFB\u53D6\u6D3B\u52A8/\u65E5\u62A5=activity\uFF0C\u521B\u5EFA\u63D0\u9192=reminders\u3002\u4E0D\u786E\u5B9A\u5C31\u7559\u7A7A\u3002",
+    "- capabilities \u53EA\u7ED1\u5B9A\u7528\u6237\u660E\u786E\u9700\u8981\u7684\u80FD\u529B\uFF1A\u4F01\u4E1A\u5FAE\u4FE1\u63A5\u6536=wecom\uFF0C\u90AE\u4EF6\u6536\u53D1\u4E0E\u5206\u6790=mail\uFF0C\u4F1A\u8BAE\u5F55\u97F3\u4E0E\u7EAA\u8981=meeting\uFF0C\u6388\u6743\u6587\u6863\u8BB2\u89E3=document\uFF0C\u8BFB\u53D6\u6D3B\u52A8/\u65E5\u62A5=activity\uFF0C\u521B\u5EFA\u63D0\u9192=reminders\uFF0C\u64CD\u4F5C\u7535\u8111=computer\uFF0C\u5BF9\u63A5\u5916\u90E8\u667A\u80FD\u52A9\u7406\u5E73\u53F0=platform\u3002\u4E0D\u786E\u5B9A\u5C31\u7559\u7A7A\u3002",
     "- \u201C\u6BCF\u5929/\u5B9A\u671F\u201D\u53EA\u63CF\u8FF0\u5DE5\u4F5C\u9891\u7387\uFF0C\u4E0D\u7B49\u4E8E\u521B\u5EFA\u63D0\u9192\uFF1B\u53EA\u6709\u7528\u6237\u660E\u786E\u8981\u63D0\u9192\u6216\u5F85\u529E\u65F6\u624D\u7ED1\u5B9A reminders\u3002",
     "- \u4E0D\u8981\u8F93\u51FA\u6A21\u578B\u540D\u3001\u5BC6\u94A5\u3001\u989D\u5EA6\u6216\u8F93\u51FA\u4E0A\u9650\uFF1B\u8FD9\u4E9B\u7531\u7528\u6237\u5728\u9AD8\u7EA7\u8BBE\u7F6E\u91CC\u51B3\u5B9A\u3002",
     "- skinId \u9ED8\u8BA4\u6CBF\u7528\u57FA\u51C6\u5F62\u8C61\u3002",
@@ -20715,8 +21001,8 @@ var MemberManagement = class {
 
 // src/computer.ts
 import { spawn as spawn7 } from "node:child_process";
-import { randomUUID as randomUUID22 } from "node:crypto";
-import path23 from "node:path";
+import { randomUUID as randomUUID23 } from "node:crypto";
+import path24 from "node:path";
 
 // src/command.ts
 import { execFile as execFile2 } from "node:child_process";
@@ -20982,7 +21268,7 @@ var integer2 = (value) => typeof value === "number" && Number.isSafeInteger(valu
 var rect = (v) => integer2(v.left) && integer2(v.top) && integer2(v.width) && integer2(v.height) && Math.abs(v.left) <= 1e5 && Math.abs(v.top) <= 1e5 && v.width > 0 && v.width <= 4e4 && v.height > 0 && v.height <= 4e4;
 function parseTarget(raw) {
   const v = object4(raw);
-  if (!v || typeof v.windowId !== "string" || !/^[1-9]\d{0,19}$/.test(v.windowId) || !integer2(v.pid) || v.pid <= 0 || v.pid > 4294967295 || typeof v.processPath !== "string" || !path23.win32.isAbsolute(v.processPath) || v.processPath.length > 2e3 || typeof v.processStartedAt !== "string" || !/^\d{1,24}$/.test(v.processStartedAt) || typeof v.className !== "string" || !v.className || v.className.length > 256 || typeof v.title !== "string" || !v.title.trim() || v.title.length > 2e3 || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(v.title + v.className + v.processPath) || !rect(v)) return null;
+  if (!v || typeof v.windowId !== "string" || !/^[1-9]\d{0,19}$/.test(v.windowId) || !integer2(v.pid) || v.pid <= 0 || v.pid > 4294967295 || typeof v.processPath !== "string" || !path24.win32.isAbsolute(v.processPath) || v.processPath.length > 2e3 || typeof v.processStartedAt !== "string" || !/^\d{1,24}$/.test(v.processStartedAt) || typeof v.className !== "string" || !v.className || v.className.length > 256 || typeof v.title !== "string" || !v.title.trim() || v.title.length > 2e3 || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(v.title + v.className + v.processPath) || !rect(v)) return null;
   return v;
 }
 function parseControl(raw) {
@@ -21078,7 +21364,7 @@ function sessionOf(exec, bridge) {
   }
 }
 function registerComputerTools(host, deps) {
-  const script = path23.join(deps.scriptDir, "computer.ps1");
+  const script = path24.join(deps.scriptDir, "computer.ps1");
   const run = deps.run ?? runComputerScript;
   const output = { schema: { type: "string" }, render: (_args, value) => [{ type: "text", text: value }] };
   const targets = /* @__PURE__ */ new Map();
@@ -21253,7 +21539,7 @@ function registerComputerTools(host, deps) {
           vision = { ...visionSetup, screen };
         }
         if (session.signal.aborted || !session.isCurrent()) return reject("\u8BF7\u6C42\u5DF2\u53D6\u6D88\u6216\u684C\u9762\u4F1A\u8BDD\u5DF2\u5207\u6362\uFF0C\u672A\u63D0\u4EA4\u6388\u6743");
-        const targetId = randomUUID22();
+        const targetId = randomUUID23();
         const subject = `computer:look:${targetId}`;
         const entry = { session: session.id, target, depth: args.maxDepth ?? 4, expiresAt: Date.now() + 12e4, subject, state: "pending", ...vision ? { vision } : {} };
         targets.set(targetId, entry);
@@ -21309,7 +21595,7 @@ function registerComputerTools(host, deps) {
   const submitAuthorized = (session, entry, targetId, fixed, name2) => {
     if (session.signal.aborted || !session.isCurrent()) throw new BeforeEffectError("\u8BF7\u6C42\u5DF2\u53D6\u6D88\u6216\u684C\u9762\u4F1A\u8BDD\u5DF2\u5207\u6362\uFF0C\u672A\u63D0\u4EA4\u64CD\u4F5C");
     if (actions.size >= 32) throw new Error("\u5F85\u5904\u7406\u7684\u7535\u8111\u64CD\u4F5C\u8FC7\u591A\uFF0C\u8BF7\u5148\u6838\u67E5");
-    const actionId = randomUUID22(), subject = `computer:action:${actionId}`;
+    const actionId = randomUUID23(), subject = `computer:action:${actionId}`;
     const grant = {
       session: session.id,
       targetId,
@@ -21448,7 +21734,7 @@ function registerComputerTools(host, deps) {
         if (session.signal.aborted || !session.isCurrent()) return reject("\u8BF7\u6C42\u5DF2\u53D6\u6D88\u6216\u684C\u9762\u4F1A\u8BDD\u5DF2\u5207\u6362\uFF0C\u672A\u63D0\u4EA4\u547D\u4EE4");
         const shown = `${spec.program} ${spec.args.join(" ")}`.trim().slice(0, 400);
         const proposal = deps.bridge.submitAssistant({
-          subject: `computer:command:${randomUUID22()}`,
+          subject: `computer:command:${randomUUID23()}`,
           tool: "personal_assistant_computer_run_command",
           summary: "\u8FD9\u6761\u547D\u4EE4\u4F1A\u4EE5\u4F60\u7684\u8EAB\u4EFD\u5728\u672C\u673A\u6267\u884C\u4E00\u6B21\uFF0C\u4E0D\u53EF\u64A4\u9500\u3002\u8BF7\u6838\u5BF9\u7A0B\u5E8F\u3001\u53C2\u6570\u3001\u76EE\u5F55\u4E0E\u8D85\u65F6\u3002",
           target: shown,
@@ -21621,12 +21907,12 @@ function startRetention(enabled, run, onError, hooks) {
 
 // src/tools.ts
 import { defineTool as defineTool9 } from "@deepseek-ai/dsh-tools";
-import path26 from "node:path";
+import path27 from "node:path";
 
 // src/deletion.ts
-import { lstatSync as lstatSync5, readFileSync as readFileSync12 } from "node:fs";
+import { lstatSync as lstatSync5, readFileSync as readFileSync14 } from "node:fs";
 import { unlink } from "node:fs/promises";
-import path24 from "node:path";
+import path25 from "node:path";
 var DELETION_CATEGORIES = ["draft_entry", "report_version", "activity_range", "material", "memory", "exported_file"];
 var DELETION_CATEGORY_LABEL = {
   draft_entry: "\u5220\u9664\u8349\u7A3F\u6761\u76EE",
@@ -22043,7 +22329,7 @@ function fileState(file) {
   try {
     const stat2 = lstatSync5(file);
     if (!stat2.isFile()) return { exists: true, regular: false, digest: null, size: stat2.size, mtimeMs: stat2.mtimeMs };
-    return { exists: true, regular: true, digest: sha256(readFileSync12(file, "utf8")), size: stat2.size, mtimeMs: stat2.mtimeMs };
+    return { exists: true, regular: true, digest: sha256(readFileSync14(file, "utf8")), size: stat2.size, mtimeMs: stat2.mtimeMs };
   } catch {
     return { exists: false };
   }
@@ -22111,7 +22397,7 @@ function planExportedFileDeletion(deps, reportId, revision2, reasonInput) {
   const record3 = deps.reports.revision(reportId, revision2);
   if (!record3) return { ok: false, message: `\u627E\u4E0D\u5230 ${reportId} \u7B2C ${revision2} \u7248` };
   if (!record3.targetPath || !wasPublished(deps, record3)) return { ok: false, message: "\u8FD9\u4E00\u7248\u6CA1\u6709\u53D1\u5E03\u8FC7\uFF0C\u6CA1\u6709\u5BFC\u51FA\u6587\u4EF6" };
-  const file = path24.resolve(record3.targetPath);
+  const file = path25.resolve(record3.targetPath);
   const reason = reasonInput?.trim() || "\u7528\u6237\u5728\u5DE5\u4F5C\u53F0\u5220\u9664\u5BFC\u51FA\u6587\u4EF6";
   const state = fileState(file);
   const temps = deps.reports.history(reportId).map((item) => tempPathFor(file, item.revision)).filter((temp) => fileState(temp).exists);
@@ -22206,40 +22492,40 @@ function planDraftEntryDeletion(deps, input) {
 
 // src/evidence-import.ts
 import { execFileSync } from "node:child_process";
-import { readFileSync as readFileSync13, realpathSync as realpathSync6, statSync as statSync7 } from "node:fs";
-import path25 from "node:path";
+import { readFileSync as readFileSync15, realpathSync as realpathSync6, statSync as statSync7 } from "node:fs";
+import path26 from "node:path";
 var MAX_PROJECT_FILE_BYTES = 256 * 1024;
 var MAX_IMPORT_LINES = 400;
 var GIT_TIMEOUT_MS2 = 5e3;
 function strictlyInside(root, target) {
-  const relative = path25.relative(root, target);
-  return !!relative && relative !== ".." && !relative.startsWith(`..${path25.sep}`) && !path25.isAbsolute(relative);
+  const relative = path26.relative(root, target);
+  return !!relative && relative !== ".." && !relative.startsWith(`..${path26.sep}`) && !path26.isAbsolute(relative);
 }
 function resolveInside(scope, candidate, mustExist) {
   if (typeof candidate !== "string" || !candidate.trim()) return { ok: false, message: "\u6CA1\u6709\u7ED9\u51FA\u6587\u4EF6\u8DEF\u5F84" };
-  const absolute = path25.resolve(scope.projectDir, candidate);
+  const absolute = path26.resolve(scope.projectDir, candidate);
   let real;
   try {
     real = realpathSync6(absolute);
   } catch {
     if (mustExist) return { ok: false, message: `\u6587\u4EF6\u4E0D\u5B58\u5728\uFF1A${absolute}` };
-    let parent = path25.dirname(absolute);
+    let parent = path26.dirname(absolute);
     while (true) {
       try {
         realpathSync6(parent);
         break;
       } catch {
       }
-      const up = path25.dirname(parent);
+      const up = path26.dirname(parent);
       if (up === parent) return { ok: false, message: `\u8DEF\u5F84\u4E0D\u5728\u6388\u6743\u8303\u56F4\u5185\uFF1A${absolute}` };
       parent = up;
     }
     const realParent = realpathSync6(parent);
-    real = path25.join(realParent, path25.relative(parent, absolute));
+    real = path26.join(realParent, path26.relative(parent, absolute));
   }
   if (!strictlyInside(scope.projectDir, real)) return { ok: false, message: `\u5B9E\u9645\u8DEF\u5F84\u4E0D\u5728\u5DF2\u6388\u6743\u7684\u9879\u76EE\u76EE\u5F55\u5185\uFF1A${real}` };
   if (scope.currentFile && real !== scope.currentFile) return { ok: false, message: "\u8FD9\u6B21\u5E2E\u52A9\u53EA\u6388\u6743\u4E86\u4E00\u4E2A\u6587\u4EF6\uFF0C\u4E0D\u80FD\u8BFB\u53D6\u5B83\u4E4B\u5916\u7684\u6587\u4EF6" };
-  return { ok: true, real, relative: path25.relative(scope.projectDir, real) };
+  return { ok: true, real, relative: path26.relative(scope.projectDir, real) };
 }
 function decodeText2(buffer) {
   if (buffer.includes(0)) return null;
@@ -22283,7 +22569,7 @@ function fileBasis(file) {
   }
 }
 function readProjectMaterial(scopes, request, now) {
-  if (typeof request.projectDir !== "string" || !path25.isAbsolute(request.projectDir)) return { ok: false, message: "\u9879\u76EE\u76EE\u5F55\u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84" };
+  if (typeof request.projectDir !== "string" || !path26.isAbsolute(request.projectDir)) return { ok: false, message: "\u9879\u76EE\u76EE\u5F55\u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84" };
   const scope = scopes.authorizedScope(request.projectDir);
   if (!scope) return { ok: false, message: "\u8BE5\u76EE\u5F55\u6CA1\u6709\u88AB\u7528\u6237\u6388\u6743\u4E3A\u5E2E\u52A9\u4E0A\u4E0B\u6587\uFF08\u6216\u6388\u6743\u5DF2\u64A4\u9500\u3001\u5B9E\u9645\u8DEF\u5F84\u5DF2\u6539\u6307\uFF09\uFF0C\u4E0D\u80FD\u8BFB\u53D6" };
   const paths = Array.isArray(request.paths) ? request.paths.filter((item) => typeof item === "string") : [];
@@ -22295,7 +22581,7 @@ function readProjectMaterial(scopes, request, now) {
     const stat2 = statSync7(resolved.real);
     if (!stat2.isFile()) return { ok: false, message: "\u53EA\u80FD\u8BFB\u53D6\u666E\u901A\u6587\u4EF6" };
     if (stat2.size > MAX_PROJECT_FILE_BYTES) return { ok: false, message: `\u6587\u4EF6\u8D85\u8FC7 ${MAX_PROJECT_FILE_BYTES / 1024}KB\uFF0C\u4E0D\u8BFB\u53D6\uFF1B\u8BF7\u6307\u5B9A\u884C\u8303\u56F4\u8F83\u5C0F\u7684\u6587\u672C\u6587\u4EF6` };
-    const decoded = decodeText2(readFileSync13(resolved.real));
+    const decoded = decodeText2(readFileSync15(resolved.real));
     if (decoded === null) return { ok: false, message: "\u8FD9\u4E0D\u662F UTF-8 \u6587\u672C\u6587\u4EF6\uFF08\u53EF\u80FD\u662F\u4E8C\u8FDB\u5236\uFF09\uFF0C\u4E0D\u8BFB\u53D6" };
     const all = decoded.replace(/\r\n?/g, "\n").split("\n");
     const total = all.length;
@@ -22347,7 +22633,7 @@ function readProjectMaterial(scopes, request, now) {
       truncated,
       digest: sha256(content),
       coverage: `\u4ED3\u5E93 ${scope.projectDir} \u5DE5\u4F5C\u533A\u76F8\u5BF9 HEAD \u7684\u5DEE\u5F02\uFF1A${files.length} \u4E2A\u6587\u4EF6\uFF08${shown}\uFF09\uFF0C${Math.min(lines.length, MAX_IMPORT_LINES)} \u884C${truncated ? `\uFF0C\u8D85\u8FC7 ${MAX_IMPORT_LINES} \u884C\u7684\u90E8\u5206\u5DF2\u622A\u65AD` : ""}\uFF1B\u8BFB\u53D6\u4E8E ${formatLocalTime(now)}\u3002\u4E0D\u542B\u672A\u8DDF\u8E2A\u7684\u65B0\u6587\u4EF6\u4E0E\u63D0\u4EA4\u5386\u53F2\uFF0C\u4E5F\u4E0D\u8BF4\u660E\u6D4B\u8BD5\u662F\u5426\u901A\u8FC7`,
-      basis: files.map((file) => fileBasis(path25.join(scope.projectDir, file)))
+      basis: files.map((file) => fileBasis(path26.join(scope.projectDir, file)))
     }
   };
 }
@@ -23139,7 +23425,7 @@ function registerAssistantTools(ctx, tracker, options) {
     });
   };
   const authorizedProjectDir = (projectDir) => {
-    if (!options.helpContexts || typeof projectDir !== "string" || !path26.isAbsolute(projectDir)) return null;
+    if (!options.helpContexts || typeof projectDir !== "string" || !path27.isAbsolute(projectDir)) return null;
     return options.helpContexts.authorizedScope(projectDir)?.projectDir ?? null;
   };
   const authorizedProjectDirs = () => options.helpContexts ? [...new Set(options.helpContexts.list().map((item) => authorizedProjectDir(item.projectDir)).filter((dir) => !!dir))].sort() : [];
@@ -24446,7 +24732,7 @@ function registerAssistantTools(ctx, tracker, options) {
         return json4({ ok: false, error: "\u65F6\u95F4\u8303\u56F4\u65E0\u6548\uFF1A\u8BF7\u63D0\u4F9B\u4E0D\u8D85\u8FC7 366 \u5929\u7684\u8D77\u6B62\u6BEB\u79D2\u65F6\u95F4" });
       }
       const store = options.helpContexts;
-      if (typeof args.projectDir !== "string" || !path26.isAbsolute(args.projectDir) || !store || !options.observations || !options.workItems) {
+      if (typeof args.projectDir !== "string" || !path27.isAbsolute(args.projectDir) || !store || !options.observations || !options.workItems) {
         return json4({ ok: false, error: "\u9879\u76EE\u65F6\u95F4\u7EBF\u672A\u88C5\u914D\u6216\u9879\u76EE\u8DEF\u5F84\u65E0\u6548" });
       }
       const scope = store.authorizedScope(args.projectDir);
@@ -25571,7 +25857,7 @@ var ActivityTracker = class {
 };
 
 // src/artifacts.ts
-import { createHash as createHash13 } from "node:crypto";
+import { createHash as createHash14 } from "node:crypto";
 function artifactMentioned(text7, pointer) {
   const haystack = text7.toLowerCase();
   if (haystack.trim() === "") return false;
@@ -25611,9 +25897,9 @@ var ArtifactStore = class {
    * 记忆里只需要"它现在是什么样"，留一串历史只会让提示词变成活动日志。
    */
   record(input, now = Date.now()) {
-    const path29 = input.path.trim();
-    if (path29 === "") throw new Error("\u4EA7\u7269\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");
-    const existing = this.db.prepare("SELECT artifact_id FROM artifact_pointers WHERE path = ?").get(path29);
+    const path30 = input.path.trim();
+    if (path30 === "") throw new Error("\u4EA7\u7269\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");
+    const existing = this.db.prepare("SELECT artifact_id FROM artifact_pointers WHERE path = ?").get(path30);
     const id = existing === void 0 ? `art-${now}-${Math.random().toString(36).slice(2, 8)}` : String(existing.artifact_id);
     this.db.prepare(`
       INSERT INTO artifact_pointers(artifact_id, kind, path, digest, label, task_id, meeting_id, created_at, last_seen_at, state)
@@ -25621,7 +25907,7 @@ var ArtifactStore = class {
       ON CONFLICT(artifact_id) DO UPDATE SET
         kind = excluded.kind, digest = excluded.digest, label = excluded.label,
         task_id = excluded.task_id, meeting_id = excluded.meeting_id, last_seen_at = excluded.last_seen_at, state = 'ok'
-    `).run(id, input.kind, path29, input.digest, input.label, input.taskId ?? null, input.meetingId ?? null, now, now);
+    `).run(id, input.kind, path30, input.digest, input.label, input.taskId ?? null, input.meetingId ?? null, now, now);
     return this.get(id);
   }
   get(id) {
@@ -25736,8 +26022,8 @@ function describeIntakeMismatch(materialDigest2, declaredDigest) {
 }
 
 // src/workbench.ts
-import { lstatSync as lstatSync6, readFileSync as readFileSync14 } from "node:fs";
-import path27 from "node:path";
+import { lstatSync as lstatSync6, readFileSync as readFileSync16 } from "node:fs";
+import path28 from "node:path";
 var InputError = class extends Error {
 };
 var DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -25808,7 +26094,7 @@ function fileFacts(file) {
   try {
     const stat2 = lstatSync6(file);
     if (!stat2.isFile()) return { exists: true, digest: null };
-    return { exists: true, digest: sha256(readFileSync14(file, "utf8")) };
+    return { exists: true, digest: sha256(readFileSync16(file, "utf8")) };
   } catch {
     return { exists: false, digest: null };
   }
@@ -25850,7 +26136,7 @@ var ReportWorkbench = class {
     };
   }
   targetFor(date) {
-    return path27.resolve(this.deps.reportDir, `${date}.md`);
+    return path28.resolve(this.deps.reportDir, `${date}.md`);
   }
   async handle(method, route, query, body) {
     try {
@@ -25916,7 +26202,7 @@ var ReportWorkbench = class {
     const deletedExports = reports.exportDeletions(reportId);
     const exports = history.filter((record3) => record3.targetPath && (record3.state === "archived" || reports.jobsFor(reportId).some((job) => job.revision === record3.revision && job.state === "succeeded"))).map((record3) => {
       const facts = fileFacts(record3.targetPath);
-      const deletion = deletedExports.find((item) => item.revision === record3.revision && item.path === path27.resolve(record3.targetPath));
+      const deletion = deletedExports.find((item) => item.revision === record3.revision && item.path === path28.resolve(record3.targetPath));
       return {
         revision: record3.revision,
         path: record3.targetPath,
@@ -26147,7 +26433,7 @@ var ReportWorkbench = class {
       return fail2(409, "wrong_state", `\u7B2C ${revision2} \u7248\u5F53\u524D\u72B6\u6001\u662F ${current.state}\uFF0C\u4E0D\u80FD\u8BF7\u6C42\u53D1\u5E03`);
     }
     const expected = this.targetFor(date);
-    if (path27.resolve(targetPath) !== expected) {
+    if (path28.resolve(targetPath) !== expected) {
       return fail2(409, "target_mismatch", `\u4F60\u770B\u5230\u7684\u4FDD\u5B58\u4F4D\u7F6E\uFF08${targetPath}\uFF09\u4E0E\u5B9E\u9645\u53D1\u5E03\u4F4D\u7F6E\uFF08${expected}\uFF09\u4E0D\u4E00\u81F4\uFF0C\u6CA1\u6709\u63D0\u4EA4`, { expected });
     }
     let proposal;
@@ -26275,7 +26561,7 @@ var ReportWorkbench = class {
     const result = materials.register({
       kind,
       origin: "desktop_selection",
-      sourceLabel: optionalText(input.sourceLabel, "\u6765\u6E90", 80) ?? (fileName ? `file:${path27.basename(fileName)}` : "desktop"),
+      sourceLabel: optionalText(input.sourceLabel, "\u6765\u6E90", 80) ?? (fileName ? `file:${path28.basename(fileName)}` : "desktop"),
       objectLabel: optionalText(input.objectLabel, "\u5BF9\u8C61", 200),
       coveredFrom,
       coveredTo,
@@ -26402,8 +26688,8 @@ function mountReportWorkbench(bridge, deps) {
 }
 
 // src/sub-assistant-secrets.ts
-import { createCipheriv, createDecipheriv, randomBytes as randomBytes2, randomUUID as randomUUID23 } from "node:crypto";
-import { chmodSync as chmodSync2, closeSync as closeSync5, fsyncSync as fsyncSync4, openSync as openSync5, readFileSync as readFileSync15, renameSync as renameSync4, statSync as statSync8, unlinkSync as unlinkSync4, writeFileSync as writeFileSync5 } from "node:fs";
+import { createCipheriv, createDecipheriv, randomBytes as randomBytes2, randomUUID as randomUUID24 } from "node:crypto";
+import { chmodSync as chmodSync2, closeSync as closeSync5, fsyncSync as fsyncSync4, openSync as openSync5, readFileSync as readFileSync17, renameSync as renameSync4, statSync as statSync8, unlinkSync as unlinkSync4, writeFileSync as writeFileSync6 } from "node:fs";
 var MB = 1024 * 1024;
 var MAX_SECRETS = 32;
 var UUID2 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -26437,7 +26723,7 @@ var SubAssistantSecrets = class {
     let raw;
     try {
       if (statSync8(filePath).size > MB) fail3("\u5B50\u52A9\u7406\u5BC6\u94A5\u5E93\u6587\u4EF6\u8FC7\u5927");
-      raw = readFileSync15(filePath, "utf8");
+      raw = readFileSync17(filePath, "utf8");
     } catch (error) {
       if (error instanceof SubAssistantSecretsError) throw error;
       if (error.code === "ENOENT") return;
@@ -26479,7 +26765,7 @@ var SubAssistantSecrets = class {
   save(input) {
     const value = record2(input);
     if (Object.keys(value).some((key) => !["id", "apiKey"].includes(key))) fail3("\u5B50\u52A9\u7406\u5BC6\u94A5\u4FDD\u5B58\u8BF7\u6C42\u5305\u542B\u672A\u77E5\u5B57\u6BB5");
-    const id = value.id === void 0 ? randomUUID23() : idOf(value.id);
+    const id = value.id === void 0 ? randomUUID24() : idOf(value.id);
     const previous = this.state.entries.find((entry2) => entry2.id === id);
     if (!previous && this.state.entries.length >= MAX_SECRETS) fail3("\u5B50\u52A9\u7406\u5BC6\u94A5\u6570\u91CF\u5DF2\u8FBE\u4E0A\u9650");
     let encryptedKey = previous?.encryptedKey ?? "";
@@ -26515,7 +26801,7 @@ var SubAssistantSecrets = class {
     }
   }
   commit(next) {
-    const temporary = `${this.filePath}.${randomUUID23()}.tmp`;
+    const temporary = `${this.filePath}.${randomUUID24()}.tmp`;
     let descriptor;
     let created = false;
     try {
@@ -26523,7 +26809,7 @@ var SubAssistantSecrets = class {
       if (Buffer.byteLength(content) > MB) fail3("\u5B50\u52A9\u7406\u5BC6\u94A5\u5E93\u6587\u4EF6\u8FC7\u5927");
       descriptor = openSync5(temporary, "wx", 384);
       created = true;
-      writeFileSync5(descriptor, content, "utf8");
+      writeFileSync6(descriptor, content, "utf8");
       fsyncSync4(descriptor);
       closeSync5(descriptor);
       descriptor = void 0;
@@ -26553,17 +26839,17 @@ function fileKeyCodec(keyPath) {
   const loadKey = () => {
     if (cached) return cached;
     try {
-      const key = readFileSync15(keyPath);
+      const key = readFileSync17(keyPath);
       if (key.length !== 32) throw new Error("bad length");
       cached = key;
       return key;
     } catch {
       const key = randomBytes2(32);
-      const temporary = `${keyPath}.${randomUUID23()}.tmp`;
+      const temporary = `${keyPath}.${randomUUID24()}.tmp`;
       try {
         const descriptor = openSync5(temporary, "wx", 384);
         try {
-          writeFileSync5(descriptor, key);
+          writeFileSync6(descriptor, key);
           fsyncSync4(descriptor);
         } finally {
           closeSync5(descriptor);
@@ -26601,7 +26887,7 @@ function fileKeyCodec(keyPath) {
 
 // src/cli-agent.ts
 import { spawn as spawn8 } from "node:child_process";
-import { randomUUID as randomUUID24 } from "node:crypto";
+import { randomUUID as randomUUID25 } from "node:crypto";
 var MAX_BUFFER = 1024 * 1024 * 4;
 var KILL_GRACE_MS2 = 3e3;
 var CliAgent = class {
@@ -26618,7 +26904,7 @@ var CliAgent = class {
     if (this.pending) return Promise.resolve({ kind: "error", text: "\u4E0A\u4E00\u4EFB\u52A1\u5C1A\u672A\u7ED3\u675F\uFF0C\u540C\u4E00\u4F1A\u8BDD\u4E32\u884C\u6267\u884C" });
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) return Promise.resolve({ kind: "error", text: "CLI \u8C03\u7528\u8D85\u65F6\u53C2\u6570\u65E0\u6548" });
     return new Promise((resolve) => {
-      const id = randomUUID24();
+      const id = randomUUID25();
       let child;
       try {
         child = this.ensureChild();
@@ -26741,7 +27027,7 @@ var CliAgent = class {
 };
 
 // src/sub-assistant-protocol.ts
-import { randomUUID as randomUUID25 } from "node:crypto";
+import { randomUUID as randomUUID26 } from "node:crypto";
 var SUB_ASSISTANT_PROTOCOL_PROMPT = [
   "\u4F60\u662F\u88AB\u5206\u6D3E\u4EFB\u52A1\u7684\u5B50\u52A9\u7406\u3002\u8BF7\u53EA\u5904\u7406\u5206\u6D3E\u7ED9\u4F60\u3001\u4E14\u5728\u4F60\u7684\u5E73\u53F0\u80FD\u529B\u4E0E\u6743\u9650\u8303\u56F4\u5185\u7684\u4EFB\u52A1\u3002",
   "\u4EFB\u52A1\u9700\u8981\u672C\u5730\u6587\u4EF6\u64CD\u4F5C\u3001\u6267\u884C\u547D\u4EE4\u3001\u8BBF\u95EE\u672C\u7CFB\u7EDF\u7684\u5176\u4ED6\u6210\u5458\u6216\u5DE5\u5177\u65F6\uFF0C\u4E0D\u8981\u5C1D\u8BD5\u5B8C\u6210\uFF0C\u53EA\u8FD4\u56DE\u4E00\u884C JSON\uFF1A",
@@ -26935,9 +27221,9 @@ ${SUB_ASSISTANT_PROTOCOL_PROMPT}` };
 };
 
 // src/sub-assistant-dispatch.ts
-import { createHash as createHash14, randomUUID as randomUUID26 } from "node:crypto";
+import { createHash as createHash15, randomUUID as randomUUID27 } from "node:crypto";
 function subAssistantTaskDigest(task) {
-  return createHash14("sha256").update(task).digest("hex");
+  return createHash15("sha256").update(task).digest("hex");
 }
 var SubAssistantDispatch = class {
   options;
@@ -27000,7 +27286,7 @@ var SubAssistantDispatch = class {
       );
     }
     const run = this.options.ledger.beginSubAssistantRun({
-      runId: randomUUID26(),
+      runId: randomUUID27(),
       assistantId: member.assistantId,
       dispatchId,
       taskDigest,
@@ -27069,7 +27355,7 @@ var SubAssistantDispatch = class {
   refuse(assistantId, displayName, dispatchId, task, depth, reason, startedAt) {
     const existing = this.options.ledger.getSubAssistantRunByDispatchId(dispatchId);
     const runId = existing?.runId ?? this.options.ledger.beginSubAssistantRun({
-      runId: randomUUID26(),
+      runId: randomUUID27(),
       assistantId,
       dispatchId,
       taskDigest: subAssistantTaskDigest(task),
@@ -27084,7 +27370,7 @@ var SubAssistantDispatch = class {
 };
 
 // src/member-scheduler.ts
-import { randomUUID as randomUUID27 } from "node:crypto";
+import { randomUUID as randomUUID28 } from "node:crypto";
 var MAX_LAST_TEXT = 2e3;
 var MemberScheduler = class {
   options;
@@ -27155,7 +27441,7 @@ var MemberScheduler = class {
     void this.fire(claimed, now).catch((error) => this.options.log(`\u6210\u5458\u5B9A\u65F6\u4EFB\u52A1\u6267\u884C\u5F02\u5E38\uFF1A${error instanceof Error ? error.message : String(error)}`)).finally(() => this.running.delete(schedule.scheduleId));
   }
   async fire(schedule, triggerAt) {
-    const runId = randomUUID27();
+    const runId = randomUUID28();
     this.options.store.insertMemberScheduleRun({
       runId,
       scheduleId: schedule.scheduleId,
@@ -27296,7 +27582,7 @@ var inject = ["tools", "storageDomain", "systemPrompt"];
 var OWNED_SESSION_FLAG = "bridge_owned_session_id";
 var ASSISTANT_ENABLED_FLAG = "assistant_enabled";
 function dshHome() {
-  return process.env.DSH_HOME || path28.join(os2.homedir(), ".dsh");
+  return process.env.DSH_HOME || path29.join(os2.homedir(), ".dsh");
 }
 var PROACTIVE_EVALUATE_MS = 3e4;
 function hostAgents(ctx) {
@@ -27307,12 +27593,12 @@ function hostAgents(ctx) {
 }
 function resolveDefaultModel(home) {
   const candidates = [
-    path28.join(home, "profiles", "desktop", "cordis.patch.yml"),
-    path28.join(home, "settings.yaml.imported")
+    path29.join(home, "profiles", "desktop", "cordis.patch.yml"),
+    path29.join(home, "settings.yaml.imported")
   ];
   for (const file of candidates) {
     try {
-      const text7 = readFileSync16(file, "utf8");
+      const text7 = readFileSync18(file, "utf8");
       const block = /id:\s*agent-default-model[\s\S]{0,400}/.exec(text7)?.[0];
       if (!block) continue;
       const provider = /provider:\s*['"]?([A-Za-z0-9._-]+)/.exec(block)?.[1];
@@ -27474,6 +27760,37 @@ function mountUserCommands(ctx, deps) {
       }
     });
     register({
+      name: "assistant-platform-get",
+      description: "\u8BFB\u53D6\u5916\u90E8\u667A\u80FD\u52A9\u7406\u5E73\u53F0\u5BF9\u63A5\u914D\u7F6E\uFF08\u53EA\u8BFB\uFF0Csecret \u63A9\u7801\uFF09",
+      recordInput: false,
+      async handler() {
+        const c = readPlatformConfig(home);
+        return { kind: "success", text: JSON.stringify({ ok: true, ...c, secret: c.secret ? "***" : "" }) };
+      }
+    });
+    register({
+      name: "assistant-platform-set",
+      description: "\u914D\u7F6E\u5916\u90E8\u5E73\u53F0\u5BF9\u63A5\uFF1Aenabled/endpoint/appid/channel/secret/signTemplate/userId/assistId/timeoutMs\uFF08key=value \u7A7A\u683C\u5206\u9694\uFF09",
+      recordInput: false,
+      async handler(invocation) {
+        const allowedKeys = ["enabled", "endpoint", "appid", "channel", "secret", "signTemplate", "userId", "assistId", "timeoutMs"];
+        const patch = {};
+        for (const token of String(invocation.rawInput ?? "").split(/\s+/).filter(Boolean)) {
+          const eq = token.indexOf("=");
+          if (eq <= 0) continue;
+          const key = token.slice(0, eq);
+          const val = token.slice(eq + 1);
+          if (!allowedKeys.includes(key)) continue;
+          if (key === "enabled") patch[key] = val === "true";
+          else if (key === "timeoutMs") patch[key] = Number(val) || 15e3;
+          else patch[key] = val;
+        }
+        if (Object.keys(patch).length === 0) return { kind: "success", text: "\u7528\u6CD5\uFF1Aassistant-platform-set enabled=true endpoint=<url> appid=<id> secret=<key> userId=<uid> assistId=<aid>" };
+        const c = writePlatformConfig(home, patch);
+        return { kind: "success", text: JSON.stringify({ ok: true, ...c, secret: c.secret ? "***" : "" }) };
+      }
+    });
+    register({
       name: "assistant-task-set",
       description: "\u6539\u4E00\u6761\u5F85\u529E/\u63D0\u9192\uFF1Atitle|deadline|interval|cancel\uFF08\u5199\u64CD\u4F5C\u8D70\u672C\u4EBA\u786E\u8BA4\uFF09",
       recordInput: false,
@@ -27498,9 +27815,9 @@ function mountUserCommands(ctx, deps) {
         }
         const tasks = deps.tasks;
         if (tasks === void 0) return { kind: "error", text: "\u6CA1\u6539\u6210\uFF1A\u4EFB\u52A1\u8FD0\u884C\u65F6\u4E0D\u53EF\u7528" };
-        const path29 = `/companion/v1/tasks/${encodeURIComponent(request.taskId)}`;
+        const path30 = `/companion/v1/tasks/${encodeURIComponent(request.taskId)}`;
         try {
-          const detail = await tasks.request("GET", path29, null, "client");
+          const detail = await tasks.request("GET", path30, null, "client");
           const view = detail.body?.task;
           const revision2 = view?.revision;
           if (detail.status !== 200 || typeof revision2 !== "number") {
@@ -27530,9 +27847,9 @@ function mountUserCommands(ctx, deps) {
               payload = { deadlineAt: request.value };
             }
           }
-          const result = await tasks.request("POST", `${path29}/${action}`, {
+          const result = await tasks.request("POST", `${path30}/${action}`, {
             protocolVersion: 1,
-            commandId: randomUUID28(),
+            commandId: randomUUID29(),
             expiresAt: new Date(Date.now() + 6e4).toISOString(),
             payload,
             taskId: request.taskId,
@@ -27753,17 +28070,17 @@ function mountUserCommands(ctx, deps) {
         }
         const tasks = deps.tasks;
         if (tasks === void 0) return { kind: "error", text: "\u4F18\u5148\u7EA7\u6CA1\u6539\u6210\uFF1A\u4EFB\u52A1\u8FD0\u884C\u65F6\u4E0D\u53EF\u7528" };
-        const path29 = `/companion/v1/tasks/${encodeURIComponent(parsed.taskId)}`;
+        const path30 = `/companion/v1/tasks/${encodeURIComponent(parsed.taskId)}`;
         try {
-          const detail = await tasks.request("GET", path29, null, "client");
+          const detail = await tasks.request("GET", path30, null, "client");
           const view = detail.body?.task;
           const revision2 = view?.revision;
           if (detail.status !== 200 || typeof revision2 !== "number") {
             return { kind: "error", text: "\u4F18\u5148\u7EA7\u6CA1\u6539\u6210\uFF1A\u6CA1\u627E\u5230\u8FD9\u6761\u5F85\u529E" };
           }
-          const result = await tasks.request("POST", `${path29}/set-priority`, {
+          const result = await tasks.request("POST", `${path30}/set-priority`, {
             protocolVersion: 1,
-            commandId: randomUUID28(),
+            commandId: randomUUID29(),
             expiresAt: new Date(Date.now() + 6e4).toISOString(),
             payload: { priority: parsed.priority },
             taskId: parsed.taskId,
@@ -27877,9 +28194,9 @@ async function apply(ctx, config) {
   const domain = await ctx.storageDomain.open(personalAssistantDomainSpec);
   ctx.effect(() => () => void domain.close(), "personal-assistant:domain");
   const scriptPath = fileURLToPath(new URL(`../assets/${samplerScriptName(process.platform) ?? "sampler.ps1"}`, import.meta.url));
-  const sampleDir = path28.join(home, "personal-assistant", "samples");
-  mkdirSync6(sampleDir, { recursive: true });
-  const storePath = config.storePath || path28.join(home, "personal-assistant", "assistant.sqlite");
+  const sampleDir = path29.join(home, "personal-assistant", "samples");
+  mkdirSync7(sampleDir, { recursive: true });
+  const storePath = config.storePath || path29.join(home, "personal-assistant", "assistant.sqlite");
   const db = openAssistantStore(storePath);
   const memories = new MemoryStore(db);
   const observations = new ObservationStore(db);
@@ -27981,7 +28298,7 @@ async function apply(ctx, config) {
     cwd: () => process.cwd()
   };
   let evidenceIntakeHandler = null;
-  const pluginDir = path28.dirname(path28.dirname(fileURLToPath(import.meta.url)));
+  const pluginDir = path29.dirname(path29.dirname(fileURLToPath(import.meta.url)));
   const petDirResolution = resolvePetDir({
     configured: config.petDir,
     env: process.env.DSH_PET_DIR,
@@ -28019,12 +28336,12 @@ async function apply(ctx, config) {
   };
   const helpContexts = new HelpContextStore(db);
   const helpEpisodes = new HelpEpisodeStore(db);
-  const teamStorePath = config.teamStorePath || path28.join(home, "desktop-team", "team.sqlite");
+  const teamStorePath = config.teamStorePath || path29.join(home, "desktop-team", "team.sqlite");
   const teamStore = new TeamStore(teamStorePath);
   teamStore.failInterruptedSubAssistantRuns(Date.now());
   const subAssistantSecrets = new SubAssistantSecrets(
-    path28.join(home, "sub-assistant-secrets.json"),
-    fileKeyCodec(path28.join(home, "sub-assistant-secrets.key"))
+    path29.join(home, "sub-assistant-secrets.json"),
+    fileKeyCodec(path29.join(home, "sub-assistant-secrets.key"))
   );
   const subAssistantRegistry = new SubAssistantRegistry({
     idleTtlMs: config.subAssistantIdleTtlMs,
@@ -28052,6 +28369,12 @@ async function apply(ctx, config) {
       teamStore.directory.setSession(id, null);
     }
   });
+  let subagentsRuntime = null;
+  if (typeof ctx.inject === "function") {
+    ctx.inject(["subagents"], (scope) => {
+      subagentsRuntime = scope.subagents ?? null;
+    });
+  }
   const memberRuntime = new MemberRuntime({
     ctx,
     /* 成员会话挂到总助理当前的工作目录下：与文档会话 scope 共用同一个解析器。 */
@@ -28078,8 +28401,8 @@ async function apply(ctx, config) {
      * 想减少确认次数，应当用带范围/次数/期限的常驻授权，而不是把这一行改成 auto。
      */
     computer: (memberCtx) => registerComputerTools(memberCtx, {
-      scriptDir: path28.join(pluginDir, "assets"),
-      shotDir: path28.join(home, "personal-assistant", "screenshots"),
+      scriptDir: path29.join(pluginDir, "assets"),
+      shotDir: path29.join(home, "personal-assistant", "screenshots"),
       approvalMode: () => "manual",
       bridge,
       log,
@@ -28103,6 +28426,41 @@ async function apply(ctx, config) {
       const config2 = readMailImapConfig(home);
       if (!config2) throw new Error("\u90AE\u7BB1\u503C\u5B88\u8FD8\u6CA1\u6709\u914D\u7F6E IMAP\uFF0C\u8BF7\u5148\u8FD0\u884C setup-mail.mjs");
       return await readUnreadMail(config2, await decryptSecret(home), { limit: limit2 });
+    },
+    platform: { config: () => readPlatformConfig(home) },
+    subagents: () => subagentsRuntime,
+    memberSchedule: {
+      list: (assistantId) => teamStore.listMemberSchedules().filter((s) => s.assistantId === assistantId).map((s) => ({
+        scheduleId: s.scheduleId,
+        title: s.title,
+        prompt: s.prompt,
+        channel: s.channel,
+        enabled: s.enabled,
+        localTime: s.spec.kind === "daily" ? s.spec.localTime : void 0,
+        repeatKind: s.spec.kind
+      })),
+      update: (assistantId, scheduleId, patch) => {
+        const s = teamStore.getMemberSchedule(scheduleId);
+        if (!s || s.assistantId !== assistantId) return { ok: false, message: "\u53EA\u80FD\u4FEE\u6539\u4F60\u81EA\u5DF1\u7684\u5B9A\u65F6\u4EFB\u52A1" };
+        const now = Date.now();
+        const tz = s.spec.timezone;
+        const kind = patch.repeatKind ?? s.spec.kind;
+        let spec;
+        if (kind === "daily") spec = { kind: "daily", timezone: tz, localTime: patch.localTime ?? (s.spec.kind === "daily" ? s.spec.localTime : "09:00") };
+        else if (kind === "interval") spec = { kind: "interval", timezone: tz, runAt: s.spec.kind !== "daily" ? s.spec.runAt : new Date(now).toISOString(), everySeconds: patch.everySeconds ?? (s.spec.kind === "interval" ? s.spec.everySeconds : 3600) };
+        else spec = { kind: "once", timezone: tz, runAt: s.spec.kind !== "daily" ? s.spec.runAt : new Date(now).toISOString() };
+        const channel = patch.channel === "wecom" || patch.channel === "desktop" ? patch.channel : s.channel;
+        teamStore.saveMemberSchedule({
+          ...s,
+          prompt: patch.prompt ?? s.prompt,
+          spec,
+          channel,
+          nextRunAt: s.enabled ? firstScheduleAt(spec, now) : null,
+          generation: s.generation + 1
+        });
+        bridge.notifyApprovalSnapshot();
+        return { ok: true, message: `\u5DF2\u66F4\u65B0\u5B9A\u65F6\u4EFB\u52A1\u300C${s.title}\u300D` };
+      }
     },
     onChange: () => bridge.notifyApprovalSnapshot()
   });
@@ -28131,13 +28489,14 @@ async function apply(ctx, config) {
         skinId: member.skinId,
         voiceProfile: member.voiceProfile,
         text: text7,
-        runId: randomUUID28(),
+        runId: randomUUID29(),
         reportMode: "self"
       });
       for (const key of channelManager.settingsSnapshot().deliverHere) {
         if (!channelManager.canDeliver(key)) continue;
         try {
-          await channelManager.deliver(key, text7);
+          await channelManager.deliver(key, `\u3010${member.displayName}\u3011
+${text7}`);
         } catch (error) {
           log(`\u90AE\u4EF6\u4F01\u5FAE\u63D0\u9192\u6295\u9012\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         }
@@ -28232,18 +28591,18 @@ ${material}
   companionRuntime.start();
   surface.add("companion-tools", () => registerCompanionTools(ctx, companionRuntime, bridge));
   surface.add("computer-tools", () => registerComputerTools(ctx, {
-    scriptDir: path28.join(pluginDir, "assets"),
-    shotDir: path28.join(home, "personal-assistant", "screenshots"),
+    scriptDir: path29.join(pluginDir, "assets"),
+    shotDir: path29.join(home, "personal-assistant", "screenshots"),
     approvalMode: () => config.approvalMode,
     bridge,
     log,
     attachComputerExecutor: (fn) => companionRuntime.attachComputerExecutor(fn)
   }));
   surface.add("mail-tools", () => registerMailTools(ctx, { home, bridge, store: teamStore, epoch: bridge.epoch, log }));
-  const channelsFile = path28.join(home, "personal-assistant", "channels.json");
+  const channelsFile = path29.join(home, "personal-assistant", "channels.json");
   const readChannelSettings = () => {
     try {
-      const raw = JSON.parse(readFileSync16(channelsFile, "utf8"));
+      const raw = JSON.parse(readFileSync18(channelsFile, "utf8"));
       const strings = (value) => Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.length > 0 && item.length <= 200) : [];
       return {
         allowedUserIds: strings(raw.allowedUserIds),
@@ -28290,7 +28649,9 @@ ${material}
       const member = teamStore.directory.list().find((item) => item.enabled && item.capabilities.includes("wecom"));
       if (!member) return null;
       if (!key.startsWith("wecom:single:")) return "\u6210\u5458\u72EC\u7ACB\u8BB0\u5FC6\u6682\u4E0D\u4E0E\u7FA4\u804A\u5171\u4EAB\uFF0C\u8BF7\u5728\u5DF2\u914D\u5BF9\u7684\u5355\u804A\u4E2D\u4EA4\u529E\u4EFB\u52A1\u3002";
-      return await memberRuntime.chat(member.assistantId, text7, void 0, key, "wecom", sessionScope);
+      const reply = await memberRuntime.chat(member.assistantId, text7, void 0, key, "wecom", sessionScope);
+      return `\u3010${member.displayName}\u3011
+${reply}`;
     },
     host: {
       async create(key) {
@@ -28320,7 +28681,7 @@ ${material}
         const channelModel = resolveDefaultModel(home);
         const handle = await create.call(agents, {
           // 会话 id 带上渠道会话标识，任务工具据此把提醒默认发回当前会话。
-          sessionId: `channel-${Buffer.from(key, "utf8").toString("hex")}-${randomUUID28()}`,
+          sessionId: `channel-${Buffer.from(key, "utf8").toString("hex")}-${randomUUID29()}`,
           meta: { cwd: process.cwd() },
           ...channelModel ? { agentOptions: channelModel } : {},
           // 远程渠道只允许读与已登记的普通任务工具；shell、写文件、安装、再委派一律拒绝。
@@ -28339,8 +28700,8 @@ ${material}
     replyReminder: (chatKey, reply, accountKey) => companionRuntime.respondChannelReminder(chatKey, reply, accountKey),
     log: (message) => {
       try {
-        mkdirSync6(path28.join(home, "personal-assistant"), { recursive: true });
-        appendFileSync2(path28.join(home, "personal-assistant", "channels.log"), `${(/* @__PURE__ */ new Date()).toISOString()} ${message}
+        mkdirSync7(path29.join(home, "personal-assistant"), { recursive: true });
+        appendFileSync2(path29.join(home, "personal-assistant", "channels.log"), `${(/* @__PURE__ */ new Date()).toISOString()} ${message}
 `, "utf8");
       } catch {
       }
@@ -28348,8 +28709,8 @@ ${material}
     },
     readSettings: readChannelSettings,
     writeSettings: (settings2) => {
-      mkdirSync6(path28.dirname(channelsFile), { recursive: true });
-      writeFileSync6(channelsFile, `${JSON.stringify(settings2, null, 2)}
+      mkdirSync7(path29.dirname(channelsFile), { recursive: true });
+      writeFileSync7(channelsFile, `${JSON.stringify(settings2, null, 2)}
 `, "utf8");
     },
     replyTimeoutMs: 12e4
@@ -28364,13 +28725,14 @@ ${material}
   const memberScheduler = new MemberScheduler({
     store: teamStore,
     enabled: () => teamRuntime !== null,
-    run: (id, prompt2) => memberRuntime.chat(id, prompt2, void 0, void 0, "desktop"),
+    run: (id, prompt2) => memberRuntime.chat(id, prompt2, void 0, void 0, "desktop", void 0, void 0, bridge.sessionAgent()),
     deliver: async ({ assistantId, text: text7, channel, recipientId }) => {
       const member = teamStore.directory.get(assistantId);
       if (!member) return false;
       if (channel === "wecom") {
         if (!recipientId) return false;
-        return await channelManager.deliver(recipientId, text7);
+        return await channelManager.deliver(recipientId, `\u3010${member.displayName}\u3011
+${text7}`);
       }
       bridge.notifySubAssistantReport({
         assistantId,
@@ -28378,7 +28740,7 @@ ${material}
         skinId: member.skinId,
         voiceProfile: member.voiceProfile,
         text: text7,
-        runId: randomUUID28(),
+        runId: randomUUID29(),
         reportMode: "self"
       });
       return true;
@@ -28491,7 +28853,7 @@ ${material}
   });
   const assistantApprovals = new AssistantApprovalService({ epoch: bridge.epoch, ttlMs: Math.max(1e4, config.approvalTtlMs) });
   bridge.attachAssistantApprovals(assistantApprovals);
-  const reportDir = config.reportDir || path28.join(home, "personal-assistant", "reports");
+  const reportDir = config.reportDir || path29.join(home, "personal-assistant", "reports");
   bridge.attachReportApprovals(new ReportApprovalService(db, reports, {
     epoch: bridge.epoch,
     reportDir,
@@ -28646,7 +29008,7 @@ ${material}
         if (!teamStore.directory.get(input.assistantId)) throw new Error("\u6210\u5458\u4E0D\u5B58\u5728\uFF0C\u4E0D\u80FD\u4E3A\u5176\u521B\u5EFA\u5B9A\u65F6\u4EFB\u52A1");
         if (input.channel === "wecom" && !input.recipientId) throw new Error("\u4F01\u4E1A\u5FAE\u4FE1\u63A8\u9001\u9700\u8981\u6307\u5B9A\u6536\u4EF6\u4F1A\u8BDD\uFF08recipientId\uFF09");
         teamStore.saveMemberSchedule({
-          scheduleId: randomUUID28(),
+          scheduleId: randomUUID29(),
           assistantId: input.assistantId,
           title: input.title,
           prompt: input.prompt,

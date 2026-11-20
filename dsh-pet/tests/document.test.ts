@@ -579,9 +579,9 @@ describe('表格与公式的段落标记', () => {
     assert.equal(outline.sections[0].hasFormula, false)
   })
 
-  test('提纲如实标出不朗读的部分', () => {
+  test('提纲如实标出不朗读的部分（表格现在照念，不标不朗读）', () => {
     const table = outlineOf(buildOutline('a.md', '## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n'))
-    assert.match(describeOutline(table), /1\. 花名册（含表格，不朗读）/)
+    assert.doesNotMatch(describeOutline(table), /不朗读/, '表格照念，提纲不应标不朗读')
     const code = outlineOf(buildOutline('b.md', '## 实现\n\n说明。\n\n```\ncode()\n```\n'))
     assert.match(describeOutline(code), /1\. 实现（含代码，不朗读）/, '只有代码时文案与原来逐字一致')
     const formula = outlineOf(buildOutline('c.md', '## 推导\n\n$$\nx = 1\n$$\n'))
@@ -600,18 +600,27 @@ describe('原文朗读：念什么、停多久', () => {
     assert.equal(plan.holdMs, 0)
   })
 
-  test('代码/表格/公式段只念一句跳过提示，并留 10 秒给屏幕', () => {
+  test('代码/公式段只念一句跳过提示，并留 10 秒给屏幕', () => {
     for (const [markdown, kind] of [
       ['## 实现\n\n说明。\n\n```ts\nconst x = 1\n```\n', '代码'],
-      ['## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n', '表格'],
       ['## 推导\n\n$$\nx = 1\n$$\n', '公式'],
     ] as const) {
       const plan = docSpeechPlan(sectionOf(markdown), 'source')
       assert.match(plan.text, new RegExp(`这段是${kind}`))
       assert.match(plan.text, /看屏幕/)
       assert.equal(plan.holdMs, DOC_SKIP_HOLD_MS)
-      assert.doesNotMatch(plan.text, /const x|张三|E = |x = 1/, '跳过就是跳过，不能把要跳过的内容念出来')
+      assert.doesNotMatch(plan.text, /const x|E = |x = 1/, '跳过就是跳过，不能把要跳过的内容念出来')
     }
+  })
+
+  test('表格段照念：格子进正文、不念竖线，不停留', () => {
+    const plan = docSpeechPlan(sectionOf('## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n| 张三 | 音频 |\n'), 'source')
+    assert.match(plan.text, /姓名/)
+    assert.match(plan.text, /张三/)
+    assert.match(plan.text, /音频/)
+    assert.doesNotMatch(plan.text, /\|/, '竖线等格式符号不念')
+    assert.doesNotMatch(plan.text, /这段是表格/, '表格不再跳过')
+    assert.equal(plan.holdMs, 0)
   })
 
   test('多类同时出现时只说一次，优先说代码', () => {
@@ -631,11 +640,13 @@ describe('原文朗读：念什么、停多久', () => {
     assert.equal(plan.holdMs, DOC_SKIP_HOLD_MS)
   })
 
-  test('纯表格段同样是提示 + 停留', () => {
+  test('只有表头+分隔行的表格：表头照念，分隔行不念', () => {
     const section = sectionOf('## 花名册\n\n| 姓名 | 部门 |\n| --- | --- |\n')
     const plan = docSpeechPlan(section, 'source')
-    assert.match(plan.text, /这段是表格/)
-    assert.equal(plan.holdMs, DOC_SKIP_HOLD_MS)
+    assert.match(plan.text, /姓名/)
+    assert.doesNotMatch(plan.text, /---/, '分隔行不念')
+    assert.doesNotMatch(plan.text, /这段是表格/)
+    assert.equal(plan.holdMs, 0)
   })
 
   test('真空段（没正文、也没任何标记）：空串 + 不停，由调用方静默跳段', () => {

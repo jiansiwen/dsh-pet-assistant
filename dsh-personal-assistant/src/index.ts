@@ -110,7 +110,9 @@ import { fileKeyCodec, SubAssistantSecrets } from './sub-assistant-secrets.ts'
 import { SubAssistantRegistry } from './sub-assistant-registry.ts'
 import { SubAssistantDispatch } from './sub-assistant-dispatch.ts'
 import { MemberScheduler } from './member-scheduler.ts'
-import { firstScheduleAt } from './scheduler.ts'
+import { readPlatformConfig, writePlatformConfig } from './platform-connector.ts'
+import { firstScheduleAt, nextScheduleAt } from './scheduler.ts'
+import type { ReminderSchedule } from './companion-contract.ts'
 import {
   formatAssistantState,
   InjectionGate,
@@ -447,6 +449,39 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
         } catch {
           return { kind: 'error' as const, text: '设置没改成：桌面宠物没在运行，先召唤它' }
         }
+      },
+    })
+
+    // ── 通用外部平台对接配置（配置驱动，代码不绑定公司；secret 只存配置不回显）──
+    register({
+      name: 'assistant-platform-get',
+      description: '读取外部智能助理平台对接配置（只读，secret 掩码）',
+      recordInput: false,
+      async handler() {
+        const c = readPlatformConfig(home)
+        return { kind: 'success' as const, text: JSON.stringify({ ok: true, ...c, secret: c.secret ? '***' : '' }) }
+      },
+    })
+    register({
+      name: 'assistant-platform-set',
+      description: '配置外部平台对接：enabled/endpoint/appid/channel/secret/signTemplate/userId/assistId/timeoutMs（key=value 空格分隔）',
+      recordInput: false,
+      async handler(invocation) {
+        const allowedKeys = ['enabled', 'endpoint', 'appid', 'channel', 'secret', 'signTemplate', 'userId', 'assistId', 'timeoutMs'] as const
+        const patch: Record<string, unknown> = {}
+        for (const token of String(invocation.rawInput ?? '').split(/\s+/).filter(Boolean)) {
+          const eq = token.indexOf('=')
+          if (eq <= 0) continue
+          const key = token.slice(0, eq)
+          const val = token.slice(eq + 1)
+          if (!(allowedKeys as readonly string[]).includes(key)) continue
+          if (key === 'enabled') patch[key] = val === 'true'
+          else if (key === 'timeoutMs') patch[key] = Number(val) || 15000
+          else patch[key] = val
+        }
+        if (Object.keys(patch).length === 0) return { kind: 'success' as const, text: '用法：assistant-platform-set enabled=true endpoint=<url> appid=<id> secret=<key> userId=<uid> assistId=<aid>' }
+        const c = writePlatformConfig(home, patch)
+        return { kind: 'success' as const, text: JSON.stringify({ ok: true, ...c, secret: c.secret ? '***' : '' }) }
       },
     })
 
@@ -1155,6 +1190,11 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       teamStore.directory.setSession(id, null)
     },
   })
+  // 可选注入 DSH 子代理运行时：成员 spawn 继承宿主工具用；宿主未提供时保持 null→回退插件会话。
+  let subagentsRuntime: unknown = null
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['subagents'], scope => { subagentsRuntime = (scope as unknown as { subagents?: unknown }).subagents ?? null })
+  }
   const memberRuntime = new MemberRuntime({
     ctx: ctx as never,
   /* 成员会话挂到总助理当前的工作目录下：与文档会话 scope 共用同一个解析器。 */
@@ -1201,6 +1241,29 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       if (!config) throw new Error('邮箱值守还没有配置 IMAP，请先运行 setup-mail.mjs')
       return await readUnreadMail(config, await decryptSecret(home), { limit })
     },
+    platform: { config: () => readPlatformConfig(home) },
+    subagents: () => subagentsRuntime,
+    memberSchedule: {
+      list: assistantId => teamStore.listMemberSchedules().filter(s => s.assistantId === assistantId)
+        .map(s => ({ scheduleId: s.scheduleId, title: s.title, prompt: s.prompt, channel: s.channel, enabled: s.enabled,
+          localTime: s.spec.kind === 'daily' ? s.spec.localTime : undefined, repeatKind: s.spec.kind })),
+      update: (assistantId, scheduleId, patch) => {
+        const s = teamStore.getMemberSchedule(scheduleId)
+        if (!s || s.assistantId !== assistantId) return { ok: false, message: '只能修改你自己的定时任务' }
+        const now = Date.now()
+        const tz = s.spec.timezone
+        const kind = (patch.repeatKind ?? s.spec.kind) as 'daily' | 'interval' | 'once'
+        let spec: ReminderSchedule
+        if (kind === 'daily') spec = { kind: 'daily', timezone: tz, localTime: patch.localTime ?? (s.spec.kind === 'daily' ? s.spec.localTime : '09:00') }
+        else if (kind === 'interval') spec = { kind: 'interval', timezone: tz, runAt: s.spec.kind !== 'daily' ? s.spec.runAt : new Date(now).toISOString(), everySeconds: patch.everySeconds ?? (s.spec.kind === 'interval' ? s.spec.everySeconds : 3600) }
+        else spec = { kind: 'once', timezone: tz, runAt: s.spec.kind !== 'daily' ? s.spec.runAt : new Date(now).toISOString() }
+        const channel = (patch.channel === 'wecom' || patch.channel === 'desktop') ? patch.channel : s.channel
+        teamStore.saveMemberSchedule({ ...s, prompt: patch.prompt ?? s.prompt, spec, channel,
+          nextRunAt: s.enabled ? firstScheduleAt(spec, now) : null, generation: s.generation + 1 })
+        bridge.notifyApprovalSnapshot()
+        return { ok: true, message: `已更新定时任务「${s.title}」` }
+      },
+    },
     onChange: () => bridge.notifyApprovalSnapshot(),
   })
   const memberAssistant = new MemberAssistant({ ctx: ctx as never, defaultModel: () => resolveDefaultModel(home), log })
@@ -1226,7 +1289,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
         voiceProfile: member.voiceProfile, text, runId: randomUUID(), reportMode: 'self' })
       for (const key of channelManager.settingsSnapshot().deliverHere) {
         if (!channelManager.canDeliver(key)) continue
-        try { await channelManager.deliver(key, text) } catch (error) { log(`邮件企微提醒投递失败：${error instanceof Error ? error.message : String(error)}`) }
+        try { await channelManager.deliver(key, `【${member.displayName}】\n${text}`) } catch (error) { log(`邮件企微提醒投递失败：${error instanceof Error ? error.message : String(error)}`) }
       }
       return true
     },
@@ -1371,7 +1434,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       const member = teamStore.directory.list().find(item => item.enabled && item.capabilities.includes('wecom'))
       if (!member) return null
       if (!key.startsWith('wecom:single:')) return '成员独立记忆暂不与群聊共享，请在已配对的单聊中交办任务。'
-      return await memberRuntime.chat(member.assistantId, text, undefined, key, 'wecom', sessionScope)
+      const reply = await memberRuntime.chat(member.assistantId, text, undefined, key, 'wecom', sessionScope)
+      return `【${member.displayName}】\n${reply}`
     },
     host: {
       async create(key: string) {
@@ -1439,13 +1503,13 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const memberScheduler = new MemberScheduler({
     store: teamStore,
     enabled: () => teamRuntime !== null,
-    run: (id, prompt) => memberRuntime.chat(id, prompt, undefined, undefined, 'desktop'),
+    run: (id, prompt) => memberRuntime.chat(id, prompt, undefined, undefined, 'desktop', undefined, undefined, bridge.sessionAgent() as never),
     deliver: async ({ assistantId, text, channel, recipientId }) => {
       const member = teamStore.directory.get(assistantId)
       if (!member) return false
       if (channel === 'wecom') {
         if (!recipientId) return false
-        return await channelManager.deliver(recipientId, text)
+        return await channelManager.deliver(recipientId, `【${member.displayName}】\n${text}`)
       }
       bridge.notifySubAssistantReport({ assistantId, displayName: member.displayName, skinId: member.skinId,
         voiceProfile: member.voiceProfile, text, runId: randomUUID(), reportMode: 'self' })
