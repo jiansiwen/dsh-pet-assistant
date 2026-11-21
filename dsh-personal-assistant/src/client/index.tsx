@@ -1,12 +1,12 @@
 /**
  * 客户端插件：左侧导航「个人助理」+ 工作台面板 + 会话头「绑定会话」。
  *
- * 这一页的形态是**工作台**，不是入口页：顶部一行状态、四格概览、七个横向 tab 各自给出
- * 真正的列表或配置。三条贯穿全文件的规矩：
+ * 工作台和设置各有分类和可搜索的功能表；真实列表与配置在详情弹窗中打开。
+ * 三条贯穿全文件的规矩：
  *
  * 1. **拿不到就说拿不到**：区分「还没有待办」（连上了、确实没有）与「暂时读不到待办」
  *    （压根没拿到）。混成一句会让用户以为事情做完了，或者反过来以为系统坏了。
- * 2. **不编数字**：列表命令没就绪时，tab 里是空态 + 一个真能用的「在桌面宠物里打开」，
+ * 2. **不编数字**：列表命令没就绪时，详情里给出提示和「在桌面宠物里打开」，
  *    不是一张假表格，也不是点了没反应的死按钮。
  * 3. **所有动作走已有命令**（`/summon-pet`、`/bind-pet`、`/assistant-on|off`、
  *    `/open-workbench <page>`），不另建通信、不新增 IPC。
@@ -16,15 +16,15 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   TOKENS, badge, configBlock, dockButton, dot, header, page, primaryButton, result as resultStyle,
   secondaryButton, smallButton, statGrid, statLabel, statNote, statTile, statValue, statValueSmall,
-  statusBar, statusRow, subtitle, summaryRow, tabBar, tabButton, tabPanel, tableEmpty,
-  tableHeadRow, tableHint, tableRow, tableWrap, title, titleRow,
+  statusBar, statusRow, subtitle, summaryRow, tableEmpty,
+  tableHeadRow, tableHint, tableRow, tableWrap, title, workbenchCss,
 } from './styles.ts'
 import { overviewValue, type OverviewCommand, type OverviewReadout } from './overview.ts'
 import {
   LIST_TABS, MEETING_HISTORY, MEETING_HISTORY_COMMAND, PRIORITY_CHOICES, SETTINGS_SUMMARY_COMMAND, TABS,
   columnClassName, columnTone, narrowTableCss, parseList, parseSettingsSummary, priorityCommand,
-  priorityOutcome, reconcilePending, rowMeetingId, rowTaskId, tableView,
-  type ListParse, type ListRow, type ListTabDefinition, type ListTabId, type SettingsParse, type TabId,
+  priorityOutcome, reconcilePending, rowMeetingId, rowTaskId, tableView, workbenchEntries,
+  type ListParse, type ListRow, type ListTabDefinition, type ListTabId, type SettingsParse, type TabDefinition, type TabId, type WorkbenchSection,
 } from './tabs.ts'
 import {
   EMPTY_SNAPSHOT, MAIL_FIELDS, SETTINGS_OPTIONS, WECOM_FIELDS, buildCommandLine, fieldPlaceholder,
@@ -192,19 +192,15 @@ function BindSessionButton({ ctx }: { ctx: ClientContext }) {
   )
 }
 
-/**
- * 概览四格：前三格各有一条只读命令；「日报草稿」没有命令，保持 `—`。
- * `command` 为 null 的格子不发请求 —— 宁可空着，也不为凑齐四格编一个数字。
- */
-const OVERVIEW: ReadonlyArray<{ icon: IconName; label: string; command: OverviewCommand | null }> = [
+/** 只显示有真实数据源的概览，不保留长期显示未连接的日报占位卡。 */
+const OVERVIEW: ReadonlyArray<{ icon: IconName; label: string; command: OverviewCommand }> = [
   { icon: 'checklist', label: '待办', command: 'todo' },
   { icon: 'calendar', label: '今天会议', command: 'meeting' },
   { icon: 'clock', label: '今日活动', command: 'summary' },
-  { icon: 'document', label: '日报草稿', command: null },
 ]
 
 /** 是不是列表类 tab（有表头的四种）。 */
-function isListTab(tab: TabId): tab is ListTabId {
+function isListTab(tab: TabId | null): tab is ListTabId {
   return tab === 'todo' || tab === 'report' || tab === 'meeting' || tab === 'team'
 }
 
@@ -225,20 +221,31 @@ const HISTORY_TTL_MS = 60_000
  */
 const NARROW_TABLE_CSS = narrowTableCss()
 
-/** 邮件与企业微信：本轮只有配置区（连接状态 + 说明 + 主按钮），因为它们没有数据源。 */
-const CONFIG_TABS: Record<'mail' | 'wecom', { title: string; state: string; detail: string; action: string }> = {
-  mail: {
-    title: '邮件',
-    state: '未连接',
-    detail: '审批发信需要的邮箱配置在桌面宠物里。这里将来会显示收发记录与草稿。',
-    action: '去桌面宠物配置',
-  },
-  wecom: {
-    title: '企业微信',
-    state: '未连接',
-    detail: '企业微信连接与已配对会话在桌面宠物里管理。这里将来会显示消息与待处理提醒。',
-    action: '去桌面宠物配置',
-  },
+const SECTION_LABEL: Record<WorkbenchSection, string> = { workbench: '工作台', settings: '设置' }
+const TAB_ICONS: Record<TabId, IconName> = {
+  todo: 'checklist', report: 'document', meeting: 'calendar', team: 'team', skills: 'checklist',
+  pet: 'paw', mail: 'mail', wecom: 'link', settings: 'settings',
+}
+
+/** 真正的详情弹窗：原生模态保持键盘焦点，关闭后返回原筛选和打开按钮。 */
+function WorkbenchDetail({ item, onClose, children }: { item: TabDefinition; onClose(): void; children?: ReactNode }) {
+  const ref = useRef<HTMLDialogElement | null>(null)
+  useEffect(() => {
+    const node = ref.current
+    if (node && !node.open) node.showModal()
+  }, [])
+  return (
+    <dialog ref={ref} className="pa-detail" aria-labelledby="pa-detail-heading" onClose={onClose}>
+      <header className="pa-detail-head">
+        <div>
+          <p>个人助理 ／ {SECTION_LABEL[item.section]}</p>
+          <h3 id="pa-detail-heading">{item.label}</h3>
+        </div>
+        <button type="button" className="pa-detail-close" aria-label="关闭详情" onClick={() => ref.current?.close()}>关闭</button>
+      </header>
+      <div className="pa-detail-body">{children}</div>
+    </dialog>
+  )
 }
 
 function AssistantPanel({ ctx }: { ctx: ClientContext }) {
@@ -249,10 +256,14 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
   const [petReload, setPetReload] = useState(0)
   /** 绑定状态同样只能按回执推断；端口从回执文本里取，取不到就不显示。 */
   const [bound, setBound] = useState<{ bound: boolean; port: number | null }>({ bound: false, port: null })
-  const [outcome, setOutcome] = useState<Outcome | null>(null)
+  const [outcome, setOutcome] = useState<(Outcome & { tab: TabId | null }) | null>(null)
   const [readouts, setReadouts] = useState<Record<OverviewCommand, OverviewReadout> | null>(null)
   const [readingOverview, setReadingOverview] = useState(false)
-  const [tab, setTab] = useState<TabId>('todo')
+  const [section, setSection] = useState<WorkbenchSection>('workbench')
+  const [category, setCategory] = useState<TabId | undefined>(undefined)
+  const [search, setSearch] = useState('')
+  /** 只有打开详情才取相应列表或配置；总览不批量读取频道和凭据设置。 */
+  const [tab, setTab] = useState<TabId | null>(null)
   /** 四个列表 tab 的取数结果；没取过的就是 undefined（= 还没查，不是"没有"）。 */
   const [lists, setLists] = useState<Partial<Record<ListTabId, ListParse>>>({})
   const [listLoading, setListLoading] = useState<Partial<Record<ListTabId, boolean>>>({})
@@ -505,7 +516,7 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
     setBusy(kind)
     try {
       const result = await executeCommand(ctx, line)
-      setOutcome(result)
+      setOutcome({ ...result, tab })
       if (result.ok && (kind === 'summon' || kind === 'bind')) {
         setBound({ bound: true, port: parsePort(result.text) })
       }
@@ -517,14 +528,13 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
   }
 
   /**
-   * 打开桌面宠物里的某一页。后端对"参数不对 / 桌宠没跑"也返回 success，
-   * 所以这里只把原话放回状态行，不染成成功色。
+   * 后端对「桌宠没跑」也返回 success；直接展示回执，不根据它推断连接状态。
    */
   const openInPet = async (pageName: string): Promise<void> => {
     setBusy('open')
     try {
       const result = await executeCommand(ctx, `/open-workbench ${pageName}`)
-      setOutcome(result)
+      setOutcome({ ...result, tab })
     } finally {
       setBusy(null)
     }
@@ -623,7 +633,8 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
   )
 
   const connected = sessionId !== undefined && bound.bound
-  const dotColor = outcome !== null && !outcome.ok ? TOKENS.amber : connected ? TOKENS.green : TOKENS.grey
+  const connectionOutcome = outcome?.tab === null ? outcome : null
+  const dotColor = connectionOutcome?.ok === false ? TOKENS.amber : connected ? TOKENS.green : TOKENS.grey
   const injectionOn = power?.injection === 'on'
   const powerText = power === null || power.injection === 'unknown' ? '' : injectionOn ? ' · 助理已开启' : ' · 助理已关闭'
   // 采集与注入是两件事：工具开着但"等采集范围确认"/"被配置拦住"都要如实显示，
@@ -636,27 +647,29 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
   const connectionText = sessionId === undefined
     ? '尚未打开会话'
     : connected
-      ? `会话已绑定${bound.port === null ? '' : ` · 桥接端口 ${bound.port}`}${powerText}${captureText}`
-      : `未绑定${powerText}${captureText}`
+      ? `会话已绑定桌宠${powerText}${captureText}`
+      : `会话尚未绑定桌宠${powerText}${captureText}`
+  const connectionHint = [bound.port === null ? '' : `桥接端口 ${bound.port}`, power?.blocked ?? ''].filter(Boolean).join(' · ')
+  const navigation = workbenchEntries(section)
+  const entries = workbenchEntries(section, search, category)
+  const detail = TABS.find(item => item.id === tab)
+  const overviewTitle = section === 'settings' ? '全部设置' : '全部功能'
+  const filterTitle = navigation.find(item => item.id === category)?.label ?? overviewTitle
+  const selectSection = (next: WorkbenchSection): void => { setSection(next); setCategory(undefined); setSearch('') }
 
   return (
-    <div style={page}>
-      {/* 客户端没有 CSS 构建链，响应式规则只能内联；只作用于 .wb-col-* 单元格。 */}
-      <style>{NARROW_TABLE_CSS}</style>
-      {/* 标题、说明合成一块：不给它们各配一张卡，顶部只占三行。 */}
+    <div style={page} data-personal-assistant>
+      <style>{workbenchCss + NARROW_TABLE_CSS}</style>
       <header style={header}>
-        <div style={titleRow}>
-          <h2 style={title}>个人助理</h2>
-          <span style={badge}>{connected ? '已就绪' : '未连接'}</span>
-          <span style={subtitle}>召唤桌面宠物、查看待办与会议、整理日报；所有写操作仍走你本人确认。</span>
-        </div>
+        <h2 style={title}>个人助理</h2>
+        <p style={subtitle}>在工作台处理待办和会议，在设置中管理助理与桌宠。需要审批的操作仍由你本人确认。</p>
       </header>
 
-      {/* 连接状态条：一行，高 ≤44px。 */}
       <section style={statusBar} aria-label="连接状态">
-        <span style={statusRow} title={power?.blocked ?? undefined}><i style={dot(dotColor)} />{connectionText}</span>
+        <span style={statusRow} title={connectionHint || undefined}><i style={dot(dotColor)} />{connectionText}</span>
         <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button type="button" disabled={busy !== null} onClick={() => void run('summon', '/summon-pet')} style={smallButton}>
+          <button type="button" disabled={busy !== null} onClick={() => void run('summon', '/summon-pet')}
+            style={{ ...smallButton, borderColor: TOKENS.primary, background: TOKENS.primary, color: '#fff' }}>
             {busy === 'summon' ? '召唤中…' : '召唤宠物'}
           </button>
           <button
@@ -671,49 +684,71 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
           </button>
         </span>
       </section>
-      <p style={{ ...resultStyle, marginTop: 6, color: outcome === null ? TOKENS.faint : outcome.ok ? TOKENS.ok : TOKENS.bad }}>
-        {outcome === null ? '还没有执行操作' : outcome.text}
-      </p>
+      {connectionOutcome !== null && <p role="status" style={{ ...resultStyle, marginTop: 6, color: connectionOutcome.ok ? TOKENS.ok : TOKENS.bad }}>
+        {connectionOutcome.text}
+      </p>}
 
-      {/* 概览：一行四格，矮卡。 */}
-      <div style={statGrid}>
+      {section === 'workbench' && <section style={statGrid} aria-label="今日概览">
         {OVERVIEW.map(item => {
-          const readout = item.command === null ? null : readouts?.[item.command] ?? null
-          const loadingThis = item.command !== null && readingOverview && readout === null
-          const value = item.command === null
-            ? '—'
-            : loadingThis ? '读取中…' : readout === null ? '未连接' : readout.value
-          const note = readout?.kind === 'metric' && readout.detail !== null
-            ? readout.detail
-            : item.command === null ? '未连接' : null
-          const muted = item.command === null || loadingThis || readout === null || readout.kind === 'unavailable'
+          const readout = readouts?.[item.command] ?? null
+          const loadingThis = readingOverview && readout === null
+          const value = loadingThis ? '读取中…' : readout?.value ?? '尚未读取'
+          const note = readout?.kind === 'metric' ? readout.detail : null
+          const muted = loadingThis || readout === null || readout.kind === 'unavailable'
           return (
             <div key={item.label} style={statTile}>
-              <div style={{ ...(readout?.kind === 'metric' ? statValue : statValueSmall), color: muted ? TOKENS.faint : TOKENS.ink }}>
+              <div style={{ ...statLabel, display: 'flex', alignItems: 'center', gap: 6 }}><Icon name={item.icon} />{item.label}</div>
+              <div style={{ ...(readout?.kind === 'metric' ? statValue : statValueSmall), color: muted ? TOKENS.muted : TOKENS.ink }}>
                 {value}
               </div>
-              <div style={statLabel}>{item.label}</div>
               {note !== null && <div style={statNote}>{note}</div>}
             </div>
           )
         })}
+      </section>}
+
+      <div className="pa-workspace">
+        <nav className="pa-rail" aria-label="个人助理分类">
+          <div className="pa-modes" role="group" aria-label="切换工作台和设置">
+            {(['workbench', 'settings'] as const).map(mode => (
+              <button type="button" key={mode} aria-pressed={section === mode} onClick={() => selectSection(mode)}>{SECTION_LABEL[mode]}</button>
+            ))}
+          </div>
+          <div className="pa-categories">
+            <button type="button" aria-current={category === undefined ? 'page' : undefined}
+              onClick={() => selectSection(section)}>{overviewTitle}</button>
+            {navigation.map(item => (
+              <button type="button" key={item.id} aria-current={category === item.id ? 'page' : undefined}
+                onClick={() => { setCategory(item.id); setSearch('') }}><Icon name={TAB_ICONS[item.id]} />{item.label}</button>
+            ))}
+          </div>
+        </nav>
+        <section className="pa-content" aria-labelledby="pa-overview-title">
+          <div className="pa-tools">
+            <h3 id="pa-overview-title">{filterTitle}</h3>
+            <input type="search" className="pa-search" value={search} onChange={event => setSearch(event.target.value)}
+              aria-label={section === 'settings' ? '搜索设置' : '搜索工作台功能'} placeholder="按功能名称或说明搜索" />
+          </div>
+          <div className="pa-table-frame">
+            <table className="pa-table" aria-labelledby="pa-overview-title">
+              <thead><tr><th scope="col">功能</th><th scope="col">说明</th><th scope="col">详情</th></tr></thead>
+              <tbody>{entries.map(item => (
+                <tr key={item.id}>
+                  <th scope="row">{item.label}</th>
+                  <td className="pa-description">{item.description}</td>
+                  <td><button className="pa-open-detail" type="button" aria-haspopup="dialog" aria-label={`查看${item.label}详情`}
+                    onClick={() => setTab(item.id)}>查看详情</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+            {entries.length === 0 && <p className="pa-empty" role="status">没有找到匹配的功能，换个关键词再试。</p>}
+          </div>
+        </section>
       </div>
 
-      {/* 水平 tab：DSH 左侧已有全局导航，这里再来一条竖导航就重复了。 */}
-      <nav style={tabBar} role="tablist" aria-label="工作台页面">
-        {TABS.map(item => (
-          <button
-            key={item.id}
-            type="button"
-            role="tab"
-            aria-selected={tab === item.id}
-            onClick={() => setTab(item.id)}
-            style={tabButton(tab === item.id)}
-          >{item.label}</button>
-        ))}
-      </nav>
-
-      <div style={tabPanel} role="tabpanel">
+      {detail !== undefined && <WorkbenchDetail item={detail} onClose={() => setTab(null)}>
+        {outcome?.tab === detail.id && <p role="status" style={{ ...resultStyle, marginBottom: 8,
+          color: outcome.ok ? TOKENS.muted : TOKENS.bad }}>{outcome.text}</p>}
         {tab === 'mail' ? (
           <ConfigFormPanel
             ctx={ctx}
@@ -755,7 +790,7 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
             errors={optionErrors}
             onSet={(key, value) => void setOption(key, value)}
           />
-        ) : (
+        ) : isListTab(tab) ? (
           <>
             <ListPanel
               tab={tab}
@@ -791,8 +826,8 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
               />
             )}
           </>
-        )}
-      </div>
+        ) : null}
+      </WorkbenchDetail>}
     </div>
   )
 }
@@ -1328,13 +1363,14 @@ function SkillsPanel({ ctx, connected }: { ctx: ClientContext; connected: boolea
 
   return (
     <section aria-label="技能">
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
-        <span style={tableHint}>同类工作攒够样本会自动总结成技能；你在这里查验、修改或删除。</span>
-        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8 }}>
+      <div className="pa-tools">
+        <h4>已保存技能 <span style={badge}>{snap.skills.length}</span></h4>
+        <span className="pa-sample-actions">
           <button type="button" style={smallButton} disabled={loading || busy !== null} onClick={() => void load()}>刷新</button>
           <button type="button" style={smallButton} disabled={busy !== null} onClick={() => { setCreating(v => !v); setEditing(null) }}>{creating ? '收起新建' : '新建技能'}</button>
         </span>
       </div>
+      {notice !== null && <p role="status" style={{ ...resultStyle, marginBottom: 8, color: notice.ok ? TOKENS.ok : TOKENS.bad }}>{notice.text}</p>}
 
       {creating && (
         <div style={editBarStyle}>
@@ -1354,47 +1390,60 @@ function SkillsPanel({ ctx, connected }: { ctx: ClientContext; connected: boolea
         </div>
       )}
 
-      <div style={{ display: 'grid', gap: 10 }}>
-        {snap.skills.length === 0 && <div style={tableWrap}><div style={tableEmpty}><span>还没有技能。同类活做多了会自动攒出来，也可点"新建技能"。</span></div></div>}
-        {snap.skills.map(skill => (
-          <div key={skill.id} style={configBlock}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <strong style={{ fontSize: 14 }}>{skill.name}</strong>
-              <span style={badge}>{skill.assistantName}</span>
-              <span style={badge}>{STATUS_LABEL[skill.status] ?? skill.status}</span>
-              <span style={badge}>v{skill.version}</span>
-              <span style={{ ...tableHint, color: skill.origin === 'auto-selfreport' ? TOKENS.amber : TOKENS.faint }}>{ORIGIN_LABEL[skill.origin] ?? skill.origin}</span>
-            </div>
-            <p style={{ ...tableHint, margin: 0, whiteSpace: 'pre-wrap' }}>{skill.body.length > 120 ? `${skill.body.slice(0, 120)}…` : skill.body}</p>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => { setEditing({ id: skill.id, body: skill.body }); setCreating(false) }}>编辑</button>
-              {skill.status !== 'active' && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`promote:${skill.id}`, `/assistant-skill-set promote ${skill.id}`)}>让它生效</button>}
-              {skill.status === 'active' && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`retire:${skill.id}`, `/assistant-skill-set retire ${skill.id}`)}>退役</button>}
-              {skill.version > 1 && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`rollback:${skill.id}`, `/assistant-skill-set rollback ${skill.id} ${skill.version - 1}`)}>回滚上一版</button>}
-              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`delete:${skill.id}`, `/assistant-skill-set delete ${skill.id}`)}>删除</button>
-            </div>
-          </div>
-        ))}
+      <div className="pa-table-frame">
+        {snap.skills.length === 0 ? <p className="pa-empty">还没有技能，可等待可信样本积累，或手动新建。</p> : (
+          <table className="pa-table pa-skill-table" aria-label="已保存技能">
+            <thead><tr><th scope="col">技能</th><th scope="col">归属</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+            <tbody>{snap.skills.map(skill => (
+              <tr key={skill.id}>
+                <th scope="row">
+                  <strong>{skill.name}</strong>
+                  <p style={{ ...tableHint, color: TOKENS.muted, margin: '3px 0 0', fontWeight: 400, whiteSpace: 'pre-wrap' }}>{skill.body.length > 120 ? `${skill.body.slice(0, 120)}…` : skill.body}</p>
+                </th>
+                <td>{skill.assistantName}</td>
+                <td>
+                  <span className="pa-row-state" data-tone={skill.status === 'active' ? 'ok' : undefined}>{STATUS_LABEL[skill.status] ?? skill.status}</span>
+                  <div style={{ ...tableHint, color: skill.origin === 'auto-selfreport' ? TOKENS.amber : TOKENS.faint }}>第 {skill.version} 版 · {ORIGIN_LABEL[skill.origin] ?? skill.origin}</div>
+                </td>
+                <td><div className="pa-sample-actions">
+                  <button type="button" style={smallButton} disabled={busy !== null} onClick={() => { setEditing({ id: skill.id, body: skill.body }); setCreating(false) }}>编辑</button>
+                  {skill.status !== 'active' && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`promote:${skill.id}`, `/assistant-skill-set promote ${skill.id}`)}>让它生效</button>}
+                  {skill.status === 'active' && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`retire:${skill.id}`, `/assistant-skill-set retire ${skill.id}`)}>退役</button>}
+                  {skill.version > 1 && <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`rollback:${skill.id}`, `/assistant-skill-set rollback ${skill.id} ${skill.version - 1}`)}>回滚上一版</button>}
+                  <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`delete:${skill.id}`, `/assistant-skill-set delete ${skill.id}`)}>删除</button>
+                </div></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
       </div>
 
       {(snap.pending.length > 0 || snap.unverified.length > 0) && (
-        <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
-          {snap.unverified.map(item => (
-            <div key={`u:${item.assistantId}:${item.shape}`} style={{ ...editBarStyle, marginTop: 0 }}>
-              <span style={{ fontSize: 12 }}>{item.assistantName}「{item.shape}」自报 {item.count} 次，待你确认</span>
-              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`verify:${item.shape}`, `/assistant-skill-set verify ${item.assistantId} ${item.shape}`)}>确认属实</button>
-              <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`retract:${item.shape}`, `/assistant-skill-set retract ${item.assistantId} ${item.shape}`)}>撤回</button>
-            </div>
-          ))}
-          {snap.pending.map(item => (
-            <div key={`p:${item.assistantId}:${item.shape}`} style={{ ...editBarStyle, marginTop: 0 }}>
-              <span style={{ fontSize: 12 }}>{item.assistantName}「{item.shape}」已攒 {item.count} 次可信成功，够格形成技能</span>
-            </div>
-          ))}
-        </div>
+        <section className="pa-samples" aria-labelledby="pa-samples-heading">
+          <h4 id="pa-samples-heading">学习样本 <span style={badge}>{snap.unverified.length} 组待核对</span></h4>
+          <div className="pa-table-frame">
+            <table className="pa-table" aria-labelledby="pa-samples-heading">
+              <thead><tr><th scope="col">工作类型</th><th scope="col">助理</th><th scope="col">样本次数</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+              <tbody>
+                {snap.unverified.map(item => (
+                  <tr key={`u:${item.assistantId}:${item.shape}`}>
+                    <th scope="row">{item.shape}</th><td>{item.assistantName}</td><td>{item.count} 次</td><td>待核对</td>
+                    <td><div className="pa-sample-actions">
+                      <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`verify:${item.shape}`, `/assistant-skill-set verify ${item.assistantId} ${item.shape}`)}>确认属实</button>
+                      <button type="button" style={smallButton} disabled={busy !== null} onClick={() => void run(`retract:${item.shape}`, `/assistant-skill-set retract ${item.assistantId} ${item.shape}`)}>撤回</button>
+                    </div></td>
+                  </tr>
+                ))}
+                {snap.pending.map(item => (
+                  <tr key={`p:${item.assistantId}:${item.shape}`}>
+                    <th scope="row">{item.shape}</th><td>{item.assistantName}</td><td>{item.count} 次</td><td>可信样本已达标</td><td>—</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
       )}
-
-      {notice !== null && <p role="status" style={{ margin: '8px 0 0', fontSize: 12, color: notice.ok ? TOKENS.ok : TOKENS.bad }}>{notice.text}</p>}
     </section>
   )
 }

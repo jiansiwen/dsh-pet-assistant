@@ -1,5 +1,5 @@
 /**
- * 工作台的七个 tab：标题、对应的桌面宠物页面、以及列表类 tab 的列定义。
+ * 个人助理的功能分组与列表列定义。
  *
  * 为什么单独一个文件：这一页的产品信息量全在这张表里 —— 有哪些 tab、每个 tab 是什么列、
  * 空态与"读不到"分别怎么说。把它写进 `.tsx` 里就只能靠开壳数；放在这里，测试可以逐条钉，
@@ -21,6 +21,7 @@
  */
 
 export type TabId = 'todo' | 'mail' | 'wecom' | 'report' | 'meeting' | 'team' | 'skills' | 'pet' | 'settings'
+export type WorkbenchSection = 'workbench' | 'settings'
 
 /** 列表类 tab：有表头、有行、有空态/读不到两种空。 */
 export type ListTabId = Extract<TabId, 'todo' | 'report' | 'meeting' | 'team'>
@@ -35,23 +36,27 @@ export interface TabColumn {
 export interface TabDefinition {
   readonly id: TabId
   readonly label: string
-  /** 对应桌面宠物里那一页的名字，用于「在桌面宠物里打开」。 */
-  readonly page: string
+  readonly section: WorkbenchSection
+  readonly description: string
 }
 
 export const TABS: readonly TabDefinition[] = [
-  { id: 'todo', label: '待办', page: 'todo' },
-  { id: 'mail', label: '邮件', page: 'mail' },
-  { id: 'wecom', label: '企业微信', page: 'wecom' },
-  { id: 'report', label: '日报周报', page: 'report' },
-  { id: 'meeting', label: '会议', page: 'meeting' },
-  { id: 'team', label: '助理团', page: 'team' },
-  // 技能：自动形成 + 人工查验/增删改查，都在这里。
-  { id: 'skills', label: '技能', page: 'team' },
-  // 桌宠右键菜单里可配置的外观项（形象 / 随机动作 / 显示 / 上台）在这里也有一份。
-  { id: 'pet', label: '宠物', page: 'general' },
-  { id: 'settings', label: '设置', page: 'general' },
+  { id: 'todo', label: '待办提醒', section: 'workbench', description: '查看优先级、到期时间和催办提醒。' },
+  { id: 'report', label: '日报周报', section: 'workbench', description: '查看草稿与已发布的工作记录。' },
+  { id: 'meeting', label: '会议助手', section: 'workbench', description: '查看今天的会议、历史录音和纪要。' },
+  { id: 'team', label: '助理团', section: 'settings', description: '查看成员、角色与使用额度。' },
+  { id: 'skills', label: '技能与样本', section: 'settings', description: '查阅技能、调整生效状态，核对或撤回学习样本。' },
+  { id: 'pet', label: '宠物外观', section: 'settings', description: '调整角色形象、随机动作和显示。' },
+  { id: 'mail', label: '邮件配置', section: 'settings', description: '设置审批发信使用的邮箱。' },
+  { id: 'wecom', label: '企业微信', section: 'settings', description: '配置企业微信连接与提醒推送。' },
+  { id: 'settings', label: '其他设置', section: 'settings', description: '管理语音唤醒、播报和文档讲解模式。' },
 ]
+
+export function workbenchEntries(section: WorkbenchSection, query = '', category?: TabId): readonly TabDefinition[] {
+  const search = query.trim().toLowerCase()
+  return TABS.filter(item => item.section === section && (category === undefined || item.id === category)
+    && `${item.label} ${item.description}`.toLowerCase().includes(search))
+}
 
 /**
  * 旧回包的列数与「旧第 i 格 → 新第几列」的映射。

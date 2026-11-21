@@ -1,16 +1,8 @@
 /**
  * 个人助理工作台的样式常量。
  *
- * 为什么是 TS 而不是 CSS 文件：客户端插件没有样式构建链（esbuild 只打 JS，宿主也不加载
- * 额外样式表），写一个 .css 进去不会被任何人读取。所以样式只能以内联对象的形式存在，
- * 集中在这个文件里至少能保证同一种卡片只有一个定义。
- *
- * 视觉口径：白底、留白足、卡片化 —— 卡片只有 1px 描边与圆角，不加阴影；主色只用在
- * 主按钮、选中 tab 与状态点。不要渐变、不要重色块。
- *
- * 两处按用户反馈调过：
- * 1. 页面**撑满**（上限 1200px）而不是居中 880px 小框 —— 后者旁边空一大块，看起来像没做完；
- * 2. 顶部**压缩**：标题、说明、连接状态各占一行就够，不给它们各配一张大卡。
+ * 宿主只加载客户端包，不加载独立样式文件。面板布局规则放在有作用域的内嵌样式里，
+ * 既有业务表格和表单继续共用下方样式常量。
  */
 
 import type { CSSProperties } from 'react'
@@ -23,7 +15,10 @@ export const TOKENS = {
   faint: 'rgba(31,35,41,.42)',
   line: '#eceef2',
   soft: '#f7f8fa',
-  primary: '#4a7dff',
+  primary: '#09634e',
+  rail: '#f2f6f5',
+  accentWash: '#e2f2eb',
+  railLine: '#dce7e4',
   green: '#22c55e',
   grey: '#c9ccd3',
   amber: '#f59e0b',
@@ -32,31 +27,34 @@ export const TOKENS = {
 } as const
 
 export const page: CSSProperties = {
+  // 桌面宿主用居中的弹性面板承载插件；开启容器查询后必须显式撑宽。
+  width: '100%',
   maxWidth: TOKENS.maxWidth,
   margin: '0 auto',
-  padding: '28px 32px 40px',
+  padding: '26px clamp(14px, 2.6vw, 36px) 36px',
   color: TOKENS.ink,
   font: '400 14px/1.6 ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
   boxSizing: 'border-box',
+  containerType: 'inline-size',
+  containerName: 'personal-assistant',
 }
 
 export const header: CSSProperties = { margin: '0 0 14px' }
-export const titleRow: CSSProperties = { display: 'flex', alignItems: 'baseline', gap: 10, margin: '0 0 4px', flexWrap: 'wrap' }
-export const title: CSSProperties = { fontSize: 22, fontWeight: 600, margin: 0, letterSpacing: '.2px' }
+export const title: CSSProperties = { fontSize: 22, fontWeight: 600, margin: '0 0 4px', letterSpacing: '.2px' }
 export const badge: CSSProperties = {
   fontSize: 12, lineHeight: '20px', padding: '0 8px', borderRadius: 6,
   background: '#f2f3f5', color: TOKENS.muted, whiteSpace: 'nowrap',
 }
 export const subtitle: CSSProperties = { fontSize: 13, margin: 0, color: TOKENS.muted }
 
-/** 顶部状态条：一行、高 ≤44px。 */
+/** 顶部状态条；窄窗口允许连接操作换行。 */
 export const statusBar: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'space-between',
   gap: 12,
   minHeight: 44,
-  padding: '0 14px',
+  padding: '8px 12px',
   border: `1px solid ${TOKENS.line}`,
   borderRadius: 12,
   background: '#fff',
@@ -64,7 +62,7 @@ export const statusBar: CSSProperties = {
 }
 
 export const statGrid: CSSProperties = {
-  display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 10, marginTop: 12,
+  display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(150px, 100%), 1fr))', gap: 10, marginTop: 12,
 }
 export const statTile: CSSProperties = {
   background: TOKENS.soft, borderRadius: 10, padding: '10px 12px',
@@ -74,33 +72,72 @@ export const statValueSmall: CSSProperties = { fontSize: 12.5, fontWeight: 500, 
 export const statLabel: CSSProperties = { fontSize: 11.5, color: TOKENS.muted, marginTop: 1 }
 export const statNote: CSSProperties = { fontSize: 11, color: TOKENS.faint, marginTop: 4, lineHeight: '15px' }
 
-/** 水平 tab：下边 1px 分隔，选中项 2px 品牌下划线。 */
-export const tabBar: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 24,
-  margin: '18px 0 0',
-  borderBottom: `1px solid ${TOKENS.line}`,
-  overflowX: 'auto',
+export const workbenchCss = `
+.pa-workspace { margin-top: 16px; display: grid; grid-template-columns: 174px minmax(0, 1fr); min-height: 340px;
+  border: 1px solid ${TOKENS.railLine}; border-radius: 12px; overflow: hidden; background: #fff; }
+.pa-rail { padding: 14px 10px; background: ${TOKENS.rail}; border-inline-end: 1px solid ${TOKENS.railLine}; }
+.pa-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; padding: 3px; margin-bottom: 12px;
+  border: 1px solid ${TOKENS.railLine}; border-radius: 8px; }
+.pa-categories { display: grid; gap: 3px; }
+.pa-rail button, .pa-open-detail, .pa-detail-close { border: 0; border-radius: 7px; background: transparent;
+  color: inherit; font: inherit; cursor: pointer; }
+.pa-rail button { min-height: 36px; }
+.pa-rail button[aria-pressed='true'] { background: #fff; color: ${TOKENS.primary}; font-weight: 650; }
+.pa-categories button { display: flex; align-items: center; gap: 8px; padding: 5px 10px; text-align: start; }
+.pa-rail button:hover, .pa-categories button[aria-current='page'] { background: ${TOKENS.accentWash}; color: ${TOKENS.primary}; }
+.pa-categories button[aria-current='page'] { font-weight: 650; }
+.pa-content { min-width: 0; padding: 18px 20px; }
+.pa-tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.pa-tools :is(h3, h4), .pa-detail-head h3, .pa-samples h4 { margin: 0; font-size: 15px; font-weight: 650; }
+.pa-search { width: min(250px, 100%); box-sizing: border-box; border: 1px solid ${TOKENS.railLine}; border-radius: 7px;
+  padding: 7px 10px; background: #fff; color: ${TOKENS.ink}; font: inherit; }
+.pa-table-frame { border: 1px solid ${TOKENS.railLine}; border-radius: 8px; overflow: auto; }
+.pa-table { width: 100%; border-collapse: collapse; text-align: start; font-size: 13px; }
+.pa-table :is(th, td) { padding: 10px 12px; border-bottom: 1px solid ${TOKENS.railLine}; vertical-align: middle; text-align: start; }
+.pa-table thead { background: ${TOKENS.rail}; color: ${TOKENS.muted}; }
+.pa-table tbody tr:last-child > * { border-bottom: 0; }
+.pa-table tbody th { font-weight: 650; }
+.pa-table :is(th, td):last-child { text-align: end; white-space: nowrap; }
+.pa-content .pa-table th:first-child { width: 110px; white-space: nowrap; }
+.pa-description { color: ${TOKENS.muted}; overflow-wrap: anywhere; }
+.pa-row-state { color: ${TOKENS.muted}; font-size: 12px; }
+.pa-row-state[data-tone='ok'] { color: ${TOKENS.primary}; }
+.pa-open-detail { color: ${TOKENS.primary}; padding: 4px; white-space: nowrap; }
+.pa-open-detail:hover { text-decoration: underline; text-underline-offset: 3px; }
+.pa-empty { padding: 18px 12px; text-align: center; color: ${TOKENS.muted}; font-size: 13px; margin: 0; }
+.pa-detail { width: min(960px, calc(100vw - 30px)); max-height: min(86vh, 840px); max-height: min(86dvh, 840px);
+  margin: auto; padding: 0; box-sizing: border-box; color: ${TOKENS.ink}; background: #fff; border: 1px solid ${TOKENS.railLine};
+  border-radius: 14px; overflow: auto; box-shadow: 0 18px 56px rgb(23 45 39 / 16%); }
+.pa-detail::backdrop { background: rgb(24 43 40 / 39%); }
+.pa-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px;
+  border-bottom: 1px solid ${TOKENS.railLine}; background: #fff; position: sticky; top: 0; z-index: 3; }
+.pa-detail-head h3 { font-size: 17px; }
+.pa-detail-head p { margin: 0; color: ${TOKENS.muted}; font-size: 12px; }
+.pa-detail-close { flex: none; padding: 6px 10px; background: ${TOKENS.rail}; }
+.pa-detail-close:hover { background: ${TOKENS.accentWash}; color: ${TOKENS.primary}; }
+.pa-detail-body { padding: 16px 20px 20px; }
+.pa-samples { margin-top: 16px; }
+.pa-samples h4 { margin-bottom: 7px; }
+.pa-samples .pa-table, .pa-skill-table { min-width: 416px; }
+.pa-samples .pa-table th:first-child, .pa-skill-table th:first-child { overflow-wrap: anywhere; }
+.pa-sample-actions { display: inline-flex; justify-content: flex-end; gap: 5px; flex-wrap: wrap; }
+[data-personal-assistant] :is(button,input,select,textarea):focus-visible { outline: 2px solid ${TOKENS.primary}; outline-offset: 2px; }
+@container personal-assistant (max-width: 660px) {
+  .pa-workspace { grid-template-columns: minmax(0, 1fr); }
+  .pa-rail { border-inline-end: 0; border-bottom: 1px solid ${TOKENS.railLine}; }
+  .pa-modes { width: max-content; }
+  .pa-modes button { padding-inline: 16px; }
+  .pa-categories { display: flex; flex-wrap: wrap; }
+  .pa-content { padding: 12px; }
 }
-
-export const tabButton = (active: boolean): CSSProperties => ({
-  appearance: 'none',
-  border: 0,
-  borderBottom: active ? `2px solid ${TOKENS.primary}` : '2px solid transparent',
-  background: 'transparent',
-  color: active ? TOKENS.primary : TOKENS.muted,
-  font: 'inherit',
-  fontSize: 13.5,
-  fontWeight: active ? 600 : 500,
-  padding: '10px 0',
-  marginBottom: -1,
-  cursor: 'pointer',
-  whiteSpace: 'nowrap',
-  transition: 'color .16s ease, border-color .16s ease',
-})
-
-export const tabPanel: CSSProperties = { padding: '16px 0 0' }
+@container personal-assistant (max-width: 460px) {
+  .pa-content .pa-table th:first-child { width: auto; white-space: normal; }
+  .pa-content .pa-table :is(th, td) { padding-inline: 8px; }
+}
+@media (max-width: 600px) {
+  .pa-detail-body, .pa-detail-head { padding-inline: 12px; }
+}
+`
 
 export const tableWrap: CSSProperties = {
   border: `1px solid ${TOKENS.line}`, borderRadius: 12, background: '#fff',

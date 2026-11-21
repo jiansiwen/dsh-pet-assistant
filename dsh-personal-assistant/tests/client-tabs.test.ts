@@ -13,7 +13,7 @@ import {
   LIST_TABS, LIST_SEPARATOR, MEETING_HISTORY, MEETING_HISTORY_COMMAND, NARROW_HIDDEN_COLUMNS, SETTINGS_SUMMARY,
   SETTINGS_SUMMARY_COMMAND, TABS,
   PRIORITY_CHOICES, columnClassName, columnTone, narrowTableCss, parseList, parseSettingsSummary,
-  priorityCommand, priorityLabel, priorityOutcome, priorityTone, reconcilePending, rowMeetingId, rowTaskId, statusTone, tableView,
+  priorityCommand, priorityLabel, priorityOutcome, priorityTone, reconcilePending, rowMeetingId, rowTaskId, statusTone, tableView, workbenchEntries,
 } from '../src/client/tabs.ts'
 
 /**
@@ -26,14 +26,18 @@ import {
 const cells = (parsed: { rows: readonly { cells: readonly string[] }[] }): (readonly string[])[] =>
   parsed.rows.map(row => row.cells)
 
-describe('七个 tab', () => {
-  it('顺序与标题固定', () => {
-    assert.deepEqual(TABS.map(tab => tab.id), ['todo', 'mail', 'wecom', 'report', 'meeting', 'team', 'skills', 'pet', 'settings'])
-    assert.deepEqual(TABS.map(tab => tab.label), ['待办', '邮件', '企业微信', '日报周报', '会议', '助理团', '技能', '宠物', '设置'])
+describe('工作台与设置分组', () => {
+  it('保留九项功能，工作与配置分开，其他设置在最后', () => {
+    assert.deepEqual(workbenchEntries('workbench').map(item => item.id), ['todo', 'report', 'meeting'])
+    assert.deepEqual(workbenchEntries('settings').map(item => item.id), ['team', 'skills', 'pet', 'mail', 'wecom', 'settings'])
+    assert.equal(workbenchEntries('settings').at(-1)?.label, '其他设置')
   })
 
-  it('每个 tab 都能对应到桌面宠物里的一页（用于「在桌面宠物里打开」）', () => {
-    for (const tab of TABS) assert.ok(tab.page.length > 0, tab.id)
+  it('搜索匹配名称与说明，只在所选分组和分类下找功能', () => {
+    assert.deepEqual(workbenchEntries('settings', '  唤醒  ').map(item => item.id), ['settings'])
+    assert.deepEqual(workbenchEntries('workbench', '唤醒'), [])
+    assert.deepEqual(workbenchEntries('settings', '学习样本', 'pet'), [])
+    assert.deepEqual(workbenchEntries('settings', '', 'pet').map(item => item.id), ['pet'])
   })
 
   it('文案里不出现实现词', () => {
