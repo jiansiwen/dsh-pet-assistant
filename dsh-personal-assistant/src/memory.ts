@@ -76,6 +76,14 @@ export interface MemoryRecord {
   importBatch: string | null
 }
 
+export const containsMemoryCredential = (value: string): boolean =>
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|secret|api[_-]?key|密码|口令)\s*[:=：]\s*\S+/i.test(value)
+
+export function isShareableMemory(record: MemoryRecord): boolean {
+  return record.scope.kind === 'global' && record.status === 'confirmed' && record.sensitivity === 'normal'
+    && !containsMemoryCredential(record.topic) && !containsMemoryCredential(record.text)
+}
+
 export interface MemoryTidyPreview {
   memoryId: string
   revision: number
@@ -149,7 +157,7 @@ export const WRITE_REJECTION_MESSAGES: Record<WriteRejection, string> = {
   empty_text: '记忆内容不能为空',
   unknown_sensitivity: '敏感级别不认识，只能用 normal 或 sensitive',
   sensitive_without_encryption:
-    '这条被标成敏感内容，但本机还没有落地加密存储（数据密钥 + Windows DPAPI + 密钥恢复提示），所以拒绝写入。不能通过改标普通内容绕过限制。',
+    '这条含有凭据或被标成敏感内容。记忆库尚未接入 Windows DPAPI 等静态加密，不能保存这类内容；设为私密也不会加密。',
   replacement_requires_user: '只有用户明确指定的替换才能让旧记忆失效，助理只能提交候选',
   invalid_replacement: '替换目标必须存在、尚未失效，且与新记忆类型和范围一致；不能替换选中的记忆自身',
 }
@@ -223,6 +231,8 @@ export interface MemoryInput {
   sourceRefs?: string[] | null
   sensitivity?: string | null
   expiresAt?: number | null
+  /** 仅对已确认的新全局记忆生效，不自动扩大历史记录的可见范围。 */
+  visibility?: 'team' | 'private'
   /** 用户明确要替换的旧记忆 id；省略即追加兼容规则，不按主题推断矛盾。 */
   replaceIds?: string[]
   actor: MemoryActor
@@ -402,7 +412,8 @@ export class MemoryStore {
    */
   put(input: MemoryInput, now: number): PutResult {
     const rejection = validateMemoryInput(input)
-      ?? ((input.sensitivity ?? 'normal') === 'sensitive' ? 'sensitive_without_encryption' : null)
+      ?? (input.sensitivity === 'sensitive' || containsMemoryCredential(input.text) || containsMemoryCredential(input.topic ?? '')
+        ? 'sensitive_without_encryption' : null)
     if (rejection) {
       return { ok: false, rejection, message: WRITE_REJECTION_MESSAGES[rejection] }
     }
@@ -435,12 +446,17 @@ export class MemoryStore {
         && normalizeTopic(record.text) === normalizeTopic(text),
       )
       if (duplicate && replaceIds.length === 0) {
-        return { ok: true, record: duplicate, conflicts: [], superseded: [] }
+        // 明确的私密请求可以收回已有共享；没有明确请求时不触碰历史范围。
+        if (input.actor.isUser && input.visibility === 'private' && this.isShared(duplicate.id)) {
+          this.setShared(duplicate.id, false, now)
+        }
+        return { ok: true, record: this.get(duplicate.id, now)!, conflicts: [], superseded: [] }
       }
 
       const id = duplicate?.id ?? makeMemoryId(kind.slice(0, 4), now)
       if (duplicate) {
         this.setStatus(id, 'confirmed', now, input.actor.id)
+        if (input.visibility === 'private' && this.isShared(id)) this.setShared(id, false, now)
       } else {
         this.write(id, {
           kind,
@@ -463,6 +479,11 @@ export class MemoryStore {
       for (const record of superseded) this.setStatus(record.id, 'expired', now, null)
       const stored = this.get(id, now)
       if (!stored) throw new Error(`记忆 ${id} 在写入事务中消失`)
+      if (!duplicate && isShareableMemory(stored) && stored.expiresAt === null && input.visibility !== 'private'
+        && (kind === 'user_preference' || kind === 'team_experience')
+        && superseded.every(record => this.isShared(record.id))) {
+        this.db.prepare('INSERT INTO memory_sharing(memory_id, shared_at) VALUES (?, ?)').run(id, now)
+      }
       return {
         ok: true,
         record: stored,
@@ -564,16 +585,20 @@ export class MemoryStore {
    * - 只认已确认：候选记忆连总助理自己都不能当事实用，更不能下发；
    * - 找不到或状态不对返回 `null`，由调用方如实回一句"这条不能共享"，不静默当成成功。
    */
-  setShared(memoryId: string, shared: boolean, now = Date.now()): { shared: boolean } | null {
-    const record = this.get(memoryId, now)
-    if (!record || record.scope.kind !== 'global' || record.status !== 'confirmed') return null
-    if (shared) {
-      this.db.prepare('INSERT INTO memory_sharing(memory_id, shared_at) VALUES (?, ?) ON CONFLICT(memory_id) DO UPDATE SET shared_at = excluded.shared_at')
-        .run(memoryId, now)
-    } else {
-      this.db.prepare('DELETE FROM memory_sharing WHERE memory_id = ?').run(memoryId)
-    }
-    return { shared }
+  setShared(memoryId: string, shared: boolean, now = Date.now(), expectedRevision?: number): { shared: boolean } | null {
+    return inTransaction(this.db, () => {
+      const record = this.get(memoryId, now)
+      if (!record || record.scope.kind !== 'global' || record.status !== 'confirmed'
+        || (shared && !isShareableMemory(record)) || (expectedRevision !== undefined && record.revision !== expectedRevision)) return null
+      if (this.isShared(memoryId) === shared) return { shared }
+      if (shared) {
+        this.db.prepare('INSERT INTO memory_sharing(memory_id, shared_at) VALUES (?, ?)').run(memoryId, now)
+      } else {
+        this.db.prepare('DELETE FROM memory_sharing WHERE memory_id = ?').run(memoryId)
+      }
+      this.db.prepare('UPDATE memories SET revision = revision + 1, updated_at = ? WHERE memory_id = ?').run(now, memoryId)
+      return { shared }
+    })
   }
 
   /** 某条记忆当前是否标记为可共享。 */
@@ -592,7 +617,7 @@ export class MemoryStore {
     if (rows.length === 0) return []
     const shared = new Set(rows.map(row => String(row.memory_id)))
     return this.list({}, now)
-      .filter(record => record.status === 'confirmed' && shared.has(record.id))
+      .filter(record => shared.has(record.id) && isShareableMemory(record))
       .slice(0, Math.max(0, limit))
   }
 
@@ -652,7 +677,7 @@ export class MemoryStore {
   revise(id: string, input: { text: string; topic?: string | null; actor: MemoryActor; expectedRevision: number }, now: number): MemoryRecord | null {
     if (input.actor.isUser !== true || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) return null
     const nextText = input.text.trim()
-    if (nextText === '') return null
+    if (nextText === '' || containsMemoryCredential(nextText) || containsMemoryCredential(input.topic ?? '')) return null
     return inTransaction(this.db, () => {
       const current = this.get(id, now)
       if (!current || current.status === 'expired' || current.revision !== input.expectedRevision) return null
@@ -918,6 +943,7 @@ export class MemoryStore {
     this.db.prepare('DELETE FROM memory_sources WHERE derived_id = ?').run(record.id)
     this.db.prepare('DELETE FROM memory_sources WHERE source_id = ?').run(record.id)
     this.db.prepare('DELETE FROM memory_tidy_history WHERE memory_id = ?').run(record.id)
+    this.db.prepare('DELETE FROM memory_sharing WHERE memory_id = ?').run(record.id)
     this.db.prepare('DELETE FROM memories WHERE memory_id = ?').run(record.id)
   }
 

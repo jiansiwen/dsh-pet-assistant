@@ -47,14 +47,12 @@ export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?
 /**
  * 设置面板的页面。
  *
- * 前九个是导航上的九项，按「工作 / 设置」两组排布（顺序见 `settings-nav.ts`，那里是单一真源）。
- * 末两个 `agent`（总助理）与 `reminders`（提醒）**不在导航里**：总助理从「通用」页的入口进去，
- * 提醒的内容并入了「待办提醒」。保留它们在联合类型里，是因为 `AssistantSettings` 仍按 section
- * 渲染这两块内容 —— 删掉就等于把功能藏起来。
+ * `workbench`、`settings` 是列表页；其他项也可以从旧入口打开详情。
  */
 export type SettingsPage =
+  | 'workbench' | 'settings'
   | 'chat' | 'todo' | 'mail' | 'wecom' | 'report' | 'meeting'
-  | 'team' | 'doc' | 'general'
+  | 'team' | 'doc' | 'voice' | 'appearance' | 'learning' | 'general'
   | 'agent' | 'reminders'
   | AssistantSettingsPage
 
@@ -656,7 +654,7 @@ export interface PetApi extends MemberApi {
   /** 听写第一拍：申请麦克风并开流式会话。streaming=true 时走逐帧喂数。 */
   onVoiceTurnComplete(callback: (event: import('../session-types.js').VoiceTurnCompletion) => void): () => void
   onVoiceConversationStop(callback: () => void): () => void
-  asrBegin(options?: { bargeIn?: boolean }): Promise<{ ok: boolean; streaming?: boolean; direct?: boolean; error?: string }>
+  asrBegin(options?: { bargeIn?: boolean; voiceprint?: boolean }): Promise<{ ok: boolean; streaming?: boolean; direct?: boolean; error?: string }>
   // ===== 共享采集 / 唤醒 / 插话（M1-02、M1-03、M1-05）=====
   onAudioGrants(callback: (grants: import('./barge-in.ts').AudioGrantsPayload) => void): () => void
   audioSync(): Promise<import('./barge-in.ts').AudioGrantsPayload>

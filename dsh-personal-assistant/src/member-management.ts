@@ -30,6 +30,7 @@ const draft = z.object({
   allowedTools: z.array(z.string().min(1).max(100)).max(100), dailyTokenLimit: limit, totalTokenLimit: limit,
   thresholdPercent: z.number().min(1).max(100), timezone: z.string().min(1).max(100),
   kind: z.enum(['expert', 'platform', 'local-cli']).default('expert'),
+  scheduleWorkspaceId: z.string().uuid().nullish(),
   binding: binding.nullish(),
   /** 平台密钥只在桥上一程（编辑器→插件），随即入加密存储，绝不回显、不入快照。 */
   apiKey: z.string().min(1).max(4096).optional(),
@@ -84,7 +85,7 @@ export class MemberManagement {
      */
     sharedMemories?(): NonNullable<MemberSnapshot['sharedMemories']>
     /** 切换某条记忆的可共享状态；不可共享时返回 null，由上层如实回一句。 */
-    toggleShared?(memoryId: string, shared: boolean): { shared: boolean } | null
+    toggleShared?(memoryId: string, shared: boolean, expectedRevision: number): { shared: boolean } | null
     /** 词库列表（设置页展示用）。 */
     glossary?(): Array<{ term: string; expansion: string; createdAt: number }>
     /** 增删术语；返回最新列表。 */
@@ -161,6 +162,7 @@ export class MemberManagement {
     }
     return { enabled: this.options.enabled(), members: directory.list().map(profile => ({ profile, quota: directory.quota(profile.assistantId), busy: runtime.busy(profile.assistantId) })),
       requests: directory.requests(), defaultModel: this.options.defaultModel(),
+      ...(runtime.listWorkspaces ? { workspaces: runtime.listWorkspaces() } : {}),
       ...(mailNoticeAttention ? { mailNoticeAttention } : {}), ...(mailNoticeAttentionError ? { mailNoticeAttentionError } : {}),
       ...(mailSendAttention ? { mailSendAttention } : {}), ...(mailSendAttentionError ? { mailSendAttentionError } : {}),
       ...(channelInboundAttention ? { channelInboundAttention } : {}), ...(channelInboundAttentionError ? { channelInboundAttentionError } : {}),
@@ -173,6 +175,9 @@ export class MemberManagement {
   /** 密钥只在桥上一程：apiKey 随即入加密存储换成 secretId，此后草稿与快照只携带标识。 */
   private settle(input: z.infer<typeof draft>): MemberDraft {
     const { apiKey, binding: bound, ...rest } = input
+    if (input.scheduleWorkspaceId && !this.options.runtime.listWorkspaces?.().some(item => item.id === input.scheduleWorkspaceId)) {
+      throw new Error('工作区已失效或未在 DSH 登记，请重新选择')
+    }
     if (apiKey !== undefined && input.kind !== 'platform') throw new Error('只有平台子助理需要配置 API 密钥')
     if (input.kind === 'expert') return { ...rest, binding: null }
     if (!bound) throw new Error('子助理必须配置外部绑定（平台端点或本地工具命令）')
@@ -186,6 +191,14 @@ export class MemberManagement {
     const { directory, memories } = this.options
     try {
       if (method === 'GET' && pathname === '/companion/v1/members') return { status: 200, body: this.snapshot() }
+      const newSession = /^\/companion\/v1\/members\/([A-Za-z0-9_-]+)\/new-session$/.exec(pathname)
+      if (method === 'POST' && newSession) {
+        const { title, expectedRevision } = z.object({ title: z.string().trim().min(1).max(60), expectedRevision: revision }).strict().parse(raw)
+        const id = newSession[1]!
+        this.idle(id)
+        if (directory.get(id)?.revision !== expectedRevision) throw new Error('成员设置已变化，请刷新后再新建会话')
+        return { status: 200, body: await this.options.runtime.newSession(id, title) }
+      }
       if (method === 'GET' && pathname === '/companion/v1/member-schedules') {
         return { status: 200, body: { schedules: this.options.schedules ? this.options.schedules() : [] } }
       }
@@ -394,10 +407,10 @@ export class MemberManagement {
       if (pathname === '/companion/v1/memories/shared') {
         if (method !== 'POST') return { status: 200, body: { records: this.options.sharedMemories?.() ?? [] } }
         if (!this.options.toggleShared) return { status: 503, body: { code: 'SHARING_UNAVAILABLE', message: '记忆共享尚未启用' } }
-        const input = z.object({ memoryId: z.string().trim().min(1).max(200), shared: z.boolean() }).strict().parse(raw)
-        const result = this.options.toggleShared(input.memoryId, input.shared)
+        const input = z.object({ memoryId: z.string().trim().min(1).max(200), shared: z.boolean(), expectedRevision: z.number().int().positive() }).strict().parse(raw)
+        const result = this.options.toggleShared(input.memoryId, input.shared, input.expectedRevision)
         if (result === null) {
-          return { status: 409, body: { code: 'NOT_SHAREABLE', message: '只有已确认的全局记忆可以共享给子助理' } }
+          return { status: 409, body: { code: 'NOT_SHAREABLE', message: '记忆已变化或不是可共享的全局记忆，请刷新核对' } }
         }
         this.options.changed()
         return { status: 200, body: { shared: result.shared, records: this.options.sharedMemories?.() ?? [] } }

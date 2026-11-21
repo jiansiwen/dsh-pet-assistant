@@ -16,6 +16,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { nextScheduleAt } from './scheduler.ts'
+import { MemberWorkspaceUnavailable } from './member-runtime.ts'
 import type { MemberScheduleRecord, TeamStore } from './team-domain.ts'
 
 export interface MemberSchedulerDeliverInput {
@@ -23,6 +24,8 @@ export interface MemberSchedulerDeliverInput {
   text: string
   channel: 'desktop' | 'wecom'
   recipientId: string | null
+  runId: string
+  sessionId?: string
 }
 
 export interface MemberSchedulerOptions {
@@ -30,7 +33,7 @@ export interface MemberSchedulerOptions {
   /** 团队模式开着才跑（与 memberRuntime.enabled 同一闸）。 */
   enabled(): boolean
   /** 自主跑成员，返回回复文本（装配侧 = memberRuntime.chat）。 */
-  run(memberId: string, prompt: string): Promise<string>
+  run(memberId: string, prompt: string): Promise<string | { text: string; sessionId: string }>
   /** 投递结果；返回 true 才算实际送达（装配侧 = 企微 deliver / 桌面播报）。 */
   deliver(input: MemberSchedulerDeliverInput): Promise<boolean>
   log(message: string): void
@@ -85,7 +88,8 @@ export class MemberScheduler {
     if (!schedule.enabled) return { state: 'skipped', text: '定时任务已停用' }
     if (!this.options.enabled()) return { state: 'skipped', text: '团队模式未开启，成员不能运行' }
     if (this.running.has(scheduleId)) return { state: 'skipped', text: '该定时任务正在执行' }
-    return await this.fire(schedule, this.now())
+    this.running.add(scheduleId)
+    try { return await this.fire(schedule, this.now()) } finally { this.running.delete(scheduleId) }
   }
 
   /** 认领：先把 nextRunAt 推进/停用落库，再异步执行——下一拍绝不会重复触发同一条。 */
@@ -107,26 +111,30 @@ export class MemberScheduler {
       generation: schedule.generation, triggerAt, state: 'running', text: null, startedAt: triggerAt, finishedAt: null })
     let state: 'succeeded' | 'failed' = 'failed'
     let text = ''
+    let pauseWorkspace = false
     try {
       const reply = await this.options.run(schedule.assistantId, schedule.prompt)
-      text = (reply ?? '').trim()
+      text = (typeof reply === 'string' ? reply : reply.text).trim()
       if (text === '') {
         text = '成员没有产出可推送的内容'
         state = 'failed'
       } else {
-        const delivered = await this.options.deliver({ assistantId: schedule.assistantId, text, channel: schedule.channel, recipientId: schedule.recipientId })
+        const delivered = await this.options.deliver({ assistantId: schedule.assistantId, text, channel: schedule.channel,
+          recipientId: schedule.recipientId, runId, ...(typeof reply === 'string' ? {} : { sessionId: reply.sessionId }) })
         state = delivered ? 'succeeded' : 'failed'
         if (!delivered) text = `${text}\n[投递失败：渠道不可达或未绑定收件会话]`
       }
     } catch (error) {
       state = 'failed'
-      text = `成员运行失败：${error instanceof Error ? error.message : String(error)}`
+      pauseWorkspace = error instanceof MemberWorkspaceUnavailable
+      text = `${pauseWorkspace ? '定时任务已暂停' : '成员运行失败'}：${error instanceof Error ? error.message : String(error)}`
     }
     const finishedAt = this.now()
     this.options.store.finishMemberScheduleRun(runId, state, text.slice(0, MAX_LAST_TEXT), finishedAt)
     // 回读最新计划再写回 lastStatus：执行期间用户可能改了 prompt/启用状态，不能拿旧快照覆盖。
-    const latest = this.options.store.getMemberSchedule(schedule.scheduleId) ?? schedule
-    this.options.store.saveMemberSchedule({ ...latest, lastStatus: state, lastText: text.slice(0, MAX_LAST_TEXT) })
+    const latest = this.options.store.getMemberSchedule(schedule.scheduleId)
+    if (latest) this.options.store.saveMemberSchedule({ ...latest, lastStatus: state, lastText: text.slice(0, MAX_LAST_TEXT),
+      ...(pauseWorkspace && latest.generation === schedule.generation ? { enabled: false, nextRunAt: null, generation: latest.generation + 1 } : {}) })
     this.options.log(`成员定时任务「${schedule.title}」${state === 'succeeded' ? '已推送' : '失败'}：${text.slice(0, 120)}`)
     return { state, text }
   }

@@ -61,7 +61,7 @@ function initialForm(member: MemberView | null): DraftForm {
     enabled: p?.enabled ?? true, provider: p?.provider ?? '', model: p?.model ?? '', maxTokens: String(p?.maxTokens ?? 16384),
     capabilities: [...(p?.capabilities ?? [])], allowedTools: [], dailyTokenLimit: String(p?.dailyTokenLimit ?? 0),
     totalTokenLimit: String(p?.totalTokenLimit ?? 0), thresholdPercent: String(p?.thresholdPercent ?? 80),
-    timezone: p?.timezone ?? localTimezone(),
+    timezone: p?.timezone ?? localTimezone(), scheduleWorkspaceId: p?.scheduleWorkspaceId,
     kind: p?.kind ?? 'expert',
     endpoint: binding?.kind === 'platform' ? binding.endpoint : '', platformModel: binding?.kind === 'platform' ? binding.model : '',
     secretId: binding?.kind === 'platform' ? binding.secretId : '',
@@ -114,6 +114,7 @@ function formDraft(form: DraftForm, member: MemberView | null): MemberDraft {
     thresholdPercent: safeInteger(rest.thresholdPercent, member?.profile.thresholdPercent ?? 80, 1),
     timezone: rest.timezone.trim() || localTimezone(), allowedTools: [],
     kind: rest.kind, reportMode: rest.reportMode, binding: bindingOf(form),
+    ...(rest.kind !== 'expert' ? { scheduleWorkspaceId: null } : {}),
   }
 }
 function validDraft(form: DraftForm): boolean {
@@ -135,12 +136,13 @@ function toDraft(form: DraftForm): MemberDraft {
 export interface MemberEditorPanelProps {
   member: MemberView | null
   latest?: MemberView
+  workspaces?: MemberSnapshot['workspaces']
   pending: boolean
   onSave(draft: MemberDraft, memberId: string | null, expectedRevision?: number): Promise<MemberResult>
   onDelete?(memberId: string, expectedRevision: number): Promise<MemberResult>
   onClose(): void
 }
-export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, onClose }: MemberEditorPanelProps) {
+export function MemberEditorPanel({ member, latest, workspaces, pending, onSave, onDelete, onClose }: MemberEditorPanelProps) {
   const [form, setForm] = useState(() => initialForm(member))
   const [voiceStyle, setVoiceStyle] = useState('')
   const [voiceSampleFile, setVoiceSampleFile] = useState('')
@@ -401,7 +403,7 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
 
     <section className="editor-card" aria-label="成员类型与外部绑定">
       <h2>成员类型</h2>
-      <p className="editor-hint">本机专家在本机运行并按权限使用本地工具；平台智能体与本地 AI 工具是子助理——持久独立会话、没有本地工具，越权任务会回退给总助理重新分析。</p>
+      <p className="editor-hint">本机成员使用独立 DSH 会话和宿主工具。外部平台与本地 AI 工具沿用各自的会话，不继承 DSH 工具；越权回给总助理处理。</p>
       <div className="editor-permissions" role="radiogroup" aria-label="成员类型">
         {MEMBER_KINDS.map(kind => <label key={kind} className={form.kind === kind ? 'is-selected' : undefined}>
           <input type="radio" name="memberKind" value={kind} checked={form.kind === kind} disabled={busy}
@@ -410,6 +412,16 @@ export function MemberEditorPanel({ member, latest, pending, onSave, onDelete, o
           <span>{MEMBER_KIND_LABELS[kind].hint}</span>
         </label>)}
       </div>
+      {form.kind === 'expert' && (workspaces !== undefined || form.scheduleWorkspaceId) && <label className="editor-field">
+        <span>定时任务工作区</span>
+        <select value={form.scheduleWorkspaceId ?? ''} disabled={busy} onChange={event => set('scheduleWorkspaceId', event.target.value || null)}>
+          <option value="">用主工作会话所在工作区</option>
+          {form.scheduleWorkspaceId && !workspaces?.some(item => item.id === form.scheduleWorkspaceId) &&
+            <option value={form.scheduleWorkspaceId}>原工作区不可用，请重选</option>}
+          {workspaces?.map(item => <option key={item.id} value={item.id}>{item.title}（{item.path}）</option>)}
+        </select>
+        <small>总助理派活跟随发起任务的会话工作区，不受此项影响。</small>
+      </label>}
       {form.kind === 'platform' && <div className="editor-grid">
         <label className="editor-field"><span>平台端点（OpenAI 兼容，https 或本机回环）</span>
           <input autoComplete="off" maxLength={2048} value={form.endpoint} disabled={busy} onChange={event => set('endpoint', event.target.value)}
@@ -665,7 +677,7 @@ export default function MemberEditorApp() {
   </main>
   return <main className="editor-shell">
     {error && <p className="editor-error" role="alert">{error}</p>}
-    <MemberEditorPanel key={context.memberId ?? 'new'} member={member} latest={member ?? undefined}
+    <MemberEditorPanel key={context.memberId ?? 'new'} member={member} latest={member ?? undefined} workspaces={snapshot?.workspaces}
       pending={pending} onSave={save} onDelete={member ? remove : undefined} onClose={() => void window.memberEditorApi.close()} />
   </main>
 }

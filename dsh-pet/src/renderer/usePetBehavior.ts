@@ -14,7 +14,7 @@ export type PetAction =
   /** 走路收步（一次）：走姿 → 站定。走到目标时插在 walk 与 idle 之间 */
   | 'walk-stop'
   /** 插兜swagger走：行走类自定义动作，接窗口移动与翻面，素材朝左 */
-  | 'swagger'
+  | 'swagger' | 'swagger-stop'
   /** 打盹三步（与 InteractionPhase 同名，直接投影成动作） */
   | 'sleep-in' | 'sleep-loop' | 'sleep-out'
 

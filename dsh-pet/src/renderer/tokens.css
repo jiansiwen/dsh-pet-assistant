@@ -63,6 +63,11 @@
   --win-amber: #b07a25;
   --win-amber-ink: #8a5f1c;
   --win-amber-wash: #f8f1e4;
+  /* 设置总览：只在导航与查看详情处用竹青，审批仍沿用靛色。 */
+  --settings-rail: #f2f6f5;
+  --settings-accent: #09634e;
+  --settings-accent-wash: #e2f2eb;
+  --settings-rule: #dce7e4;
 
   /* —— 字体：Win11 的 Segoe UI Variable 比微软雅黑 UI 细一档，也更中性 —— */
   --font-ui: "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei UI",

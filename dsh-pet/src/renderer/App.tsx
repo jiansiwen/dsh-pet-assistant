@@ -19,7 +19,7 @@ import { dockEdge, dockPosition, dockStatusTone, type DockEdge } from './pet-doc
 import DockedPet from './DockedPet.js'
 import { PET_WIDTH } from './pet-metrics.js'
 import { HOVER_CLOSE_MS, HOVER_OPEN_MS, hoverActions, initialHover, reduceHover, type HoverEventKind } from './hover-toolbar.js'
-import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isNarrationEcho, isVoiceStop, planInterruptInput, plausibleDirectQuestion } from '../voice-conversation.ts'
+import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isNarrationEcho, isVoiceStop, planInterruptInput, plausibleDirectQuestion, preferInterruptTranscript } from '../voice-conversation.ts'
 import { isExplicitContinue, isRestResume } from '../main/followup-window.ts'
 import type { VoiceTurn } from '../session-types.js'
 import {
@@ -1220,7 +1220,7 @@ export default function App() {
     hoverState.current = initialHover(hoverEnabled)
     setHoverBar(null)
     if (id === 'chat') { setSettingsPage(null); setPanelOpen(true); return }
-    if (id === 'settings') { setSettingsPage('general'); return }
+    if (id === 'settings') { setSettingsPage('settings'); return }
     if (id === 'meeting') { setSettingsPage('meeting'); return }
     if (id === 'todo') {
       void window.petApi.openCompanionTasks().then(result => { if (!result.ok) showToast('待办窗口未能打开') })
@@ -1932,8 +1932,10 @@ export default function App() {
           return
         }
         const refined = await window.petApi.asrTranscribe(arrayBufferToBase64(wav))
-        if (refined.ok && refined.text) await accept(refined.text)
-        else if (partial.text) await accept(partial.text)
+        const final = refined.ok ? refined.text ?? '' : ''
+        const text = gateInterrupt && speakingRef.current && !restingRef.current && questionWindowRef.current === null
+          ? preferInterruptTranscript(final, partial.text ?? '') : final || partial.text
+        if (text) await accept(text)
         else showToast(refined.error || '未识别到语音内容')
         return
       }
@@ -2541,10 +2543,17 @@ export default function App() {
           }}
           onClose={() => setSettingsPage(null)}
           quotaPending={quotaPending}
+          status={{ team: memberFeed.state ? (memberFeed.state.enabled ? '已启用' : '已关闭') : '未取得状态',
+            general: runtime?.label, voice: '口令模式', meeting: operations?.meeting === 'recording' ? '正在录音' : undefined }}
+          values={{ team: memberFeed.state ? `已启用成员 ${memberFeed.state.members.filter(item => item.profile.enabled).length} 位；可管理记忆范围和定时任务` : undefined,
+            doc: docSpeechMode === 'source' ? '原文朗读；支持用口令暂停' : '模型讲解；支持用口令暂停',
+            voice: `回复朗读${readReplies ? '已开启' : '已关闭'}；唤醒与声纹可单独设置`,
+            appearance: `大小 ${Math.round(petScale * 100)}%；透明度 ${Math.round(petOpacity * 100)}%` }}
         >
-          {settingsPage === 'general' ? (
+          {settingsPage === 'workbench' || settingsPage === 'settings' ? null :
+            ['general', 'appearance', 'voice', 'learning'].includes(settingsPage) ? (
             <div className="management-general">
-              <section className="management-section" aria-label="运行时与诊断">
+              {settingsPage === 'general' && <section className="management-section" aria-label="运行时与诊断">
                 <h3>运行状态</h3>
                 {runtime ? (
                   <div className={`runtime-row tone-${runtime.tone}`} role="status">
@@ -2589,8 +2598,8 @@ export default function App() {
                   {companion && <p className="management-diagnostic">运行配置 <code>{companion.profile}</code></p>}
                   <button className="management-button" onClick={() => void mirror.refresh().catch(error => showToast(String(error)))}>重新同步会话</button>
                 </details>
-              </section>
-              <section className="management-section" aria-label="外观">
+              </section>}
+              {settingsPage === 'appearance' && <section className="management-section" aria-label="外观">
                 <h3>外观</h3>
                 {/* 两档都是三选一：不做滑杆 —— 连续值会造出"点不中自己"的尺寸和"看不见自己"的透明度。 */}
                 {([
@@ -2650,9 +2659,9 @@ export default function App() {
                   <p>透明度只作用于角色本身，气泡与快捷工具栏保持清晰。</p>
                   <p>收起后仍会用一个小圆点显示录音、待处理与出错状态；单击展开。</p>
                 </details>
-              </section>
+              </section>}
 
-              <section className="management-section" aria-label="睡眠与唤醒">
+              {settingsPage === 'voice' && <section className="management-section" aria-label="睡眠与唤醒">
                 <h3>睡眠与唤醒</h3>
                 {(['idleSleepMinutes', 'sleepMinutes'] as const).map(key => (
                   <label className="management-sleep" key={`${key}-${sleepSettings[key]}`}>
@@ -2724,8 +2733,9 @@ export default function App() {
                   <summary>关闭固定后会怎样</summary>
                   <p>会话框按屏幕空间自动换到上、下、左、右四侧，避免超出屏幕。</p>
                 </details>
-              </section>
-              <ResidencySettings
+              </section>}
+              {(settingsPage === 'voice' || settingsPage === 'general') && <ResidencySettings
+                section={settingsPage === 'general' ? 'startup' : 'voice'}
                 activity={operations && operations.connection === 'connected' ? operations.activity : null}
                 onOpenActivity={() => {
                   // 活动记录的授权走插件的可信审批：这里只把开启指令放进输入框，由用户自己发出去。
@@ -2735,9 +2745,9 @@ export default function App() {
                   window.setTimeout(() => inputRef.current?.focus(), 60)
                 }}
                 showToast={showToast}
-              />
-              <FastReplySettings showToast={showToast} />
-              <section className="management-section" aria-label="会议与文档审批">
+              />}
+              {settingsPage === 'voice' && <><FastReplySettings showToast={showToast} /><VoiceApiSettings /></>}
+              {settingsPage === 'general' && <section className="management-section" aria-label="会议与文档审批">
                 <h3>会议与文档审批</h3>
                 <label className="management-voice">
                   <input type="checkbox" checked={meetingDocumentAutoApprove === true} disabled={meetingDocumentAutoApprove === null}
@@ -2757,16 +2767,17 @@ export default function App() {
                   <p>开启后，当前桌面请求可不经逐次弹窗开始或停止会议录音、讲解授权目录内的文档。录音会采集麦克风和所选系统音频，讲解会把文档片段发送给当前模型服务商；请确保参会者知情。关闭后恢复逐次确认。邮件、纪要及其他操作仍按各自规则审批。</p>
                   <p>讲解期间会监听麦克风以支持插话；语音识别使用当前配置的识别服务，可能将插话音频发送给该服务。</p>
                 </details>
-              </section>
-              <EnvironmentCheck showToast={showToast} />
-              <ArtifactsSettings />
-              <TimelineSettings />
-              <SkillsSettings showToast={showToast} />
-              <GlossarySettings showToast={showToast} />
-              <WorkEvidenceSettings showToast={showToast} />
-              <PresentationSettings active={presentation} />
-              <VoiceApiSettings />
-              <section className="management-section" aria-label="快捷操作">
+              </section>}
+              {settingsPage === 'general' && <EnvironmentCheck showToast={showToast} />}
+              {settingsPage === 'learning' && <>
+                <SkillsSettings showToast={showToast} />
+                <GlossarySettings showToast={showToast} />
+                <ArtifactsSettings />
+                <TimelineSettings />
+                <WorkEvidenceSettings showToast={showToast} />
+              </>}
+              {settingsPage === 'voice' && <PresentationSettings active={presentation} />}
+              {settingsPage === 'appearance' && <section className="management-section" aria-label="快捷操作">
                 <h3>快捷操作</h3>
                 <div className="management-quick">
                   {QUICK_COMMANDS.map(command => (
@@ -2782,7 +2793,7 @@ export default function App() {
                     .then(result => { if (!result.ok) showToast('日报文件夹未能打开') })
                     .catch(() => showToast('日报文件夹未能打开'))}>打开日报文件夹</button>
                 </div>
-              </section>
+              </section>}
             </div>
           ) : settingsPage === 'team' ? (
             <>
@@ -2805,7 +2816,7 @@ export default function App() {
                 <p className="management-hint">成员干活时听你的，而这里定的是"你自己"叫什么、怎么说话。子助理各有自己的性格，在各自的编辑窗口里改。</p>
                 <button className="management-button primary" onClick={() => setSettingsPage('agent')}>总助理设置（名字与性格）</button>
               </section>
-              <p className="management-hint">运行时启停与连接诊断请到通用设置。</p>
+              <p className="management-hint">运行时启停与连接诊断请到「其他设置」。</p>
               <MemberManagement feed={memberFeed} />
               <TeamPanel snapshot={snapshot} memberNames={memberNames} onOpenApproval={openApproval} bindingId={session?.bindingId} />
               {snapshot?.team && <form className="management-section" onSubmit={async event => {

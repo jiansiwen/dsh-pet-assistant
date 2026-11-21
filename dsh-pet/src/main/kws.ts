@@ -196,7 +196,8 @@ function verify(samples) {
   input.acceptWaveform({ sampleRate: 16000, samples })
   input.inputFinished()
   if (!extractor.isReady(input)) return -1
-  const embedding = extractor.compute(input)
+  // 与录入一致：Electron 的 Worker 也不能使用 sherpa 默认的外部 ArrayBuffer。
+  const embedding = extractor.compute(input, false)
   let best = -1
   for (const reference of workerData.voiceprint.embeddings) {
     best = Math.max(best, similarity(embedding, reference))

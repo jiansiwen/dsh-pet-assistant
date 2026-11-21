@@ -1092,6 +1092,27 @@ export class MeetingRecorder {
     return { ok: true }
   }
 
+  /**
+   * 补齐"退出时正在录音"留下的会议：收尾只把状态置 stopped，自动转写没来得及跑，
+   * 这类会议有录音块却没有转写段，界面上又只有"重试转写"（仅失败时出现），用户会觉得"不能转写"。
+   * 启动时把 stopped 且无转写段、但有录音块的会议逐场补转写，录音始终保留、不丢数据。
+   */
+  async repairUntranscribed(): Promise<number> {
+    let done = 0
+    for (const meeting of this.store.listMeetings(50)) {
+      if (meeting.state !== 'stopped') continue
+      if (this.store.getSegments(meeting.id).length > 0) continue
+      if (this.store.listChunks(meeting.id).length === 0) continue
+      const last: LastMeeting = {
+        meetingId: meeting.id, name: meeting.name, sources: meeting.sources,
+        startedAt: meeting.startedAt, missingTracks: [], missingTrackReasons: {},
+      }
+      await this.runJob(meeting.id, () => this.refineJob(meeting.id, last))
+      done += 1
+    }
+    return done
+  }
+
   /** 只重试失败的片段：成功的替换占位段，没人声的去掉占位，仍失败的保留缺口。其余段原样。 */
   retryFailed(meetingId: string): { ok: true } | { ok: false; error: string } {
     const meeting = this.store.getMeeting(meetingId)

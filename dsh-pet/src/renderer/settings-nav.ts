@@ -1,14 +1,11 @@
 /**
- * 设置面板的导航：九项、两组，按"先干活、后配置"排。
+ * 工作台放要处理的事，设置页放配置；两组共用同一份功能列表。
  *
  * 为什么单独一个纯逻辑文件：
  *
  * 1. **顺序与标题是产品决定**，不是渲染细节。用户在哪儿找"日报"、第一项是不是"对话"，
  *    这类判断错了，界面就难用；而它一旦写死在 `.tsx` 里，就只能靠开壳用眼睛数。
- * 2. 主理人给的验收判据里有一条"正好 9 项、两组、id 不重复、chat 第一、general 最后"，
- *    这些断言需要一份可 `node --test` 直接导入的数据源。
- *
- * 排序理由：前六项是"今天要做的事"，后三项是"把这只宠物调成我喜欢的样子"。
+ * 2. 其他设置放在最后，不抢占常用功能的位置。
  * 对话排第一位，是因为它是用户最常回来的一页 —— 打开面板十次里有八次其实只是想接着说话。
  */
 
@@ -30,7 +27,7 @@ export interface SettingsNavGroup {
 }
 
 /**
- * 九项导航。`chat` 不是"一个设置页"，点了会关掉面板直接开对话 —— 但它必须在这里，
+ * `chat` 不是"一个设置页"，点了会关掉面板直接开对话 —— 但它必须在这里，
  * 否则用户想从设置里回到对话就得先找关闭按钮再找输入框。
  */
 export function settingsNavGroups(): readonly SettingsNavGroup[] {
@@ -51,9 +48,12 @@ export function settingsNavGroups(): readonly SettingsNavGroup[] {
       id: 'settings',
       label: '设置',
       items: [
-        { id: 'team', title: '助理团', summary: '管理成员、额度与等待处理的任务。' },
+        { id: 'team', title: '助理团设置', summary: '管理成员、记忆范围、额度与定时任务。' },
         { id: 'doc', title: '文档与讲解', summary: '管理授权目录、阅读与讲解方式。' },
-        { id: 'general', title: '通用', summary: '调整桌面伙伴的行为、语音与隐私。' },
+        { id: 'voice', title: '语音与声纹', summary: '配置唤醒词、声纹、外放插话与识别服务。' },
+        { id: 'learning', title: '记忆与技能', summary: '查看技能、专属词库与工作资料。' },
+        { id: 'appearance', title: '外观与交互', summary: '调整角色大小、透明度、停靠和快捷操作。' },
+        { id: 'general', title: '其他设置', summary: '管理启动、托盘常驻、活动记录和环境检查。' },
       ],
     },
   ]
@@ -66,6 +66,8 @@ export function settingsNavGroups(): readonly SettingsNavGroup[] {
  * 那比不显示还糟：用户会以为自己点错了。
  */
 export function settingsPageMeta(page: SettingsPage): { title: string; summary: string } {
+  if (page === 'workbench') return { title: '工作台', summary: '查看待办、邮件、日报与会议，选择要处理的工作。' }
+  if (page === 'settings') return { title: '设置', summary: '先看每项功能的当前配置，需要更改时再打开详情。' }
   for (const group of settingsNavGroups()) {
     for (const item of group.items) {
       if (item.id === page) return { title: item.title, summary: item.summary }
@@ -76,7 +78,18 @@ export function settingsPageMeta(page: SettingsPage): { title: string; summary: 
   return { title: '设置', summary: '' }
 }
 
-/** 九项是否按"组顺序 → 项顺序"平铺后的完整列表。入口处按它编号（01–09）。 */
+export function settingsOverview(page: SettingsPage): 'workbench' | 'settings' {
+  return page === 'workbench' || page === 'reminders' || settingsNavGroups()[0].items.some(item => item.id === page)
+    ? 'workbench' : 'settings'
+}
+
+export function settingsRows(overview: 'workbench' | 'settings', query: string, category?: SettingsPage): readonly SettingsNavItem[] {
+  const search = query.trim().toLowerCase()
+  return settingsNavGroups()[overview === 'workbench' ? 0 : 1].items
+    .filter(item => (category === undefined || item.id === category) && `${item.title} ${item.summary}`.toLowerCase().includes(search))
+}
+
+/** 所有分类的完整功能列表。 */
 export function settingsNavItems(): readonly SettingsNavItem[] {
   return settingsNavGroups().flatMap(group => group.items)
 }

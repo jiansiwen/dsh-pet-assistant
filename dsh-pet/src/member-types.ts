@@ -48,6 +48,7 @@ export const SUB_ASSISTANT_REPORT_LABELS: Record<SubAssistantReportMode, string>
   chief: '总助理汇总播报', self: '子助理直接播报',
 }
 export interface MemberDraft {
+  scheduleWorkspaceId?: string | null
   displayName: string
   description: string
   personality: string
@@ -125,6 +126,7 @@ export interface MemberSharedMemory {
   shared: boolean
 }
 export interface MemberSnapshot {
+  workspaces?: Array<{ id: string; title: string; path: string }>
   enabled: boolean
   members: MemberView[]
   requests: MemberQuotaRequest[]
@@ -165,6 +167,7 @@ export interface MemberCommandInputs {
   create: MemberDraft
   update: MemberDraft & { id: string; expectedRevision: number }
   mode: { enabled: boolean }
+  'new-session': { id: string; expectedRevision: number; title: string }
   /** purgeMemory=true 表示连它的独立记忆一起删；不传只删成员。 */
   delete: { id: string; expectedRevision: number; purgeMemory?: boolean }
   'reset-quota': { id: string; expectedQuotaRevision: number; scope: QuotaResetScope }
@@ -178,13 +181,13 @@ export interface MemberCommandInputs {
   'memory-delete-preview': { id: string; memoryId: string; expectedRevision: number }
   'memory-delete': { id: string; memoryId: string; expectedRevision: number; previewId: string }
   /** 记忆共享：不属于任何成员，所以不带 id。 */
-  'share-memory': { memoryId: string; shared: boolean }
+  'share-memory': { memoryId: string; shared: boolean; expectedRevision: number }
 }
 export type MemberAction = keyof MemberCommandInputs
 export interface MemoryDeletePreview { previewId: string; impact: unknown }
 export interface MemberAssistDraft { draft: MemberDraft; notes: string }
 export interface MemberEditorContext { memberId: string | null; skins?: Array<{ id: string; name: string }> }
-export type MemberData = { records: MemoryRecord[] } | MemoryDeletePreview | MemberAssistDraft
+export type MemberData = { records: MemoryRecord[] } | MemoryDeletePreview | MemberAssistDraft | { sessionId: string; title: string }
 export type MemberResult<T = MemberData> = { ok: true; state?: MemberSnapshot; data?: T } | { ok: false; error: { code: string; message: string } }
 export interface MemberApi {
   membersState(): Promise<MemberResult>

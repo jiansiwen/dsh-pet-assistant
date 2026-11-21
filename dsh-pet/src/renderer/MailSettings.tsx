@@ -128,7 +128,7 @@ export default function MailSettings() {
               <summary>
                 {timeLabel(row.createdAt)} · {row.memberId} · {row.uids.length} 封邮件
                 {row.suggestions.length > 0 ? ` · ${row.suggestions.length} 条建议` : ''}
-                {row.notifiedAt === null ? ' · 尚未通知' : ''}
+                 {row.silent ? ' · 按成员规则不提醒' : row.notifiedAt === null ? ' · 尚未通知' : ''}
               </summary>
               <p className="management-hint">{row.result.slice(0, 4000)}</p>
               {row.suggestions.length > 0 && <ul className="assistant-settings-list">

@@ -19,6 +19,22 @@ function init(store: TeamStore, upper = 50) {
     bootstrapUpperUid: upper, legacy: null }, 1)
 }
 
+test('不提醒的分析仍保留可查，两个通知入口都不会投递；混合批次只通知未静音的部分', t => {
+  const { store } = fixture(t)
+  const scope = store.commitMailWatchPage(init(store), 25, [1, 2])
+  const saved = store.completeMailWatchAnalysis(scope.scopeId, 'member', [{ uid: 1, sourceDigest: 'a', truncated: false }],
+    '已分析第一封', 2, [], { sessionId: 'member-session', silent: true })
+  assert.equal(store.listMailWatchAnalyses()[0]?.silent, true)
+  assert.equal(store.pendingMailWatchNotifications(scope.scopeId).length, 0)
+  assert.equal(store.pendingMailNotices('account-1', 'member').length, 0)
+  assert.equal(store.claimMailNotice(saved.analysisId, 'account-1', 'member', 'epoch', 3), null)
+  store.completeMailWatchAnalysis(scope.scopeId, 'member', [{ uid: 2, sourceDigest: 'b', truncated: false }],
+    '有二类材料', 4, [], { sessionId: 'member-session', noticeText: '仅一类需通知' })
+  assert.equal(store.pendingMailWatchNotifications(scope.scopeId)[0]?.sessionId, 'member-session')
+  assert.equal(store.pendingMailNotices('account-1', 'member')[0]?.result, '仅一类需通知')
+  assert.equal(store.listMailWatchAnalyses()[0]?.sessionId, undefined)
+})
+
 test('邮件表升级复用唯一 TeamStore 库，v9 数据保留且重复打开幂等', t => {
   const f = fixture(t)
   f.store.insertOperation({ operationId: 'old-op', taskId: 'old-task', approvalId: null, kind: 'write',

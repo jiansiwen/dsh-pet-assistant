@@ -15,6 +15,8 @@
  * `record()`/`save()` 仍接受显式提交（本人或模型提候选）。
  */
 import type { DatabaseSync } from 'node:sqlite'
+import { inTransaction } from './store.ts'
+import type { SkillSample } from './skill-formation.ts'
 
 export const SKILL_STATUSES = ['candidate', 'active', 'retired'] as const
 export type SkillStatus = typeof SKILL_STATUSES[number]
@@ -109,6 +111,9 @@ export class SkillStore {
     const columns = (this.db.prepare('PRAGMA table_info(skill_evidence)').all() as Array<Record<string, unknown>>)
       .map(row => String(row.name))
     if (!columns.includes('verified')) this.db.exec('ALTER TABLE skill_evidence ADD COLUMN verified INTEGER NOT NULL DEFAULT 0')
+    if (!columns.includes('source_ref')) this.db.exec('ALTER TABLE skill_evidence ADD COLUMN source_ref TEXT')
+    if (!columns.includes('sample')) this.db.exec('ALTER TABLE skill_evidence ADD COLUMN sample TEXT')
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_source ON skill_evidence(assistant_id, shape, source_ref) WHERE source_ref IS NOT NULL')
     // 技能来源：老库默认 manual；自动形成的两条路各自打标，界面据此提示"待查验"。
     const skillColumns = (this.db.prepare('PRAGMA table_info(skill_versions)').all() as Array<Record<string, unknown>>)
       .map(row => String(row.name))
@@ -142,8 +147,12 @@ export class SkillStore {
 
   /** 删除一个技能的全部版本（界面"删"）。回滚/退役仍走版本化，删除是彻底移除。 */
   remove(id: string): number {
-    const changed = this.db.prepare('DELETE FROM skill_versions WHERE skill_key = ?').run(id)
-    return Number(changed.changes)
+    return inTransaction(this.db, () => {
+      const current = this.history(id)[0]
+      const changed = this.db.prepare('DELETE FROM skill_versions WHERE skill_key = ?').run(id)
+      if (current) this.retract(current.assistantId, current.name)
+      return Number(changed.changes)
+    })
   }
 
   /** 某个助理当前生效的技能（每项取最高版本且状态为 active）。 */
@@ -211,14 +220,20 @@ export class SkillStore {
    * 或本人在桌面确认过）。成员自报成功、模型自述完成、artifacts 非空 —— 都不算。
    * 传 false 也记一行，是为了留痕："这件事做过，但没核实"。
    */
-  noteSuccess(assistantId: string, shape: string, verified: boolean, now = Date.now()): number {
+  noteSuccess(assistantId: string, shape: string, verified: boolean, now = Date.now(), evidence?: { ref: string; sample: SkillSample }): number {
     const owner = assistantId.trim()
     const key = shape.trim()
     if (owner === '' || key === '') throw new Error('技能证据需要助理与同类工作签名')
     if (typeof verified !== 'boolean') throw new Error('必须明确这次成功是否已被独立核实')
-    this.db.prepare('INSERT INTO skill_evidence(assistant_id, shape, recorded_at, verified) VALUES (?, ?, ?, ?)')
-      .run(owner, key, now, verified ? 1 : 0)
+    this.db.prepare(`INSERT OR IGNORE INTO skill_evidence(assistant_id, shape, recorded_at, verified, source_ref, sample)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(owner, key, now, verified ? 1 : 0, evidence?.ref ?? null, evidence ? JSON.stringify(evidence.sample) : null)
     return this.evidenceCount(owner, key)
+  }
+
+  verifiedSamples(assistantId: string, shape: string): SkillSample[] {
+    const rows = this.db.prepare(`SELECT sample FROM skill_evidence WHERE assistant_id = ? AND shape = ? AND verified = 1
+      AND source_ref IS NOT NULL AND sample IS NOT NULL ORDER BY recorded_at DESC, rowid DESC LIMIT 6`).all(assistantId, shape)
+    return rows.map(row => JSON.parse(String(row.sample)) as SkillSample)
   }
 
   /** 某个 shape 里**已核实**的样本数。成形判定与界面都只看这个数。 */

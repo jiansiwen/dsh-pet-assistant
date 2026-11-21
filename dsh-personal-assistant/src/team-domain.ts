@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto'
 import type { MailSuggestion } from './mail-suggestions.ts'
 import type { CompanionBlocker, CompanionCommand, CompanionHttpResult, CompanionInput, CompanionTaskKind, DesktopReminderDelivery, ReminderSchedule } from './companion-contract.ts'
 import { MemberDirectory, migrateMemberDirectory } from './member-directory.ts'
+import { MemberFeedback } from './member-feedback.ts'
 
 export interface CompanionTaskMeta {
   taskId: string
@@ -245,6 +246,22 @@ export interface MailWatchAnalysis {
   suggestions: MailSuggestion[]
   createdAt: number
   notifiedAt: number | null
+  sessionId?: string
+  mailTopic?: string
+  mailLabel?: string
+  silent?: boolean
+  noticeText?: string
+}
+
+function mailAnalysisOf(row: Row): MailWatchAnalysis {
+  return { analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
+    uids: JSON.parse(String(row.uids)) as number[], result: String(row.result), suggestions: parseStoredSuggestions(row.suggestions),
+    createdAt: Number(row.created_at), notifiedAt: row.notified_at === null ? null : Number(row.notified_at),
+    ...(typeof row.member_session_id === 'string' ? { sessionId: row.member_session_id } : {}),
+    ...(typeof row.mail_topic === 'string' ? { mailTopic: row.mail_topic } : {}),
+    ...(typeof row.mail_label === 'string' ? { mailLabel: row.mail_label } : {}),
+    ...(typeof row.notice_text === 'string' ? { noticeText: row.notice_text } : {}),
+    ...(row.silent === 1 ? { silent: true } : {}) }
 }
 
 export interface MailNoticeAttention {
@@ -867,6 +884,7 @@ function parseList(raw: string | null): string[] {
 export class TeamStore {
   private readonly db: DatabaseSync
   readonly directory: MemberDirectory
+  readonly feedback: MemberFeedback
   /** 事务嵌套深度：内层调用跟随外层一起提交或回滚（SQLite 对嵌套 BEGIN 直接报错）。 */
   private transactionDepth = 0
 
@@ -878,6 +896,7 @@ export class TeamStore {
     try {
       this.transaction(() => this.migrate())
       this.directory = new MemberDirectory(this.db, body => this.transaction(body))
+      this.feedback = new MemberFeedback(this.db)
     } catch (error) {
       this.db.close()
       throw error
@@ -1361,6 +1380,9 @@ export class TeamStore {
       const columns = (this.db.prepare('PRAGMA table_info(mail_watch_analyses)').all() as Array<Record<string, unknown>>)
         .map(row => String(row.name))
       if (!columns.includes('suggestions')) this.db.exec("ALTER TABLE mail_watch_analyses ADD COLUMN suggestions TEXT NOT NULL DEFAULT '[]'")
+      for (const [name, type] of [['member_session_id', 'TEXT'], ['mail_topic', 'TEXT'], ['mail_label', 'TEXT'], ['notice_text', 'TEXT'], ['silent', 'INTEGER NOT NULL DEFAULT 0']]) {
+        if (!columns.includes(name)) this.db.exec(`ALTER TABLE mail_watch_analyses ADD COLUMN ${name} ${type}`)
+      }
     }
     this.db.exec(`PRAGMA user_version = ${TEAM_SCHEMA_VERSION}`)
     this.db
@@ -2579,14 +2601,15 @@ export class TeamStore {
   /** 分析成功与待通知一起落库；通知失败或重启不能让已完成分析再次花费额度。 */
   completeMailWatchAnalysis(scopeId: string, memberId: string,
     messages: readonly { uid: number; sourceDigest: string; truncated: boolean }[], result: string, at: number,
-    suggestions: readonly MailSuggestion[] = []): MailWatchAnalysis {
+    suggestions: readonly MailSuggestion[] = [], context: Pick<MailWatchAnalysis, 'sessionId' | 'mailTopic' | 'mailLabel' | 'silent' | 'noticeText'> = {}): MailWatchAnalysis {
     if (!result.trim() || messages.length === 0) throw new Error('不能保存空邮件分析')
     return this.transaction(() => {
       const analysis: MailWatchAnalysis = { analysisId: randomUUID(), scopeId, memberId,
-        uids: messages.map(message => message.uid), result, suggestions: [...suggestions], createdAt: at, notifiedAt: null }
-      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, suggestions, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result,
-        json(analysis.suggestions), at)
+        uids: messages.map(message => message.uid), result, suggestions: [...suggestions], createdAt: at, notifiedAt: null, ...context }
+      this.db.prepare(`INSERT INTO mail_watch_analyses(analysis_id, scope_id, member_id, uids, result, suggestions, created_at,
+        member_session_id, mail_topic, mail_label, silent, notice_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(analysis.analysisId, scopeId, memberId, json(analysis.uids), result,
+          json(analysis.suggestions), at, context.sessionId ?? null, context.mailTopic ?? null, context.mailLabel ?? null, bool(context.silent === true), context.noticeText ?? null)
       const update = this.db.prepare(`UPDATE mail_watch_messages SET state = 'analyzed', analysis_id = ?,
         source_digest = ?, truncated = ?, detail = NULL WHERE scope_id = ? AND uid = ? AND state = 'pending'`)
       for (const message of messages) {
@@ -2607,21 +2630,30 @@ export class TeamStore {
   listMailWatchAnalyses(limit = 20): MailWatchAnalysis[] {
     const capped = Math.max(1, Math.min(50, Math.trunc(limit)))
     const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(capped) as Row[]
-    return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
-      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at),
-      notifiedAt: row.notified_at === null ? null : Number(row.notified_at) }))
+    return rows.map(({ member_session_id: _session, mail_topic: _topic, mail_label: _label, notice_text: _notice, ...row }) => mailAnalysisOf(row))
+  }
+
+  reportContext(assistantId: string, runId: string): string | null {
+    const mail = this.db.prepare('SELECT COALESCE(notice_text, result) AS body FROM mail_watch_analyses WHERE analysis_id = ? AND member_id = ? AND silent = 0')
+      .get(runId, assistantId) as Row | undefined
+    const scheduled = mail ?? this.db.prepare('SELECT text AS body FROM member_schedule_runs WHERE run_id = ? AND assistant_id = ?')
+      .get(runId, assistantId) as Row | undefined
+    return typeof scheduled?.body === 'string' ? scheduled.body.slice(0, 2000) : null
+  }
+
+  reviewedScheduleTitle(assistantId: string, runId: string): string | null {
+    const row = this.db.prepare("SELECT schedule_id FROM member_schedule_runs WHERE run_id = ? AND assistant_id = ? AND state = 'succeeded'")
+      .get(runId, assistantId) as Row | undefined
+    return row ? this.getMemberSchedule(String(row.schedule_id))?.title ?? null : null
   }
 
   /** 尚未确认送达的分析；结果未知或本人已核对的不一定允许重发。 */
   pendingMailWatchNotifications(scopeId: string, limit = 5, deliverableOnly = false): MailWatchAnalysis[] {
-    const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses WHERE scope_id = ? AND notified_at IS NULL
+    const rows = this.db.prepare(`SELECT * FROM mail_watch_analyses WHERE scope_id = ? AND notified_at IS NULL AND silent = 0
       AND (? = 0 OR NOT EXISTS (SELECT 1 FROM mail_notice_deliveries d
         WHERE d.analysis_id = mail_watch_analyses.analysis_id AND d.state != 'pending'))
       ORDER BY created_at, rowid LIMIT ?`).all(scopeId, deliverableOnly ? 1 : 0, limit) as Row[]
-    return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
-      suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at), notifiedAt: null }))
+    return rows.map(mailAnalysisOf)
   }
 
   markMailWatchNotified(analysisId: string, at: number): void {
@@ -2635,15 +2667,15 @@ export class TeamStore {
     const rows = this.db.prepare(`SELECT a.* FROM mail_watch_analyses a
       JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
       LEFT JOIN mail_notice_deliveries d ON d.analysis_id = a.analysis_id
-      WHERE s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL AND (d.analysis_id IS NULL OR d.state = 'pending')
+      WHERE s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL AND a.silent = 0 AND (d.analysis_id IS NULL OR d.state = 'pending')
       ORDER BY a.created_at, a.rowid LIMIT ?`).all(accountKey, memberId, limit) as Row[]
     return rows.map(row => ({ analysisId: String(row.analysis_id), scopeId: String(row.scope_id), memberId: String(row.member_id),
-      uids: JSON.parse(String(row.uids)) as number[], result: String(row.result),
+       uids: JSON.parse(String(row.uids)) as number[], result: String(row.notice_text ?? row.result),
       suggestions: parseStoredSuggestions(row.suggestions), createdAt: Number(row.created_at), notifiedAt: null }))
   }
 
   mailNoticeAttention(accountKey: string, memberId: string | null, limit = 20): MailNoticeAttention[] {
-    const rows = this.db.prepare(`SELECT a.analysis_id, a.member_id, a.result, d.state, d.attempt_id FROM mail_notice_deliveries d
+    const rows = this.db.prepare(`SELECT a.analysis_id, a.member_id, COALESCE(a.notice_text, a.result) AS result, d.state, d.attempt_id FROM mail_notice_deliveries d
       JOIN mail_watch_analyses a ON a.analysis_id = d.analysis_id JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
       WHERE s.account_key = ? AND (? IS NULL OR a.member_id = ?) AND a.notified_at IS NULL AND d.state IN ('failed', 'unknown')
       ORDER BY d.updated_at, a.rowid LIMIT ?`).all(accountKey, memberId, memberId, limit) as Row[]
@@ -2658,7 +2690,7 @@ export class TeamStore {
     return this.transaction(() => {
       const available = this.db.prepare(`SELECT 1 FROM mail_watch_analyses a JOIN mail_watch_scopes s ON s.scope_id = a.scope_id
         LEFT JOIN mail_notice_deliveries d ON d.analysis_id = a.analysis_id
-        WHERE a.analysis_id = ? AND s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL
+        WHERE a.analysis_id = ? AND s.account_key = ? AND a.member_id = ? AND a.notified_at IS NULL AND a.silent = 0
         AND (d.analysis_id IS NULL OR d.state = 'pending')`).get(analysisId, accountKey, memberId)
       if (!available) return null
       const attemptId = randomUUID()

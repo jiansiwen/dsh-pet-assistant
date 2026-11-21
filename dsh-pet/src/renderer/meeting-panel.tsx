@@ -490,7 +490,14 @@ export default function MeetingPanel({ onClose }: MeetingPanelProps) {
           )}
 
           {segments.length === 0 ? (
-            <p className="meeting-hint">{transcribing && isLatest ? '精修完成后在这里显示转写段。' : '还没有转写段。'}</p>
+            <p className="meeting-hint">
+              {transcribing && isLatest ? '精修完成后在这里显示转写段。' : '还没有转写段。'}
+              {!transcribing && !(isLatest && runtime?.recording) && (
+                <button type="button" className="meeting-btn" onClick={() => void retranscribe()}>
+                  转写这场会议
+                </button>
+              )}
+            </p>
           ) : (
             <>
               <ul className="meeting-speakers">

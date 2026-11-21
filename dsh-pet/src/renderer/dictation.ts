@@ -204,6 +204,8 @@ export interface RecordOptions {
    * 一开口就该交给这句本身说完 —— 否则用户说到一半会被静默超时掐掉。
    */
   onSpeechStart?: () => void
+  /** 通过授权并收到第一帧之后，才提示用户开始说话。 */
+  onReady?: () => void
   /** 等授权到达的上限。 */
   grantTimeoutMs?: number
   /** 测试注入的墙钟（兜底超时用）。 */
@@ -249,7 +251,7 @@ export async function recordDictation(options: RecordOptions = {}): Promise<Dict
 
   const process = (frame: CaptureFrame): void => {
     if (finished) return
-    if (sampleRate === 0) sampleRate = frame.sampleRate
+    if (sampleRate === 0) { sampleRate = frame.sampleRate; options.onReady?.() }
     if (frame.sampleRate !== sampleRate) {
       // 设备中途换了采样率（切了设备）：已录的照常交出去，后面的不混进同一个 wav。
       finished = true

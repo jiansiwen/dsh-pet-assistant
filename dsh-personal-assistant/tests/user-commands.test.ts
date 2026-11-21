@@ -61,6 +61,7 @@ interface Overrides {
   meetingHistory?: Array<Record<string, unknown>> | 'timeout'
   /** 任务运行时替身：改优先级命令要用它读快照 + 提交提案。 */
   tasks?: { request(method: string, path: string, body: unknown, subject: string): Promise<{ status: number; body: unknown }> }
+  continueMember?: (sessionId: string, message: string) => Promise<{ member: string; text: string }>
   /** `settings.set` 的回包：'ok' 表示 applied，'error:<原因>' 表示桌宠拒绝，'timeout' 表示超时。 */
   settingsSet?: 'ok' | `error:${string}` | 'timeout'
   /** 会议改删 / 提醒间隔桌面命令的回包。 */
@@ -182,6 +183,7 @@ function harness(overrides: Overrides = {}) {
     power: power as never,
     ...(overrides.summary === undefined ? {} : { summary: overrides.summary }),
     ...(overrides.tasks === undefined ? {} : { tasks: overrides.tasks }),
+    ...(overrides.continueMember === undefined ? {} : { continueMember: overrides.continueMember }),
     ...(overrides.lists === undefined ? {} : {
       lists: {
         todos: overrides.lists.todos ?? (() => null),
@@ -198,6 +200,18 @@ test('宿主没有 commands 服务时静默跳过，不影响插件加载', () =
     bridge: {} as never,
     power: {} as never,
   }))
+})
+
+test('成员续聊命令把原话送到明确的已有会话，不以总助理身份处理', async () => {
+  const sent: Array<{ session: string; text: string }> = []
+  const h = harness({ continueMember: async (session, text) => {
+    sent.push({ session, text }); return { member: '信使', text: '收到' }
+  } })
+  const command = h.command('assistant-member-continue')
+  assert.equal((await command.handler({ rawInput: 'member-one' })).kind, 'error')
+  assert.deepEqual(sent, [])
+  assert.equal((await command.handler({ rawInput: 'member-one  复盘一下吧\n保留原始格式' })).text, '【信使】\n收到')
+  assert.deepEqual(sent, [{ session: 'member-one', text: '复盘一下吧\n保留原始格式' }])
 })
 
 test('commands 服务晚于插件就绪时，等它出现再注册', () => {

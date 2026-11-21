@@ -82,6 +82,10 @@ export function configureChannelAgent(
   }
   ctx.systemPrompt.variable('channel_assistant_name', ({ agent }) => owns(agent) && turn ? snapshot().name : '')
   ctx.systemPrompt.variable('channel_assistant_persona', ({ agent }) => owns(agent) && turn ? snapshot().persona : '')
+  // 外部聊天入口不是老板的本地主会话，不能继承它的私密记忆或冲突正文。
+  ctx.systemPrompt.variable('personal_assistant_preferences', () => '')
+  ctx.systemPrompt.variable('personal_assistant_memory_conflicts', () => '')
+  ctx.systemPrompt.variable('personal_assistant_own_skills', () => '')
   ctx.systemPrompt.section({
     name: 'personal-assistant:channel-agent',
     order: 160,

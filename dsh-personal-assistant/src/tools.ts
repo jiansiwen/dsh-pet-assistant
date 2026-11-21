@@ -31,7 +31,9 @@ import {
 import { activityEvidenceType, activitySpanObservation, type Observation, type ObservationStore } from './observation.ts'
 import { legacySpanId } from './migrate.ts'
 import {
+  containsMemoryCredential,
   describeConflict,
+  isShareableMemory,
   renderMemorySection,
   scopeLabel,
   type MemoryActor,
@@ -93,9 +95,11 @@ export interface ToolOptions {
    * 晋升/回滚/退役**不在工具面**：那些是本人的动作，走桌面「技能」那一节。
    * 模型只能把经验写成候选，不能替本人决定它生效。
    */
-  skills?: { save(assistantId: string, plan: { name: string; body: string }, status: 'candidate'): { id: string; version: number; status: string } }
+  skills?: { save(assistantId: string, plan: { name: string; body: string }, status: 'candidate'): { id: string; version: number; status: string }; renderFor?(assistantId: string): string }
   /** 成员是否存在；未装配时跳过校验（工具仍会写库，由技能归属自己兜底）。 */
   memberExists?(assistantId: string): boolean
+  memberSession?(args: { assistantId: string; title?: string; sessionId?: string; message?: string }, exec: unknown): Promise<unknown>
+  onOwnerText?(sessionId: string, messageId: string, text: string): void
   /**
    * 总助理的名字与性格，来自设置页「总助理」（assistant-settings 的 agent 段）。
    *
@@ -629,6 +633,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
     scope: scopeLabel(item.scope, {}), scopeKind: item.scope.kind, scopeId: item.scope.id,
     topic: item.topic, text: item.text, status: item.status, revision: item.revision,
     updatedAt: item.updatedAt, imported: item.importBatch !== null,
+    ...(item.scope.kind === 'global' ? { visibility: isShareableMemory(item) && options.memories.isShared(item.id) ? 'team' : 'private' } : {}),
   })
 
   /**
@@ -1539,22 +1544,27 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
 
   host.tools.register(defineTool({
     name: 'personal_assistant_remember_preference',
-    description: '记录用户明确说出的长期偏好。同主题可以有多条兼容规则，不自动互斥。只有用户明确要求替换旧规则时才填写 replaceIds；单次日报修改不自动成为长期偏好。用户明确说这条只适用于某个项目时填写 projectDir（必须是当前仍有效的帮助授权目录），项目规则不注入系统提示词，只随该项目的证据读取一起返回。',
+    description: '记录用户明确说出的长期偏好，或用户认可的通用团队经验。新增长期全局规则默认由本地子助理沿用；用户说只给总助理或内容私密时必须填 visibility=private，凭据不能写入。只有用户明确要求替换旧规则时才填写 replaceIds；单次修改不是长期偏好。项目规则必须指定仍有效的帮助授权目录，不参与共享。',
     parameters: {
       text: { type: 'string', required: true, description: '偏好规则的完整描述，照用户的意思写，不要替他扩充' },
       topic: { type: 'string', required: true, description: '这条偏好管的是哪件事，如：日报口径 / 回复语言 / 提交规范' },
       replaceIds: { type: 'array', items: { type: 'string' }, description: '用户明确要求替换的旧规则编号；未点名替换时省略' },
       projectDir: { type: 'string', description: '仅对该项目生效时填写：已授权帮助范围的项目目录绝对路径；全局偏好省略' },
-      kind: { type: 'string', enum: ['user_preference', 'project_fact'], description: '项目范围可选 project_fact（项目事实）；默认 user_preference' },
+      kind: { type: 'string', enum: ['user_preference', 'project_fact', 'team_experience'], description: '默认用户偏好；可选项目事实或通用团队经验' },
+      visibility: { type: 'string', enum: ['private'], description: '仅总助理可用时填 private；普通新增长期全局规则省略' },
     },
     output: { schema: { type: 'string' }, render: textRender },
-    async execute(args: { text: string; topic: string; replaceIds?: string[]; projectDir?: string; kind?: string }) {
+    async execute(args: { text: string; topic: string; replaceIds?: string[]; projectDir?: string; kind?: string; visibility?: 'private' }) {
       args = structuredClone(args)
+      if (containsMemoryCredential(args.text) || containsMemoryCredential(args.topic)) {
+        return json({ pending: false, remembered: false, error: '记忆不能保存凭据；私密范围不代表加密。' })
+      }
       const projectDir = args.projectDir ? authorizedProjectDir(args.projectDir) : ''
       if (projectDir === null) {
         return json({ pending: false, error: '该目录当前没有有效的帮助授权（未授权、已撤销或实际路径已改指），不能写入项目记忆' })
       }
-      const kind = args.kind === 'project_fact' && projectDir ? 'project_fact' : 'user_preference'
+      const kind = args.kind === 'project_fact' && projectDir ? 'project_fact'
+        : args.kind === 'team_experience' && !projectDir ? 'team_experience' : 'user_preference'
       const scope = projectDir ? { kind: 'project' as const, id: projectDir } : { kind: 'global' as const, id: '' }
       const before = preferenceSnapshot(args)
       // 授权在提交、批准与执行三处都重验：撤销或改指之后旧待批不能再落库。
@@ -1568,6 +1578,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
         topic: args.topic,
         text: args.text,
         replaceIds: args.replaceIds,
+        visibility: args.visibility,
         sensitivity: 'normal',
         sourceRefs: [],
         actor: TRUSTED_ACTOR,
@@ -1579,6 +1590,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
         scope: scopeLabel(result.record.scope, {}),
         revision: result.record.revision,
         status: result.record.status,
+        ...(scope.kind === 'global' ? { visibility: options.memories.isShared(result.record.id) ? 'team' : 'private' } : {}),
         superseded: result.superseded.map(item => ({ id: item.id, text: item.text })),
         conflicts: result.conflicts.map(item => ({ id: item.id, text: item.text })),
         message: result.conflicts.length > 0
@@ -1600,11 +1612,53 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       return propose({ subject: 'memories', tool: 'personal_assistant_remember_preference',
         summary: projectDir
           ? '保存仅对下列项目生效的规则并仅替换列出的规则。批准后保存在本机；不注入系统提示词，只在读取该项目证据时随证据返回当前会话，发送给对应模型服务商。'
-          : '保存长期偏好并仅替换列出的规则。来源为模型根据本次对话整理的候选内容；批准后跨会话保存在本机，并自动注入当前及未来会话的模型提示词，发送给对应模型服务商。',
+          : `保存长期规则并仅替换列出的规则。批准后将保存在本机、随对话发送给使用该规则的模型。${args.visibility === 'private' ? '仅总助理使用。' : '普通新增规则默认由本地子助理只读沿用；不自动公开原有私密记录。'}`,
         target: projectDir ? `项目 ${projectDir} 的记忆` : '本机全局记忆与未来会话模型', risk: 'high',
         snapshot: { args, scope, memories: before },
         validate: () => scopeStillValid() && snapshotDigest(before) === snapshotDigest(preferenceSnapshot(args)),
         execute: write,
+      })
+    },
+  }))
+
+  if (options.memberSession) host.tools.register(defineTool({
+    name: 'personal_assistant_member_session',
+    description: '仅在用户明确要求时，为指定本机子助理新开有名称的独立会话，或按已有会话编号继续。新开不复制旧对话、不替换定时任务使用的主会话。',
+    parameters: {
+      assistantId: { type: 'string', required: true, description: '成员编号，不能指定总助理' },
+      title: { type: 'string', description: '新会话名称。有此字段时只新建，不发送任务' },
+      sessionId: { type: 'string', description: '要继续的成员会话编号，必须属于该成员' },
+      message: { type: 'string', description: '用户希望转交给该会话的原话，与 sessionId 一起用' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { assistantId: string; title?: string; sessionId?: string; message?: string }, exec: unknown) {
+      try { return json(await options.memberSession!(args, exec)) }
+      catch (error) { return json({ ok: false, error: error instanceof Error ? error.message : String(error) }) }
+    },
+  }))
+
+  host.tools.register(defineTool({
+    name: 'personal_assistant_set_memory_visibility',
+    description: '用户明确要求把某条已确认的全局记忆设为仅总助理，或公开给本地助理团时使用。只提交本人审批，不改正文，不赋予工具权限。',
+    parameters: {
+      id: { type: 'string', required: true, description: '要切换范围的记忆编号' },
+      visibility: { type: 'string', required: true, enum: ['private', 'team'], description: '仅总助理或团队共享' },
+    },
+    output: { schema: { type: 'string' }, render: textRender },
+    async execute(args: { id: string; visibility: 'private' | 'team' }) {
+      const { id, visibility } = args
+      const target = options.memories.get(id, Date.now())
+      if (!target || !isShareableMemory(target)) return json({ pending: false, error: '找不到可切换范围的已确认全局记忆' })
+      const label = visibility === 'team' ? '团队共享' : '仅总助理'
+      return propose({ subject: 'memories', tool: 'personal_assistant_set_memory_visibility',
+        summary: `将这条记忆设为「${label}」，正文和编号不变。下一轮生效，已发送的历史无法追回。`,
+        target: label, risk: 'high', snapshot: { memory: describeMemory(target), visibility },
+        validate: () => options.memories.get(id, Date.now())?.revision === target.revision,
+        execute: () => {
+          if (!options.memories.setShared(id, visibility === 'team', Date.now(), target.revision)) throw new Error('记忆已变化，请刷新后重试')
+          options.bridge.notifyApprovalSnapshot()
+          return { id, visibility, updated: true }
+        },
       })
     },
   }))
@@ -2026,6 +2080,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       '## 已确认的记忆（默认遵守，无需用户重复说明）',
       '这里只有全局记忆。每条都标了类型，标了"导入"的来自旧版本，内容仍是用户当时亲口说过的。项目范围的规则不在这里：只在 personal_assistant_read_project_evidence 返回该项目证据时随 projectRules 一起给出，且只适用于那个项目：',
       '{{personal_assistant_preferences}}',
+      '{{personal_assistant_own_skills}}',
       '',
       '## 需要用户裁决的矛盾记忆',
       '{{personal_assistant_memory_conflicts}}',
@@ -2052,7 +2107,8 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
       `- 用户说"写周报"或"总结本周"：调用 personal_assistant_today（detail 用 full）取最近 7 天的记录，必要时用 personal_assistant_project_timeline 补项目维度；**有 uninterpretedSpans 就先逐条 commit_events 再写**，否则周报会漏掉整周的电脑活动。周报六段：本周重点工作 / 项目进展 / 重要会议及结论 / 已完成任务 / 未完成事项 / 下周计划与风险。写完后调用 personal_assistant_save_draft **并传 period="week"**（周报和同一天的日报是两份互不覆盖的文件，各自独立确认），再调用 personal_assistant_submit_report 同样传 period="week"。${REPORT_EVIDENCE_RULES}`,
       '- 用户对日报提出修改：若当前对话没有草稿内容，先调用 personal_assistant_get_draft 取回最新版本；按用户要求调整后，再次调用 personal_assistant_save_draft（内容一改就是新版本，旧版本的确认自动作废），重新调用 personal_assistant_submit_report，并展示新草稿。只有用户明确表示"以后"、"今后"或长期有效，才调用 personal_assistant_remember_preference 记录；单次修改只改当前草稿。用户明确替换旧规则时填写 replaceIds，不能因主题相同自动替换。',
       '- 用户在聊天中确认定稿（如"可以了"、"确认"）：只能查询 personal_assistant_confirm_report 的待批状态，并引导用户在桌面专用审批窗口阅读全文、核对版本和目标后批准。模型工具不能发布，不能把聊天确认当作授权；未连接桌面壳时保持待批，不得降级。只有可信通道实际发布后才能说已保存，停止采集失败要如实转述。',
-      '- 用户表达对日报或助理行为的长期喜好：主动调用 personal_assistant_remember_preference。用户明确说只适用于某个项目时填 projectDir（须是仍有效的帮助授权目录）；项目规则只在处理该项目时遵守，不得带到其他项目或无项目的对话。',
+       '- 用户表达对日报或助理行为的长期喜好：主动调用 personal_assistant_remember_preference。用户明确说只适用于某个项目时填 projectDir（须是仍有效的帮助授权目录）；项目规则只在处理该项目时遵守，不得带到其他项目或无项目的对话。',
+       '- 用户说「只给你知道」时把新增长期规则设为 private；要修改已有规则的使用范围，先用 personal_assistant_list_preferences 定位原编号，再用 personal_assistant_set_memory_visibility。只有本人明确要求才公开原有私密记忆。',
       '- 用户要求删除某条记忆：调用 personal_assistant_forget_preference，然后把返回的四类结果（deleted / invalidated / retained / uncontrolled）如实转告用户，不能只说"已经忘了"。',
       '- 用户要求整理记忆时，可调用 personal_assistant_tidy_memory 预览相邻重复行的保守整理；它不是语义压缩，必须经桌面审批。撤回前先查 personal_assistant_list_memory_tidy，再调用 personal_assistant_undo_memory_tidy；后续修改、到期或删除后不得覆盖或复活。',
       '- "需要用户裁决的矛盾记忆"非空时：在合适的时机把这几条互相矛盾的说法摆给用户，请用户选择应生效的规则，再调用 personal_assistant_resolve_preference；只有用户明确点名不要的规则才填 replaceIds，兼容规则可逐条保留，不自动删除。',
@@ -2083,9 +2139,18 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
   // 订阅本身也包 try/catch：宿主不认识这个事件名时不该让插件起不来。
   let lastUserText = ''
   try {
-    host.on?.('session/event', (_session, event) => {
+    host.on?.('session/event', (session, event) => {
       const text = userMessageText(event as { type?: unknown; data?: unknown })
       if (text !== '') lastUserText = text
+      if (text && options.onOwnerText) {
+        const data = (event as { data?: { id?: unknown; source?: { kind?: unknown } } }).data
+        const snapshot = session as { id?: unknown; header?: { id?: unknown; origin?: unknown } } | undefined
+        const id = snapshot?.header?.id ?? snapshot?.id
+        if (data?.source?.kind === 'user' && typeof data.id === 'string' && typeof id === 'string'
+          && !/^(?:channel-|member-)/u.test(id) && snapshot?.header?.origin !== 'subagent') {
+          try { options.onOwnerText(id, data.id, text) } catch { /* 学习不得阻塞正常对话 */ }
+        }
+      }
       return undefined
     })
   } catch {
@@ -2109,6 +2174,7 @@ export function registerAssistantTools(ctx: AssistantHost, tracker: ActivityTrac
   // renderPreferences 保证非空，所以拼接结果永远非空（宿主不接受空变量值）。
   host.systemPrompt.variable('personal_assistant_preferences',
     () => joinSections(renderPreferences(options, lastUserText), renderWorkContext(options), renderGlossaryFor(options, lastUserText)))
+  host.systemPrompt.variable('personal_assistant_own_skills', () => options.skills?.renderFor?.('member-tangseng') ?? '')
 
   // 矛盾的记忆一律不注入（isInjectable 只放 confirmed）。但"不注入"不等于"没这回事"：
   // 用户需要知道有两条互相打架的说法停在那里，否则助理看起来像是把他教过的东西忘了。

@@ -74,6 +74,7 @@ export interface MemberProfile extends MemberConfig {
   thresholdPercent: number
   timezone: string
   sessionId: string | null
+  scheduleWorkspaceId?: string | null
   kind: MemberKind
   binding: SubAssistantBinding | null
 }
@@ -129,6 +130,7 @@ export interface MemberSharedMemory {
   shared: boolean
 }
 export interface MemberSnapshot {
+  workspaces?: Array<{ id: string; title: string; path: string }>
   enabled: boolean
   members: MemberView[]
   requests: MemberQuotaRequest[]
@@ -179,6 +181,8 @@ export interface MemberDraft {
   totalTokenLimit: number
   thresholdPercent: number
   timezone: string
+  /** 仅本机成员：定时与邮件值守使用的宿主工作区，不由模型提供路径。 */
+  scheduleWorkspaceId?: string | null
   /** 子助理两字段；缺省=expert/无绑定（normalize 补默认，旧调用方零改动）。 */
   kind?: MemberKind
   binding?: SubAssistantBinding | null

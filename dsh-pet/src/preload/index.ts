@@ -164,7 +164,7 @@ contextBridge.exposeInMainWorld('petApi', {
   openApproval: (proposalId: string) =>
     ipcRenderer.invoke('approval-open', proposalId) as Promise<{ ok: boolean; error?: string }>,
   /** 听写第一拍：申请麦克风并开流式会话。streaming=true 时走逐帧喂数。 */
-  asrBegin: (options?: { bargeIn?: boolean }) =>
+  asrBegin: (options?: { bargeIn?: boolean; voiceprint?: boolean }) =>
     ipcRenderer.invoke('asr-begin', options) as Promise<{ ok: boolean; streaming?: boolean; direct?: boolean; error?: string }>,
   /** 流式喂数：一帧 16kHz Int16 PCM（base64），返回当前累积的识别文本。 */
   asrStreamFeed: (chunkBase64: string) =>

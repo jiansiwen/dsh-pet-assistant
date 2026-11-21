@@ -29,7 +29,7 @@ import { isPresenting, shouldIgnoreWakeDuringSpeech, shouldPassWithoutVoiceprint
 import { kwsModelProblem, startKws, type KwsSession } from './kws.ts'
 import { DEFAULT_WAKE_NAME } from './wake-name.ts'
 import { clearVoiceprint, enrollVoiceprint, loadVoiceprint, voiceprintModelPath, voiceprintModelTag, voiceprintStatus, type VoiceprintStatus } from './voiceprint.ts'
-import { getDataKey } from './dpapi.ts'
+import { getDataKey, keyFilePath } from './dpapi.ts'
 import { RendererPlayback, createSwitchingTransport, type RendererReceipt } from './tts-renderer-transport.ts'
 import { TtsCache, voiceFingerprint } from './tts-cache.ts'
 import { DOC_CONTINUE_ACKS, DOC_RESUME_ACKS, DOC_STOP_ACKS, DOC_THINKING_ACKS, WAKE_GREETINGS, fixedPhrases, pickPhrase } from './greetings.ts'
@@ -619,7 +619,7 @@ let lastGrants = ''
 function audioGrants(): { dictation: boolean; bargeIn: boolean; kws: boolean; meetingId: string | null; autoGainControl: boolean } {
   return {
     // 外放插话开着时关自动增益：否则回声残余被放大到人声量级，插话检测分不开（隔离验证实测）。
-    autoGainControl: !audioPrefs().bargeIn,
+    autoGainControl: !(audioPrefs().bargeIn || audioState.meetingActive || (docTalk?.spoken && !docTalk.stopped)),
     dictation: audioState.holder === 'dictation',
     bargeIn: audioState.holder === 'barge-in' || (audioState.meetingActive && audioState.bargeInMeeting),
     // 唤醒与会议/听写可并存（共享采集多消费者）；只要 KWS 唤醒在跑就授权，不再绑定 holder。
@@ -4325,6 +4325,10 @@ const subAssistantSpokenRunIds = new Set<string>()
  */
 function requestPetExit(): void {
   exitRequested = true
+  // 退出时若正在录音，先请求停录：让渲染层停流并冲刷最后几块音频，再走 before-quit 收尾，
+  // 避免留下"录到一半、没冲刷"的会议。收尾会把状态置 stopped，启动时补转写。
+  const ms = meetingRecorder?.getState()
+  if (ms?.recording && ms.meetingId) meetingRecorder?.requestStop(ms.meetingId)
   // 先把嘴闭上。退场动画有四秒多，等到 before-quit 才停，角色都已经在漩涡里挥手告别了
   // 还在念上一句回答。dispose 是幂等的，退出收尾时再调一次不要紧。
   narrator.dispose()
@@ -4391,9 +4395,7 @@ function buildContextMenu(target: MenuTarget | null): Menu {
   // 本机存过的优先；没有就用渲染层报的当前生效皮肤（插件下发的或编制默认的）。
   const current = stored ?? target?.skin ?? ''
   const items: Array<MenuItemConstructorOptions> = []
-  // 高频在上：右键只留「最常用的三件」+ 形象/动作 + 隐藏/退出（原来 11 项）。
-  // 其余入口全都并进了工作台（`settings-nav.ts` 是导航的单一真源）：宠物设置 / 团队管理 /
-  // 文档管理 / 任务与提醒 / 日报工作台各自对应工作台里的一页，右键再列一遍只会越来越长。
+  // 右键只留常用动作和入口；工作台处理事项，设置调整配置。
   items.push(
     // AI 对话：复用既有的 summon 通道 —— 渲染层收到后会打开对话面板并把焦点放进输入框，
     // 和"讲完文档顺手聊一句"走的是同一条路，不新增通道。
@@ -4402,10 +4404,8 @@ function buildContextMenu(target: MenuTarget | null): Menu {
       sendToRenderer('summon', null)
     } },
     { label: '会议助手', click: () => openSettings('meeting') },
-    { label: '打开工作台', click: () => openSettings('general') },
-    // 日报文件夹暂时留在右键：它的"次级按钮"要加在工作台 report 页（渲染层），
-    // 这轮只动菜单，先保证用户找得到；渲染层加上之后这一项可以撤掉。
-    { label: '日报文件夹', click: () => { void shell.openPath(path.join(dshHome(), 'personal-assistant', 'reports')) } },
+    { label: '打开工作台', click: () => openSettings('workbench') },
+    { label: '打开设置', click: () => openSettings('settings') },
     { type: 'separator' },
   )
   if (target) {
@@ -4923,6 +4923,8 @@ function registerIpc(): void {
 
   meetingRecorder.sweepRetention()
   setInterval(() => meetingRecorder?.sweepRetention(), 6 * 3_600_000).unref()
+  // 退出时正在录音的会议只被收尾成 stopped、自动转写没跑：启动时补转写，避免"不能转写"。
+  void meetingRecorder?.repairUntranscribed().catch(error => speechLog(`补转写失败：${error instanceof Error ? error.message : String(error)}`))
 
   // 用户自配的 TTS / 语音识别服务。密钥用系统密钥库（DPAPI）加密落盘；页面永远拿不到密钥本体。
   voiceApiStore = new VoiceApiStore(path.join(app.getPath('userData'), 'voice-apis.json'), {
@@ -5002,7 +5004,8 @@ const VOICE_PREVIEW_TEXT = '你好，我是你的桌面助理。这句话用来�
    * 音频格式、系统密钥）。以前只有一句"注册失败：<英文>"，看不出是哪一层。
    * 这里逐步试，每步都记下原始错误，用户点一下就能看到断在哪。
    */
-  ipcMain.handle('voiceprint-diagnose', async () => {
+  ipcMain.handle('voiceprint-diagnose', async event => {
+    if (!stageSender(event)) return { ok: false, steps: [{ name: '声纹自检', ok: false, detail: '设置来源无效' }] }
     const steps: Array<{ name: string; ok: boolean; detail: string }> = []
     const userData = app.getPath('userData')
     const modelPath = voiceprintModelPath(userData)
@@ -5010,7 +5013,10 @@ const VOICE_PREVIEW_TEXT = '你好，我是你的桌面助理。这句话用来�
       const size = statSync(modelPath).size
       steps.push({ name: '声纹模型文件', ok: true, detail: `${modelPath}（${Math.round(size / 1024 / 1024)} MB）` })
     } catch (error) {
-      steps.push({ name: '声纹模型文件', ok: false, detail: `读不到：${error instanceof Error ? error.message : String(error)}` })
+      const missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
+      steps.push({ name: '声纹模型文件', ok: false, detail: missing
+        ? '尚未安装分人／声纹模型。请到「其他设置 → 环境检查」安装；本次自检未录音。'
+        : `声纹模型文件无法读取：${error instanceof Error ? error.message : String(error)}` })
       return { ok: false, steps }
     }
     try {
@@ -5022,9 +5028,13 @@ const VOICE_PREVIEW_TEXT = '你好，我是你的桌面助理。这句话用来�
       return { ok: false, steps }
     }
     try {
-      const key = voiceprintKey()
-      steps.push({ name: '系统密钥', ok: true, detail: '可用' })
-      void key
+      if (!existsSync(keyFilePath(userData))) {
+        steps.push({ name: '系统密钥', ok: true, detail: '还未创建，首次保存时再验证，不在自检中修改' })
+      } else {
+        const key = voiceprintKey()
+        steps.push({ name: '系统密钥', ok: key.status === 'ok', detail: 'message' in key ? key.message
+          : key.status === 'ok' ? '已成功解包' : '当前系统密钥库不可用' })
+      }
     } catch (error) {
       steps.push({ name: '系统密钥', ok: false, detail: error instanceof Error ? error.message : String(error) })
     }
@@ -6005,9 +6015,17 @@ ${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messag
     }
   }
 
-  ipcMain.handle('asr-begin', (_event, options?: unknown) => {
-    // 插话交接的听写才能穿过会议录音；手动按键听写仍被会议拒绝。
-    const bargeIn = options !== null && typeof options === 'object' && (options as { bargeIn?: unknown }).bargeIn === true
+  ipcMain.handle('asr-begin', (event, options?: unknown) => {
+    const request = options !== null && typeof options === 'object' ? options as { bargeIn?: unknown; voiceprint?: unknown } : {}
+    const voiceprint = request.voiceprint === true
+    if (voiceprint) {
+      if (!stageSender(event)) return { ok: false, error: '录入来源无效' }
+      if (audioState.meetingActive || narrator.isSpeaking()) return { ok: false, error: '请结束录音或暂停播报后再录入声纹' }
+      if (!voiceprintModelTag(voiceprintModelPath(app.getPath('userData')))) {
+        return { ok: false, error: '缺少本地声纹模型，请在「其他设置 → 环境检查」安装分人／声纹模型后重试' }
+      }
+    }
+    const bargeIn = !voiceprint && request.bargeIn === true
     const granted = applyAudio({ type: 'dictation-requested', ...(bargeIn ? { source: 'barge-in' as const } : {}) })
     if (granted.denied) return { ok: false, error: granted.denied }
     /*
@@ -6017,6 +6035,7 @@ ${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messag
     */
     const direct = false
     armDictationSafety()
+    if (voiceprint) { resetStreamState(); return { ok: true, streaming: false, direct } }
     // 用户挑的自定义服务是"整段上传"的接口，没有实时部分文本：这时不开本地流式会话。
     let apiAsr: ResolvedVoiceApi | null = null
     try {
@@ -6088,7 +6107,7 @@ ${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messag
       buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
       (text) => sendToRenderer('asr-delta', { text }),
     ).then(result => {
-      speechLog(`asr-transcribe ok=${result.ok} text=${(result.text ?? '').slice(0, 40)}`)
+      speechLog(`asr-transcribe ok=${result.ok} length=${result.text?.length ?? 0}`)
       return result
     }).finally(() => {
       // 超时与正常结束都可能走到这里，仲裁器对重复收尾是幂等的。

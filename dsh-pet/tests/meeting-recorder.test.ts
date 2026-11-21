@@ -44,6 +44,7 @@ process.on('exit', () => {
 interface Harness {
   recorder: MeetingRecorder
   store: MeetingStore
+  dir: string
   clock: { now(): number; advance(ms: number): void }
   events: Array<{ channel: string; payload: unknown }>
   audioEffects: string[]
@@ -89,7 +90,7 @@ function setup(opts: {
     now: clock.now,
     ...(opts.flushTimeoutMs !== undefined ? { flushTimeoutMs: opts.flushTimeoutMs } : {}),
   })
-  return { recorder, store, clock, events, audioEffects, audioState: () => audioState, transcribed }
+  return { recorder, store, dir, clock, events, audioEffects, audioState: () => audioState, transcribed }
 }
 
 /** 模拟渲染层：收到 meeting-started 后推 n 块 PCM，每块间隔 chunkGapMs。 */
@@ -554,5 +555,35 @@ describe('删除整场会议', () => {
       '删除后要推送会议状态，界面才会刷新列表')
     assert.equal(h.recorder.deleteMeeting(meetingId).ok, false, '重复删除要明确失败')
     h.store.close()
+  })
+})
+
+describe('退出时正在录音：收尾置 stopped，启动补转写', () => {
+  test('close 收尾后会议 stopped 无转写段；新进程 repairUntranscribed 补齐', async () => {
+    const h = setup()
+    const started = h.recorder.startMeeting(CONSENT)
+    if (!started.ok) throw new Error(started.error)
+    const meetingId = started.meetingId
+    fakeRendererPush(h, meetingId, 3)
+    // 模拟"录到一半退出"：close 会把 active 收尾成 stopped（integrity unknown），不跑转写。
+    await h.recorder.close()
+    // 模拟重启：同目录新库 + 新 recorder。close 已关旧库，状态用新库读。
+    const store2 = new MeetingStore(h.dir, { keyProvider: () => ({ status: 'ok' as const, key: FAKE_KEY }), now: h.clock.now })
+    assert.equal(store2.getMeeting(meetingId)!.state, 'stopped')
+    assert.equal(store2.getSegments(meetingId).length, 0, '退出收尾不应已转写')
+    assert.ok(store2.listChunks(meetingId).length > 0, '录音块应已落盘')
+    const transcribed2: ArrayBuffer[] = []
+    const recorder2 = new MeetingRecorder({
+      store: store2, userDataDir: h.dir,
+      audio: () => ({ state: INITIAL_AUDIO_STATE, effects: [], denied: null }),
+      notifyRenderer: () => {},
+      transcribe: async wav => { transcribed2.push(wav); return { ok: true, text: '补转写' } },
+      now: h.clock.now,
+    })
+    const done = await recorder2.repairUntranscribed()
+    assert.ok(done >= 1, '应补齐至少一场')
+    assert.equal(store2.getMeeting(meetingId)!.state, 'transcribed')
+    assert.ok(store2.getSegments(meetingId).length > 0, '补转写后应有转写段')
+    await recorder2.close()
   })
 })

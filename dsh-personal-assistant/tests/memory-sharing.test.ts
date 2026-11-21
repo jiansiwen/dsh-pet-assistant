@@ -14,6 +14,7 @@ import { test, type TestContext } from 'node:test'
 import { MemoryStore } from '../src/memory.ts'
 import { MemberMemory } from '../src/member-memory.ts'
 import { TeamStore } from '../src/team-domain.ts'
+import { workbenchFixture } from './support/workbench-fixture.ts'
 
 function store(t: TestContext): { memories: MemoryStore; member: MemberMemory; memberId: string } {
   const dir = mkdtempSync(path.join(tmpdir(), 'dsh-memory-sharing-'))
@@ -45,29 +46,91 @@ function confirmGlobal(memories: MemoryStore, text: string): string {
   return put.record.id
 }
 
-void test('共享：默认不共享，标记后才进子助理的投影', (t) => {
+void test('共享：新增普通长期规则及通用经验默认进入只读投影', (t) => {
   const { memories, member } = store(t)
   const id = confirmGlobal(memories, '汇报要简单明了，不要长篇大论')
-
-  assert.equal(memories.isShared(id), false, '刚写下的记忆默认不共享')
-  assert.equal(memories.sharedGlobals().length, 0)
-  assert.match(member.shared(), /没有共享/u, '没共享时要明说没有，不能给空串')
-
-  assert.deepEqual(memories.setShared(id, true), { shared: true })
+  const experience = memories.put({ kind: 'team_experience', scopeKind: 'global', text: '先验证产物再汇报', actor: { id: 'owner', isUser: true } }, Date.now())
+  assert.ok(experience.ok)
+  assert.equal(memories.isShared(id), true)
+  assert.equal(memories.isShared(experience.record.id), true)
   const projection = member.shared()
   assert.match(projection, /汇报要简单明了/u)
+  assert.match(projection, /先验证产物再汇报/u)
   assert.match(projection, /只读/u, '要明确告诉子助理这是只读的')
   assert.match(projection, /不是授权/u)
 })
 
-void test('共享：取消之后子助理立刻看不见（投影不是复制）', (t) => {
+void test('共享：切换范围保留编号，重复写入不公开私密记录，旧版本不能改回', (t) => {
   const { memories, member } = store(t)
   const id = confirmGlobal(memories, '喜欢在上午十点开会')
-  memories.setShared(id, true)
   assert.match(member.shared(), /上午十点/u)
 
-  memories.setShared(id, false)
+  const before = memories.get(id, Date.now())!
+  assert.deepEqual(memories.setShared(id, false, Date.now(), before.revision), { shared: false })
   assert.doesNotMatch(member.shared(), /上午十点/u, '取消共享后不能再出现在投影里')
+  assert.equal(confirmGlobal(memories, '喜欢在上午十点开会'), id)
+  assert.equal(memories.isShared(id), false)
+  assert.equal(memories.setShared(id, true, Date.now(), before.revision), null)
+  const privateRecord = memories.get(id, Date.now())!
+  assert.deepEqual(memories.setShared(id, true, Date.now(), privateRecord.revision), { shared: true })
+  assert.equal(memories.sharedGlobals()[0].id, id)
+})
+
+void test('共享：显式私密、短期规则和旧库未共享的内容不自动公开', (t) => {
+  const { memories } = store(t)
+  const now = Date.now()
+  const input = { kind: 'user_preference', scopeKind: 'global', actor: { id: 'owner', isUser: true } }
+  const privateRule = memories.put({ ...input, text: '这条只告诉总助理', visibility: 'private' }, now)
+  assert.ok(privateRule.ok)
+  const temporary = memories.put({ ...input, text: '临时偏好', expiresAt: now + 60000 }, now)
+  assert.ok(temporary.ok)
+  const imported = { ...privateRule.record, id: 'legacy-private', text: '旧库里没有共享的长期规则' }
+  assert.equal(memories.importRecord(imported), true)
+  assert.deepEqual(memories.sharedGlobals(), [])
+})
+
+void test('共享：复用已有同文规则替换旧规则时，仍遵守本人指定的私密范围', t => {
+  const { memories, member } = store(t)
+  const prior = confirmGlobal(memories, '周报按时间排序')
+  const id = confirmGlobal(memories, '周报先列结论')
+  const result = memories.put({ kind: 'user_preference', scopeKind: 'global', topic: '汇报口径', text: '周报先列结论',
+    replaceIds: [prior], visibility: 'private', actor: { id: 'owner', isUser: true } }, Date.now())
+  assert.ok(result.ok)
+  assert.equal(result.record.id, id)
+  assert.equal(memories.isShared(id), false)
+  assert.doesNotMatch(member.shared(), /周报/u)
+})
+
+void test('共享：只给总助理也不能把凭据保存进明文记忆，凭据不能出现在分类主题里', t => {
+  const { memories } = store(t)
+  const input = { kind: 'user_preference', scopeKind: 'global', actor: { id: 'owner', isUser: true } }
+  const result = memories.put({ ...input, text: '密码：测试占位', visibility: 'private' }, Date.now())
+  assert.equal(result.ok, false)
+  const id = confirmGlobal(memories, '周报先列结论')
+  const current = memories.get(id, Date.now())!
+  assert.equal(memories.revise(id, { text: current.text, topic: '口令：测试占位', actor: input.actor, expectedRevision: current.revision }, Date.now()), null)
+  assert.equal(memories.get(id, Date.now())?.topic, current.topic)
+})
+
+void test('共享：对话能按记忆编号申请公开或收回，旧版本确认失效', async t => {
+  const { rt } = workbenchFixture(t)
+  await rt.bind()
+  const privateRule = await rt.call('remember_preference', { text: '周报仍在试行', topic: '周报口径', visibility: 'private' })
+  assert.equal((await rt.decide(privateRule.proposalId)).ok, true)
+  const saved = rt.memories.list({}, Date.now())[0]!
+  assert.equal(rt.memories.isShared(saved.id), false)
+  const request = () => rt.call('set_memory_visibility', { id: saved.id, visibility: 'team' })
+  const stale = await request()
+  assert.equal(stale.pending, true)
+  assert.ok(rt.memories.revise(saved.id, { text: '周报先列结论', actor: { id: 'owner', isUser: true }, expectedRevision: saved.revision }, Date.now()))
+  assert.equal((await rt.decide(stale.proposalId)).ok, false)
+  assert.equal(rt.memories.isShared(saved.id), false)
+  assert.equal((await rt.decide((await request()).proposalId)).ok, true)
+  assert.equal(rt.memories.sharedGlobals()[0]?.text, '周报先列结论')
+  const hide = await rt.call('set_memory_visibility', { id: saved.id, visibility: 'private' })
+  assert.equal((await rt.decide(hide.proposalId)).ok, true)
+  assert.deepEqual(rt.memories.sharedGlobals(), [])
+  assert.equal(rt.memories.get(saved.id, Date.now())?.text, '周报先列结论')
 })
 
 void test('共享：记忆删除后投影跟着空（不留下副本）', (t) => {

@@ -51,7 +51,7 @@
   position: absolute;
   right: 16px;
   top: 16px;
-  width: 700px;
+  width: 760px;
   max-width: calc(100vw - 32px);
   height: min(780px, calc(100vh - 32px));
   display: grid;
@@ -167,7 +167,42 @@
 .pet-management .management-header button:hover { background: var(--paper-hover); color: var(--ink); }
 .pet-management .management-header button:active { transform: scale(.92); }
 
-/* ===== 左侧导航（深色栏）===== */
+.management-overview-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s-2); margin-bottom: var(--s-3); }
+.management-overview-tools h3 { margin: 0; font-size: var(--t-md); }
+.pet-management input.management-search { width: min(230px, 100%); padding: 7px 10px; border: 1px solid var(--settings-rule); border-radius: var(--r-control); }
+.management-table-scroll { overflow: auto; border: 1px solid var(--settings-rule); border-radius: var(--r-control); background: var(--paper-raised); }
+.management-overview { width: 100%; min-width: 430px; border-collapse: collapse; text-align: left; }
+.management-overview :is(th, td) { padding: 11px 10px; border-bottom: 1px solid var(--settings-rule); vertical-align: middle; }
+.management-overview tbody tr:last-child > * { border-bottom: 0; }
+.management-overview thead { background: var(--settings-rail); color: var(--ink-2); }
+.management-overview tbody td:nth-child(3) { color: var(--ink-3); }
+.management-overview :is(th:first-child, th:last-child, td:last-child) { white-space: nowrap; }
+.management-overview :is(th:last-child, td:last-child) { text-align: right; }
+.management-state { font-size: var(--t-sm); white-space: nowrap; }
+.management-state[data-known]::before { content: ''; display: inline-block; margin-right: 5px; width: 5px; height: 5px; border-radius: 50%; background: var(--settings-accent); vertical-align: 2px; }
+.pet-management .management-link { padding: 4px; background: none; border: 0; color: var(--settings-accent); font: inherit; cursor: pointer; }
+.management-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+.pet-management:has(.management-detail[open]) > :is(.management-header, .management-tabs, .management-content) { opacity: .46; }
+.pet-management .management-detail {
+  position: fixed;
+  inset: 34px 32px auto auto;
+  margin: 0;
+  width: min(708px, calc(100vw - 64px));
+  max-height: min(744px, calc(100vh - 68px));
+  padding: 0;
+  overflow: auto;
+  color: var(--ink);
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-panel);
+  box-shadow: 0 16px 40px rgba(22, 22, 26, .24);
+}
+.management-detail::backdrop { background: transparent; }
+.management-detail .management-header { position: sticky; top: 0; z-index: 1; background: var(--paper-raised); }
+.management-detail-body { padding: var(--s-4); }
+.pet-management :is(button, input, select):focus-visible { outline: 2px solid var(--indigo); outline-offset: 2px; }
+
+/* ===== 左侧导航：只列当前入口的分组 ===== */
 
 .pet-management nav.management-tabs {
   grid-area: rail;
@@ -175,28 +210,13 @@
   flex-direction: column;
   gap: 2px;
   padding: var(--s-5) var(--s-2) var(--s-4);
-  border-right: 0;
-  background: var(--rail);
+  border-right: 1px solid var(--settings-rule);
+  background: var(--settings-rail);
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, .18) transparent;
+  scrollbar-color: var(--settings-rule) transparent;
 }
 
-/* 分组标题：小、暗、不加字距。它只回答"下面这几项是一类"，不是标签。 */
-.pet-management nav.management-tabs .management-nav-group {
-  padding: var(--s-3) var(--s-3) var(--s-1);
-  color: var(--rail-text-dim);
-  font-size: 10.5px;
-  font-weight: 600;
-  line-height: 1.4;
-  letter-spacing: 0;
-}
-.pet-management nav.management-tabs .management-nav-group:first-child { padding-top: var(--s-1); }
-
-/*
- * 导航项：一行，通栏，压在深色栏上。
- * 选中 = 一层更亮的白膜 + 左侧 3px 靛色内阴影，不用白底块（白块压在近黑栏上会跳出来当按钮）。
- */
 .pet-management nav.management-tabs button {
   position: relative;
   display: flex;
@@ -210,7 +230,7 @@
   border: 0;
   border-radius: 9px;
   background: transparent;
-  color: var(--rail-text);
+  color: var(--ink-2);
   font: inherit;
   font-size: var(--t-base);
   line-height: 1.4;
@@ -219,14 +239,16 @@
   transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
     transform var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
 }
-.pet-management nav.management-tabs button:hover { background: var(--rail-hover); color: #fff; }
+.pet-management nav.management-tabs button:hover { background: var(--settings-accent-wash); color: var(--settings-accent); }
 .pet-management nav.management-tabs button:active { transform: scale(.985); }
 .pet-management nav.management-tabs button[aria-current='page'] {
-  background: var(--rail-active);
-  color: #fff;
+  background: var(--settings-accent-wash);
+  color: var(--settings-accent);
   font-weight: 600;
-  box-shadow: inset 3px 0 0 var(--indigo-lift);
 }
+.management-modes { display: flex; gap: 2px; flex: none; margin-bottom: var(--s-4); padding: 2px; border: 1px solid var(--settings-rule); border-radius: var(--r-control); }
+.pet-management nav.management-tabs .management-modes button { flex: 1; justify-content: center; min-height: 29px; padding: 3px 5px; font-size: var(--t-sm); white-space: nowrap; }
+.pet-management nav.management-tabs .management-modes button[aria-pressed='true'] { background: var(--paper-raised); color: var(--settings-accent); font-weight: 650; }
 
 /* 序号那格还在 DOM 里（组件结构不动），但不再显示——保留 aria-hidden 的空 span 无害。 */
 .pet-management .management-tab-index { display: none; }
@@ -855,7 +877,7 @@
     border-bottom: 1px solid var(--rule);
     overflow-x: auto;
   }
-  .pet-management nav.management-tabs .management-nav-group { display: none; }
+  .management-modes { margin: 0; }
   .pet-management nav.management-tabs button { width: auto; flex: none; }
   .pet-management .management-content { padding: var(--s-4) var(--s-4) var(--s-6); }
   .pet-management .management-entry { grid-template-columns: minmax(0, 1fr); gap: var(--s-2); }

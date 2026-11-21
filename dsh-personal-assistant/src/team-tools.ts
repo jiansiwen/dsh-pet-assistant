@@ -18,7 +18,7 @@ import { PATH_TARGET_TOOLS, canonicalPath, canonicalRoot, fileVersion, gateDecis
 import { HelpTaskError } from './help-task.ts'
 import type { SessionBridge } from './bridge.ts'
 import type { TaskOutcome, TeamService } from './team.ts'
-import { REVIEW_RESOLUTIONS, type OperationRecord } from './team-domain.ts'
+import { REVIEW_RESOLUTIONS, type MemberConfig, type OperationRecord } from './team-domain.ts'
 
 interface TeamHost {
   tools: { register(definition: unknown): () => void }
@@ -190,6 +190,9 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
           note: '名字不存在或席位未启用时不会替换成别人；按最新目录核对，不要求用户手工选人或擅自开启成员',
         })
       }
+      const kind = (member as MemberConfig & { kind?: string }).kind
+      if (kind === 'platform' || kind === 'local-cli') return json({ ok: false, member: member.displayName,
+        note: '这位成员通过已配置的外部适配器运行，请用 personal_assistant_dispatch_subassistant，未用总助理身份代跑。' })
       const task = team.submitTask({
         goal: args.goal,
         inputEvidence: args.evidence ?? [],
@@ -540,7 +543,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     text: [
       '## 桌面专家助理团',
       '',
-      '本环境装有 desktop_team_* 工具。你（当前会话）就是总助理：理解用户目标，根据当前目录中成员的职责与能力自动委派，再汇总结论。成员列表可变化，不是固定角色。',
+      '{{desktop_team_identity}}',
       '',
       '成员编制（只有 enabled 的席位能接单）：',
       '{{desktop_team_roster}}',
@@ -549,6 +552,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       '协作规则：',
       '- 用户说"开启团队模式"、"叫上专家"：调用 desktop_team_start。',
       '- 请求与已启用成员职责匹配时，自动选择其 assistantId 调用 desktop_team_assign，不要让用户手工挑选，也不要只口头说已分派。把必要材料写进 evidence、可核验要求写进 acceptance；不转发总助理全局偏好或其他成员记忆。拿到真实 summary/artifacts/blockers 后再汇总，并保留证据与阻碍。',
+      '- 目录标为「外部平台」或「本地 AI 工具」的成员，改用 personal_assistant_dispatch_subassistant；只转交必要任务描述，不把私人记忆或未经授权的附件交给外部服务。外部成员回执越权时由你重新分析范围，不把越权当完成。',
       '- 使用目录中的准确身份。成员不存在、停用、忙碌或额度不足时如实解释；不静默换人，不替用户启用成员。',
       /*
        * 汇报方式：目录里标了「自己汇报」的成员，结论要由他自己说一遍。
@@ -578,12 +582,17 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
   })
 
   const CAPABILITY_LABELS: Record<string, string> = { wecom: '企业微信接收', mail: '邮件收发与分析', meeting: '会议记录', document: '文档讲解', activity: '活动/日报', reminders: '提醒' }
+  ctx.systemPrompt.variable('desktop_team_identity', () => '你是总助理：按成员职责与能力委派并汇总。没有合适的启用成员时，在自己的授权范围内处理，不假称已派单。')
   ctx.systemPrompt.variable('desktop_team_roster', () => {
     const members = team.roster()
     // 空值会被宿主当成装配错误直接炸（真机实测过），空态必须给字符串。
     if (members.length === 0) return '（还没有成员。需要时引导用户到宠物设置的团队管理中添加，不要虚构成员。）'
     return members
-      .map(member => `- ${member.displayName}（${member.assistantId}）：${member.enabled ? '已启用' : '未启用'}；职责：${member.description || member.persona}；能力：${member.capabilities?.map(capability => CAPABILITY_LABELS[capability] ?? capability).join('、') || '无外部能力'}；只读工具：${member.allowedTools?.join('、') || '无额外工具'}；汇报方式：${member.reportMode === 'self' ? '自己直接向用户汇报' : '由你汇总'}${member.roleId === 'tangseng' ? '；当前总助理，不向自身委派' : ''}`)
+      .map(member => {
+        const kind = (member as MemberConfig & { kind?: string }).kind
+        const route = kind === 'platform' ? '；入口：外部平台' : kind === 'local-cli' ? '；入口：本地 AI 工具' : ''
+        return `- ${member.displayName}（${member.assistantId}）：${member.enabled ? '已启用' : '未启用'}；职责：${member.description || member.persona}；能力：${member.capabilities?.map(capability => CAPABILITY_LABELS[capability] ?? capability).join('、') || '无外部能力'}；只读工具：${member.allowedTools?.join('、') || '无额外工具'}；汇报方式：${member.reportMode === 'self' ? '自己直接向用户汇报' : '由你汇总'}${route}${member.roleId === 'tangseng' ? '；当前总助理，不向自身委派' : ''}`
+      })
       .join('\n')
   })
   ctx.systemPrompt.variable('desktop_team_reports', () => {

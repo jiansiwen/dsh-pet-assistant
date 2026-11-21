@@ -6,13 +6,22 @@
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { isNarrationEcho, parseInterruptPhrase, planInterruptInput, plausibleDirectQuestion } from '../src/voice-conversation.ts'
+import { isNarrationEcho, parseInterruptPhrase, planInterruptInput, plausibleDirectQuestion, preferInterruptTranscript } from '../src/voice-conversation.ts'
 
 test('讲解插话的停一下进入后续听写，口令后直接带问题时只发送问题', () => {
   assert.deepEqual(planInterruptInput('停一下', true), { action: 'listen' })
   assert.deepEqual(planInterruptInput('停一下，这段什么意思？', true), { action: 'send', text: '这段什么意思？' })
   assert.deepEqual(planInterruptInput('这里是什么意思？', true), { action: 'direct' })
   assert.deepEqual(planInterruptInput('普通环境声', false), { action: 'ignore' })
+  assert.deepEqual(planInterruptInput('暂停服务应该通知谁', false), { action: 'ignore' })
+})
+
+test('精修丢失明确口令时保留完整的流式口令，不补发未经精修的提问', () => {
+  assert.equal(preferInterruptTranscript('一下。', '停一下'), '停一下')
+  assert.equal(preferInterruptTranscript('这段文档', '休息一下'), '休息一下')
+  assert.equal(preferInterruptTranscript('暂停一下，这段什么意思？', '停一下'), '暂停一下，这段什么意思？')
+  assert.equal(preferInterruptTranscript('有人在读文档', '暂停服务应该通知谁'), '有人在读文档')
+  assert.equal(preferInterruptTranscript('有人在读文档', '停一下，这段什么意思？'), '有人在读文档')
 })
 
 test('直接提问的门槛：咳嗽、单字回声、被截断的口令尾巴都不打断讲解', () => {
@@ -95,5 +104,10 @@ describe('念稿回声门禁', () => {
   })
   test('非口令不参与回声判定', () => {
     assert.equal(isNarrationEcho('这段什么意思', '这段什么意思呢'), false)
+  })
+  test('真人的问题与稿子不同，不能因为稿子也含口令就丢掉整句', () => {
+    assert.equal(isNarrationEcho('停一下，这页为什么这样安排？', '请大家停一下，注意这里的配置。'), false)
+    assert.equal(isNarrationEcho('停一下，注意这里的配置。', '请大家停一下，注意这里的配置。'), true)
+    assert.equal(isNarrationEcho('休息一下', '第二部分结束后，我们休息一下。'), true)
   })
 })

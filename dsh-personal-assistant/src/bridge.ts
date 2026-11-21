@@ -264,6 +264,7 @@ export interface SessionBridgeOptions {
    * 必须与成员会话实际落的工作区同一口径，否则"换工作区新开"会判错。
    */
   cwd?: () => string | undefined
+  onMemberOwnerText?(assistantId: string, sessionId: string, requestId: string, text: string): void
   /**
    * 外部证据收件（桌面壳 → 插件）：已确认的会议纪要、用户主动记录的窗口文本。
    *
@@ -1397,6 +1398,9 @@ export class SessionBridge {
     const team = this.team
     const parent = this.teamAgent ?? (this.agent as unknown as Agent | null)
     if (!team || !parent) return Promise.resolve()
+    if (member.enabled && !docScope) {
+      try { this.options.onMemberOwnerText?.(member.assistantId, String(parent.id), requestId, text) } catch { /* 不影响本人交给成员的请求 */ }
+    }
     const task = team.submitTask({
       goal: text,
       ownerId: member.assistantId,

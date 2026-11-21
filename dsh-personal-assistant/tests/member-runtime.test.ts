@@ -179,6 +179,7 @@ async function fixture(t: TestContext, file?: string) {
     // 实际工厂的 agent scope 继承驱动插件已声明的服务依赖，不从 registry 的代理调用上下文猜依赖。
     driver.scope = createScope(ctx, driver.agent)
     Object.assign(driver.agent, { ctx: driver.scope.ctx })
+    if ('meta' in options && options.meta) Object.assign(driver.agent.session.header, options.meta)
     beforeSetup?.(driver)
     try { await options.setup?.(driver.scope.ctx, driver.agent) }
     catch (error) { await driver.scope.dispose(); throw error }
@@ -778,6 +779,30 @@ test('团队接线保留任务账本、通用成员和已保存启用状态，�
   await team.dispose()
 })
 
+test('宿主在会话自身注册的未授权工具不会进入成员模型列表，也不能执行', async t => {
+  const h = await fixture(t)
+  let called = false
+  h.beforeSetup(driver => {
+    driver.scope.ctx.tools.register(defineTool({
+      name: 'local_fixture_tool', description: '隔离测试的会话局部工具', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, result) => [{ type: 'text', text: result }] },
+      async execute() { called = true; return '测试工具被执行' },
+    }))
+    driver.scope.ctx.systemPrompt.section({ name: 'tool:local_fixture_tool', order: 20, text: '不应显示的工具提示' })
+  })
+  const member = h.store.directory.create(draft('工具投影测试'))
+  const { driver, activation } = await h.start(member.assistantId)
+  assert.ok(h.root.tools.get('local_fixture_tool', driver.agent), '只能由执行门禁和最终装配过滤会话局部工具')
+  const prompt = await h.root.systemPrompt.assemble(assembleContextFor(driver.agent))
+  assert.ok(prompt.tools.some(tool => tool.name === 'companion_member_remember'))
+  assert.ok(!prompt.tools.some(tool => tool.name === 'local_fixture_tool'))
+  assert.doesNotMatch(renderPrompt(prompt), /不应显示的工具提示/)
+  assert.equal((await driver.tool('local_fixture_tool')).isError, true)
+  assert.equal(called, false)
+  await complete(driver)
+  await activation.dispose()
+})
+
 test('动态团队提示与工具禁止模型设置额度，不固定成员或要求用户选人', async t => {
   const h = await fixture(t)
   const approvals = new ApprovalService(h.store, { ttlMs: 60_000, runtimeEpoch: '工具测试' })
@@ -873,7 +898,7 @@ test('workspaceRegistry 服务不可用时记日志并照常派活', async t => 
   await activation.dispose()
 })
 
-test('旧成员会话 cwd 与当前目录不一致时清除绑定并重建，不 resume 错误会话', async t => {
+test('旧成员会话 cwd 与当前目录不一致时，另开并复用工作区会话，不清除主历史', async t => {
   const h = await fixture(t)
   h.options.cwd = () => 'D:\\work\\新目录'
   const member = h.store.directory.create(draft('清理成员'))
@@ -883,11 +908,15 @@ test('旧成员会话 cwd 与当前目录不一致时清除绑定并重建，不
   h.options.ctx.provide('sessions', {
     get: (id: string) => id === first.child.id ? { header: { cwd: 'C:\\Users\\lakala\\.dsh\\profiles\\desktop' } } : undefined,
   })
+  h.allowChannelFollowup()
   const second = await h.start(member.assistantId)
   assert.notEqual(second.child.id, first.child.id, 'cwd 不一致必须重建')
   assert.deepEqual(h.calls.map(item => item.kind), ['create', 'create'], '不走 resume')
-  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, second.child.id)
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, first.child.id)
   await complete(second.driver); await second.activation.dispose()
+  const third = await h.start(member.assistantId)
+  assert.equal(third.child.id, second.child.id, '同工作区复用独立会话')
+  await complete(third.driver); await third.activation.dispose()
 })
 
 test('旧成员会话 cwd 一致时保留 resume', async t => {
@@ -915,4 +944,47 @@ test('读不到旧会话 cwd 时保留原绑定，不误清', async t => {
   assert.equal(second.child.id, first.child.id)
   assert.deepEqual(h.calls.map(item => item.kind), ['create', 'resume'])
   await complete(second.driver); await second.activation.dispose()
+})
+
+test('定时走成员配置的工作区，派活走真实发起者，普通会话在首轮之前装配宿主预设', async t => {
+  const h = await fixture(t)
+  h.allowChannelFollowup()
+  h.options.cwd = () => 'D:\\错误兜底目录'
+  const workspaceId = 'c0d0ab4e-3c88-4ee3-a390-e147a1e91e27'
+  const directory = 'D:\\work\\日常运营'
+  const attach: string[] = [], mounts: string[] = [], titles: string[] = []
+  const workspace = { id: workspaceId, path: directory, title: '日常运营', status: async () => 'ok', attachSession: async (id: string) => { attach.push(id) } }
+  let live = true
+  h.options.ctx.provide('workspaceRegistry', { get: (id: string) => live && id === workspaceId ? workspace : undefined,
+    list: () => live ? [workspace] : [], resolveByPath: async () => undefined })
+  h.options.ctx.provide('agentPresets', { defaultId: '测试预设', mount: async (_ctx: Context, id: string) => { mounts.push(id) } })
+  h.options.ctx.provide('sessionTitle', { rename: (_session: unknown, title: string) => { titles.push(title) } })
+  const member = h.store.directory.create(draft('信使', { scheduleWorkspaceId: workspaceId }))
+
+  const run = h.runtime.chatRun(member.assistantId, '定时任务输入', undefined, undefined, 'schedule')
+  const driver = await h.next()
+  assert.equal(driver.agent.session.header.cwd, directory)
+  assert.deepEqual(mounts, ['测试预设'])
+  await complete(driver)
+  const done = await run
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, done.sessionId)
+  assert.deepEqual(attach, [done.sessionId])
+  assert.match(titles[0]!, /信使.*工作会话/u)
+
+  h.options.ctx.provide('sessions', { get: (id: string) => id === done.sessionId ? { header: { cwd: directory } } : undefined })
+  const parent = { session: { header: { cwd: 'D:\\work\\大赛演示' } } } as Agent
+  const delegated = await h.runtime.start(member.assistantId, [{ type: 'text', text: '办一件事' }], new AbortController().signal,
+    undefined, 'desktop', undefined, parent)
+  const delegatedDriver = h.drivers.at(-1)!
+  assert.equal(delegated.child.session.header.cwd, 'D:\\work\\大赛演示')
+  assert.notEqual(delegated.child.id, done.sessionId)
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, done.sessionId)
+  await complete(delegatedDriver); await delegated.activation.dispose()
+
+  const alternative = await h.runtime.newSession(member.assistantId, '复盘')
+  assert.equal(h.store.directory.ownsSession(member.assistantId, alternative.sessionId), true)
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, done.sessionId)
+  live = false
+  await assert.rejects(h.runtime.chatRun(member.assistantId, '不要跑到其他目录', undefined, undefined, 'schedule'), /工作区已不可用/u)
+  assert.equal(h.runtime.busy(member.assistantId), false)
 })

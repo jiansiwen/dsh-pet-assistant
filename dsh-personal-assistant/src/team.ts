@@ -39,6 +39,7 @@ export interface TeamLogger {
 }
 
 export interface TeamOptions {
+  onAccepted?(task: Task, runId: string): void
   readonly teamId: string
   /** 成员运行时拥有独立持久会话、工具门禁和日/总额度账本。 */
   readonly members?: MemberRuntime
@@ -1139,6 +1140,12 @@ export class TeamService {
     const updated = this.setStatus(task, 'done')
     if (!updated) return { ok: false, status: task.status, message: '任务状态已变化，请刷新后重试' }
     this.store.appendEvent('task/updated', { taskId, by: 'user', note: '本人复核产物后确认完成', status: 'done' }, { taskId, assistantId: task.ownerId })
+    if (task.status === 'review') {
+      const evidence = this.store.listRuns(taskId).find(run => run.state === 'succeeded' && run.assistantId === task.ownerId)
+      if (evidence) {
+        try { this.options.onAccepted?.(updated, evidence.runId) } catch { this.options.logger.warn('已确认任务，但未记录技能样本') }
+      }
+    }
     return { ok: true, status: updated.status, message: '已按你的确认标记完成' }
   }
 

@@ -32,7 +32,7 @@ export const plausibleDirectQuestion = (text: string): boolean =>
  *
  * 返回去掉口令后的剩余内容：用户可能一口气说「停一下，这一段是什么意思」。
  */
-const INTERRUPT_PREFIX = /^(?:请?停一下|先停(?:一下)?|停一停|停停|停下来|暂停一下|暂停|稍等(?:一下)?|等等|等一等|等一下|等会(?:儿)?|打断一下|打断|别说了|先别说|安静一下)[，,。.！!？?、\s]*/u
+const INTERRUPT_PREFIX = /^(?:请?停一下|先停一下|停一停|停停|停下来|暂停一下|稍等一下|等一等|等一下|打断一下|别说了|先别说|安静一下|(?:先停|暂停|稍等|等等|等会(?:儿)?|打断)(?=$|[，,。.！!？?、\s]))[，,。.！!？?、\s]*/u
 const INTERRUPT_EXACT = /^(?:停|安静|别吵)[嘛啊呀吧。！!，,\s]*$/u
 /**
  * 口令前的客套/口头语：`稍微等一下`、`请你停一下`、`麻烦先停一下` 都是同一个意思。
@@ -71,16 +71,25 @@ export function parseInterruptPhrase(text: string): InterruptPhrase {
  * 必须带"一下/一会儿/片刻"这类时长词：光一个"休息"在讨论里太常见（"我们休息讨论一下"），
  * 带上时长词才是明确的"停下来歇着"指令，与提问暂停（停一下）分开。
  */
-const REST_PREFIX = /^(?:请|麻烦|大家|我们|你们|先)?休息(?:一下|一会儿|一会(?:儿)?|片刻)[，,。.！!？?、\s]*/u
+const REST_PHRASE = /^(?:请|麻烦|大家|我们|你们|先)?休息(?:一下|一会(?:儿)?|片刻)[，,。.！!？?、\s]*$/u
+const isRestPhrase = (text: string): boolean => REST_PHRASE.test(text) || REST_PHRASE.test(text.replace(INTERRUPT_FILLER, ''))
 
 /** 讲解插话可以直接提问；单独的停止口令需要接着听问题；休息口令进入无限期休息。 */
 export function planInterruptInput(text: string, direct: boolean):
   { action: 'ignore' | 'direct' | 'listen' | 'rest' } | { action: 'send'; text: string } {
   const trimmed = text.trim()
-  if (REST_PREFIX.test(trimmed) || REST_PREFIX.test(trimmed.replace(INTERRUPT_FILLER, ''))) return { action: 'rest' }
+  if (isRestPhrase(trimmed)) return { action: 'rest' }
   const phrase = parseInterruptPhrase(text)
   if (!phrase.matched) return { action: direct ? 'direct' : 'ignore' }
   return phrase.rest ? { action: 'send', text: phrase.rest } : { action: 'listen' }
+}
+
+/** 整句精修可能吞掉话头。只用流式结句挽回独立口令，不拿流式问题替换精修结果。 */
+export function preferInterruptTranscript(refined: string, streamed: string): string {
+  if (!refined.trim()) return streamed
+  if (planInterruptInput(refined, false).action !== 'ignore') return refined
+  const mode = planInterruptInput(streamed, false).action
+  return mode === 'listen' || mode === 'rest' ? streamed : refined
 }
 
 const normForEcho = (text: string): string => text.replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase()
@@ -89,19 +98,19 @@ const normForEcho = (text: string): string => text.replace(/[\s\p{P}\p{S}]/gu, '
  * 这句口令是不是"念稿回声"：外放时麦克风把助理正在念的正文录了回来。
  *
  * 文档里恰好有"停一下"，念到那里时麦克风识别出"停一下"，会被当成真口令误停。
- * 判据：识别出的口令核心**落在当前正在念的段落里** → 是念稿回声，忽略。用户真喊口令时
- * 念的段落里没有这几个字 → 照常打断。代价：用户喊的口令恰好与当前念的字一样会被吞，按快捷键即可。
+ * 单独口令要查口令核心；带提问时查完整内容，不能因为稿子里恰好也有「停一下」丢掉新问题。
  */
 export function isNarrationEcho(text: string, narration: string): boolean {
   const narr = normForEcho(narration)
   if (narr.length === 0) return false
   const trimmed = text.trim()
+  if (isRestPhrase(trimmed)) return narr.includes(normForEcho(trimmed.replace(INTERRUPT_FILLER, '')))
   const direct = matchInterrupt(trimmed)
   const stripped = trimmed.replace(INTERRUPT_FILLER, '')
   const phrase = direct ?? (stripped !== trimmed ? matchInterrupt(stripped) : null)
   if (phrase === null) return false
   const source = direct !== null ? trimmed : stripped
-  const core = normForEcho(source.slice(0, source.length - phrase.rest.length))
+  const core = normForEcho(source)
   return core.length > 0 && narr.includes(core)
 }
 

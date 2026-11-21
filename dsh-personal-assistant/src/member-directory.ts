@@ -145,7 +145,7 @@ function extension(profile: MemberProfile): Extension {
   return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, reportMode: profile.reportMode, speechBy: profile.speechBy, voiceDesign: profile.voiceDesign, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
     capabilities: profile.capabilities, allowedTools: profile.allowedTools, dailyTokenLimit: profile.dailyTokenLimit,
     totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId,
-    kind: profile.kind, binding: profile.binding }
+    kind: profile.kind, binding: profile.binding, scheduleWorkspaceId: profile.scheduleWorkspaceId }
 }
 function normalize(draft: MemberDraft): NormalizedMemberDraft {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) throw new Error('成员配置无效')
@@ -172,7 +172,10 @@ const reportMode = draft.reportMode ?? 'chief'
   if (!MEMBER_KINDS.includes(kind)) throw new Error('成员类型无效')
   const binding = normalizeBinding(kind, draft.binding)
   if (kind !== 'expert' && binding === null) throw new Error('子助理必须配置外部绑定')
+  const workspaceId = draft.scheduleWorkspaceId
+  if (workspaceId != null && (kind !== 'expert' || !/^[a-f0-9-]{36}$/iu.test(workspaceId))) throw new Error('请选择本机成员可用的 DSH 工作区')
   return { displayName: text(draft.displayName, '成员名称', 80, true), description: text(draft.description, '职责说明', 4000),
+    ...(workspaceId !== undefined || kind !== 'expert' ? { scheduleWorkspaceId: workspaceId ?? null } : {}),
     personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode, reportMode, speechBy,
     persona: text(draft.persona, '人设', 16000), skinId, enabled: draft.enabled,
     voiceProfile: text(draft.voiceProfile ?? '', '音色', 200),
@@ -342,6 +345,19 @@ toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] },
     if (!/^[a-f0-9]{64}$/u.test(scope)) throw new Error('渠道会话范围无效')
     const row = this.db.prepare('SELECT session_id FROM member_channel_sessions WHERE assistant_id = ? AND scope = ?').get(id, scope) as Row | undefined
     return row ? String(row.session_id) : null
+  }
+
+  ownsSession(id: string, sessionId: string): boolean {
+    const member = this.get(id)
+    return !!member && (member.sessionId === sessionId || !!this.db.prepare(
+      'SELECT 1 FROM member_channel_sessions WHERE assistant_id = ? AND session_id = ?',
+    ).get(id, sessionId))
+  }
+
+  sessionOwner(sessionId: string): string | null {
+    const row = this.db.prepare(`SELECT assistant_id FROM assistant_profiles WHERE json_extract(data, '$.sessionId') = ?
+      UNION SELECT assistant_id FROM member_channel_sessions WHERE session_id = ? LIMIT 1`).get(sessionId, sessionId) as Row | undefined
+    return row ? String(row.assistant_id) : null
   }
 
   setChannelSession(id: string, scope: string, sessionId: string): void {

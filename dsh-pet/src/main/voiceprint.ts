@@ -228,7 +228,7 @@ export const extractEmbedding: EmbeddingExtractor = async (samples, modelPath) =
     SpeakerEmbeddingExtractor: new (config: { model: string; numThreads?: number; provider?: string; debug?: number }) => {
       createStream(): { acceptWaveform(input: { sampleRate: number; samples: Float32Array }): void; inputFinished(): void }
       isReady(stream: unknown): boolean
-      compute(stream: unknown): Float32Array
+      compute(stream: unknown, enableExternalBuffer: boolean): Float32Array
     }
   }
   const extractor = new sherpa.SpeakerEmbeddingExtractor({ model: modelPath, numThreads: 2, provider: 'cpu', debug: 0 })
@@ -236,7 +236,8 @@ export const extractEmbedding: EmbeddingExtractor = async (samples, modelPath) =
   stream.acceptWaveform({ sampleRate: 16000, samples })
   stream.inputFinished()
   if (!extractor.isReady(stream)) throw new Error('没有检测到有效的人声，请靠近麦克风重录')
-  return Array.from(extractor.compute(stream))
+  // sherpa 默认用原生内存创建外部 ArrayBuffer，Electron 不允许。显式让它复制到 JS 管理的缓冲区。
+  return Array.from(extractor.compute(stream, false))
 }
 
 export type VoiceprintEnrollResult =
@@ -281,12 +282,13 @@ export async function enrollVoiceprint(input: {
     return { ok: false, error: `注册失败：${problems[0] ?? '有效录音不足 2 段'}` }
   }
   const model = voiceprintModelTag(modelPath)
-  saveVoiceprint(input.userDataDir, {
-    version: 1,
-    name: input.name,
-    embeddings,
-    ...(model === null ? {} : { model }),
-    createdAt: (input.now ?? Date.now)(),
-  }, input.loadKey)
+  try {
+    saveVoiceprint(input.userDataDir, {
+      version: 1, name: input.name, embeddings,
+      ...(model === null ? {} : { model }), createdAt: (input.now ?? Date.now)(),
+    }, input.loadKey)
+  } catch (error) {
+    return { ok: false, error: `声纹已提取，但加密保存失败：${error instanceof Error ? error.message : String(error)}` }
+  }
   return { ok: true, count: embeddings.length }
 }

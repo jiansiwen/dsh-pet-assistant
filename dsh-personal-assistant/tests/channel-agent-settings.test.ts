@@ -316,6 +316,9 @@ test('真实 SDK 的系统提示词注册、变量插值、作用域和释放，
   const promptPlugin = root.plugin(SystemPrompt, { personaPrefix: '共享基础提示词' })
   await promptPlugin
   t.after(() => promptPlugin.dispose())
+  root.systemPrompt.variable('personal_assistant_preferences', () => '总助理私密偏好')
+  root.systemPrompt.variable('personal_assistant_memory_conflicts', () => '总助理私密冲突')
+  root.systemPrompt.section({ name: '测试总助理记忆', order: 150, text: '{{personal_assistant_preferences}}\n{{personal_assistant_memory_conflicts}}' })
   const key = { session: {} } as Agent
   let scope!: { ctx: Context; dispose(): Promise<void> }
   const ownerPlugin = root.plugin(Object.assign((ctx: Context) => { scope = createScope(ctx, key) }, { inject: ['systemPrompt'] }))
@@ -330,8 +333,11 @@ test('真实 SDK 的系统提示词注册、变量插值、作用域和释放，
   assert.match(renderPrompt(assembly), /名称：渠道小助手/)
   assert.match(renderPrompt(assembly), /职责保留 \{\{字面量\}\}/)
   assert.match(renderPrompt(assembly), /共享基础提示词/)
+  assert.doesNotMatch(renderPrompt(assembly), /总助理私密/u)
   const other = { ctx: {}, session: {} } as Agent
-  assert.doesNotMatch(renderPrompt(await root.systemPrompt.assemble(assembleContextFor(other))), /渠道小助手/)
+  const otherPrompt = renderPrompt(await root.systemPrompt.assemble(assembleContextFor(other)))
+  assert.doesNotMatch(otherPrompt, /渠道小助手/)
+  assert.match(otherPrompt, /总助理私密偏好/u)
   const child = { ctx: {}, session: {} } as Agent
   const childScope = createScope(scope.ctx, child, { parent: key })
   Object.assign(child, { ctx: childScope.ctx })

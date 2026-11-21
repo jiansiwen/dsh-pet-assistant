@@ -13,6 +13,7 @@ import {
   clearVoiceprint,
   cosineSimilarity,
   enrollVoiceprint,
+  extractEmbedding,
   loadVoiceprint,
   saveVoiceprint,
   voiceprintPath,
@@ -69,6 +70,26 @@ test('WAV 解析只接受 16k 单声道 16bit', () => {
   assert.equal(wavToSamples(Buffer.from('not a wav')).length, 0)
 })
 
+test('声纹提取显式使用 JS 管理的缓冲区，兼容 Electron 的原生模块限制', async t => {
+  const pcm = samples()
+  t.mock.module('sherpa-onnx-node', { defaultExport: {
+    SpeakerEmbeddingExtractor: class {
+      createStream() {
+        return { acceptWaveform(input: { sampleRate: number; samples: Float32Array }) {
+          assert.equal(input.sampleRate, 16000)
+          assert.equal(input.samples, pcm)
+        }, inputFinished() {} }
+      }
+      isReady() { return true }
+      compute(_stream: unknown, enableExternalBuffer = true) {
+        if (enableExternalBuffer) throw new Error('External buffers are not allowed')
+        return new Float32Array([0.25, -0.5])
+      }
+    },
+  } })
+  assert.deepEqual(await extractEmbedding(pcm, '测试模型.onnx'), [0.25, -0.5])
+})
+
 test('注册 3 段、保存后能读回；文件里没有明文 embedding', async () => {
   const dir = tempDir()
   try {
@@ -106,6 +127,18 @@ test('有效录音不足 2 段时失败，不覆盖已有声纹', async () => {
     assert.match(result.ok ? '' : result.error, /没检测到有效人声/)
     assert.equal(loadVoiceprint(dir, loadKey)?.name, '旧名字', '失败不能把旧声纹冲掉')
   } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('声纹提取完成但系统密钥失效：返回加密保存错误且保留旧文件', async t => {
+  const dir = tempDir()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  saveVoiceprint(dir, { version: 1, name: '旧名字', embeddings: [[1, 0]], createdAt: 1 }, loadKey)
+  const wav = makeWav(Array.from(samples(1)))
+  const result = await enrollVoiceprint({ userDataDir: dir, name: '新的', wavs: [wav, wav], extract: async () => [0, 1],
+    loadKey: () => ({ status: 'lost', message: '系统密钥无法解包' }) })
+  assert.equal(result.ok, false)
+  assert.match(result.ok ? '' : result.error, /加密保存.*系统密钥无法解包/u)
+  assert.equal(loadVoiceprint(dir, loadKey)?.name, '旧名字')
 })
 
 test('短录音在提取前就被拒绝；删除后状态回到未注册', async () => {

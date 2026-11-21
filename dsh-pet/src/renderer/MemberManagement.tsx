@@ -58,6 +58,7 @@ const memoryStatuses: Record<MemoryRecord['status'], string> = { candidate: '候
 export default function MemberManagement({ feed }: { feed: Feed }) {
   const { state, error, loading, refresh } = feed
   const [memoryId, setMemoryId] = useState<string | null>(null)
+  const [newSession, setNewSession] = useState<{ memberId: string; title: string } | null>(null)
   const [pending, setPending] = useState(false)
   const [notice, setNotice] = useState('')
   const active = useRef(false)
@@ -109,17 +110,20 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
         {state.requests.filter(item => item.state === 'pending').map(request => <QuotaRequestCard key={request.requestId} request={request}
           member={state.members.find(item => item.profile.assistantId === request.assistantId)} pending={pending || !!error} run={run} />)}
       </section>
-      <section aria-label="记忆共享" className="team-section">
-        <h4>共享给我的助理们的记忆</h4>
-        <p className="management-hint">打开开关后，这条记忆会以**只读**方式出现在所有子助理的上下文里（它们不知道就做不到"老板说要简单明了"）。取消或删除，下一轮立刻失效——是投影，不是复制。</p>
+      <section aria-label="总助理记忆范围" className="team-section">
+        <h4>总助理记忆范围</h4>
+        <p className="management-hint">新增长期规矩和通用经验通常由本地子助理只读沿用。你可以逐条切换「私密」或「团队共享」，下一轮生效，不改写历史。私密只限制使用范围，不是加密。</p>
         {state.sharedMemoriesError && <p className="assistant-settings-error" role="alert">记忆列表暂时读不到，请稍后刷新核对。</p>}
         {!state.sharedMemoriesError && (state.sharedMemories?.length ?? 0) === 0 &&
           <p className="management-hint">还没有已确认的全局记忆可以共享。先跟总助理说"记住……"，确认后就会出现在这里。</p>}
         {!!state.sharedMemories?.length && <ul className="team-list">{state.sharedMemories.map(record => <li key={record.id} className="team-task">
-          <label className="management-voice">
-            <input type="checkbox" checked={record.shared} disabled={pending || !!error}
-              onChange={event => void run('share-memory', { memoryId: record.id, shared: event.target.checked })} />
-            <span>{record.topic}：{record.text}</span>
+          <strong>{record.topic || '未分类记忆'}</strong>
+          <p>{record.text}</p>
+          <label className="management-voice">使用范围
+            <select value={record.shared ? 'team' : 'private'} disabled={pending || !!error}
+              onChange={event => void run('share-memory', { memoryId: record.id, shared: event.target.value === 'team', expectedRevision: record.revision })}>
+              <option value="team">团队共享</option><option value="private">私密（仅总助理）</option>
+            </select>
           </label>
         </li>)}</ul>}
       </section>
@@ -169,7 +173,7 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
         </li>)}</ul>
       </section>}
       <ul className="team-list" aria-label="成员列表">
-        {state.members.map(member => <li key={member.profile.assistantId} className="team-task member-card">
+      {state.members.map(member => <li key={member.profile.assistantId} className="team-task member-card">
           <div className="member-heading"><strong>{member.profile.displayName}</strong><span>{member.busy ? '忙碌中' : member.profile.enabled ? '可用' : '已停用'}</span></div>
           <p>{member.profile.description || '未填写描述'}</p>
           <p className="management-hint">已绑定能力：{member.profile.capabilities.map(item => MEMBER_CAPABILITY_LABELS[item]).join('、') || '无（仅提示词）'}</p>
@@ -180,13 +184,19 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
           <p className="management-hint">软限额：按已用量加在途预留停线，单次请求仍可能超出上限；不是计费硬封顶。</p>
           {(member.quota.unknown || (member.quota.blocked && member.profile.enabled)) && <p className="team-blocked">{member.quota.unknown ? '用量未知，请核对后处理申请。' : '已到额度停线，需处理申请。'}</p>}
           {/* 会话 id 是"小会说过什么"的唯一入口：它建在总助理当前工作目录下，能在会话列表里找到。 */}
-      <p className="member-session">独立会话：{member.profile.sessionId || '尚未创建；首次派活时自动新建，并挂在当前总助理的工作目录下'}</p>
+          <p className="member-session">主工作会话：{member.profile.sessionId || '尚未创建；首次使用时自动新建'}</p>
+          {member.profile.kind === 'expert' && <p className="management-hint">定时工作区：{member.profile.scheduleWorkspaceId
+            ? state.workspaces?.find(item => item.id === member.profile.scheduleWorkspaceId)?.title ?? '原工作区不可用，请重选'
+            : '主工作会话所在目录'}；总助理派活跟随发起会话。</p>}
           <p className="management-hint">成员标识：{member.profile.assistantId} · 配置版本 {member.profile.revision}</p>
           <div className="member-actions">
             <button type="button" className="management-button" disabled={pending || member.busy || !!error} onClick={() => { setMemoryId(null); void openEditor(member.profile.assistantId) }}>编辑成员</button>
             <button type="button" className="management-button" disabled={pending || !!error || !member.profile.sessionId} onClick={() => {
               void window.petApi.viewMemberSession(member.profile.assistantId).then(r => { if (!r.ok) setNotice(r.error ?? '会话窗口未能打开') })
-            }}>查看会话</button>
+             }}>查看会话</button>
+             {member.profile.kind === 'expert' && <button type="button" className="management-button"
+               disabled={pending || !state.enabled || member.busy || !member.profile.enabled || !!error}
+               onClick={() => setNewSession({ memberId: member.profile.assistantId, title: '' })}>新开会话</button>}
             <button type="button" className="management-button" disabled={pending || !!error} onClick={() => setMemoryId(memoryId === member.profile.assistantId ? null : member.profile.assistantId)}>{memoryId === member.profile.assistantId ? '收起记忆' : '独立记忆'}</button>
             <button type="button" className="management-button danger" disabled={pending || member.busy || !!error} onClick={() => {
               if (memoryId === member.profile.assistantId) setMemoryId(null)
@@ -201,7 +211,20 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
             if (memoryId === member.profile.assistantId) setMemoryId(null)
             void run('delete', { id: member.profile.assistantId, expectedRevision: member.profile.revision, purgeMemory: true })
           }}>删除并清空它的记忆…</button>
-          </div>
+           </div>
+          {newSession?.memberId === member.profile.assistantId && <form className="member-actions" onSubmit={async event => {
+            event.preventDefault()
+            if (!newSession.title.trim()) return
+            const result = await run('new-session', { id: member.profile.assistantId, expectedRevision: member.profile.revision, title: newSession.title })
+            if (result.ok && result.data && 'sessionId' in result.data) {
+              setNewSession(null)
+              setNotice(`已新开「${member.profile.displayName}｜${result.data.title}」，编号 ${result.data.sessionId}。主工作会话不变。`)
+            }
+          }}>
+            <label>会话名称 <input value={newSession.title} maxLength={60} disabled={pending} onChange={event => setNewSession({ ...newSession, title: event.target.value })} /></label>
+            <button type="submit" className="management-button" disabled={pending || !newSession.title.trim()}>创建会话…</button>
+            <button type="button" className="management-button" disabled={pending} onClick={() => setNewSession(null)}>取消</button>
+          </form>}
           <QuotaReset member={member} pending={pending || !!error} run={run} />
           {member.busy && <p className="management-hint">成员忙碌时不能编辑或重置额度。</p>}
         </li>)}

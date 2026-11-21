@@ -12,7 +12,7 @@ function harness(overrides: { autoForm?: boolean; autoActivate?: boolean; scopeC
     skills,
     autoForm: () => overrides.autoForm ?? true,
     autoActivate: () => overrides.autoActivate ?? true,
-    samples: () => [{ goal: '写周报', acceptance: '', artifacts: '[]', updatedAt: 1 }],
+    samples: () => [1, 2, 3].map(updatedAt => ({ goal: '写周报', acceptance: '本人确认', artifacts: '[]', updatedAt })),
     synthesize: async () => { calls++; return overrides.synth ? overrides.synth() : { body: '步骤一…步骤二…', scopeChanged: overrides.scopeChanged ?? false } },
     threshold: 3,
   })
@@ -69,14 +69,33 @@ test('已有同名技能不重复形成', async () => {
   h.db.close()
 })
 
-test('成员自报样本攒够也形成，来源标 auto-selfreport', async () => {
+test('成员自报样本只供核查，不能形成技能', async () => {
   const h = harness()
   for (let i = 0; i < 3; i++) h.formation.record('member-b', '整理纪要', false)
   await new Promise(r => setTimeout(r, 20))
   const list = h.skills.list('member-b')
-  assert.equal(list.length, 1)
-  assert.equal(list[0].origin, 'auto-selfreport')
-  assert.equal(list[0].status, 'active')
+  assert.equal(list.length, 0)
+  assert.equal(h.skills.unverifiedCount('member-b', '整理纪要'), 3)
+  h.db.close()
+})
+
+test('同一个回执只算一次；删除技能清除旧样本，后续不会据同一批证据直接恢复', async () => {
+  const h = harness()
+  function record(ref: string) {
+    h.formation.record('member-a', '写周报', true, { ref,
+      sample: { goal: '写周报', acceptance: '本人验收', artifacts: '周报摘要', updatedAt: 1 } })
+  }
+  record('run-a'); record('run-a'); record('run-b')
+  assert.equal(h.calls(), 0)
+  assert.equal(h.skills.verifiedSamples('member-a', '写周报').length, 2)
+  record('run-c')
+  await Promise.resolve()
+  const formed = h.skills.list('member-a')[0]!
+  assert.equal(formed.status, 'active')
+  assert.equal(h.skills.remove(formed.id), 1)
+  record('run-d')
+  assert.deepEqual(h.skills.list('member-a'), [])
+  assert.equal(h.skills.evidenceCount('member-a', '写周报'), 1)
   h.db.close()
 })
 

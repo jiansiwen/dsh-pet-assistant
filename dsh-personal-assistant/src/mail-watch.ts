@@ -5,6 +5,7 @@ import { ImapFlow, type MessageStructureObject } from 'imapflow'
 import { simpleParser } from 'mailparser'
 import { decryptSecret, mailDir, readMailConfig, type MailConfig } from './mail.ts'
 import { parseMailAnalysis } from './mail-suggestions.ts'
+import { mailTopicKey } from './member-feedback.ts'
 import type { MailWatchLegacy, TeamStore } from './team-domain.ts'
 
 const WATCH_FILE = 'mail-watch.json'
@@ -214,9 +215,11 @@ export interface MailWatcherOptions {
   member(): { id: string; name: string } | null
   enabled(): boolean
   /** 必须接既有成员运行时的软额度门禁；未知模型请求的停线与恢复仍由成员账本负责。 */
-  analyze(memberId: string, prompt: string): Promise<string>
+  analyze(memberId: string, prompt: string): Promise<string | { text: string; sessionId: string }>
   /** 只有显式返回 true 才表示实际接收；仅入队或未接回执不算送达。 */
-  notify?(text: string, memberId: string): boolean | void | Promise<boolean | void>
+  notify?(text: string, memberId: string, analysis: import('./team-domain.ts').MailWatchAnalysis): boolean | void | Promise<boolean | void>
+  quiet?(memberId: string, mail: UnreadMail): boolean
+  analyzed?(analysis: import('./team-domain.ts').MailWatchAnalysis, covered: readonly string[]): void
   log(message: string): void
   now?(): number
   /** 测试注入；生产缺省走 DPAPI。 */
@@ -263,7 +266,7 @@ export class MailWatcher {
     if (!this.options.notify) return
     for (const analysis of this.options.store.pendingMailWatchNotifications(scopeId, MAIL_WATCH_LIMITS.maxMessages, true)) {
       if (!this.options.enabled()) return
-      const received = await this.options.notify(clip(analysis.result, MAX_NOTIFICATION_CHARS), analysis.memberId)
+      const received = await this.options.notify(clip(analysis.noticeText ?? analysis.result, MAX_NOTIFICATION_CHARS), analysis.memberId, analysis)
       if (received === true) this.options.store.markMailWatchNotified(analysis.analysisId, this.options.now?.() ?? Date.now())
     }
   }
@@ -360,7 +363,7 @@ export class MailWatcher {
         ...loaded.map(({ message }, index) => [`【邮件 ${index + 1} / UID ${message.uid}】`, `发件人：${message.from}`, `主题：${message.subject}`,
           `时间：${message.date || '未知'}`, message.text].join('\n')),
       ].join('\n\n')
-      let reply: string
+      let reply: Awaited<ReturnType<MailWatcherOptions['analyze']>>
       try { reply = await this.options.analyze(member.id, prompt) }
       catch (error) {
         for (const item of loaded) store.noteMailWatchMessage(scope.scopeId, item.message.uid, '分析失败或软额度拒绝，保留待处理；未知模型请求由成员额度账本停线')
@@ -370,10 +373,28 @@ export class MailWatcher {
        * 解析成结构化建议。**格式不对不丢结论**：parseMailAnalysis 会把整段当摘要，
        * 这里只在"摘要和建议都空"时才放弃这一轮。
        */
-      const parsed = parseMailAnalysis(reply)
+      const parsed = parseMailAnalysis(typeof reply === 'string' ? reply : reply.text)
       if (parsed.summary.trim() === '' && parsed.suggestions.length === 0) return { fresh: loaded.length, analyzed: false }
-      store.completeMailWatchAnalysis(scope.scopeId, member.id, loaded.map(item => ({ uid: item.message.uid,
-        sourceDigest: item.sourceDigest, truncated: item.message.truncated === true })), parsed.summary, now, parsed.suggestions)
+      const first = loaded[0]?.message
+      const key = first ? mailTopicKey(first.from, first.subject) : null
+      const topic = key && loaded.every(({ message }) => mailTopicKey(message.from, message.subject) === key) ? key : null
+      const visible = loaded.filter(({ message }) => !this.options.quiet?.(member.id, message))
+      const notice = visible.length < loaded.length && visible.length > 0
+        ? `有 ${visible.length} 封需通知的邮件：\n${visible.map(({ message }) => `- ${clip(message.subject, 100) || '无主题'}`).join('\n')}\n完整分析可在桌宠邮件页查看。` : undefined
+      const sourceUids = new Set(loaded.map(({ message }) => message.uid))
+      const covered = parsed.structured && parsed.suggestions.length === sourceUids.size
+        && new Set(parsed.suggestions.map(item => item.uid)).size === sourceUids.size
+        && parsed.suggestions.every(item => item.uid !== null && sourceUids.has(item.uid))
+        ? parsed.suggestions.map(item => item.kind) : []
+      const completed = store.completeMailWatchAnalysis(scope.scopeId, member.id, loaded.map(item => ({ uid: item.message.uid,
+        sourceDigest: item.sourceDigest, truncated: item.message.truncated === true })), parsed.summary, now, parsed.suggestions, {
+        ...(typeof reply !== 'string' ? { sessionId: reply.sessionId } : {}),
+        ...(topic && first ? { mailTopic: topic, mailLabel: clip(`${first.from}｜${first.subject}`, 160) } : {}),
+        ...(visible.length === 0 ? { silent: true } : {}), ...(notice ? { noticeText: notice } : {}),
+      })
+      if (covered.length > 0) {
+        try { this.options.analyzed?.(completed, covered) } catch { this.options.log('邮件分析已保存，但未登记学习样本') }
+      }
       await this.notifyPending(scope.scopeId)
       return { fresh: loaded.length, analyzed: true }
     } finally { this.running = false }

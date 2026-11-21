@@ -42,6 +42,7 @@ export interface MailAnalysisRow {
   suggestions: MailSuggestionRow[]
   createdAt: number
   notifiedAt: number | null
+  silent?: boolean
 }
 
 export type AssistantMailResult =
@@ -116,6 +117,7 @@ export function projectAnalyses(value: unknown): MailAnalysisRow[] {
       result: text(row.result),
       createdAt: integer(row.createdAt),
       notifiedAt: row.notifiedAt === null || row.notifiedAt === undefined ? null : integer(row.notifiedAt),
+      ...(row.silent === true ? { silent: true } : {}),
       suggestions: suggestions.map(entry => {
         const suggestion = record(entry)
         return {

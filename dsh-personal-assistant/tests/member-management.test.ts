@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import { TeamStore } from '../src/team-domain.ts'
 import { MemberManagement } from '../src/member-management.ts'
-import { MemoryStore } from '../src/memory.ts'
+import { isShareableMemory, MemoryStore } from '../src/memory.ts'
 import { MemberMemory } from '../src/member-memory.ts'
 import { CompanionTaskRuntime } from '../src/task-runtime.ts'
 import { ApprovalService } from '../src/approval.ts'
@@ -97,4 +97,37 @@ test('删除成员拒绝忙碌与未结束任务，成功后从目录消失', as
   assert.equal(Number((db.prepare('SELECT COUNT(*) AS n FROM memories WHERE scope_kind = ? AND scope_id = ?').get('role', id) as { n: number }).n), 0)
   assert.equal(Number((db.prepare('SELECT COUNT(*) AS n FROM deletion_ledger').get() as { n: number }).n), 1)
   assert.equal((await service.request('POST', `/companion/v1/members/${id}/delete`, { expectedRevision })).status, 409)
+})
+
+test('记忆范围只接受桌面所有者按当前版本切换，切回私密后不再进入成员投影', async t => {
+  const store = new TeamStore(':memory:')
+  const memories = new MemoryStore(store.db)
+  const actor = { id: 'owner', isUser: true }
+  const saved = memories.put({ kind: 'team_experience', scopeKind: 'global', topic: '周报', text: '先列结论', visibility: 'private', actor }, Date.now())
+  assert.ok(saved.ok)
+  const { id, revision } = saved.record
+  const memberMemories = new MemberMemory({ store: memories, ownerId: 'owner', exists: () => false, invalidate: () => assert.fail('切换范围不应更换会话') })
+  const service = new MemberManagement({ directory: store.directory, runtime: { busy: () => false } as unknown as MemberRuntime, memories: memberMemories,
+    enabled: () => true, setMode: async () => {}, defaultModel: () => null, changed: () => {},
+    sharedMemories: () => memories.list({}, Date.now()).filter(isShareableMemory)
+      .map(record => ({ id: record.id, topic: record.topic, text: record.text, revision: record.revision, shared: memories.isShared(record.id) })),
+    toggleShared: (memoryId, shared, expectedRevision) => memories.setShared(memoryId, shared, Date.now(), expectedRevision),
+  })
+  const runtime = new CompanionTaskRuntime(store, new ApprovalService(store, { ttlMs: 60000, runtimeEpoch: 'test' }), { epoch: 'test' })
+  runtime.attachMemberManagement(service)
+  t.after(async () => { await runtime.dispose(); store.close() })
+  const route = '/companion/v1/memories/shared'
+  const input = { memoryId: id, shared: true, expectedRevision: revision }
+  assert.equal((await runtime.request('GET', route, null, 'client')).status, 403)
+  assert.equal((await runtime.request('POST', route, input, 'executor')).status, 403)
+  assert.equal((await runtime.request('POST', route, { memoryId: id, shared: true }, 'owner')).status, 422)
+  assert.doesNotMatch(memberMemories.shared(), /先列结论/u)
+
+  assert.equal((await runtime.request('POST', route, input, 'owner')).status, 200)
+  assert.match(memberMemories.shared(), /先列结论/u)
+  assert.equal((await runtime.request('POST', route, { ...input, shared: false }, 'owner')).status, 409)
+  assert.equal((await runtime.request('POST', route, { ...input, shared: false, expectedRevision: revision + 1 }, 'owner')).status, 200)
+  assert.doesNotMatch(memberMemories.shared(), /先列结论/u)
+  assert.equal(memories.get(id, Date.now())?.text, '先列结论')
+  assert.equal(memories.get(id, Date.now())?.revision, revision + 2)
 })

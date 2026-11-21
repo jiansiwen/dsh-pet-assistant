@@ -135,7 +135,7 @@ test('swagger 向右走：镜像翻面、位置右移、走到收步', t => {
   const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
   const right = mount(t, { lines: lines(), randomActions: ['swagger'], home: { x: 100, y: 900 } }, 0.99)
   for (let i = 0; i < 12 && right.behavior.action !== 'swagger'; i++) right.seconds(1, lines)
-  assert.equal(right.behavior.action, 'swagger')
+  assert.equal(String(right.behavior.action), 'swagger')
   right.frames(60)
   assert.equal(right.behavior.facing, -1, '视频朝左，向右走应镜像')
   assert.ok(right.behavior.x > 100, '向右走位置应右移')
@@ -157,7 +157,7 @@ test('swagger 向左走：不镜像、位置左移、走到收步', t => {
   const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
   const left = mount(t, { lines: lines(), randomActions: ['swagger'], home: { x: 1800, y: 900 } }, 0.3)
   for (let i = 0; i < 12 && left.behavior.action !== 'swagger'; i++) left.seconds(1, lines)
-  assert.equal(left.behavior.action, 'swagger')
+  assert.equal(String(left.behavior.action), 'swagger')
   left.frames(60)
   assert.equal(left.behavior.facing, 1, '向左走不镜像')
   assert.ok(left.behavior.x < 1800, '向左走位置应左移')
@@ -179,9 +179,9 @@ test('随机走路落点太近时推远，不会刚迈步就收步', t => {
   const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
   const pet = mount(t, { lines: lines(), randomActions: ['walk'], home: { x: 960, y: 900 } }, 0.5)
   for (let i = 0; i < 12 && pet.behavior.action !== 'walk'; i++) pet.seconds(1, lines)
-  assert.equal(pet.behavior.action, 'walk')
+  assert.equal(String(pet.behavior.action), 'walk')
   pet.frames(30)
-  assert.equal(pet.behavior.action, 'walk', '0.5 秒后仍应在走，落点至少 60px')
+  assert.equal(String(pet.behavior.action), 'walk', '0.5 秒后仍应在走，落点至少 60px')
   assert.ok(Math.abs(pet.behavior.x - 960) > 10, '位置应明显离开起点')
   let sawStop = false
   for (let i = 0; i < 30; i++) {
@@ -202,9 +202,9 @@ test('走路进行到一半不打盹，走完后才允许入睡', t => {
   const lines = () => manifestFor({ assistantId: 'member-tangseng' }).lines
   const pet = mount(t, { lines: lines(), randomActions: ['walk'], home: { x: 960, y: 900 }, idleSleepMinutes: 0.083 }, 0.5)
   for (let i = 0; i < 12 && pet.behavior.action !== 'walk'; i++) pet.seconds(1, lines)
-  assert.equal(pet.behavior.action, 'walk')
+  assert.equal(String(pet.behavior.action), 'walk')
   pet.frames(30)
-  assert.equal(pet.behavior.action, 'walk', '空闲阈值已过但走路中不能睡')
+  assert.equal(String(pet.behavior.action), 'walk', '空闲阈值已过但走路中不能睡')
   pet.frames(150)
   if (pet.behavior.action === 'walk-stop') {
     pet.behavior.completeAnimation('walk-stop', pet.behavior.animationVersion)

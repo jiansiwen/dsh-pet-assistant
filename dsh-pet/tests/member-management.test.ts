@@ -183,6 +183,30 @@ test('渠道异常本人核查须原生确认并重验版本，不执行或重�
   assert.deepEqual(writes().at(-1)?.body, { expectedRevision: 3 })
   assert.match(dialogs.at(-1)?.detail ?? '', /不会.*执行.*重发|不.*执行.*重发/su)
 })
+test('记忆范围确认绑定原文和版本，确认期间发生编辑不提交旧范围', async () => {
+  mount()
+  const saved = { id: memoryId, topic: '周报', text: '先列结论', revision: 3, shared: false }
+  state.sharedMemories = [saved]
+  const input = { memoryId, shared: true, expectedRevision: saved.revision }
+  confirm = async () => ({ response: 0 })
+  assert.equal(code(await command('share-memory', input)), 'cancelled')
+  assert.equal(writes().length, 0)
+  assert.match(dialogs.at(-1)?.detail ?? '', /先列结论/u)
+
+  confirm = async () => { state.sharedMemories = [{ ...saved, revision: 4, text: '新版内容' }]; return { response: 1 } }
+  assert.equal(code(await command('share-memory', input)), 'conflict')
+  assert.equal(writes().length, 0, '确认期间改过的正文不能沿用旧决定公开')
+
+  confirm = async () => ({ response: 1 })
+  const fresh = { ...input, expectedRevision: 4 }
+  assert.equal((await command('share-memory', fresh)).ok, true)
+  assert.deepEqual(writes().at(-1)?.body, fresh)
+  assert.equal(writes().at(-1)?.path, '/companion/v1/memories/shared')
+  state.sharedMemories = [{ ...saved, revision: 5, shared: true }]
+  assert.equal((await command('share-memory', { ...fresh, shared: false, expectedRevision: 5 })).ok, true)
+  assert.match(dialogs.at(-1)?.message ?? '', /仅总助理/u)
+})
+
 test('记忆逐字段镜像，范围只读，标识严格编码', async () => {
   mount()
   respond = async () => ({ status: 200, body: { records: [{ ...memory(), secret: '秘密', scope: { ...memory().scope, actor: '秘密' } }], ownerToken: '秘密' } })
@@ -284,7 +308,7 @@ test('十一种动作固定路径与 CAS 正文，不发送 scope 或 actor 身�
   }
   assert.equal(dialogs.length, 10)
   assert.match(dialogs.at(-1)!.detail, /研究员甲.*成员 空格/s)
-  assert.match(dialogs.at(-1)!.detail, /删除影响.*独立会话甲.*历史无法追回.*新会话隔离/s)
+  assert.match(dialogs.at(-1)!.detail, /删除影响.*独立会话甲.*新一轮不再注入.*历史无法追回/s)
   assert.ok(dialogs.some(item => item.detail.includes('历史会话和任务记录保留作为审计')))
 })
 test('用户取消所有写入确认时绝不发送修改', async () => {

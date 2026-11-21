@@ -13,6 +13,7 @@ export interface InboundChannelMessage {
   chatType: 'single' | 'group'
   senderId: string
   text: string
+  quote?: string
   reply(text: string): Promise<void>
 }
 
@@ -101,7 +102,7 @@ export interface ChannelManagerOptions {
   epoch?: string
   /** 机器人配置变更或断开时，旧连接上的排队消息不能继续执行。 */
   acceptsMessage?(message: InboundChannelMessage): boolean
-  route?(text: string, chatKey: string, sessionScope: string): Promise<string | null>
+  route?(text: string, chatKey: string, sessionScope: string, source: { text: string; quote?: string; messageId: string; accountKey: string; paired: boolean }): Promise<string | null>
 }
 
 interface Conversation {
@@ -127,8 +128,10 @@ function accountKeyOf(message: InboundChannelMessage): string {
 }
 
 function messageDigest(message: InboundChannelMessage, accountKey: string): string {
-  return createHash('sha256').update(JSON.stringify([message.channel, accountKey, message.chatType, message.chatId,
-    message.senderId.trim()])).update('\0').update(message.text).digest('hex')
+  const hash = createHash('sha256').update(JSON.stringify([message.channel, accountKey, message.chatType, message.chatId,
+    message.senderId.trim()])).update('\0').update(message.text)
+  if (message.quote) hash.update('\0').update(message.quote)
+  return hash.digest('hex')
 }
 
 export function channelKeyOf(message: Pick<InboundChannelMessage, 'channel' | 'chatType' | 'chatId'>): string {
@@ -263,7 +266,8 @@ export class ChannelManager {
     // 排队期间只使用已登记的快照，外部对象后续变化不能改变要执行的委托。
     if (!incoming || typeof incoming !== 'object') return
     const message = Object.freeze({ channel: incoming.channel, accountId: incoming.accountId, msgid: incoming.msgid,
-      chatId: incoming.chatId, chatType: incoming.chatType, senderId: incoming.senderId, text: incoming.text, reply: incoming.reply })
+      chatId: incoming.chatId, chatType: incoming.chatType, senderId: incoming.senderId, text: incoming.text,
+      quote: typeof incoming.quote === 'string' ? incoming.quote.slice(0, MAX_MESSAGE_CHARS) : undefined, reply: incoming.reply })
     if (this.stopped || !validIdentifier(message.channel) || !/^[a-z0-9_-]+$/iu.test(message.channel) || !validIdentifier(message.msgid)
       || !validIdentifier(message.chatId) || !validIdentifier(message.senderId)
       || (message.accountId !== undefined && !validIdentifier(message.accountId))
@@ -354,6 +358,7 @@ export class ChannelManager {
   private async execute(message: InboundChannelMessage, key: string, scopedKey: string): Promise<string> {
     if (message.text.length > MAX_MESSAGE_CHARS) return `消息超过 ${MAX_MESSAGE_CHARS} 字，尚未处理；请分段发送。`
     const text = message.text.trim()
+    if (/^\/(?:新)?接续/u.test(text) || /汇报编号[：:\s]*[a-f0-9]{12}/iu.test(message.quote ?? '')) return this.answer(message, key, scopedKey)
     if (this.options.approve && (text === '允许' || text === '同意' || text === '拒绝')) {
       const decision = text === '拒绝' ? 'reject' : 'approve'
       const handled = this.options.approve(key, decision)
@@ -384,7 +389,8 @@ export class ChannelManager {
   private async answer(message: InboundChannelMessage, key: string, scopedKey: string): Promise<string> {
     let conversation = this.conversations.get(scopedKey)
     const sessionScope = createHash('sha256').update(scopedKey).digest('hex')
-    const routed = await this.options.route?.(promptFor(message), key, sessionScope)
+    const routed = await this.options.route?.(promptFor(message), key, sessionScope, { text: message.text,
+      quote: message.quote, messageId: message.msgid, accountKey: accountKeyOf(message), paired: message.chatType === 'single' && this.settings.deliverHere.includes(key) })
     if (routed !== null && routed !== undefined) return routed
     if (!conversation) {
       // 会话缓存按机器人隔离；宿主接收原渠道标识，供既有提醒工具识别会话。

@@ -65,7 +65,7 @@ function displayBody(body: RecordValue): RecordValue {
   if (typeof body.apiKey !== 'string' || !body.apiKey) return body
   return { ...body, apiKey: '（已输入新密钥；确认后保存到本机加密存储，此处不回显）' }
 }
-const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'reportMode', 'speechBy', 'persona', 'voiceProfile', 'voiceDesign', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone', 'kind', 'binding', 'apiKey']
+const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'reportMode', 'speechBy', 'persona', 'voiceProfile', 'voiceDesign', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone', 'scheduleWorkspaceId', 'kind', 'binding', 'apiKey']
 /** 子助理绑定（桥上白名单形状；https/回环等深度校验在插件 member-directory）。 */
 function subAssistantBinding(value: unknown): SubAssistantBinding {
   const bound = record(value)
@@ -90,6 +90,7 @@ function draft(value: RecordValue, writing = false): MemberDraft {
     kind: value.kind === undefined ? undefined : choice(value.kind, MEMBER_KINDS),
     binding: value.binding === undefined || value.binding === null ? (value.binding === null ? null : undefined) : subAssistantBinding(value.binding),
     apiKey: value.apiKey === undefined ? undefined : text(value.apiKey, 4096),
+    scheduleWorkspaceId: value.scheduleWorkspaceId == null ? value.scheduleWorkspaceId as null | undefined : identifier(value.scheduleWorkspaceId),
   }
   if (writing) {
     if (!next.displayName.trim() || !!next.provider.trim() !== !!next.model.trim() || next.allowedTools.length > 0) throw new Error('invalid_input')
@@ -97,7 +98,7 @@ function draft(value: RecordValue, writing = false): MemberDraft {
     new Intl.DateTimeFormat('zh-CN', { timeZone: next.timezone }).format()
   }
   // 可选字段未提供时不留空键：快照投影、确认弹窗与候选草稿的逐字段比对都按实际字段走。
-  for (const key of ['apiKey', 'kind', 'reportMode', 'binding'] as const) if (next[key] === undefined) delete next[key]
+  for (const key of ['apiKey', 'kind', 'reportMode', 'binding', 'scheduleWorkspaceId'] as const) if (next[key] === undefined) delete next[key]
   return next
 }
 /** 所有已知回包逐字段投影，绝不将服务凭据或附带调试字段交给渲染器。 */
@@ -110,6 +111,17 @@ export function projectMemberState(value: unknown): MemberSnapshot {
   let mailSendAttentionError: boolean | undefined
   let channelInboundAttention: MemberSnapshot['channelInboundAttention']
   let channelInboundAttentionError: boolean | undefined
+  let sharedMemories: MemberSnapshot['sharedMemories']
+  let sharedMemoriesError = source.sharedMemoriesError === true
+  if (source.sharedMemories !== undefined) {
+    try {
+      sharedMemories = list(source.sharedMemories, item => {
+        const memory = record(item)
+        return { id: identifier(memory.id), topic: text(memory.topic), text: text(memory.text),
+          revision: integer(memory.revision, 1), shared: bool(memory.shared) }
+      })
+    } catch { sharedMemoriesError = true }
+  }
   if (source.mailNoticeAttentionError !== undefined) {
     mailNoticeAttentionError = typeof source.mailNoticeAttentionError === 'boolean' ? source.mailNoticeAttentionError : true
   }
@@ -162,6 +174,11 @@ export function projectMemberState(value: unknown): MemberSnapshot {
   }
   return {
     enabled: bool(source.enabled), defaultModel: defaultModel && { provider: text(defaultModel.provider), model: text(defaultModel.model) },
+    ...(Array.isArray(source.workspaces) ? { workspaces: list(source.workspaces, item => {
+      const workspace = record(item)
+      return { id: identifier(workspace.id), title: text(workspace.title, 500), path: text(workspace.path, 4096) }
+    }) } : {}),
+    ...(sharedMemories ? { sharedMemories } : {}), ...(sharedMemoriesError ? { sharedMemoriesError } : {}),
     members: list(source.members, item => {
       const view = record(item), p = record(view.profile), q = record(view.quota), policy = record(p.toolPolicy)
       const profile: MemberProfile = {
@@ -221,7 +238,7 @@ function publicImpact(value: unknown, depth = 0): unknown {
 }
 interface Parsed { action: MemberAction; path: string; body: RecordValue; id?: string; memoryId?: string; requestId?: string; analysisId?: string; intentId?: string; channelId?: string }
 function parseCommand(action: unknown, raw: unknown): Parsed {
-  const a = choice(action, ['create', 'update', 'mode', 'delete', 'reset-quota', 'decide-request', 'ack-mail-notice', 'ack-mail-send', 'ack-channel-inbound', 'memory-create', 'memory-update', 'memory-confirm', 'memory-delete-preview', 'memory-delete', 'share-memory'] as const)
+  const a = choice(action, ['create', 'update', 'mode', 'new-session', 'delete', 'reset-quota', 'decide-request', 'ack-mail-notice', 'ack-mail-send', 'ack-channel-inbound', 'memory-create', 'memory-update', 'memory-confirm', 'memory-delete-preview', 'memory-delete', 'share-memory'] as const)
   const input = record(raw)
   /*
    * 记忆共享开关：它不属于任何成员，所以必须在下面那句 `identifier(input.id)` 之前拦掉
@@ -229,9 +246,9 @@ function parseCommand(action: unknown, raw: unknown): Parsed {
    * 不是对某一个成员的写入。
    */
   if (a === 'share-memory') {
-    keys(input, ['memoryId', 'shared'])
+    keys(input, ['memoryId', 'shared', 'expectedRevision'])
     return { action: a, path: '/companion/v1/memories/shared',
-      body: { memoryId: identifier(input.memoryId), shared: bool(input.shared) } }
+      body: { memoryId: identifier(input.memoryId), shared: bool(input.shared), expectedRevision: integer(input.expectedRevision, 1) } }
   }
   if (a === 'ack-channel-inbound') {
     keys(input, ['id', 'expectedRevision'])
@@ -276,6 +293,12 @@ function parseCommand(action: unknown, raw: unknown): Parsed {
     return { action: a, requestId, path: `${ROOT}/requests/${memberPathIdentifier(requestId)}/decide`, body }
   }
   const id = identifier(input.id), base = `${ROOT}/${memberPathIdentifier(id)}`
+  if (a === 'new-session') {
+    keys(input, ['id', 'expectedRevision', 'title'])
+    const title = text(input.title, 60).trim()
+    if (!title) throw new Error('invalid_input')
+    return { action: a, id, path: `${base}/new-session`, body: { expectedRevision: integer(input.expectedRevision, 1), title } }
+  }
   if (a === 'delete') {
     keys(input, ['id', 'expectedRevision', 'purgeMemory'])
     return { action: a, id, path: `${base}/delete`, body: {
@@ -401,6 +424,8 @@ export function registerMemberManagement(options: Options): () => void {
     saving = true
     try {
       const state = projectMemberState(await request(event, 'GET', ROOT))
+      const sharedMemory = command.action === 'share-memory' ? state.sharedMemories?.find(item => item.id === command.body.memoryId) : undefined
+      if (command.action === 'share-memory' && (!sharedMemory || sharedMemory.revision !== command.body.expectedRevision)) return failure('conflict')
       const quotaRequest = command.requestId ? state.requests.find(item => item.requestId === command.requestId) : undefined
       const mailNotice = command.analysisId ? state.mailNoticeAttention?.find(item => item.analysisId === command.analysisId) : undefined
       if (command.analysisId && (!mailNotice || mailNotice.attemptId !== command.body.attemptId || mailNotice.state !== command.body.expectedState)) return failure('conflict')
@@ -411,8 +436,8 @@ export function registerMemberManagement(options: Options): () => void {
       const id = command.id ?? quotaRequest?.assistantId
       const member = id ? state.members.find(item => item.profile.assistantId === id) : undefined
       if ((id && !member) || (command.requestId && (!quotaRequest || quotaRequest.state !== 'pending'))) return failure('conflict')
-      if (member?.busy && ['update', 'delete', 'reset-quota', 'decide-request'].includes(command.action)) return failure('busy')
-      if (command.action === 'update' && command.body.expectedRevision !== member?.profile.revision) return failure('conflict')
+      if (member?.busy && ['update', 'delete', 'reset-quota', 'decide-request', 'new-session'].includes(command.action)) return failure('busy')
+      if ((command.action === 'update' || command.action === 'new-session') && command.body.expectedRevision !== member?.profile.revision) return failure('conflict')
       if ('expectedQuotaRevision' in command.body && command.body.expectedQuotaRevision !== member?.quota.revision) return failure('conflict')
       if (command.action === 'decide-request' && command.body.decision === 'approve') {
         const change = record(command.body.change), quota = member!.quota
@@ -441,17 +466,20 @@ export function registerMemberManagement(options: Options): () => void {
         const preview = previews.get(String(command.body.previewId))
         if (!preview || preview.sender !== event.sender || preview.frame !== event.senderFrame || preview.id !== id
           || preview.memoryId !== command.memoryId || preview.revision !== command.body.expectedRevision || preview.expires < Date.now()) return failure('preview_required')
-        deletion = `\n删除影响：\n${JSON.stringify(preview.data.impact, null, 2)}\n已发送给模型的历史无法追回；后端使用新会话隔离后续上下文。`
+        deletion = `\n删除影响：\n${JSON.stringify(preview.data.impact, null, 2)}\n新一轮不再注入这条记忆。已发送给模型的历史无法追回。`
         previews.delete(String(command.body.previewId))
       }
       const labels: Record<MemberAction, string> = { create: '创建成员', update: '修改成员', mode: '切换团队模式', delete: '删除成员', 'reset-quota': '重置额度用量', 'decide-request': '决定额度申请', 'ack-mail-notice': '核对邮件通知', 'ack-mail-send': '核对邮件发送', 'ack-channel-inbound': '核查渠道消息',
+        'new-session': '新建独立会话',
         'memory-create': '本人确认新增记忆', 'memory-update': '修改记忆', 'memory-confirm': '本人确认记忆', 'memory-delete-preview': '预览删除', 'memory-delete': '删除记忆',
-  'share-memory': '把这条记忆共享给所有子助理' }
-      const target = channelIssue ? `渠道消息（${channelIssue.msgid}）` : mailNotice ? `邮件通知（${mailNotice.analysisId}）` : mailSend ? `邮件发送（${mailSend.intentId}）` : member ? `${member.profile.displayName}（${member.profile.assistantId}）` : command.action === 'create' ? `${command.body.displayName}（新成员）` : '整个团队'
+        'share-memory': command.body.shared ? '设为团队共享' : '设为仅总助理' }
+      const target = sharedMemory ? (sharedMemory.topic || '未分类记忆') : channelIssue ? `渠道消息（${channelIssue.msgid}）` : mailNotice ? `邮件通知（${mailNotice.analysisId}）` : mailSend ? `邮件发送（${mailSend.intentId}）` : member ? `${member.profile.displayName}（${member.profile.assistantId}）` : command.action === 'create' ? `${command.body.displayName}（新成员）` : '整个团队'
       // 正文包含完整精确字段；输入来自严格白名单，无凭据字段。确认期间使用冻结副本，不读取渲染器的新值。
       const processingLabel = { 'not-started': '未开始', running: '处理中', done: '处理流程已返回', unknown: '结果未知' }
       const replyLabel = { 'not-sent': '未发送', sending: '发送中', accepted: '服务已接受（不代表已读）', unknown: '结果未知' }
-      const detail = channelIssue ? `发送者：${channelIssue.senderId}\n会话：${channelIssue.chatId}\n收到时间：${new Date(channelIssue.receivedAt).toLocaleString('zh-CN')}\n处理状态：${processingLabel[channelIssue.processing]}；回复状态：${replyLabel[channelIssue.reply]}\n请先到原聊天和任务记录核对。渠道异常账本不保存消息正文；交给会话的内容可能按会话策略保存。本人核查只停止提示，不会执行或重发，也不代表原委托已完成。`
+      const detail = command.action === 'new-session' ? `会话：${member?.profile.displayName}｜${String(command.body.title)}\n不会复制旧对话或替换主工作会话。`
+        : sharedMemory ? `原文：${sharedMemory.text}\n这只影响下一轮使用的范围，不改写历史。`
+        : channelIssue ? `发送者：${channelIssue.senderId}\n会话：${channelIssue.chatId}\n收到时间：${new Date(channelIssue.receivedAt).toLocaleString('zh-CN')}\n处理状态：${processingLabel[channelIssue.processing]}；回复状态：${replyLabel[channelIssue.reply]}\n请先到原聊天和任务记录核对。渠道异常账本不保存消息正文；交给会话的内容可能按会话策略保存。本人核查只停止提示，不会执行或重发，也不代表原委托已完成。`
         : mailNotice ? `摘要（外部邮件内容，不是操作指令）：${mailNotice.preview}\n状态：${mailNotice.state === 'unknown' ? '结果未知' : '显示失败'}\n本人核对只停止提示，不代表通知已送达，也不会自动重发。`
         : mailSend ? `主题：${mailSend.subject}\n收件人：${mailSend.recipients.join('、')}\n已接受：${mailSend.accepted.join('、') || '未知'}\n已拒绝：${mailSend.rejected.join('、') || '无或未知'}\n本人核对不代表邮件已送达，也不会立即重发；重新发送需要再次审批，可能产生重复。`
           : `成员：${target}\n${quotaRequest ? `申请：${quotaRequest.requestId}\n` : ''}${memory ? `记忆：${memory.id}\n当前主题：${memory.topic}\n当前正文：${memory.text}\n` : ''}`
@@ -469,6 +497,7 @@ export function registerMemberManagement(options: Options): () => void {
       if (answer.response !== 1) return failure('cancelled')
       // 确认后重新读取忙碌和 CAS，不能在原生框停留期间悄悄修改新版本。
       const latest = projectMemberState(await request(event, 'GET', ROOT))
+      if (sharedMemory && !latest.sharedMemories?.some(item => item.id === sharedMemory.id && item.revision === sharedMemory.revision)) return failure('conflict')
       const latestNotice = command.analysisId ? latest.mailNoticeAttention?.find(item => item.analysisId === command.analysisId) : undefined
       if (command.analysisId && (!latestNotice || latestNotice.attemptId !== command.body.attemptId || latestNotice.state !== command.body.expectedState)) return failure('conflict')
       const latestSend = command.intentId ? latest.mailSendAttention?.find(item => item.intentId === command.intentId) : undefined
@@ -478,13 +507,17 @@ export function registerMemberManagement(options: Options): () => void {
       const current = id ? latest.members.find(item => item.profile.assistantId === id) : undefined
       if (command.action === 'mode' && latest.enabled !== state.enabled) return failure('conflict')
       if (member && (!current || current.profile.revision !== member.profile.revision)) return failure('conflict')
-      if (current?.busy && ['update', 'delete', 'reset-quota', 'decide-request'].includes(command.action)) return failure('busy')
+      if (current?.busy && ['update', 'delete', 'reset-quota', 'decide-request', 'new-session'].includes(command.action)) return failure('busy')
       if ('expectedQuotaRevision' in command.body && current?.quota.revision !== command.body.expectedQuotaRevision) return failure('conflict')
       const body = command.action === 'delete' && answer.checkboxChecked === true
         ? { ...command.body, purgeMemory: true }
         : command.body
-      await request(event, 'POST', command.path, body, { keepConflictMessage: command.action === 'delete' })
+      const result = await request(event, 'POST', command.path, body, { keepConflictMessage: command.action === 'delete' || command.action === 'new-session' })
       try { options.changed?.() } catch { /* 已经落库，刷新失败不影响结果 */ }
+      if (command.action === 'new-session') {
+        const view = record(result)
+        return { ok: true, data: { sessionId: identifier(view.sessionId), title: text(view.title, 60) } }
+      }
       return { ok: true }
     } finally { saving = false }
   }))

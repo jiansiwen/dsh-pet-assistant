@@ -77,11 +77,13 @@ export function createWeComAdapter(options: WeComAdapterOptions): ChannelAdapter
     const senderId = typeof objectOf(body.from)?.userid === 'string' ? String(objectOf(body.from)!.userid) : ''
     const chatId = chatType === 'group' ? (typeof body.chatid === 'string' ? body.chatid : '') : senderId
     const text = textOf(body).trim()
+    const quote = objectOf(objectOf(body.quote)?.text)?.content
     if (!msgid || !chatType || !senderId || !chatId || !text) return
     // 当前 SDK 回复只使用 req_id；入队后不再引用可变的原始事件或消息正文。
     const replyFrame: FrameLike = { headers: { req_id: frame.headers?.req_id } }
     void options.onMessage({
       channel: 'wecom', accountId: options.botId, msgid, chatId, chatType, senderId, text,
+      ...(typeof quote === 'string' ? { quote } : {}),
       reply: message => replyTo(source, replyFrame, message),
     }).catch(() => {
       options.log('[wecom] 处理消息未完成，请在桌面核查；不会自动重发')

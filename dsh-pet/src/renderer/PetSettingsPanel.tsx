@@ -1,9 +1,9 @@
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { arrayBufferToBase64, recordDictation } from './dictation.js'
 import type { ResidencyPatch, ResidencyState, SettingsPage } from './types.js'
 import type { FastReplyInput, FastReplySnapshot } from '../main/fast-reply.js'
 import { registerCharacterHitbox, unregisterCharacterHitbox } from './stage-layout.js'
-import { settingsNavGroups, settingsPageMeta } from './settings-nav.js'
+import { settingsNavGroups, settingsOverview, settingsPageMeta, settingsRows } from './settings-nav.js'
 
 interface Props {
   page: SettingsPage
@@ -11,22 +11,28 @@ interface Props {
   onClose(): void
   children: React.ReactNode
   quotaPending?: number
+  status?: Partial<Record<SettingsPage, string>>
+  values?: Partial<Record<SettingsPage, string>>
 }
 
-export default function PetSettingsPanel({ page, onPage, onClose, children, quotaPending = 0 }: Props) {
+export default function PetSettingsPanel({ page, onPage, onClose, children, quotaPending = 0, status, values }: Props) {
   const panel = useRef<HTMLDivElement | null>(null)
   const content = useRef<HTMLDivElement | null>(null)
-  /**
-   * 切页时把滚动位置归零。
-   *
-   * 两处都要归零：`.management-content` 带 `scroll-padding`，在某些窗口尺寸下自身会成为滚动
-   * 容器；而更常见的情况是外层 `.pet-management` 在滚。只清前者时，切到内容更短的一页会
-   * 出现"停在半空"——用户看到的是空白，以为页面没加载。
-   */
+  const dialog = useRef<HTMLDialogElement | null>(null)
+  const [query, setQuery] = useState('')
+  const [category, setCategory] = useState<SettingsPage>()
+  const overview = settingsOverview(page)
+  const activeCategory = category && settingsOverview(category) === overview ? category : undefined
+  const detail = page !== overview && page !== 'chat'
+
   useLayoutEffect(() => {
     if (content.current) content.current.scrollTop = 0
-    if (panel.current) panel.current.scrollTop = 0
-  }, [page])
+  }, [overview, activeCategory])
+  useLayoutEffect(() => {
+    const element = dialog.current
+    if (detail && element && !element.open) element.showModal()
+    return () => { if (element?.open) element.close() }
+  }, [detail])
   useLayoutEffect(() => {
     const element = panel.current
     if (!element) return
@@ -42,15 +48,15 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
   }, [])
 
   const groups = settingsNavGroups()
-  const meta = settingsPageMeta(page)
-
-  /*
-   * 标题区只留三样：方印、当前页标题、一句话说明。
-   *
-   * 上一版这里是「小潘 · 桌面伙伴 / 设置与管理 / 一句说明」三行堆叠，正文开头又重复一遍
-   * 「第 N 项 / 页名 + 页名」——同一个页名在一屏里出现两次，中间夹着一个 10px 加字距的眉标。
-   * 眉标与序号都不编码信息（九项是菜单不是序列），一并删掉；标题层级靠字号差就能立住。
-   */
+  const items = groups[overview === 'workbench' ? 0 : 1].items
+  const meta = settingsPageMeta(overview)
+  const itemMeta = settingsPageMeta(page)
+  const rows = settingsRows(overview, query, activeCategory)
+  const selectCategory = (next: 'workbench' | 'settings', id?: SettingsPage) => {
+    setQuery('')
+    setCategory(id)
+    onPage(next)
+  }
   return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台">
     <header className="management-header">
       <div className="management-brand" aria-hidden="true">潘</div>
@@ -58,26 +64,50 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
         <h2>{meta.title}</h2>
         <p className="management-header-sub">{meta.summary}</p>
       </div>
-      <button type="button" onClick={onClose} aria-label="关闭设置">×</button>
+      <button type="button" onClick={onClose} aria-label={`关闭${meta.title}`}>×</button>
     </header>
     <nav className="management-tabs" aria-label="功能与设置">
-      {groups.map(group => (
-        <Fragment key={group.id}>
-          {/* 组标题只是分组，不可点：它不是页面，点它没有去处。 */}
-          <div className="management-nav-group" role="presentation">{group.label}</div>
-          {group.items.map(item => (
-            <button key={item.id} id={`panel-tab-${item.id}`} type="button"
-              aria-current={page === item.id ? 'page' : undefined} onClick={() => onPage(item.id)}>
-              <span>{item.title}</span>
-              {item.id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
-            </button>
-          ))}
-        </Fragment>
-      ))}
+      <div className="management-modes" role="group" aria-label="切换工作台和设置">
+        {(['workbench', 'settings'] as const).map(mode => <button key={mode} type="button"
+          aria-pressed={overview === mode} onClick={() => selectCategory(mode)}>{settingsPageMeta(mode).title}</button>)}
+      </div>
+      <button type="button" aria-current={!activeCategory ? 'page' : undefined} onClick={() => selectCategory(overview)}>
+        {overview === 'settings' ? '全部设置' : '全部功能'}
+      </button>
+      {items.map(item => <button key={item.id} id={`panel-tab-${item.id}`} type="button"
+        aria-current={activeCategory === item.id ? 'page' : undefined}
+        onClick={() => item.id === 'chat' ? onPage(item.id) : selectCategory(overview, item.id)}>
+        <span>{item.title}</span>
+        {item.id === 'team' && quotaPending > 0 && <span className="panel-tab-badge" aria-label={`${quotaPending}条额度申请待处理`}>{quotaPending}</span>}
+      </button>)}
     </nav>
-    <div className="management-content" ref={content} key={page}>
-      {children}
+    <div className="management-content" ref={content}>
+      <div className="management-overview-tools">
+        <h3 id="management-overview-title">{activeCategory ? settingsPageMeta(activeCategory).title : overview === 'settings' ? '全部设置' : '全部功能'}</h3>
+        <input className="management-search" type="search" aria-label={`搜索${meta.title}`} value={query}
+          placeholder="按功能名称或说明搜索" onChange={event => setQuery(event.target.value)} />
+      </div>
+      <div className="management-table-scroll"><table className="management-overview" aria-labelledby="management-overview-title">
+        <thead><tr><th scope="col">功能</th><th scope="col">状态</th><th scope="col">当前配置</th><th scope="col">详情</th></tr></thead>
+        <tbody>{rows.map(item => <tr key={item.id}>
+          <th scope="row">{item.title}</th>
+          <td><span className="management-state" data-known={status?.[item.id] ? 'true' : undefined}>{status?.[item.id] ?? '—'}</span></td>
+          <td>{values?.[item.id] ?? item.summary}</td>
+          <td><button className="management-link" aria-label={item.id === 'chat' ? '打开对话' : `查看${item.title}详情`} type="button" onClick={() => onPage(item.id)}>
+            {item.id === 'chat' ? '打开对话' : '查看详情'}
+          </button></td>
+        </tr>)}</tbody>
+      </table></div>
+      {rows.length === 0 && <p className="management-hint" role="status">没有匹配的功能，可以清空搜索再试。</p>}
     </div>
+    {detail && <dialog className="management-detail" ref={dialog} aria-labelledby="management-detail-title"
+      onCancel={event => { event.preventDefault(); onPage(overview) }}>
+      <header className="management-header">
+        <div className="management-brand-copy"><h2 id="management-detail-title">{itemMeta.title}</h2><p className="management-header-sub">{itemMeta.summary}</p></div>
+        <button type="button" onClick={() => onPage(overview)} aria-label="关闭详情">×</button>
+      </header>
+      <div className="management-detail-body" key={page}>{children}</div>
+    </dialog>}
   </section>
 }
 
@@ -96,14 +126,15 @@ export interface ResidencySettingsProps {
   readonly activity: { active: boolean; capturing: boolean; titles: boolean } | null
   readonly onOpenActivity: () => void
   readonly showToast: (text: string) => void
+  readonly section?: 'voice' | 'startup'
 }
 
 const ENGINE_LABEL: Record<'system' | 'kws', string> = {
-  system: 'Windows 系统语音识别（默认）',
+  system: 'Windows 系统语音识别',
   kws: '本地唤醒模型（sherpa KWS，实验性）',
 }
 
-export function ResidencySettings({ activity, onOpenActivity, showToast }: ResidencySettingsProps) {
+export function ResidencySettings({ activity, onOpenActivity, showToast, section = 'voice' }: ResidencySettingsProps) {
   const [state, setState] = useState<ResidencyState | null>(null)
   const [saving, setSaving] = useState(false)
   useEffect(() => {
@@ -130,32 +161,35 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnosis, setDiagnosis] = useState<Array<{ name: string; ok: boolean; detail: string }>>([])
   const [enrollStep, setEnrollStep] = useState(0)
+  const [enrollReady, setEnrollReady] = useState(false)
 
   /** 录 3 次唤醒词；每次说完停一下自动收尾。录音只在内存里，交给主进程提取后即丢弃。 */
-  const enrollVoice = async (wakeName: string): Promise<void> => {
+  const enrollVoice = async (): Promise<void> => {
     if (enrolling) return
     setEnrolling(true)
     const wavs: string[] = []
     try {
       for (let i = 0; i < 3; i++) {
         setEnrollStep(i + 1)
-        // 留一拍让界面把"第几次"显示出来，用户看到提示再开口。
-        await new Promise(resolve => setTimeout(resolve, 900))
-        const granted = await window.petApi.asrBegin()
+        setEnrollReady(false)
+        const granted = await window.petApi.asrBegin({ voiceprint: true })
         if (!granted.ok) { showToast(granted.error ?? '麦克风不可用'); return }
-        const { wav, error } = await recordDictation({ maxDurationMs: 4000, outputSampleRate: 16000 })
-        await window.petApi.asrStreamStop().catch(() => undefined)
-        if (!wav) { showToast(error ?? '没有录到声音，请靠近麦克风重试'); return }
-        wavs.push(arrayBufferToBase64(wav))
+        try {
+          const { wav, error } = await recordDictation({ maxDurationMs: 4000, outputSampleRate: 16000, onReady: () => setEnrollReady(true) })
+          if (!wav) { showToast(`第 ${i + 1} 段未录到：${error ?? '请检查麦克风并重试'}`); return }
+          wavs.push(arrayBufferToBase64(wav))
+        } finally { await window.petApi.asrStreamStop().catch(() => undefined) }
       }
+      setEnrollStep(0)
       const result = await window.petApi.voiceprintEnroll(wavs)
       if (!result.ok) { showToast(result.error ?? '声纹注册失败'); return }
-      showToast(`声纹已注册（${result.count ?? wavs.length} 段）；现在只认你的声音唤醒`)
+      showToast(`已保存 ${result.count ?? wavs.length} 段声纹；是否用声纹验证取决于当前唤醒设置。`)
     } catch (cause) {
       showToast(cause instanceof Error ? cause.message : '声纹注册失败')
     } finally {
       setEnrolling(false)
       setEnrollStep(0)
+      setEnrollReady(false)
     }
   }
 
@@ -173,7 +207,7 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
   }
 
   if (state === null) {
-    return <section className="management-section" aria-label="常驻与语音"><h3>常驻与语音</h3><p className="management-hint">正在读取开关状态…</p></section>
+    return <p className="management-hint">正在读取开关状态…</p>
   }
   const wake = state.wake
   const wakeStatus = !wake.enabled ? '已关闭，不在监听'
@@ -184,14 +218,25 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
     : activity.capturing ? `采样中${activity.titles ? '（含窗口标题）' : '（不含窗口标题）'}`
     : activity.active ? '模式已开启，但未在采样' : '已关闭'
 
+  if (section === 'startup') return <section className="management-section" aria-label="启动与常驻">
+    <h3>启动与常驻</h3>
+    <label className="management-voice">
+      <input type="checkbox" checked={state.trayResident} disabled={saving}
+        onChange={event => void apply({ trayResident: event.target.checked }, '托盘常驻设置未保存')} />
+      托盘常驻：隐藏角色后仍保留托盘入口
+    </label>
+    <label className="management-voice">
+      <input type="checkbox" checked={state.launchAtLogin.enabled} disabled={saving || !state.launchAtLogin.supported}
+        onChange={event => void apply({ launchAtLogin: event.target.checked }, '开机自启设置未保存')} />
+      开机自启{!state.launchAtLogin.supported && '（这个系统上不支持）'}
+    </label>
+    <p className="management-hint" role="status">活动记录：{activityText}</p>
+    <button className="management-button" onClick={onOpenActivity}>去会话里开启活动记录（需在审批卡确认）</button>
+  </section>
+
   return (
-    <section className="management-section" aria-label="常驻与语音">
-      <h3>常驻与语音</h3>
-      <label className="management-voice">
-        <input type="checkbox" checked={state.trayResident} disabled={saving}
-          onChange={event => void apply({ trayResident: event.target.checked }, '托盘常驻设置未保存')} />
-        托盘常驻：隐藏角色后仍保留托盘入口（唤醒是否监听看下一项）
-      </label>
+    <section className="management-section" aria-label="语音唤醒与声纹">
+      <h3>语音唤醒与声纹</h3>
       <label className="management-voice">
         <input type="checkbox" checked={wake.enabled} disabled={saving || wake.engines.length === 0}
           onChange={event => void apply({ wakeEnabled: event.target.checked }, '唤醒设置未保存')} />
@@ -266,7 +311,7 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
         关闭时，正在回答或讲解时喊它不会被响应；讲解文档时始终可以打断提问。
       </p>
       {enrollStep > 0 && (
-        <p className="management-hint" role="status">第 {enrollStep}/3 次：请说「{wake.name}」，说完停一下。</p>
+        <p className="management-hint" role="status">第 {enrollStep}/3 次：{enrollReady ? `请说「${wake.name}」，说完停一下。` : '正在打开麦克风，请稍候。'}</p>
       )}
       {/*
         声纹自检：把"注册失败"背后的英文原始报错逐层暴露出来。
@@ -286,7 +331,7 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
           </li>)}
         </ul>
       )}
-      <button className="management-button" disabled={saving || enrolling} onClick={() => void enrollVoice(wake.name)}>
+      <button className="management-button" disabled={saving || enrolling} onClick={() => void enrollVoice()}>
         {enrolling ? '正在录制…' : wake.voiceprint.registered ? '重新录制声纹（3 次）' : '录制声纹（3 次）'}
       </button>
       {wake.voiceprint.registered && (
@@ -319,17 +364,10 @@ export function ResidencySettings({ activity, onOpenActivity, showToast }: Resid
       {wake.enabled && wake.problem !== null && (
         <button className="management-button" disabled={saving} onClick={() => void apply({ retryWake: true }, '重试失败')}>重新监听唤醒词</button>
       )}
-      <p className="management-hint" role="status">活动记录：{activityText}</p>
-      <button className="management-button" onClick={onOpenActivity}>去会话里开启活动记录（需在审批卡确认）</button>
-      <label className="management-voice">
-        <input type="checkbox" checked={state.launchAtLogin.enabled} disabled={saving || !state.launchAtLogin.supported}
-          onChange={event => void apply({ launchAtLogin: event.target.checked }, '开机自启设置未保存')} />
-        开机自启{state.launchAtLogin.supported ? '（关闭时不写系统启动项）' : '（这个系统上不支持）'}
-      </label>
       <label className="management-voice">
         <input type="checkbox" checked={state.bargeIn.enabled} disabled={saving}
           onChange={event => void apply({ bargeIn: event.target.checked }, '外放插话设置未保存')} />
-        外放插话（实验）：朗读时直接开口即可打断，朗读改由界面播放以便回声消除；音频只在本机处理
+        外放插话（实验）：朗读时先说「停一下」再提问，普通讨论不会打断。界面播放帮助减少回声；如选用了在线识别，插话音频会发给该服务
       </label>
       {state.bargeIn.enabled && state.bargeIn.problem !== null && <p className="management-hint" role="status">插话监听中断：{state.bargeIn.problem}</p>}
       {state.bargeIn.enabled && state.bargeIn.lastMetrics.length > 0 && (
