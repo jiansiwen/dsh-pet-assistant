@@ -63,9 +63,12 @@ export class PlatformAgent {
           : `平台请求失败（HTTP ${response.status}），请稍后重试` }
       }
       const body = await boundedBody(response, MB)
-      let parsed: unknown
-      try { parsed = JSON.parse(body.toString('utf8')) } catch { return { kind: 'error', text: '平台响应不是有效 JSON' } }
-      const content = (parsed as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]?.message?.content
+      const text = body.toString('utf8')
+      // 部分平台（如公司 agentChat）忽略 stream:false 恒返 SSE；按 content-type 分流解析。
+      const content = (response.headers.get('content-type') ?? '').includes('text/event-stream')
+        ? sseContent(text)
+        : nonStreamContent(text)
+      if (content === null) return { kind: 'error', text: '平台响应不是有效 JSON' }
       if (typeof content !== 'string' || content.length === 0) return { kind: 'error', text: '平台响应缺少回复内容' }
       return tryProtocolReceipt(content)
     } catch {
@@ -75,6 +78,30 @@ export class PlatformAgent {
       clearTimeout(timer)
     }
   }
+}
+
+/** 非流式 OpenAI 回包：choices[0].message.content；坏 JSON 返回 null 由调用方如实报错。 */
+function nonStreamContent(text: string): unknown {
+  try {
+    const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> }
+    return parsed.choices?.[0]?.message?.content
+  } catch { return null }
+}
+
+/** SSE 回包：逐行累加 data: 块里的 delta.content（兼容 message.content），忽略注释与 [DONE]。 */
+function sseContent(text: string): string {
+  let acc = ''
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue
+    const payload = line.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') continue
+    try {
+      const chunk = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: unknown }; message?: { content?: unknown } }> }
+      const piece = chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.message?.content
+      if (typeof piece === 'string') acc += piece
+    } catch { /* 单块坏 JSON 不毁整条回复 */ }
+  }
+  return acc
 }
 
 async function boundedBody(response: Response, maximum: number): Promise<Buffer> {
