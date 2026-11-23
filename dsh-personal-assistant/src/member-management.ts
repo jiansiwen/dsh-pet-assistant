@@ -16,7 +16,8 @@ const roleStyle = z.object({
 /** 子助理绑定（桥上白名单形状；https/回环等深度校验在 member-directory.normalizeBinding）。 */
 const binding = z.union([
   z.object({ kind: z.literal('platform'), endpoint: z.string().trim().min(1).max(2048),
-    model: z.string().trim().min(1).max(256), secretId: z.string().max(100).default('') }).strict(),
+    model: z.string().trim().max(256).default(''), agentId: z.string().trim().max(128).default(''),
+    secretId: z.string().max(100).default('') }).strict(),
   z.object({ kind: z.literal('local-cli'), command: z.string().trim().min(1).max(2048),
     args: z.array(z.string().min(1).max(1024)).max(32).default([]) }).strict(),
 ])

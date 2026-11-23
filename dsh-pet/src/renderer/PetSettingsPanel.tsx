@@ -4,6 +4,7 @@ import type { ResidencyPatch, ResidencyState, SettingsPage } from './types.js'
 import type { FastReplyInput, FastReplySnapshot } from '../main/fast-reply.js'
 import { registerCharacterHitbox, unregisterCharacterHitbox } from './stage-layout.js'
 import { settingsNavGroups, settingsOverview, settingsPageMeta, settingsRows } from './settings-nav.js'
+import { dragPanelPosition } from './settings-panel-drag.ts'
 
 interface Props {
   page: SettingsPage
@@ -24,6 +25,34 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
   const overview = settingsOverview(page)
   const activeCategory = category && settingsOverview(category) === overview ? category : undefined
   const detail = page !== overview && page !== 'chat'
+  /** 默认右上角；拖动标题栏时在窗口可见区域内移动浮层。 */
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null)
+  const dragCleanup = useRef<(() => void) | null>(null)
+  useEffect(() => () => dragCleanup.current?.(), [])
+  const onHeaderMouseDown = (event: React.MouseEvent) => {
+    if (event.button !== 0 || (event.target as Element).closest('button')) return
+    const node = panel.current
+    if (!node) return
+    event.preventDefault()
+    dragCleanup.current?.()
+    const rect = node.getBoundingClientRect()
+    const origin = { x: rect.left, y: rect.top }
+    const start = { x: event.clientX, y: event.clientY }
+    const move = (ev: MouseEvent) => {
+      setPos(dragPanelPosition(origin, { x: ev.clientX - start.x, y: ev.clientY - start.y },
+        { width: node.offsetWidth, height: node.offsetHeight }, { width: window.innerWidth, height: window.innerHeight }))
+    }
+    const stop = () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', stop)
+      window.removeEventListener('blur', stop)
+      dragCleanup.current = null
+    }
+    dragCleanup.current = stop
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', stop)
+    window.addEventListener('blur', stop)
+  }
 
   useLayoutEffect(() => {
     if (content.current) content.current.scrollTop = 0
@@ -46,6 +75,12 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
     window.addEventListener('resize', measure)
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__settings__') }
   }, [])
+  // ResizeObserver 不监听位置变化；拖动后必须同步更新命中盒，否则新位置会点击穿透。
+  useLayoutEffect(() => {
+    if (!panel.current || pos === null) return
+    const rect = panel.current.getBoundingClientRect()
+    registerCharacterHitbox('__settings__', { x1: rect.left, y1: rect.top, x2: rect.right, y2: rect.bottom })
+  }, [pos])
 
   const groups = settingsNavGroups()
   const items = groups[overview === 'workbench' ? 0 : 1].items
@@ -57,8 +92,9 @@ export default function PetSettingsPanel({ page, onPage, onClose, children, quot
     setCategory(id)
     onPage(next)
   }
-  return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台">
-    <header className="management-header">
+  return <section className="pet-management" ref={panel} data-interactive aria-label="小潘桌面伙伴控制台"
+    style={pos ? { left: pos.x, top: pos.y, right: 'auto' } : undefined}>
+    <header className="management-header" onMouseDown={onHeaderMouseDown}>
       <div className="management-brand" aria-hidden="true">潘</div>
       <div className="management-brand-copy">
         <h2>{meta.title}</h2>

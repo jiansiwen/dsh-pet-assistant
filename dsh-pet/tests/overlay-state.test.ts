@@ -19,17 +19,19 @@ test('内部区域、菜单或管理交互不自动收起；隐藏状态不重�
   assert.equal(shouldDismissOverlay({ ...visible, blocked: true }, outside), false)
   assert.equal(shouldDismissOverlay({ ...visible, open: false }, outside), false)
 })
-test('固定头顶：始终挂在头顶，宠物贴边时允许超出屏幕', () => {
+test('固定头顶：完整可见时钉在头顶，被屏幕裁掉时改走避让', () => {
   const viewport = { width: 1536, height: 864 }
   const size = { width: 440, height: 400 }
-  assert.deepEqual(overlayPosition({ x: 500, y: 700 }, size, 150, viewport, 'top'), { x: 355, y: 292 })
-  assert.deepEqual(overlayPosition({ x: 100, y: 8 }, size, 150, viewport, 'top'), { x: -45, y: -400 })
+  // 间隙 12px：横向取角色中心，底边离角色头顶 12px；side 表明这次挂在哪个方向。
+  assert.deepEqual(overlayPosition({ x: 500, y: 700 }, size, 150, viewport, 'top'), { x: 355, y: 288, side: 'above' })
+  // 贴屏幕顶部时头顶根本放不下：此时硬钉会把对话框推出屏幕，所以落到角色下方并夹回视口。
+  assert.deepEqual(overlayPosition({ x: 100, y: 8 }, size, 150, viewport, 'top'), { x: 8, y: 170, side: 'below' })
 })
 test('自适应：上方放不下时换到下方，左右也不够时换到侧面', () => {
   const viewport = { width: 1536, height: 864 }
   const size = { width: 440, height: 400 }
-  assert.deepEqual(overlayPosition({ x: 700, y: 8 }, size, 150, viewport, 'auto'), { x: 555, y: 166 })
-  assert.deepEqual(overlayPosition({ x: 0, y: 400 }, size, 150, viewport, 'auto'), { x: 158, y: 275 })
+  assert.deepEqual(overlayPosition({ x: 700, y: 8 }, size, 150, viewport, 'auto'), { x: 555, y: 170, side: 'below' })
+  assert.deepEqual(overlayPosition({ x: 0, y: 400 }, size, 150, viewport, 'auto'), { x: 162, y: 275, side: 'right' })
 })
 test('自适应：四个方向都放不下时选溢出最少的并整体夹回视口', () => {
   const positioned = overlayPosition(
@@ -39,7 +41,8 @@ test('自适应：四个方向都放不下时选溢出最少的并整体夹回�
     { width: 300, height: 300 },
     'auto',
   )
-  assert.deepEqual(positioned, { x: 75, y: 8 })
+  // side 是给界面画朝向用的，跟坐标一起返回；夹回只改坐标，不改这次选中的方向。
+  assert.deepEqual(positioned, { x: 75, y: 8, side: 'above' })
 })
 test('屏幕命中区域与命令只接受有效边界输入', () => {
   assert.equal(validBoxes([box]), true)

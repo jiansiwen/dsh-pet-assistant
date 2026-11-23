@@ -398,24 +398,86 @@
   line-height: 1;
 }
 
-/* 唯一装饰：从面板底部中心连向宠物的短连接，不参与命中检测。 */
+/* 唯一装饰：从面板朝向宠物的短连接，不参与命中检测；朝向随 data-dock-side 变。 */
 .chat-hud .hud-anchor {
   position: absolute;
+  pointer-events: none;
+}
+
+.chat-hud[data-dock-side='above'] .hud-anchor,
+.chat-hud:not([data-dock-side]) .hud-anchor {
   left: 50%;
   top: 100%;
   width: 22px;
   height: 8px;
   transform: translateX(-50%);
   border-top: 1px solid var(--hud-edge);
-  pointer-events: none;
 }
 
-.chat-hud .hud-anchor::after {
+.chat-hud[data-dock-side='above'] .hud-anchor::after,
+.chat-hud:not([data-dock-side]) .hud-anchor::after {
   content: '';
   display: block;
   width: 1px;
   height: 7px;
   margin: 0 auto;
+  background: var(--hud-edge);
+  box-shadow: 0 0 4px rgba(117, 202, 232, 0.3);
+}
+
+.chat-hud[data-dock-side='below'] .hud-anchor {
+  left: 50%;
+  bottom: 100%;
+  width: 22px;
+  height: 8px;
+  transform: translateX(-50%);
+  border-bottom: 1px solid var(--hud-edge);
+}
+
+.chat-hud[data-dock-side='below'] .hud-anchor::after {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 7px;
+  margin: 0 auto;
+  background: var(--hud-edge);
+  box-shadow: 0 0 4px rgba(117, 202, 232, 0.3);
+}
+
+.chat-hud[data-dock-side='left'] .hud-anchor {
+  left: 100%;
+  top: 50%;
+  width: 8px;
+  height: 22px;
+  transform: translateY(-50%);
+  border-left: 1px solid var(--hud-edge);
+}
+
+.chat-hud[data-dock-side='left'] .hud-anchor::after {
+  content: '';
+  display: block;
+  width: 7px;
+  height: 1px;
+  margin: 10px 0 0;
+  background: var(--hud-edge);
+  box-shadow: 0 0 4px rgba(117, 202, 232, 0.3);
+}
+
+.chat-hud[data-dock-side='right'] .hud-anchor {
+  right: 100%;
+  top: 50%;
+  width: 8px;
+  height: 22px;
+  transform: translateY(-50%);
+  border-right: 1px solid var(--hud-edge);
+}
+
+.chat-hud[data-dock-side='right'] .hud-anchor::after {
+  content: '';
+  display: block;
+  width: 7px;
+  height: 1px;
+  margin: 10px 0 0 auto;
   background: var(--hud-edge);
   box-shadow: 0 0 4px rgba(117, 202, 232, 0.3);
 }

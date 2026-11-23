@@ -5328,7 +5328,7 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
       layoutVersion: settings.layoutVersion,
       idleSleepMinutes: settings.idleSleepMinutes,
       sleepMinutes: settings.sleepMinutes,
-      chatDock: settings.chatDock ?? 'top',
+      chatDock: settings.chatDock ?? 'auto',
       chatSize: settings.chatSize,
       // 讲解形态与外观档位也要回读：设置页靠 get-state 回显，缺一项就会永远显示默认值。
       // （`docSpeechMode` 此前没在这里出现，等于"存得进去、读不回来"，这次一并补上。）

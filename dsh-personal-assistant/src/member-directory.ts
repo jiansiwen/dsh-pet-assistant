@@ -132,9 +132,12 @@ function normalizeBinding(kind: MemberKind, value: unknown): SubAssistantBinding
   const record = value as Record<string, unknown>
   if (kind === 'expert') throw new Error('普通成员不使用外部绑定')
   if (kind === 'platform') {
-    if (Object.keys(record).some(key => !['kind', 'endpoint', 'model', 'secretId'].includes(key))) throw new Error('平台绑定包含未知字段')
+    if (Object.keys(record).some(key => !['kind', 'endpoint', 'model', 'agentId', 'secretId'].includes(key))) throw new Error('平台绑定包含未知字段')
     if (record.kind !== 'platform') throw new Error('绑定类型与成员类型不一致')
-    return { kind: 'platform', endpoint: platformEndpoint(record.endpoint), model: printable(String(record.model ?? ''), '平台模型名', 200, true),
+    const agentId = printable(String(record.agentId ?? ''), '智能体 ID', 128, false)
+    const model = printable(String(record.model ?? ''), '平台模型名', 200, agentId === '')
+    if (model === '' && agentId === '') throw new Error('平台绑定需填写模型名或智能体 ID')
+    return { kind: 'platform', endpoint: platformEndpoint(record.endpoint), model, agentId,
       secretId: printable(String(record.secretId ?? ''), '密钥标识', 64, false) }
   }
   if (Object.keys(record).some(key => !['kind', 'command', 'args'].includes(key))) throw new Error('本地工具绑定包含未知字段')

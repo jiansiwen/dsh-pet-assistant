@@ -331,7 +331,8 @@ test('十一种动作固定路径与 CAS 正文，不发送 scope 或 actor 身�
     assert.equal(result.ok, true, JSON.stringify({ action, result }))
     assert.deepEqual(writes().at(-1), { method: 'POST', path, body, subject: 'owner' })
   }
-  assert.equal(dialogs.length, 10)
+  // 11 例里 memory-delete-preview 在写入前就返回、不弹框；update 的原配置+改动超过一页要翻两次。
+  assert.equal(dialogs.length, 11)
   assert.match(dialogs.at(-1)!.detail, /研究员甲.*成员 空格/s)
   assert.match(dialogs.at(-1)!.detail, /删除影响.*独立会话甲.*新一轮不再注入.*历史无法追回/s)
   assert.ok(dialogs.some(item => item.detail.includes('历史会话和任务记录保留作为审计')))
@@ -352,16 +353,20 @@ test('用户取消所有写入确认时绝不发送修改', async () => {
 })
 test('确认时输入已复制并冻结，重复写入被挡，确认内容与最终正文一致', async () => {
   mount()
-  let resolve!: (value: { response: number }) => void
-  confirm = () => new Promise(done => { resolve = done })
+  // 修改成员的正文要翻两页：只卡住第一页，后面几页立即放行，否则会一直等第二个确认。
+  let release!: () => void
+  const gate = new Promise<void>(done => { release = done })
+  let first = true
+  confirm = () => { if (!first) return Promise.resolve({ response: 1 }); first = false; return gate.then(() => ({ response: 1 })) }
   const input = { id, expectedRevision: 3, ...draft, capabilities: ['mail'], allowedTools: [], model: '模型甲', provider: '服务甲' }
   const pending = command('update', input)
   await new Promise<void>(done => setImmediate(done))
   assert.equal(code(await command('mode', { enabled: true })), 'busy')
-  assert.match(dialogs[0]!.detail, /研究员甲.*模型甲.*mail/s)
   assert.match(dialogs[0]!.detail, /"permissionMode": "ask"/)
   input.model = '未经确认的模型'; input.permissionMode = 'full'; input.capabilities.push('activity')
-  resolve({ response: 1 }); assert.equal((await pending).ok, true)
+  release(); assert.equal((await pending).ok, true)
+  // 正文分页展示：拼起来才能看到确认框里写的模型与能力。
+  assert.match(dialogs.map(item => item.detail).join(''), /研究员甲.*模型甲.*mail/s)
   const body = writes()[0]!.body as MemberDraft
   assert.equal(body.model, '模型甲'); assert.deepEqual(body.allowedTools, []); assert.deepEqual(body.capabilities, ['mail'])
   assert.equal(Object.isFrozen(body), true); assert.equal(Object.isFrozen(body.capabilities), true)

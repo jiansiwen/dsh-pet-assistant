@@ -74,8 +74,10 @@ const draftKeys = ['displayName', 'description', 'personality', 'permissionMode'
 function subAssistantBinding(value: unknown): SubAssistantBinding {
   const bound = record(value)
   if (bound.kind === 'platform') {
-    keys(bound, ['kind', 'endpoint', 'model', 'secretId'])
-    return { kind: 'platform', endpoint: text(bound.endpoint, 2048), model: text(bound.model, 256), secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100) }
+    keys(bound, ['kind', 'endpoint', 'model', 'agentId', 'secretId'])
+    return { kind: 'platform', endpoint: text(bound.endpoint, 2048), model: text(bound.model, 256),
+      agentId: bound.agentId === undefined ? '' : text(bound.agentId, 128),
+      secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100) }
   }
   if (bound.kind === 'local-cli') {
     keys(bound, ['kind', 'command', 'args'])
@@ -505,11 +507,22 @@ export function registerMemberManagement(options: Options): () => void {
       if (!allowed(event)) return failure('denied')
       const parent = options.parentOf?.(event) ?? options.getStageWindow()
       if (!parent || parent.isDestroyed()) return failure('denied')
-      const answer = await dialog.showMessageBox(parent, { type: 'warning', title: labels[command.action], message: `${labels[command.action]}：${target}`, detail,
-        buttons: ['取消', '确认执行'], defaultId: 0, cancelId: 0, noLink: true,
-        ...(command.action === 'delete' ? { checkboxLabel: '同时清除这个成员的独立记忆（不可恢复）', checkboxChecked: false } : {}) })
-      if (!allowed(event)) return failure('denied')
-      if (answer.response !== 1) return failure('cancelled')
+      // 原生 MessageBox 不会滚动 detail：整份成员配置会把按钮撑出屏幕。
+      // 创建/修改时逐页展示原文，只有最后一页允许「确认执行」；不截断、不改冻结的提交正文。
+      const pages = command.action === 'create' || command.action === 'update'
+        ? Array.from({ length: Math.ceil(detail.length / 750) }, (_, index) => detail.slice(index * 750, (index + 1) * 750))
+        : [detail]
+      let purgeMemory = false
+      for (const [index, page] of pages.entries()) {
+        const last = index === pages.length - 1
+        const answer = await dialog.showMessageBox(parent, { type: 'warning', title: labels[command.action],
+          message: `${labels[command.action]}：${target}${pages.length > 1 ? `（核对 ${index + 1}/${pages.length}，末页才能执行）` : ''}`,
+          detail: page, buttons: ['取消', last ? '确认执行' : '继续核对'], defaultId: 0, cancelId: 0, noLink: true,
+          ...(command.action === 'delete' ? { checkboxLabel: '同时清除这个成员的独立记忆（不可恢复）', checkboxChecked: false } : {}) })
+        if (!allowed(event)) return failure('denied')
+        if (answer.response !== 1) return failure('cancelled')
+        if (command.action === 'delete') purgeMemory = answer.checkboxChecked === true
+      }
       // 确认后重新读取忙碌和 CAS，不能在原生框停留期间悄悄修改新版本。
       const latest = projectMemberState(await request(event, 'GET', ROOT))
       if (sharedMemory && !latest.sharedMemories?.some(item => item.id === sharedMemory.id && item.revision === sharedMemory.revision)) return failure('conflict')
@@ -524,7 +537,7 @@ export function registerMemberManagement(options: Options): () => void {
       if (member && (!current || current.profile.revision !== member.profile.revision)) return failure('conflict')
       if (current?.busy && ['update', 'delete', 'reset-quota', 'decide-request', 'new-session'].includes(command.action)) return failure('busy')
       if ('expectedQuotaRevision' in command.body && current?.quota.revision !== command.body.expectedQuotaRevision) return failure('conflict')
-      const body = command.action === 'delete' && answer.checkboxChecked === true
+      const body = command.action === 'delete' && purgeMemory
         ? { ...command.body, purgeMemory: true }
         : command.body
       try { prepared?.validate() } catch (error) {

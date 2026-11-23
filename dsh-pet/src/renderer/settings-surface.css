@@ -103,6 +103,7 @@
 
 .pet-management .management-header {
   grid-area: head;
+  cursor: move;
   display: flex;
   align-items: center;
   gap: var(--s-3);
@@ -150,6 +151,7 @@
 
 .pet-management .management-header button {
   flex: none;
+  cursor: pointer;
   display: grid;
   place-items: center;
   width: 28px;
