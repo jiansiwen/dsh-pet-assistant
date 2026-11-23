@@ -687,6 +687,7 @@ export default function App() {
   const hoverPet = useRef<{ id: string; left: number; top: number; bottom: number; width: number } | null>(null)
   /** 工具栏挂在哪个角色上；`open` 期间一直保留，不随指针离开宠物而清空。 */
   const [hoverBar, setHoverBar] = useState<{ id: string; left: number; top: number; bottom: number; width: number } | null>(null)
+  const hoverBarRef = useRef<HTMLDivElement | null>(null)
 
   /**
    * 喂一个悬停事件，并按"还差多久到下一个判定点"排一个 tick。
@@ -1230,6 +1231,21 @@ export default function App() {
     void window.petApi.openReportWorkbench().then(result => { if (!result.ok) showToast('日报工作台未能打开') })
       .catch(() => showToast('日报工作台未能打开'))
   }, [hoverEnabled, showToast])
+
+  // 悬停工具栏也是浮层：不登记命中区，指针一离开宠物就点击穿透，按钮永远没反应。
+  useLayoutEffect(() => {
+    const node = hoverBarRef.current
+    if (hoverBar === null || !node) { unregisterCharacterHitbox('__hover_bar__'); return }
+    const measure = () => {
+      const rect = node.getBoundingClientRect()
+      registerCharacterHitbox('__hover_bar__', { x1: rect.left, y1: rect.top, x2: rect.right, y2: rect.bottom })
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(node)
+    window.addEventListener('resize', measure)
+    return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__hover_bar__') }
+  }, [hoverBar])
 
   useEffect(() => {
     const stopSettings = window.petApi.onSettingsOpen(setSettingsPage)
@@ -2937,6 +2953,7 @@ export default function App() {
         const top = below ? Math.round(bar.bottom + 8) : Math.round(bar.top - 8)
         return (
           <div
+            ref={hoverBarRef}
             className={`hover-bar${below ? ' hover-bar-below' : ''}`}
             role="toolbar"
             aria-label="快捷操作"
