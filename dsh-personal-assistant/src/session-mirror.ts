@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { BridgeAgent } from './bridge.ts'
 import type { SessionCommand, SessionEntry, SessionModel, SessionResult, SessionSnapshot, SessionUpdate } from '../../dsh-pet/src/session-types.ts'
@@ -39,14 +40,42 @@ function eventsOf(agent: BridgeAgent): readonly MirrorEvent[] {
 export class SessionProjection {
   readonly entries = new Map<string, SessionEntry>()
   private changed = new Map<string, SessionEntry>()
+  private readonly provisional = new Set<string>()
+  private readonly removed = new Set<string>()
   private turn: number | undefined
 
-  private put(entry: SessionEntry): void {
+  private put(entry: SessionEntry, provisional = false): void {
+    if (provisional) this.provisional.add(entry.id)
+    else this.provisional.delete(entry.id)
+    this.removed.delete(entry.id)
     const previous = this.entries.get(entry.id)
-    const next = { ...entry, seq: previous?.seq ?? entry.seq }
+    const next: SessionEntry = { ...entry, seq: previous?.seq ?? entry.seq, ...(provisional ? { provisional: true } : {}) }
     if (JSON.stringify(previous) === JSON.stringify(next)) return
     this.entries.set(next.id, next)
     this.changed.set(next.id, next)
+  }
+
+  private remove(id: string): void {
+    this.provisional.delete(id)
+    if (!this.entries.delete(id)) return
+    this.changed.delete(id)
+    this.removed.add(id)
+  }
+
+  discardLive(): void { for (const id of this.provisional) this.remove(id) }
+
+  chunk(turn: number, step: number, seq: number, chunk: RecordValue, provisional = false): void {
+    const kind = chunk.type === 'text-delta' ? 'text' : chunk.type === 'reasoning-delta' ? 'think' : null
+    const part = text(chunk.text)
+    if (kind && part) {
+      const id = `assistant:${turn}:${step}:${kind}`
+      this.put({ id, seq, turn, role: 'assistant', kind, text: (this.entries.get(id)?.text ?? '') + part, streaming: true }, provisional)
+    } else if (provisional && chunk.type === 'tool-call-delta' && text(chunk.id)) {
+      const id = `tool:${turn}:${text(chunk.id)}`
+      const old = this.entries.get(id)
+      this.put({ id, seq, turn, role: 'assistant', kind: 'tool', name: text(chunk.name) || old?.name,
+        text: (old?.text ?? '') + text(chunk.argumentsDelta), status: 'preparing', streaming: true }, true)
+    }
   }
 
   apply(event: MirrorEvent, fallbackSeq: number): void {
@@ -66,36 +95,40 @@ export class SessionProjection {
       this.put({ id: `user:${text(d.id) || seq}`, seq, turn, role: 'user', kind: 'text', text: visible(d.content), streaming: false })
     } else if (event.type === 'assistant/chunk' && turn !== undefined && step !== undefined) {
       const chunk = record(d.chunk)
-      const kind = chunk.type === 'text-delta' ? 'text' : chunk.type === 'reasoning-delta' ? 'think' : null
-      if (kind && typeof chunk.text === 'string') {
-        const id = `${prefix}:${kind}`
-        this.put({ id, seq, turn, role: 'assistant', kind, text: (this.entries.get(id)?.text ?? '') + chunk.text, streaming: true })
-      }
+      this.chunk(turn, step, seq, chunk)
       if (chunk.type === 'finish') this.finish(turn, prefix)
     } else if (event.type === 'assistant/message' && turn !== undefined && step !== undefined) {
       const blocks = list(record(d.message).content).map(record)
-      const kinds = new Set<'text' | 'think'>()
-      for (const block of blocks) {
-        if (block.type === 'text') kinds.add('text')
-        if (block.type === 'reasoning') kinds.add('think')
-      }
-      kinds.add('text'); kinds.add('think')
-      for (const kind of kinds) {
+      for (const kind of ['think', 'text'] as const) {
         const body = blocks.filter(block => block.type === (kind === 'text' ? 'text' : 'reasoning')).map(block => text(block.text)).join('')
         const id = `${prefix}:${kind}`
-        if (body || this.entries.has(id)) this.put({ id, seq, turn, role: 'assistant', kind, text: body, streaming: false,
+        if (body) this.put({ id, seq, turn, role: 'assistant', kind, text: body, streaming: false,
           ...(d.interrupted ? { status: 'interrupted' } : {}) })
+        else this.remove(id)
+      }
+      for (const block of blocks) {
+        const callId = text(block.id)
+        if (block.type !== 'tool-call' || !callId) continue
+        this.put({ id: `tool:${turn}:${callId}`, seq, turn, role: 'assistant', kind: 'tool', name: text(block.name),
+          text: text(block.arguments), status: 'pending', streaming: true })
       }
     } else if (event.type === 'tool/call') {
       this.put({ id: `tool:${turn}:${text(d.callId) || seq}`, seq, turn, role: 'assistant', kind: 'tool',
         name: text(d.name), text: text(d.arguments), status: 'running', streaming: true })
     } else if (event.type === 'tool/result') {
-      for (const block of list(record(d.message).content).map(record)) {
-        if (block.type !== 'tool-result') continue
-        const id = `tool:${turn}:${text(block.toolCallId)}`
+      const message = record(d.message)
+      const applyResult = (result: RecordValue) => {
+        const callId = text(result.toolCallId)
+        if (!callId) return
+        const id = `tool:${turn}:${callId}`
         const previous = this.entries.get(id)
         this.put({ id, seq, turn, role: 'assistant', kind: 'tool', text: previous?.text ?? '', name: previous?.name,
-          result: visible(block.content), status: block.isError || d.error ? 'error' : 'completed', streaming: false })
+          result: visible(result.content), status: result.isError || d.error ? 'error' : 'completed', streaming: false })
+      }
+      // 新宿主是独立的 tool 消息；旧宿主把回执放在 tool-result 块中。
+      if (text(message.toolCallId)) applyResult(message)
+      else for (const block of list(message.content).map(record)) {
+        if (block.type === 'tool-result') applyResult(block)
       }
     } else if (event.type === 'turn/end') {
       this.finish(turn, undefined, text(record(d.reason).kind))
@@ -108,9 +141,16 @@ export class SessionProjection {
   private finish(turn: number | undefined, prefix?: string, status?: string): void {
     for (const entry of this.entries.values()) {
       if (entry.turn === turn && entry.streaming && (!prefix || entry.id.startsWith(`${prefix}:`))) {
-        this.put({ ...entry, streaming: false, ...(status ? { status } : {}) })
+        if (this.provisional.has(entry.id)) this.remove(entry.id)
+        else this.put({ ...entry, streaming: false, ...(status ? { status: entry.kind === 'tool' && status === 'completed' ? 'no-result' : status } : {}) })
       }
     }
+  }
+
+  drainRemoved(): string[] {
+    const removed = [...this.removed]
+    this.removed.clear()
+    return removed
   }
 
   drain(): SessionEntry[] {
@@ -139,16 +179,13 @@ interface Projections { snapshot(session: BridgeAgent['session']): { values: Rec
 interface LlmLike {
   listProviders?: () => readonly { id: string; name?: string }[]
   listModels?: (provider: string) => Promise<readonly { provider?: string; id?: string; name?: string }[]>
+  resolveCallConfig?: (selection: ModelChoice) => Promise<unknown>
 }
-/**
- * 宿主 API 会话控制器：`session/selectModel` 的 Host 服务入口。
- *
- * 0.2.x 不再给插件提供 `apiProxy` 会话 RPC，但这个服务仍由宿主注册；
- * 取不到或没有 `selectModel` 时，宠物端如实保持"不能切换"，不伪造能力。
- */
+type ModelChoice = Pick<SessionModel, 'provider' | 'model' | 'reasoningEffort'>
 interface SessionControllerLike {
-  selectModel?: (request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }) => Promise<unknown>
+  selectModel?: (request: ModelChoice & { sessionId: string }) => Promise<unknown>
 }
+interface AgentModelLike { current?: () => ModelChoice | undefined; select?: (selection: ModelChoice) => void }
 
 const MODEL_CACHE_MS = 5_000
 const PAGE_MESSAGES = 50
@@ -157,9 +194,8 @@ const stale = (): SessionResult => ({ ok: false, error: '会话绑定已变化�
 /**
  * 只适配已安装宿主的服务；最小测试 agent 没有服务时不伪造原生能力或运行态。
  *
- * 0.2.x 起宿主不再给插件提供 `apiProxy` 会话 RPC：历史分页直接读会话事件日志，
- * 输入与停止直接走 live agent 的 followup / cancel，模型目录走 `ctx.llm`；
- * 模型切换走宿主注册的 `sessionController.selectModel`，取不到时保持只读。
+ * 历史读会话日志，进行中的内容读宿主独立流。模型使用原生会话控制器，
+ * 没有控制器的宿主可走 Agent 自己的持久模型选择，但仍需校验目录与路由。
  */
 export class SessionMirror {
   readonly bindingId = randomUUID()
@@ -168,14 +204,14 @@ export class SessionMirror {
   private cursor = 0
   private status: SessionSnapshot['status'] = 'disconnected'
   private title = ''
-  private model: SessionModel | null = null
-  /** 宠物侧刚选中的模型；宿主还没有把新值写回 agent.options 时先用它显示。 */
+  /** 仅为还没有 Agent.model.current() 的控制器兼容快照。 */
   private modelSelected: SessionModel | null = null
   private models: SessionModel[] = []
   private modelError: string | undefined
   private modelsAt = -Infinity
-  private modelRevision = 0
   private modelsPending: Promise<void> | null = null
+  private stream: { id: string; turn: number; step: number; seq: number; index: number } | null = null
+  private streamRevision = -1
   private metadataKey = ''
   private first = true
   private hasMore = false
@@ -198,8 +234,31 @@ export class SessionMirror {
   private service<T>(name: string): T | undefined { return this.agent?.ctx?.get(name) as T | undefined }
   private sessionId(): string | null { return this.agent?.session.id ?? this.agent?.id ?? null }
   private sessionEvents(): readonly MirrorEvent[] | undefined { return this.agent ? eventsOf(this.agent) : undefined }
+  private nativeModel(): AgentModelLike | undefined { return (this.agent as { model?: AgentModelLike } | null)?.model }
+
+  /** 片段不入宿主日志；等下一拍发布，同一步正式消息仍以宿主日志为准。 */
+  observeStream(frame: AssistantStreamFrame, seq: number): void {
+    if (frame.type === 'start') {
+      if (frame.revision <= this.streamRevision) return
+      this.streamRevision = frame.revision
+      this.projection.discardLive()
+      this.stream = { id: frame.attemptId, turn: frame.turn, step: frame.step, seq, index: -1 }
+      return
+    }
+    const stream = this.stream
+    if (!stream || stream.id !== frame.attemptId) return
+    if (frame.type === 'end') {
+      // Bridge 已扫描先于终止帧提交的正式日志。余下的条目是失败重试或没有提交的预览。
+      this.projection.discardLive()
+      this.stream = null
+    } else if (frame.index > stream.index) {
+      stream.index = frame.index
+      this.projection.chunk(stream.turn, stream.step, stream.seq, record(frame.chunk), true)
+    }
+  }
 
   observe(event: MirrorEvent, index: number): void {
+    if (event.type === 'assistant/chunk' && this.stream && event.data.turn === this.stream.turn && event.data.step === this.stream.step) return
     this.projection.apply(event, index)
     if (event.type === 'session/title') this.title = text(event.data.title)
     if (event.type === 'request/header') {
@@ -207,6 +266,20 @@ export class SessionMirror {
       // 宿主已经带着新选择发出请求：以宿主写回的值/目录为准，不再用本地临时覆盖。
       this.modelSelected = null
     }
+  }
+
+  private canSelectNativeModel(): boolean {
+    const model = this.nativeModel()
+    const llm = this.service<LlmLike>('llm')
+    return typeof model?.current === 'function' && typeof model.select === 'function'
+      && typeof llm?.listModels === 'function' && typeof llm.resolveCallConfig === 'function'
+  }
+
+  private currentModel(): SessionModel | null {
+    const header = (this.agent as { session?: { requestHeader?: () => { config?: RecordValue } | undefined } } | null)
+      ?.session?.requestHeader?.()?.config
+    const options = (this.agent as { options?: RecordValue } | null)?.options
+    return this.asModel(this.nativeModel()?.current?.()) ?? this.modelSelected ?? this.asModel(header) ?? this.asModel(options)
   }
 
   private metadata(): Omit<SessionSnapshot, 'entries'> {
@@ -223,13 +296,12 @@ export class SessionMirror {
     return {
       sessionId: this.sessionId(), bindingId: this.bindingId, cursor: this.cursor, title: this.title,
       status: this.active ? this.status : 'disconnected', hasMore: this.hasMore, beforeSeq: this.beforeSeq,
-      model: this.model, models: this.models, permissions, permission,
+      model: this.currentModel(), models: this.models, permissions, permission,
       capabilities: {
         prompt: available && typeof agent?.followup === 'function',
         cancel: available && typeof agent?.cancel === 'function',
         history: available,
-        // 宿主注册了 sessionController.selectModel 才能切；没有就保持只读，不伪造成可选。
-        models: available && typeof controller?.selectModel === 'function',
+        models: available && (typeof controller?.selectModel === 'function' || this.canSelectNativeModel()),
         permissions: available && !!presets && !!commands?.find(this.agent!, 'permission'),
       },
       ...(this.modelError ? { error: this.modelError } : {}),
@@ -239,13 +311,15 @@ export class SessionMirror {
   flush(): void {
     if (!this.active) return
     const entries = this.projection.drain()
+    const removedEntryIds = this.projection.drainRemoved()
     const metadata = this.metadata()
     const key = JSON.stringify({ ...metadata, cursor: 0 })
-    if (entries.length || key !== this.metadataKey || this.first) {
+    if (entries.length || removedEntryIds.length || key !== this.metadataKey || this.first) {
       this.metadataKey = key
       this.cursor += 1
       // 换绑只宣告重新基线，不把整份旧日志塞进 ring；客户端收到 reset 后读取最近完整页。
-      this.publish({ ...metadata, cursor: this.cursor, entries: this.first ? [] : entries, ...(this.first ? { reset: true } : {}) })
+      this.publish({ ...metadata, cursor: this.cursor, entries: this.first ? [] : entries,
+        ...(this.first ? { reset: true } : removedEntryIds.length ? { removedEntryIds } : {}) })
       this.first = false
     }
     void this.refreshModels()
@@ -263,34 +337,23 @@ export class SessionMirror {
     if (this.modelsPending) return this.modelsPending
     if (!this.active || !this.sessionId() || Date.now() - this.modelsAt < MODEL_CACHE_MS) return Promise.resolve()
     this.modelsAt = Date.now()
-    const revision = this.modelRevision
     const llm = this.service<LlmLike>('llm')
     this.modelsPending = (async () => {
-      const readCurrent = () => {
-        // 请求头是宿主实际发出的路由；没有请求头时才回落到创建时的 agent.options。
-        const header = (this.agent as { session?: { requestHeader?: () => { config?: RecordValue } | undefined } } | null)
-          ?.session?.requestHeader?.()?.config
-        const options = (this.agent as { options?: RecordValue } | null)?.options
-        this.model = this.modelSelected ?? (header ? this.asModel(header) : options ? this.asModel(options) : null)
-      }
-      // 当前模型独立于目录查询；目录失败也不能把已知模型弄丢。
-      readCurrent()
       if (llm?.listProviders && llm.listModels) {
         const groups = await Promise.all(llm.listProviders().map(async provider => {
           try { return { id: provider.id, models: await llm.listModels!(provider.id), failed: false } }
           catch { return { id: provider.id, models: [], failed: true } }
         }))
-        if (!this.active || revision !== this.modelRevision) return
+        if (!this.active) return
         this.models = groups.flatMap(group => group.models.map(model => ({
           provider: group.id, model: text(model.id), label: text(model.name) || text(model.id),
         })))
-        readCurrent()
         this.modelError = groups.some(group => group.failed) ? '部分模型目录读取失败，请检查宿主配置' : undefined
       } else {
         this.modelError = undefined
       }
     })().catch(() => {
-      if (this.active && revision === this.modelRevision) this.modelError = '模型目录读取失败，请检查宿主配置'
+      if (this.active) this.modelError = '模型目录读取失败，请检查宿主配置'
     }).finally(() => { this.modelsPending = null; if (this.active) this.flush() })
     return this.modelsPending
   }
@@ -362,7 +425,7 @@ export class SessionMirror {
         }
         case 'model': {
           const controller = this.service<SessionControllerLike>('sessionController')
-          if (!controller?.selectModel) throw new Error('当前宿主不支持从宠物侧切换模型，请在应用的模型设置里切换')
+          if (!capabilities.models) throw new Error('当前 DSH 宿主未提供会话模型切换接口，请在 DSH 的会话里切换')
           if (typeof value.provider !== 'string' || typeof value.model !== 'string'
             || !value.provider.trim() || !value.model.trim()
             || value.provider.length > 128 || value.model.length > 256) throw new Error('模型参数无效')
@@ -370,21 +433,20 @@ export class SessionMirror {
           if (sessionId === null) throw new Error('会话还未就绪，不能切换模型')
           const reasoningEffort = typeof value.reasoningEffort === 'string' && value.reasoningEffort.length <= 64
             ? value.reasoningEffort : undefined
-          await controller.selectModel({
-            sessionId,
-            provider: value.provider.trim(),
-            model: value.model.trim(),
-            ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-          })
-          const provider = value.provider.trim()
-          const model = value.model.trim()
-          this.modelSelected = {
-            provider,
-            model,
-            label: this.models.find(item => item.provider === provider && item.model === model)?.label ?? model,
-            ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          const selection = { provider: value.provider.trim(), model: value.model.trim(),
+            ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
+          if (typeof controller?.selectModel === 'function') {
+            const result = await controller.selectModel({ sessionId, ...selection })
+            this.modelSelected = this.asModel(record(result).selected) ?? this.asModel(selection)
+          } else {
+            const llm = this.service<LlmLike>('llm')!
+            try {
+              if (!(await llm.listModels!(selection.provider)).some(model => model.id === selection.model)) throw new Error('目录无该模型')
+              await llm.resolveCallConfig!(selection)
+            } catch { throw new Error('所选模型目前不可用，请在 DSH 核对模型配置') }
+            if (!this.active) return stale()
+            this.nativeModel()!.select!(selection)
           }
-          this.model = this.modelSelected
           break
         }
         case 'permission': {

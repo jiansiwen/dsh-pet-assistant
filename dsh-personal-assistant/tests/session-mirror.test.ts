@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { SessionBridge, type BridgeAgent, type BridgeEvent } from '../src/bridge.ts'
 import { SessionMirror, SessionProjection, type MirrorEvent } from '../src/session-mirror.ts'
 import type { SessionResult, SessionUpdate } from '../../dsh-pet/src/session-types.ts'
@@ -110,7 +112,7 @@ test('宿主不能从宠物侧切换模型时不能宣称选择能力可用', as
     assert.equal(state.model?.model, '模型甲')
     const result = await mirror.command({ kind: 'model', bindingId: mirror.bindingId, provider: '测试提供方', model: '模型乙' }, () => {})
     assert.equal(result.ok, false)
-    assert.match(result.error ?? '', /不支持.*切换/u)
+    assert.match(result.error ?? '', /未提供会话模型切换接口/u)
   } finally { mirror.close() }
 })
 
@@ -136,6 +138,39 @@ test('宿主提供 sessionController.selectModel 时，宠物端可以切换模�
     const after = (await mirror.snapshot(undefined, undefined, () => {})).state!
     assert.deepEqual([after.model?.provider, after.model?.model], ['测试提供方', '模型乙'])
   } finally { mirror.close() }
+})
+
+test('没有会话控制器时通过原生 Agent 切换，校验目录与路由，并读取下一次请求的已选模型', async t => {
+  const native = nativeAgent()
+  let selected = { provider: 'native', model: 'm1' }
+  const standalone = Object.assign(native.agent, { model: {
+    current: () => selected,
+    select: (next: typeof selected) => { selected = next },
+  } })
+  let unreachable = false
+  Object.assign(native.services.llm as object, {
+    async resolveCallConfig(route: typeof selected) {
+      if (unreachable) throw new Error('隔离凭据细节')
+      return route
+    },
+  })
+  const f = await fixture(t, { ...native, agent: standalone })
+  const pick = (model: string) => f.bridge.sessionCommand({ kind: 'model', bindingId: f.bindingId, provider: 'native', model })
+  assert.equal((await f.bridge.getSession()).state?.capabilities.models, true)
+  assert.equal((await pick('不存在')).ok, false)
+  assert.equal(selected.model, 'm1')
+  unreachable = true
+  const refused = await pick('m2')
+  assert.equal(refused.ok, false)
+  assert.doesNotMatch(refused.error ?? '', /隔离凭据/)
+  unreachable = false
+  assert.equal((await pick('m2')).ok, true)
+  assert.equal(selected.model, 'm2')
+  assert.equal((await f.bridge.getSession()).state?.model?.model, 'm2')
+  standalone.model.select({ provider: 'native', model: 'm1' })
+  f.append('model/selection', { provider: 'native', model: 'm1' })
+  f.bridge.onAgentStatus(standalone, 'idle')
+  assert.equal(updates(f.events).at(-1)?.model?.model, 'm1', '宿主侧选择同步回来，不等下一轮请求')
 })
 
 test('模型目录异常明确提示，不能丢失已知当前模型或泄露异常细节', async () => {
@@ -262,6 +297,65 @@ test('增量只发送改变的完整条目，工具结果按 callId 更新，轮
   assert.equal(updates(f.events).at(-1)!.entries[0].text, '新轮次')
 })
 
+test('宿主流式帧未进入会话日志时也能实时出字，工具预览与原生执行、结果使用同一条目', async t => {
+  const f = await fixture(t)
+  const other = nativeAgent('未绑定会话')
+  const frame = (part: object, agent: BridgeAgent = f.agent) =>
+    f.bridge.onAssistantStream(agent, { attemptId: '测试流', ...part } as AssistantStreamFrame)
+  const find = (match: (entries: SessionUpdate['entries']) => boolean) => updates(f.events).find(u => match(u.entries))
+  f.append('turn/start', { turn: 8 })
+  f.append('user/message', { id: 'u8', content: [{ type: 'text', text: '界面上的提问' }], source: { kind: 'user' } })
+  frame({ type: 'start', turn: 8, step: 1, revision: 1 })
+  const chunk = (index: number, value: object, agent?: BridgeAgent) => frame({ type: 'chunk', index, revision: index + 2, chunk: value }, agent)
+  const tool = { type: 'tool-call', id: 'c1', name: '只读工具', arguments: '{"name":"测试"}' }
+  chunk(0, { type: 'reasoning-delta', text: '实时思考' })
+  chunk(1, { type: 'text-delta', text: '别的会话' }, other.agent)
+  chunk(1, { type: 'text-delta', text: '未完正文' })
+  chunk(1, { type: 'text-delta', text: '重复帧' })
+  chunk(2, { type: 'tool-call-delta', id: 'c1', name: '只读工具', argumentsDelta: '{' })
+  await delay(160)
+  const partial = find(entries => entries.some(e => e.text === '未完正文'))!
+  assert.equal(partial.status, 'running')
+  assert.ok(partial.entries.some(e => e.kind === 'think' && e.text === '实时思考' && e.streaming))
+  const preparing = partial.entries.find(e => e.kind === 'tool')!
+  assert.equal(preparing.status, 'preparing')
+  assert.ok(!f.agent.session.events.some(event => event.type === 'assistant/message' || event.type === 'assistant/chunk'))
+  f.append('assistant/message', { turn: 8, step: 1, message: { content: [{ type: 'reasoning', text: '实时思考' }, { type: 'text', text: '完整正文' }, tool] } })
+  frame({ type: 'end', index: 3, revision: 5, outcome: { kind: 'committed', eventType: 'assistant/message' } })
+  f.append('tool/call', { turn: 8, step: 1, callId: 'c1', name: tool.name, arguments: tool.arguments })
+  f.bridge.onAgentStatus(f.agent, 'running')
+  assert.equal(updates(f.events).at(-1)?.entries.find(e => e.id === preparing.id)?.status, 'running')
+  f.append('tool/result', { turn: 8, step: 1, message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: '工具回执' }] } })
+  f.bridge.onAgentStatus(f.agent, 'running')
+  assert.equal(updates(f.events).at(-1)?.entries.find(e => e.id === preparing.id)?.status, 'completed', '原生回执在轮次结束之前就刷新工具状态')
+  f.append('turn/end', { turn: 8, reason: { kind: 'completed' } })
+  f.bridge.onAgentStatus(f.agent, 'idle')
+  const latest = (await f.bridge.getSession()).state!.entries
+  assert.equal(latest.filter(e => e.kind === 'tool').length, 1)
+  assert.equal(latest.find(e => e.id === preparing.id)?.result, '工具回执')
+  assert.equal(latest.filter(e => e.kind === 'text' && e.role === 'assistant').length, 1)
+  assert.ok(latest.some(e => e.text === '完整正文' && !e.streaming))
+})
+
+test('重试会撤下未提交的流式条目，旧 attempt 的尾片不能写进新 attempt', async t => {
+  const f = await fixture(t)
+  const send = (attemptId: string, value: object) => f.bridge.onAssistantStream(f.agent, { ...value, attemptId } as AssistantStreamFrame)
+  f.append('turn/start', { turn: 1 })
+  send('首次', { type: 'start', revision: 1, turn: 1, step: 1 })
+  send('首次', { type: 'chunk', revision: 2, index: 0, chunk: { type: 'text-delta', text: '未正式提交' } })
+  await delay(160)
+  const live = updates(f.events).at(-1)!.entries[0]
+  assert.equal(live.text, '未正式提交')
+  f.append('assistant/attempt', { turn: 1, step: 1 })
+  send('首次', { type: 'end', revision: 3, index: 1, outcome: { kind: 'committed', eventType: 'assistant/attempt' } })
+  await delay(160)
+  assert.deepEqual(updates(f.events).at(-1)?.removedEntryIds, [live.id])
+  send('重试', { type: 'start', revision: 4, turn: 1, step: 1 })
+  send('首次', { type: 'chunk', revision: 2, index: 1, chunk: { type: 'text-delta', text: '迟到的旧片段' } })
+  send('重试', { type: 'chunk', revision: 5, index: 0, chunk: { type: 'text-delta', text: '重新开始' } })
+  assert.equal((await f.bridge.getSession()).state?.entries[0]?.text, '重新开始')
+})
+
 test('完成消息覆盖已有 chunk，保留稳定身份和序号', () => {
   const projection = new SessionProjection()
   projection.apply({ type: 'assistant/chunk', seq: 10, data: { turn: 3, step: 1, chunk: { type: 'text-delta', text: '部分' } } }, 10)
@@ -296,7 +390,7 @@ test('原生 followup/cancel 使用当前宿主接口，运行态以宿主为准
 test('模型切换不支持时如实拒绝；权限走原生命令且错误不乐观修改', async t => {
   const f = await fixture(t)
   assert.equal((await f.bridge.getSession()).state!.capabilities.models, false)
-  assert.match((await f.bridge.sessionCommand({ kind: 'model', bindingId: f.bindingId, provider: 'native', model: 'm2' })).error!, /不支持.*切换/)
+  assert.match((await f.bridge.sessionCommand({ kind: 'model', bindingId: f.bindingId, provider: 'native', model: 'm2' })).error!, /未提供会话模型切换接口/u)
   assert.equal((await f.bridge.getSession()).state!.model!.model, 'm1')
   assert.equal(f.agent.options.model, 'm1', '未支持的切换不能改动宿主当前模型')
   assert.equal((await f.bridge.sessionCommand({ kind: 'permission', bindingId: f.bindingId, value: 'unknown' })).ok, false)

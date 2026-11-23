@@ -1,5 +1,8 @@
 import { dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron'
 import { pathToFileURL } from 'node:url'
+import { ROLE_PERSONALITY_LIMIT } from '../role-preset-types.ts'
+import type { PreparedMemberRole } from './role-presets.ts'
+import { RolePresetError } from './role-preset-store.ts'
 import {
   MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_READ_TOOLS, MEMORY_KINDS, SUB_ASSISTANT_REPORT_MODES,
   type MemberDraft, type MemberProfile, type MemberSnapshot, type MemoryRecord,
@@ -18,6 +21,7 @@ interface Options {
   parentOf?(event: IpcMainInvokeEvent): BrowserWindow | null
   /** 写入成功后通知界面刷新；失败不影响已经落库的结果。 */
   changed?(): void
+  prepareRole?(presetId: string): PreparedMemberRole
 }
 type RecordValue = Record<string, unknown>
 function record(value: unknown): RecordValue {
@@ -81,7 +85,7 @@ function subAssistantBinding(value: unknown): SubAssistantBinding {
 }
 function draft(value: RecordValue, writing = false): MemberDraft {
   const next: MemberDraft = {
-    displayName: text(value.displayName, 80), description: text(value.description, 2000), personality: text(value.personality, 2000),
+    displayName: text(value.displayName, 80), description: text(value.description, 2000), personality: text(value.personality, ROLE_PERSONALITY_LIMIT),
     permissionMode: choice(value.permissionMode, ['ask', 'auto', 'full']), reportMode: choice(value.reportMode ?? 'chief', ['chief', 'self']), speechBy: choice(value.speechBy ?? 'self', ['self', 'chief']), persona: text(value.persona, 8000), voiceProfile: text(value.voiceProfile, 200), voiceDesign: text(value.voiceDesign, 2000),
     skinId: text(value.skinId, 128), enabled: bool(value.enabled), provider: text(value.provider, 128), model: text(value.model, 256),
     maxTokens: integer(value.maxTokens, 1, 131072), capabilities: list(value.capabilities, item => choice(item, MEMBER_CAPABILITIES)),
@@ -417,10 +421,21 @@ export function registerMemberManagement(options: Options): () => void {
     try { input = parseAssist(raw) } catch { return failure('invalid_input') }
     return { ok: true, data: projectMemberAssist(await request(event, 'POST', `${ROOT}/assist`, input)) }
   }))
-  ipcMain.handle(MEMBER_CHANNELS.command, (event, action: unknown, raw: unknown) => guarded(event, async () => {
+  ipcMain.handle(MEMBER_CHANNELS.command, (event, action: unknown, raw: unknown, presetId: unknown) => guarded(event, async () => {
     if (saving) return failure('busy')
     let command: Parsed
-    try { command = freeze(parseCommand(action, raw)) } catch { return failure('invalid_input') }
+    let prepared: PreparedMemberRole | undefined
+    try {
+      const parsed = parseCommand(action, raw)
+      if (presetId !== undefined) {
+        if (parsed.action !== 'create' || typeof presetId !== 'string' || !options.allowWindow?.(event) || !options.prepareRole) return failure('invalid_input')
+        prepared = options.prepareRole(presetId)
+        parsed.body = { ...parsed.body, ...prepared.fields }
+      }
+      command = freeze(parsed)
+    } catch (error) {
+      return error instanceof RolePresetError ? { ok: false, error: { code: 'role_preset', message: error.message } } : failure('invalid_input')
+    }
     saving = true
     try {
       const state = projectMemberState(await request(event, 'GET', ROOT))
@@ -512,8 +527,20 @@ export function registerMemberManagement(options: Options): () => void {
       const body = command.action === 'delete' && answer.checkboxChecked === true
         ? { ...command.body, purgeMemory: true }
         : command.body
+      try { prepared?.validate() } catch (error) {
+        return { ok: false, error: { code: 'role_preset', message: error instanceof RolePresetError ? error.message : '角色方案不可用，新助理未创建。' } }
+      }
       const result = await request(event, 'POST', command.path, body, { keepConflictMessage: command.action === 'delete' || command.action === 'new-session' })
       try { options.changed?.() } catch { /* 已经落库，刷新失败不影响结果 */ }
+      if (command.action === 'create') {
+        const created = record(result).createdAssistantId
+        if (prepared) {
+          try { prepared.apply(identifier(created)) } catch {
+            return { ok: false, error: { code: 'role_preset', message: '助理已创建，但桌宠未能完整套用方案。请回团队列表重新为它应用，不要重复创建。' } }
+          }
+        }
+        if (typeof created === 'string') return { ok: true, data: { assistantId: identifier(created) } }
+      }
       if (command.action === 'new-session') {
         const view = record(result)
         return { ok: true, data: { sessionId: identifier(view.sessionId), title: text(view.title, 60) } }

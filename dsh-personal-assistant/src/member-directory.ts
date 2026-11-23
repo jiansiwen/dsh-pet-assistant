@@ -13,7 +13,10 @@ type Extension = Omit<MemberProfile, keyof MemberConfig>
 type ResetScope = 'daily' | 'total' | 'both'
 type Transaction = <T>(body: () => T) => T
 const MAX = Number.MAX_SAFE_INTEGER
-const SKINS = ['panda', 'girl-glasses', 'boy-glasses']
+/** 宿主只存形象标识；素材是否存在由桌宠的本地登记簿核对。 */
+export const MEMBER_SKIN_ID = /^[a-z0-9-]{1,64}$/u
+export const MEMBER_PERSONALITY_LIMIT = 8000
+type RoleStyle = Pick<MemberDraft, 'skinId' | 'personality' | 'voiceProfile' | 'voiceDesign'>
 
 function defaults(): Extension {
 return { description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceDesign: '', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
@@ -147,10 +150,15 @@ function extension(profile: MemberProfile): Extension {
     totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId,
     kind: profile.kind, binding: profile.binding, scheduleWorkspaceId: profile.scheduleWorkspaceId }
 }
+function normalizeRoleStyle(style: RoleStyle): Required<RoleStyle> {
+  const skinId = text(style.skinId ?? 'panda', '形象', 64) || 'panda'
+  if (!MEMBER_SKIN_ID.test(skinId)) throw new Error('成员形象标识无效')
+  return { skinId, personality: text(style.personality ?? '', '性格与表达风格', MEMBER_PERSONALITY_LIMIT),
+    voiceProfile: text(style.voiceProfile ?? '', '音色', 200), voiceDesign: text(style.voiceDesign ?? '', '音色设计描述', 2000) }
+}
+
 function normalize(draft: MemberDraft): NormalizedMemberDraft {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) throw new Error('成员配置无效')
-  const skinId = text(draft.skinId ?? 'panda', '形象', 80) || 'panda'
-  if (!SKINS.includes(skinId)) throw new Error('请选择已有成员形象')
   if (typeof draft.enabled !== 'boolean') throw new Error('启用状态必须是布尔值')
   const timezone = text(draft.timezone ?? 'Asia/Shanghai', '时区', 100, true)
   try { dayAt(timezone, 0) } catch { throw new Error('成员时区无效') }
@@ -176,10 +184,8 @@ const reportMode = draft.reportMode ?? 'chief'
   if (workspaceId != null && (kind !== 'expert' || !/^[a-f0-9-]{36}$/iu.test(workspaceId))) throw new Error('请选择本机成员可用的 DSH 工作区')
   return { displayName: text(draft.displayName, '成员名称', 80, true), description: text(draft.description, '职责说明', 4000),
     ...(workspaceId !== undefined || kind !== 'expert' ? { scheduleWorkspaceId: workspaceId ?? null } : {}),
-    personality: text(draft.personality ?? '', '性格与表达风格', 2000), permissionMode, reportMode, speechBy,
-    persona: text(draft.persona, '人设', 16000), skinId, enabled: draft.enabled,
-    voiceProfile: text(draft.voiceProfile ?? '', '音色', 200),
-    voiceDesign: text(draft.voiceDesign ?? '', '音色设计描述', 2000),
+    ...normalizeRoleStyle(draft), permissionMode, reportMode, speechBy,
+    persona: text(draft.persona, '人设', 16000), enabled: draft.enabled,
     provider: text(draft.provider, '模型提供方', 200), model: text(draft.model, '模型名称', 200),
     maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 131072), capabilities: [...new Set(draft.capabilities)],
     allowedTools: [...new Set(draft.allowedTools)], dailyTokenLimit: integer(draft.dailyTokenLimit, '日额度'),
@@ -301,6 +307,22 @@ toolPolicy: { mode: 'read-only', denyTools: [...current.toolPolicy.denyTools] },
         this.notifyThreshold(id, this.measure(next, now).view, now)
       }
       return next
+    })
+  }
+
+  /** 角色切换不走全量编辑：连旧成员的工具策略、额度与会话引用都必须原样保留。 */
+  updateRoleStyle(id: string, expectedRevision: number, style: RoleStyle): number {
+    integer(expectedRevision, '成员修订号', 1, MAX - 1)
+    const fields = normalizeRoleStyle(style)
+    return this.transaction(() => {
+      const current = this.require(id)
+      if (current.revision !== expectedRevision) throw new Error('成员修订冲突，请刷新后重试')
+      const next = { ...current, ...fields, revision: current.revision + 1 }
+      const changed = this.db.prepare(`UPDATE assistants SET skin_id = ?, voice_profile = ?, revision = ?
+        WHERE assistant_id = ? AND revision = ?`).run(next.skinId, next.voiceProfile, next.revision, id, expectedRevision)
+      if (Number(changed.changes) !== 1) throw new Error('成员修订冲突，请刷新后重试')
+      this.saveExtra(next)
+      return next.revision
     })
   }
 

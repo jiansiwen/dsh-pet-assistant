@@ -1,0 +1,45 @@
+.role-preset-field {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+.role-preset-field :is(input, select) {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  color: #172f29;
+  background: #fff;
+  border: 1px solid #cfe0d9;
+  border-radius: 7px;
+  font: inherit;
+  font-weight: 400;
+}
+.role-preset-field :is(input, select):focus-visible { outline: 2px solid #09634e; outline-offset: 2px; }
+.role-preset-controls .role-preset-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.role-preset-row .role-preset-field { flex: 1 1 230px; }
+.role-preset-row button { white-space: nowrap; }
+dl.role-preset-preview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+  gap: 8px 14px;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-inline-start: 2px solid #09634e;
+  background: #eef6f2;
+  color: #223b33;
+  font-size: 12px;
+}
+.role-preset-preview div:last-child { grid-column: 1 / -1; }
+.role-preset-preview dt { font-weight: 650; }
+.role-preset-preview dd { margin: 3px 0 0; text-align: start; overflow-wrap: anywhere; max-height: 7em; overflow-y: auto; }
+.pet-management .role-preset-controls .role-preset-preview dd { text-align: start; }

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import type { MemberDirectory } from './member-directory.ts'
+import { MEMBER_PERSONALITY_LIMIT, MEMBER_SKIN_ID, type MemberDirectory } from './member-directory.ts'
 import type { MemberRuntime } from './member-runtime.ts'
 import { documentSessionScope } from './member-runtime.ts'
 import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberSnapshot } from './member-contract.ts'
@@ -9,6 +9,10 @@ import type { MemberScheduleRecord } from './team-domain.ts'
 
 const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
 const limit = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+const roleStyle = z.object({
+  personality: z.string().max(MEMBER_PERSONALITY_LIMIT), skinId: z.string().regex(MEMBER_SKIN_ID),
+  voiceProfile: z.string().trim().max(200), voiceDesign: z.string().trim().max(2000),
+}).strict()
 /** 子助理绑定（桥上白名单形状；https/回环等深度校验在 member-directory.normalizeBinding）。 */
 const binding = z.union([
   z.object({ kind: z.literal('platform'), endpoint: z.string().trim().min(1).max(2048),
@@ -18,14 +22,15 @@ const binding = z.union([
 ])
 const draft = z.object({
   displayName: z.string().trim().min(1).max(80), description: z.string().trim().max(2000),
-  personality: z.string().max(2000).default(''), permissionMode: z.enum(MEMBER_PERMISSION_MODES).default('ask'),
+  ...roleStyle.shape,
+  personality: roleStyle.shape.personality.default(''), permissionMode: z.enum(MEMBER_PERMISSION_MODES).default('ask'),
   reportMode: z.enum(MEMBER_REPORT_MODES).default('chief'),
   speechBy: z.enum(MEMBER_SPEECH_BY).default('self'),
   /** 音色标识：服务商 voice id 或内置音色名；留空用总助理默认音色。 */
-  voiceProfile: z.string().trim().max(200).default(''),
-  voiceDesign: z.string().trim().max(2000).default(''),
+  voiceProfile: roleStyle.shape.voiceProfile.default(''),
+  voiceDesign: roleStyle.shape.voiceDesign.default(''),
   persona: z.string().max(8000),
-  skinId: z.string().min(1).max(100), enabled: z.boolean(), provider: z.string().trim().max(128), model: z.string().trim().max(256),
+  enabled: z.boolean(), provider: z.string().trim().max(128), model: z.string().trim().max(256),
   maxTokens: z.number().int().min(1).max(32768), capabilities: z.array(z.enum(MEMBER_CAPABILITIES)).max(MEMBER_CAPABILITIES.length),
   allowedTools: z.array(z.string().min(1).max(100)).max(100), dailyTokenLimit: limit, totalTokenLimit: limit,
   thresholdPercent: z.number().min(1).max(100), timezone: z.string().min(1).max(100),
@@ -416,8 +421,19 @@ export class MemberManagement {
         return { status: 200, body: { shared: result.shared, records: this.options.sharedMemories?.() ?? [] } }
       }
       if (method !== 'POST') return { status: 404, body: { code: 'NOT_FOUND', message: '成员接口不存在' } }
-      if (pathname === '/companion/v1/members') directory.create(this.settle(draft.parse(raw)))
-      else if (pathname === '/companion/v1/members/mode') {
+      const style = /^\/companion\/v1\/members\/([A-Za-z0-9_-]+)\/role-style$/.exec(pathname)
+      if (style) {
+        const { expectedRevision, ...fields } = roleStyle.extend({ expectedRevision: revision }).parse(raw)
+        const savedRevision = directory.updateRoleStyle(style[1], expectedRevision, fields)
+        this.options.changed()
+        return { status: 200, body: { revision: savedRevision } }
+      }
+      if (pathname === '/companion/v1/members') {
+        const createdAssistantId = directory.create(this.settle(draft.parse(raw))).assistantId
+        this.options.changed()
+        return { status: 200, body: { ...this.snapshot(), createdAssistantId } }
+      }
+      if (pathname === '/companion/v1/members/mode') {
         const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(raw)
         if (this.options.runtime.busy()) throw new Error('还有成员正在工作，不能切换团队模式')
         await this.options.setMode(enabled)

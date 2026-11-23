@@ -75,6 +75,14 @@ test('增量保留历史页边界，过期游标不覆盖新内容，换绑清�
   assert.equal(mergeSession(merged, snapshot('b', 1, [])).entries.length, 0)
 })
 
+test('撤下未提交的流式条目，保留已经显示的历史；同一步的新尝试仍能追加', () => {
+  const first = snapshot('a', 5, [entry('old', 1, '历史'), entry('preview', 4, '未提交')])
+  const update = { ...snapshot('a', 6, []), removedEntryIds: ['preview'] }
+  const after = mergeSession(first, update)
+  assert.deepEqual(after.entries.map(item => item.text), ['历史'])
+  assert.deepEqual(mergeSession(after, snapshot('a', 7, [entry('preview', 6, '新尝试')])).entries.map(item => item.text), ['历史', '新尝试'])
+})
+
 // ===== 演示隐私模式（M5-05）：只决定渲染哪些，不删数据 =====
 
 test('演示模式：分界之前的一律不可见，之后新产生的照常显示', () => {

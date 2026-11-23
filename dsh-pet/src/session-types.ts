@@ -8,6 +8,8 @@ export interface SessionEntry {
   result?: string
   status?: string
   streaming?: boolean
+  /** 进行中但尚未写入宿主日志，失败重试时可能撤下。区别于已入日志的运行中工具。 */
+  provisional?: true
   turn?: number
 }
 
@@ -83,4 +85,6 @@ export type SessionCommand =
 
 export interface SessionUpdate extends SessionSnapshot {
   reset?: boolean
+  /** 未提交的宿主流式预览被撤下，例如模型请求失败后重试。 */
+  removedEntryIds?: string[]
 }

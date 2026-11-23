@@ -452,6 +452,7 @@ test('通道清单：舞台侧注册的每一条都该在，一条不多', () =>
     'voiceprint-status', 'voiceprint-enroll', 'voiceprint-clear', 'voiceprint-diagnose',
     // 成员目录、成员编辑窗口与额度（团队管理）。
     'members-state', 'member-command', 'member-memories', 'member-assist',
+    'role-presets-list', 'role-preset-save', 'role-preset-apply',
     'member-editor-open', 'member-editor-context', 'member-editor-close', 'member-session-view',
     'member-voice-get', 'member-voice-save', 'member-voice-pick-sample', 'member-model-options', 'member-tts-profiles', 'member-voice-preview',
     // 普通任务与提醒窗口（P0-02/P0-03）。
@@ -518,6 +519,7 @@ test('通道清单：preload 暴露给渲染层的每条通道，主进程都真
     'assistant-glossary-state', 'assistant-glossary-update',
     'assistant-artifacts-state', 'assistant-timeline-state',
     'assistant-skills-state', 'assistant-skills-update', 'assistant-skills-evidence',
+    'role-presets-list', 'role-preset-save', 'role-preset-apply',
     'custom-skins-list', 'asset-studio-open',
     'fast-reply-state', 'fast-reply-save', 'fast-reply-test',
   ]

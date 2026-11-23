@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { CHIEF_ROLE_ID } from '../role-preset-types.ts'
+import { RolePresetControls } from './RolePresetControls.tsx'
 import {
   ASSISTANT_SETTINGS_LIMITS as LIMITS, reminderMinutesToSeconds,
   type AssistantSettingsInputs, type AssistantSettingsPage, type AssistantSettingsResult,
@@ -134,8 +136,14 @@ export default function AssistantSettings({ section }: { section: AssistantSetti
   }
 
   const reconnectDirty = !!state && (enabled !== state.wecom.enabled || botId.trim() !== state.wecom.botId || !!secret)
+  const agentDirty = !!state && (agentName !== state.agent.name || agentPersona !== state.agent.persona)
   return (
     <div className="management-general assistant-settings" aria-busy={pending}>
+      {section === 'agent' && state && <>
+        <RolePresetControls targets={[{ id: CHIEF_ROLE_ID, label: '总助理' }]} disabled={pending || needsRefresh || agentDirty}
+          onApplied={() => void run(() => window.petApi.assistantSettingsState())} />
+        {agentDirty && <p className="management-hint">性格或名字还有未保存的改动，请保存或刷新后再使用角色方案。</p>}
+      </>}
       <section className="management-section" aria-label={TITLES[section]}>
         <h3>{TITLES[section]}</h3>
         <div className="management-quick">

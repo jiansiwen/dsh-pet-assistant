@@ -4,6 +4,7 @@
  */
 import { contextBridge, ipcRenderer } from 'electron'
 import type { MemberAction, MemberCommandInputs, MemberDraft, MemberEditorContext, MemberResult } from '../member-types.js'
+import type { RolePresetResult } from '../role-preset-types.js'
 
 function listen<T>(channel: string, callback: (payload: T) => void): () => void {
   const listener = (_event: Electron.IpcRendererEvent, payload: T) => callback(payload)
@@ -15,8 +16,9 @@ const api = {
   context: () => ipcRenderer.invoke('member-editor-context') as Promise<MemberEditorContext | null>,
   close: () => ipcRenderer.invoke('member-editor-close') as Promise<{ ok: boolean }>,
   membersState: () => ipcRenderer.invoke('members-state') as Promise<MemberResult>,
-  memberCommand: <A extends MemberAction>(action: A, input: MemberCommandInputs[A]) =>
-    ipcRenderer.invoke('member-command', action, input) as Promise<MemberResult>,
+  memberCommand: <A extends MemberAction>(action: A, input: MemberCommandInputs[A], presetId?: string) =>
+    ipcRenderer.invoke('member-command', action, input, presetId) as Promise<MemberResult>,
+  rolePresets: () => ipcRenderer.invoke('role-presets-list') as Promise<RolePresetResult>,
   memberAssist: (input: { request: string; current?: MemberDraft; model?: { provider: string; model: string } }) =>
     ipcRenderer.invoke('member-assist', input) as Promise<MemberResult>,
   /** 按成员性格生成音色描述（复用主进程的主助理模型调用）。 */
@@ -33,8 +35,8 @@ const api = {
     ipcRenderer.invoke('member-voice-preview', input) as Promise<{ ok: true; audio: string; mime: string } | { ok: false; error: string }>,
   /** 壳侧按成员存的音色（语气/克隆样本），与插件目录里的编号/描述合并生效。 */
   getVoice: (assistantId: string) =>
-    ipcRenderer.invoke('member-voice-get', assistantId) as Promise<{ voiceId?: string; design?: string; style?: string; sampleFile?: string; sampleMime?: string } | null>,
-  saveVoice: (assistantId: string, voice: { style?: string; sampleFile?: string; sampleMime?: string }) =>
+    ipcRenderer.invoke('member-voice-get', assistantId) as Promise<{ voiceId?: string; design?: string; style?: string; sampleFile?: string; sampleMime?: string; profileId?: string } | null>,
+  saveVoice: (assistantId: string, voice: { style?: string; sampleFile?: string; sampleMime?: string; profileId?: string }) =>
     ipcRenderer.invoke('member-voice-save', assistantId, voice) as Promise<{ ok: boolean }>,
   pickVoiceSample: () =>
     ipcRenderer.invoke('member-voice-pick-sample') as Promise<{ ok: true; file: string; mime: string } | { ok: false }>,

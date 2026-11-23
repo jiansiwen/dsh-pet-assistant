@@ -40,7 +40,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import type { ActionProposal, MemberConfig, Task, TaskStatus, TeamEvent, TeamEventType } from './team-domain.ts'
 import type { TeamService, CancelReceipt } from './team.ts'
 import { documentSessionScope } from './member-runtime.ts'
@@ -894,6 +894,15 @@ export class SessionBridge {
     if (status === 'idle') this.onAgentIdle(agent)
   }
 
+  /** 0.2.x 的片段是独立的实时通知，不会逐条写入 session 快照。只接当前绑定。 */
+  onAssistantStream(agent: unknown, frame: AssistantStreamFrame): void {
+    const current = this.agent
+    if (!current || agent !== current || this.closed) return
+    // 开始时先同步用户输入；结束时先让正式消息覆盖预览。中间片段复用现有 120ms 合批。
+    if (frame.type !== 'chunk') this.scanFeed(current)
+    this.mirror.observeStream(frame, this.feedCursor)
+  }
+
   /** 团队委派需要完整 Agent 作为父身份；由团队工具在执行上下文里注入。 */
   bindTeamAgent(agent: Agent): void {
     this.teamAgent = agent
@@ -1262,10 +1271,14 @@ export class SessionBridge {
    */
   private scanFeed(agent: BridgeAgent): void {
     if (agent !== this.agent || this.closed) return
+    let events: readonly MirrorEvent[]
+    try { events = sessionEventsOf(agent) }
+    catch { return /* 本拍跳过，下次再试。 */ }
+    const previousCursor = this.feedCursor
     // 旧语音链仍按因果轮次标记；不能把网页轮次挂到恰好在等待的宠物请求。
     const pending = this.pending
-    const location = pending ? locateTurn(sessionEventsOf(agent), pending.messageId) : null
-    const attributable = pending && settleFromEvents(sessionEventsOf(agent), pending).kind !== 'failed'
+    const location = pending ? locateTurn(events, pending.messageId) : null
+    const attributable = pending && settleFromEvents(events, pending).kind !== 'failed'
     const ownedTurn = attributable && location?.kind === 'located' ? location.turn : undefined
     let eventId: string | undefined
     let think = ''
@@ -1277,17 +1290,11 @@ export class SessionBridge {
       emit({ text: think, kind: 'think' })
       think = ''
     }
-    let events: ReadonlyArray<MirrorEvent>
-    try {
-      events = sessionEventsOf(agent)
-    } catch {
-      // 读会话失败不该打断请求：本拍跳过，下一拍再试。
-      return
-    }
     for (let i = this.feedCursor; i < events.length; i += 1) {
       const event = events[i]
       const data = event.data ?? {}
       this.mirror.observe(event, i)
+      if (event.type === 'turn/start') this.mirror.setStatus('running')
       const nextId = pending && ((event.type === 'user/message' && data.id === pending.messageId)
         || (ownedTurn !== undefined && data.turn === ownedTurn)) ? pending.requestId : undefined
       if (nextId !== eventId) flushThink()
@@ -1332,7 +1339,8 @@ export class SessionBridge {
     // 状态兜底：宿主的事件是作用域分发的，`agent/status` 未必每次都送到插件这一层；
     // 漏一次，宠物的会话状态就永远停在 running —— 界面上表现为"回复早结束了，
     // 角色还在对着电脑敲"。会话日志里出现 turn/end 就说明这一轮确实结束了，据它纠偏。
-    if (latestTurnEnded(events)) this.mirror.setStatus('idle')
+    // 没有新日志时不能用上一轮的 turn/end 覆盖刚收到的 running/waiting。
+    if (previousCursor !== events.length && latestTurnEnded(events)) this.mirror.setStatus('idle')
     this.mirror.flush()
   }
 

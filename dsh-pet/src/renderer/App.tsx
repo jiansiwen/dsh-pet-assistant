@@ -687,6 +687,14 @@ export default function App() {
   const hoverPet = useRef<{ id: string; left: number; top: number; bottom: number; width: number } | null>(null)
   /** 工具栏挂在哪个角色上；`open` 期间一直保留，不随指针离开宠物而清空。 */
   const [hoverBar, setHoverBar] = useState<{ id: string; left: number; top: number; bottom: number; width: number } | null>(null)
+  const hoverBarRef = useRef<HTMLDivElement | null>(null)
+  const resetHover = useCallback((enabled: boolean) => {
+    clearTimeout(hoverTimer.current)
+    hoverTimer.current = undefined
+    hoverPet.current = null
+    hoverState.current = initialHover(enabled)
+    setHoverBar(null)
+  }, [])
 
   /**
    * 喂一个悬停事件，并按"还差多久到下一个判定点"排一个 tick。
@@ -1164,18 +1172,30 @@ export default function App() {
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); unregisterCharacterHitbox('__member_quota__') }
   }, [stageVisible, settingsPage, quotaPending])
 
-  /**
-   * 停靠时：悬停工具栏一律不弹。
-   *
-   * 48px 的圆旁边弹一排按钮会直接盖住它和状态点，而状态点正是"出事了要看得见"的那部分。
-   * 收起态要操作就用右键菜单 —— 那条路径一直在。
-   */
-  useEffect(() => {
-    if (docked === null) return
-    hoverPet.current = null
-    setHoverBar(null)
-    hoverState.current = initialHover(hoverEnabled)
-  }, [docked, hoverEnabled])
+  // 对话框或设置打开时不再竞争空间；收起、隐藏和改变缩放也必须清掉旧计时和锚点。
+  const hoverAvailable = hoverEnabled && stageVisible && !panelOpen && settingsPage === null && docked === null
+  useLayoutEffect(() => {
+    resetHover(hoverAvailable)
+    return () => clearTimeout(hoverTimer.current)
+  }, [hoverAvailable, petScale, resetHover])
+
+  useLayoutEffect(() => {
+    const element = hoverBarRef.current
+    if (!hoverAvailable || !hoverBar || !element) return
+    const place = () => {
+      const { offsetWidth: width, offsetHeight: height } = element
+      const center = hoverBar.left + hoverBar.width / 2
+      const above = hoverBar.top - height - 8
+      element.style.left = `${Math.max(8, Math.min(innerWidth - width - 8, Math.round(center - width / 2)))}px`
+      element.style.top = `${Math.max(8, Math.min(innerHeight - height - 8, Math.round(above >= 8 ? above : hoverBar.bottom + 8)))}px`
+      const rect = element.getBoundingClientRect()
+      // DOM 可点击不代表 Electron 会接收点击；整条工具栏都要退出鼠标穿透。
+      registerCharacterHitbox('__hover_bar__', { x1: rect.left, y1: rect.top, x2: rect.right, y2: rect.bottom })
+    }
+    place()
+    window.addEventListener('resize', place)
+    return () => { window.removeEventListener('resize', place); unregisterCharacterHitbox('__hover_bar__') }
+  }, [hoverAvailable, hoverBar])
 
   /**
    * 收起时给一句话。
@@ -1200,25 +1220,11 @@ export default function App() {
   }, [docked, showToast])
 
   /**
-   * 缩放变了：把悬停矩形作废。
-   *
-   * 工具栏位置来自 `getBoundingClientRect()`（含 transform），所以**重新量一次**就对了；
-   * 但"正在悬停时改大小"这一帧用的还是旧矩形，会让工具栏偏出一个角色的高度。
-   * 改完立刻清空，下次悬停按新尺寸重测 —— 比在渲染里猜偏移量可靠。
-   */
-  useEffect(() => {
-    hoverPet.current = null
-    setHoverBar(null)
-    hoverState.current = initialHover(hoverEnabled)
-  }, [hoverEnabled, petScale])
-
-  /**
    * 悬停栏的五个动作，全部走**已有能力**：不新增 IPC，也不在这里造第二条业务路径。
    * 会议按钮只把人带到会议页 —— 开始录音需要本人同意，不能让一个悬停按钮替他点掉。
    */
   const runHoverAction = useCallback((id: 'chat' | 'meeting' | 'todo' | 'report' | 'settings') => {
-    hoverState.current = initialHover(hoverEnabled)
-    setHoverBar(null)
+    resetHover(hoverAvailable)
     if (id === 'chat') { setSettingsPage(null); setPanelOpen(true); return }
     if (id === 'settings') { setSettingsPage('settings'); return }
     if (id === 'meeting') { setSettingsPage('meeting'); return }
@@ -1229,7 +1235,7 @@ export default function App() {
     }
     void window.petApi.openReportWorkbench().then(result => { if (!result.ok) showToast('日报工作台未能打开') })
       .catch(() => showToast('日报工作台未能打开'))
-  }, [hoverEnabled, showToast])
+  }, [hoverAvailable, resetHover, showToast])
 
   useEffect(() => {
     const stopSettings = window.petApi.onSettingsOpen(setSettingsPage)
@@ -2469,7 +2475,8 @@ export default function App() {
   return (
     <div className="stage" onMouseDownCapture={wakeConversation} onKeyDownCapture={wakeConversation}
       // 悬停在哪个角色上就用哪个角色：工具栏只跟着指针下那一个，不整个舞台弹。
-      onMouseOver={event => {
+      onMouseMove={event => {
+        if (!hoverAvailable) return
         const slot = (event.target as Element | null)?.closest?.('.character-slot') ?? null
         const id = slot?.getAttribute('data-assistant-id') ?? null
         if (slot === null || id === null || id === hoverPet.current?.id) return
@@ -2478,6 +2485,7 @@ export default function App() {
         feedHover('enter-pet')
       }}
       onMouseOut={event => {
+        if (!hoverAvailable) return
         const from = (event.target as Element | null)?.closest?.('.character-slot') ?? null
         if (from === null) return
         const to = (event.relatedTarget as Element | null)?.closest?.('.character-slot') ?? null
@@ -2548,7 +2556,7 @@ export default function App() {
           values={{ team: memberFeed.state ? `已启用成员 ${memberFeed.state.members.filter(item => item.profile.enabled).length} 位；可管理记忆范围和定时任务` : undefined,
             doc: docSpeechMode === 'source' ? '原文朗读；支持用口令暂停' : '模型讲解；支持用口令暂停',
             voice: `回复朗读${readReplies ? '已开启' : '已关闭'}；唤醒与声纹可单独设置`,
-            appearance: `大小 ${Math.round(petScale * 100)}%；透明度 ${Math.round(petOpacity * 100)}%` }}
+            appearance: `大小 ${Math.round(petScale * 100)}%；透明度 ${Math.round(petOpacity * 100)}%；会话框自动避边${chatDock === 'auto' ? '已开启' : '已关闭'}` }}
         >
           {settingsPage === 'workbench' || settingsPage === 'settings' ? null :
             ['general', 'appearance', 'voice', 'learning'].includes(settingsPage) ? (
@@ -2570,10 +2578,6 @@ export default function App() {
                   <input type="checkbox" checked={hoverEnabled} onChange={event => {
                     const next = event.target.checked
                     setHoverEnabled(next)
-                    hoverState.current = initialHover(next)
-                    setHoverBar(null)
-                    if (hoverTimer.current !== undefined) clearTimeout(hoverTimer.current)
-                    hoverTimer.current = undefined
                     try { localStorage.setItem('dsh-pet.hoverToolbar', next ? '1' : '0') } catch { /* 存不了就只在本次会话生效 */ }
                   }} />
                   <span>悬停宠物时显示快捷工具栏</span>
@@ -2660,6 +2664,22 @@ export default function App() {
                   <p>收起后仍会用一个小圆点显示录音、待处理与出错状态；单击展开。</p>
                 </details>
               </section>}
+              {settingsPage === 'appearance' && <section className="management-section" aria-label="会话框位置">
+                <h3>会话框位置</h3>
+                <label className="management-voice">
+                  <input type="checkbox" checked={chatDock === 'auto'} aria-describedby="chat-dock-hint"
+                    onChange={async event => {
+                      const next = event.target.checked ? 'auto' : 'top'
+                      try {
+                        const result = await window.petApi.saveSettings({ chatDock: next })
+                        if (result.ok) setChatDock(next)
+                        else showToast('会话框设置未保存')
+                      } catch { showToast('会话框设置未保存') }
+                    }} />
+                  <span>会话框自动避边</span>
+                </label>
+                <p className="management-hint" id="chat-dock-hint">开启后自动选择上、下、左、右的位置，让会话框留在屏幕内；关闭后固定在宠物头顶。</p>
+              </section>}
 
               {settingsPage === 'voice' && <section className="management-section" aria-label="睡眠与唤醒">
                 <h3>睡眠与唤醒</h3>
@@ -2716,23 +2736,6 @@ export default function App() {
                     }} />
                   <span>朗读回复，打字发出的消息也念出来</span>
                 </label>
-                <label className="management-voice">
-                  <input type="checkbox" checked={chatDock === 'top'}
-                    onChange={async event => {
-                      const pinned = event.target.checked
-                      const next = pinned ? 'top' : 'auto'
-                      try {
-                        const result = await window.petApi.saveSettings({ chatDock: next })
-                        if (result.ok) setChatDock(next)
-                        else showToast('会话框设置未保存')
-                      } catch { showToast('会话框设置未保存') }
-                    }} />
-                  <span>会话框固定在宠物头顶</span>
-                </label>
-                <details className="setting-details">
-                  <summary>关闭固定后会怎样</summary>
-                  <p>会话框按屏幕空间自动换到上、下、左、右四侧，避免超出屏幕。</p>
-                </details>
               </section>}
               {(settingsPage === 'voice' || settingsPage === 'general') && <ResidencySettings
                 section={settingsPage === 'general' ? 'startup' : 'voice'}
@@ -2939,20 +2942,13 @@ export default function App() {
         </PetSettingsPanel>
       )}
 
-      {hoverEnabled && hoverBar !== null && (() => {
-        const bar = hoverBar
-        // 头顶居中：横向取角色矩形的**中心**（不是左上角），纵向底边贴头顶 8px。
-        // 8px 是刻意留的缝：太大鼠标跨不过去，太小会盖住角色。
-        const below = bar.top < 64
-        const left = Math.max(8, Math.round(bar.left + bar.width / 2))
-        const top = below ? Math.round(bar.bottom + 8) : Math.round(bar.top - 8)
-        return (
+      {hoverAvailable && hoverBar !== null && (
           <div
-            className={`hover-bar${below ? ' hover-bar-below' : ''}`}
+            ref={hoverBarRef}
+            className="hover-bar"
             role="toolbar"
             aria-label="快捷操作"
             data-interactive
-            style={{ left, top }}
             onMouseEnter={() => feedHover('enter-bar')}
             onMouseLeave={() => feedHover('leave-bar')}
             // 工具栏区域不吃拖动：否则点按钮会被判成拖宠物。
@@ -2963,8 +2959,7 @@ export default function App() {
                 onClick={() => runHoverAction(action.id)}>{action.label}</button>
             ))}
           </div>
-        )
-      })()}
+      )}
 
       {/* 收起后的替身：屏幕边上一个 48×48 的小圆。位置由"边 + 原位"算出来，不另存坐标。 */}
       {docked !== null && (() => {

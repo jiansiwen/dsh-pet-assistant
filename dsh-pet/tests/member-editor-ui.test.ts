@@ -6,6 +6,7 @@ import ts from 'typescript'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import * as contract from '../src/member-types.ts'
 import * as speakerVoice from '../src/shared/speaker-voice.ts'
+import * as rolePresets from '../src/role-preset-types.ts'
 import type { MemberDraft, MemberResult, MemberView } from '../src/member-types.ts'
 
 const source = readFileSync(new URL('../src/renderer/MemberEditor.tsx', import.meta.url), 'utf8')
@@ -45,7 +46,10 @@ function mount(initial: MemberView | null, latest = initial ?? undefined) {
     useEffect() {},
   }
   const module = { exports: {} as { MemberEditorPanel: (props: Record<string, unknown>) => ReactNode; default: () => ReactNode } }
-  new Function('require', 'module', 'exports', compiled)((name: string) => name === 'react' ? hooks : name === '../member-types.ts' ? contract : name === '../shared/speaker-voice.ts' ? speakerVoice : require(name), module, module.exports)
+  new Function('require', 'module', 'exports', compiled)((name: string) => ({
+    react: hooks, '../member-types.ts': contract, '../shared/speaker-voice.ts': speakerVoice, '../role-preset-types.ts': rolePresets,
+    './RolePresetControls.tsx': { useRolePresetList: () => ({ presets: [], pending: false, error: '' }) },
+  } as Record<string, unknown>)[name] ?? require(name), module, module.exports)
   const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
   Object.defineProperty(globalThis, 'window', { configurable: true, value: { memberEditorApi: {
     memberAssist: async () => assistResult,

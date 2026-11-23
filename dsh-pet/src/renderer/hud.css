@@ -244,6 +244,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chat-hud .hud-process-status { flex: none; white-space: nowrap; }
 
 .chat-hud .hud-process-think {
   border-style: dashed;
@@ -453,10 +454,11 @@
  *
  * 视觉要"轻"：半透明底 + 圆角 + 小阴影，和头顶的说话气泡是一族，不用新颜色体系。
  * `pointer-events: auto` 是必须的 —— 舞台根节点平时是穿透的，工具栏若继承穿透就点不到。
- * `pointer-events` 与 `data-interactive` 一起管：后者让主进程把这块区域算进命中盒。
+ * Electron 的穿透区域另由 App 按工具栏实际矩形登记。
  */
 .hover-bar {
   position: absolute;
+  width: max-content;
   z-index: 60;
   display: flex;
   align-items: center;
@@ -467,13 +469,6 @@
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
   backdrop-filter: blur(6px);
   pointer-events: auto;
-  /* 横向居中、纵向底边贴在 top 上：定位只给 left/top，尺寸由内容决定，
-     所以必须靠 transform 自己往回挪半个宽度、一整个高度。 */
-  transform: translate(-50%, -100%);
-}
-/* 上方空间不足时翻到角色脚下：顶边贴在 bottom 上，不再往上挪一整个高度。 */
-.hover-bar-below {
-  transform: translate(-50%, 0);
 }
 .hover-bar-btn {
   appearance: none;

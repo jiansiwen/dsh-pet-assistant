@@ -3,11 +3,12 @@
  * 说明：不再保存 API 密钥与模型——宠物的对话全部走主会话桥接，凭据与模型由 dsh 统一管理。
  */
 import { app } from 'electron'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { MAX_RECENT_DIRS, type PresentationMode } from './document.ts'
 import { isCustomSkin } from './custom-skins.ts'
 import { isSafeProfileName } from './runtime-launch.ts'
+import { writeLocalJson } from './local-json.ts'
 
 export type PetId = 'panda' | 'girl-glasses' | 'boy-glasses'
 
@@ -117,6 +118,8 @@ export interface PetSettings {
   agentVoiceDesign?: string
   /** 总助理用的克隆音色 ID；填了它就用克隆声音，优先于设计描述。 */
   agentVoiceId?: string
+  /** 角色方案所选的本机语音配置标识；不复制服务凭据。 */
+  agentVoiceProfileId?: string
   /** 总助理的音色复刻样本（base64，不含 data: 前缀）；有它就用 voiceclone 模型。 */
   /** 语气/情绪/方言/角色扮演的自然语言指令。 */
   agentVoiceStyle?: string
@@ -204,6 +207,7 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   // 音色描述：只接受字符串，超长截到 2000（与成员那边同一口径）。
   merged.agentVoiceDesign = typeof merged.agentVoiceDesign === 'string' ? merged.agentVoiceDesign.slice(0, 2000) : ''
   merged.agentVoiceId = typeof merged.agentVoiceId === 'string' ? merged.agentVoiceId.slice(0, 200) : ''
+  merged.agentVoiceProfileId = typeof merged.agentVoiceProfileId === 'string' ? merged.agentVoiceProfileId.slice(0, 64) : ''
   /*
     复刻样本：只留 base64，上限 4MB 字符串（约 3MB 音频）。
     超了就丢掉 —— 存进设置会把整份配置撑爆，读写都会变慢。
@@ -355,8 +359,7 @@ export function loadSettings(): PetSettings {
 
 export function saveSettings(patch: Partial<PetSettings>): PetSettings {
   const current = normalize({ ...loadSettings(), ...patch })
-  mkdirSync(path.dirname(settingsPath()), { recursive: true })
-  writeFileSync(settingsPath(), JSON.stringify(current, null, 2), 'utf8')
+  writeLocalJson(settingsPath(), current)
   cache = current
   try { cacheMtimeMs = statSync(settingsPath()).mtimeMs } catch { cacheMtimeMs = 0 }
   return current

@@ -22,6 +22,9 @@ import { registerAssistantMail } from './assistant-mail.ts'
 import { FastReplyService, type FastReplyInput } from './fast-reply.ts'
 import { registerMemberManagement } from './member-management.ts'
 import { MemberEditorWindow } from './member-editor-window.ts'
+import { chiefRoleVoice, RolePresets } from './role-presets.ts'
+import { RolePresetError } from './role-preset-store.ts'
+import { CHIEF_ROLE_ID, type RolePresetResult } from '../role-preset-types.ts'
 import { createStreamingSession, pcm16Base64ToFloat32, streamingAvailable, transcribeWav, warmSenseVoiceAsr, warmStreamingAsr, type StreamingSession } from './asr.ts'
 import { INITIAL_AUDIO_STATE, nextAudio, type AudioEvent, type AudioState, type AudioTransition } from './audio.ts'
 import { AudioPrefsStore, loginItemAction, type AudioPrefs } from './audio-prefs.ts'
@@ -97,7 +100,7 @@ import { registerPetAssetProtocol } from './asset-protocol.ts'
 import { listCustomSkins } from './custom-skins.ts'
 import { agentVoicePayload } from './agent-voice.ts'
 import { handoverClosing, handoverOpening, type HandoverLines } from './handover-sequence.ts'
-import { hasSpeakerVoice, normalizePresetId, speakerOverlay, speakerRequestFields, type SpeakerVoice } from '../shared/speaker-voice.ts'
+import { hasSpeakerVoice, memberSpeakerVoice, speakerOverlay, speakerRequestFields, type SpeakerVoice } from '../shared/speaker-voice.ts'
 import { ttsVoiceKey } from './tts-cache.ts'
 import { modelForIntent } from '../shared/agent-voice-rule.ts'
 import type { VoiceApiKind, VoiceApiResult, VoiceApiState, ResolvedVoiceApi } from '../voice-api-types.ts'
@@ -787,7 +790,7 @@ function onWakeWord(): void {
   // 是两个设备、两种音量，录音时尤其明显；音色一致比"独立通道"重要得多。
   // 唤醒优先级高：Narrator 正在播讲解/回答时，`speakWakeGreeting` 会先把它停掉再应答。
   // 合成服务只解析一次：选句（要查哪些句子已有缓存）和播放必须用同一个音色指纹。
-  const api = voiceApiStore?.resolve('tts') ?? null
+  const api = chiefTtsApi()
   const greeting = pickGreeting(api)
   if (greeting.length > 0) void speakWakeGreeting(greeting)
   sendToRenderer('wake-triggered', greeting)
@@ -886,7 +889,7 @@ async function fallbackWakeGreeting(utteranceId: string, text: string): Promise<
   console.log('[dsh-pet] 唤醒应答没能在 1.5 秒内开口，回退系统播放器（这句的音色可能与回复不一致）')
   // 先把它从 Narrator 队列里摘掉，否则兜底播完之后 Narrator 可能又念一遍。
   narrator.interrupt('drop-queue')
-  const api = voiceApiStore?.resolve('tts') ?? null
+  const api = chiefTtsApi()
   const key = { voiceKey: greetingVoiceKey(api), text }
   const cached = ttsCache.get(key)
   const audio = cached ?? await synthesizeOneShot(text, api)
@@ -898,15 +901,12 @@ async function fallbackWakeGreeting(utteranceId: string, text: string): Promise<
 
 /** 总助理的音色配置（克隆样本 > 设计描述 > 预置音色，语气单独叠）。 */
 function chiefSpeakerVoice(): SpeakerVoice {
-  const s = loadSettings()
-  return {
-    voiceId: s.agentVoiceId ?? '',
-    design: s.agentVoiceDesign ?? '',
-    style: s.agentVoiceStyle ?? '',
-    sampleFile: s.agentVoiceSampleFile ?? '',
-    sampleMime: s.agentVoiceSampleMime ?? '',
-    sample: s.agentVoiceSample ?? '',
-  }
+  return chiefRoleVoice(loadSettings())
+}
+
+function chiefTtsApi(): ResolvedVoiceApi | null {
+  const id = chiefSpeakerVoice().profileId
+  return (id ? voiceApiStore?.resolveId(id) : null) ?? voiceApiStore?.resolve('tts') ?? null
 }
 
 /**
@@ -1252,7 +1252,7 @@ async function memberDisplayName(assistantId: string): Promise<string> {
     try {
       const result = await bridge.companionRequest('GET', '/companion/v1/members', undefined, 'owner', 5000)
       const body = result.status === 200
-        ? result.body as { members?: Array<{ profile?: { assistantId?: unknown; displayName?: unknown; voiceProfile?: unknown; voiceDesign?: unknown; persona?: unknown; speechBy?: unknown } }> } | null
+        ? result.body as { members?: Array<{ profile?: { assistantId?: unknown; displayName?: unknown; voiceProfile?: unknown; voiceDesign?: unknown; personality?: unknown; persona?: unknown; speechBy?: unknown } }> } | null
         : null
       const names = new Map<string, string>()
       const voices = new Map<string, SpeakerVoice>()
@@ -1266,7 +1266,7 @@ async function memberDisplayName(assistantId: string): Promise<string> {
             design: typeof p.voiceDesign === 'string' ? p.voiceDesign : '',
           })
           meta.set(p.assistantId, {
-            persona: typeof p.persona === 'string' ? p.persona : '',
+            persona: [p.personality, p.persona].filter(item => typeof item === 'string' && item !== '').join('\n'),
             speechBy: typeof p.speechBy === 'string' ? p.speechBy : 'self',
           })
         }
@@ -1285,17 +1285,7 @@ async function speakerForAssistant(assistantId: string | undefined): Promise<Spe
   const chief = chiefSpeakerVoice()
   if (assistantId === undefined || assistantId.trim() === '') return chief
   await memberDisplayName(assistantId)
-  const fromDirectory = memberNamesCache?.voices.get(assistantId) ?? { voiceId: '', design: '' }
-  const override = loadSettings().memberVoices?.[assistantId]
-  const merged: SpeakerVoice = {
-    voiceId: normalizePresetId(override?.voiceId || fromDirectory.voiceId || ''),
-    design: override?.design || fromDirectory.design || '',
-    style: override?.style ?? '',
-    sampleFile: override?.sampleFile ?? '',
-    sampleMime: override?.sampleMime ?? '',
-    profileId: override?.profileId ?? '',
-  }
-  return hasSpeakerVoice(merged) ? merged : chief
+  return speakerForAssistantSync(assistantId)
 }
 
 /**
@@ -1308,17 +1298,7 @@ async function speakerForAssistant(assistantId: string | undefined): Promise<Spe
 function speakerForAssistantSync(assistantId: string | undefined): SpeakerVoice {
   const chief = chiefSpeakerVoice()
   if (assistantId === undefined || assistantId.trim() === '') return chief
-  const fromDirectory = memberNamesCache?.voices.get(assistantId) ?? { voiceId: '', design: '' }
-  const override = loadSettings().memberVoices?.[assistantId]
-  const merged: SpeakerVoice = {
-    voiceId: normalizePresetId(override?.voiceId || fromDirectory.voiceId || ''),
-    design: override?.design || fromDirectory.design || '',
-    style: override?.style ?? '',
-    sampleFile: override?.sampleFile ?? '',
-    sampleMime: override?.sampleMime ?? '',
-    profileId: override?.profileId ?? '',
-  }
-  return hasSpeakerVoice(merged) ? merged : chief
+  return memberSpeakerVoice(loadSettings().memberVoices?.[assistantId], memberNamesCache?.voices.get(assistantId), chief)
 }
 
 /** 讲解正文用谁的嗓子：成员设置"由总助理代念"时用总助理，否则成员自己。 */
@@ -5730,6 +5710,41 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
   })
   const memberEditor = new MemberEditorWindow()
   memberEditor.registerIpc()
+  const notifyMembers = (): void => {
+    sendToRenderer('members-changed', null)
+    memberEditor.notifyChanged()
+  }
+  const refreshRole = (id: string): void => {
+    if (id === CHIEF_ROLE_ID) {
+      chiefContextCache = null
+      handoverLinesCache.clear()
+    } else {
+      memberNamesCache?.names.delete(id) // 下一句重新取，相同会话不必重启。
+      memberNamesCache?.voices.delete(id)
+      handoverLinesCache.delete(id)
+    }
+    sendToRenderer('characters-changed', loadSettings().characters ?? {})
+    notifyMembers()
+  }
+  const roles = new RolePresets({
+    userData: app.getPath('userData'),
+    request: (method, pathname, body) => bridge.companionRequest(method, pathname, body, 'owner'),
+    settings: loadSettings, saveSettings, customSkins: () => listCustomSkins(app.getPath('userData')),
+    voiceProfiles: () => voiceApiStore?.snapshot(), changed: refreshRole,
+  })
+  const stagePage = pathToFileURL(path.join(here, '../renderer/index.html')).href
+  const roleStageSender = (event: Electron.IpcMainInvokeEvent) => stageSender(event) && event.senderFrame?.url === stagePage
+  const roleResult = async (allowed: boolean, work?: () => Promise<void>): Promise<RolePresetResult> => {
+    if (!allowed) return { ok: false, error: '只允许从桌面的助理设置操作。' }
+    try { await work?.(); return { ok: true, presets: roles.list() } }
+    catch (error) { return { ok: false, error: error instanceof RolePresetError ? error.message : '角色方案暂时不可用，请检查连接和本地配置后重试。' } }
+  }
+  const roleId = (id: unknown): id is string => typeof id === 'string' && /^[a-z0-9_-]{1,128}$/iu.test(id)
+  ipcMain.handle('role-presets-list', event => roleResult(roleStageSender(event) || memberEditor.allowed(event)))
+  ipcMain.handle('role-preset-save', (event, id: unknown, name: unknown) =>
+    roleResult(roleStageSender(event) && roleId(id) && typeof name === 'string', () => roles.save(id as string, name as string)))
+  ipcMain.handle('role-preset-apply', (event, id: unknown, presetId: unknown) =>
+    roleResult(roleStageSender(event) && roleId(id) && roleId(presetId), () => roles.apply(id as string, presetId as string)))
   // 成员音色（壳侧）：语气与克隆样本存设置，编号/描述仍归插件目录；只认编辑窗来源。
   ipcMain.handle('member-voice-get', (event, id: unknown) => {
     if (!memberEditor.allowed(event) || typeof id !== 'string') return null
@@ -5743,9 +5758,10 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
     saveSettings({
       memberVoices: {
         ...current,
-        [id]: { ...current[id], style: str(v.style, 500), sampleFile: str(v.sampleFile, 500), sampleMime: str(v.sampleMime, 100), profileId: str(v.profileId, 64) },
+        [id]: { style: str(v.style, 500), sampleFile: str(v.sampleFile, 500), sampleMime: str(v.sampleMime, 100), profileId: str(v.profileId, 64) },
       },
     })
+    refreshRole(id)
     return { ok: true }
   })
   // 成员编辑窗的"已配置模型"下拉：与总助理会话模型下拉同源（session mirror 的 models）。
@@ -5798,10 +5814,8 @@ const voiceApiCall = (fn: () => VoiceApiState): VoiceApiResult => {
     request: (method, pathname, body, subject, timeoutMs) => bridge.companionRequest(method, pathname, body, subject, timeoutMs),
     allowWindow: event => memberEditor.allowed(event),
     parentOf: event => BrowserWindow.fromWebContents(event.sender) ?? win,
-    changed: () => {
-      if (win && !win.isDestroyed()) win.webContents.send('members-changed')
-      memberEditor.notifyChanged()
-    },
+    changed: notifyMembers,
+    prepareRole: id => roles.prepareMemberCreation(id),
   })
   // 成员独立会话查看：DSH 侧栏里成员会话埋在折叠分组里、标题又是任务原文，用户找不到。
   // 这里直接读宿主持久化的会话文件（zstd），开一个只读窗口展示，入口在团队成员行。
@@ -5872,7 +5886,6 @@ ${messages.length === 0 ? '<p>这个会话还没有可见消息。</p>' : messag
   })
 
   ipcMain.handle('member-editor-open', (event, id: unknown) => {
-    const stagePage = pathToFileURL(path.join(here, '../renderer/index.html')).href
     if (!stageSender(event) || event.senderFrame?.url !== stagePage) return { ok: false }
     if (id !== null && (typeof id !== 'string' || !id.trim() || id.length > 256)) return { ok: false }
     memberEditor.open({ memberId: id as string | null,
@@ -6491,7 +6504,7 @@ if (!gotLock) {
     // 启动后把固定话术的音频补齐到缓存（稍等一下，别和启动抢带宽）。
     // 没有这一步，唤醒应答随机抽到"没缓存过的句子"就要当场联网合成，用户会感觉
     // "有时候立刻响、有时候要等好几秒"。放到 1.5 秒：用户重启后往往很快就喊第一声。
-    const warmTimer = setTimeout(() => { void warmGreetingCache(voiceApiStore?.resolve('tts') ?? null) }, 1_500)
+    const warmTimer = setTimeout(() => { void warmGreetingCache(chiefTtsApi()) }, 1_500)
     warmTimer.unref()
     // 本地识别模型首次加载分别是秒级，而且是**同步**加载：预热期间主线程被占住，
     // 唤醒动画与播放也会跟着停顿。所以延后到用户通常已经喊过第一声之后（12 秒起），
@@ -6603,12 +6616,20 @@ if (!gotLock) {
           if (subAssistantSpokenRunIds.size > 200) {
             subAssistantSpokenRunIds.delete(subAssistantSpokenRunIds.values().next().value as string)
           }
-          // ★③ 独立播报入口：不占会话 reply 的 utteranceId 空间，打断纪律沿用现有四层管线。
-          narrator.speak({ utteranceId: `sub-${runId}`, text,
-            ...(typeof event.voiceProfile === 'string' && event.voiceProfile ? { voiceProfile: event.voiceProfile } : {}) })
+          // 独立播报也按说话人解析：角色方案里的语气与样本不能被事件里的旧音色名盖掉。
+          const assistantId = typeof event.assistantId === 'string' ? event.assistantId : ''
+          const legacyVoice = typeof event.voiceProfile === 'string' ? event.voiceProfile : ''
+          void speakerForAssistant(assistantId).then(speaker => {
+            const namedProfile = !speaker.profileId && legacyVoice && speaker.voiceId === legacyVoice
+              ? voiceApiStore?.snapshot().profiles.find(item => item.kind === 'tts' && item.name === legacyVoice)?.id : undefined
+            narrator.speak({ utteranceId: `sub-${runId}`, text,
+              ...speakerRequestFields(namedProfile ? { ...speaker, voiceId: '', profileId: namedProfile } : speaker) })
+          }).catch(() => {
+            narrator.speak({ utteranceId: `sub-${runId}`, text, ...(legacyVoice ? { voiceProfile: legacyVoice } : {}) })
+          })
           // ★② 舞台形象：让该成员的角色出气泡；角色不在 cast（未启用等）时只播语音不出气泡。
           sendToRenderer('subassistant-report', {
-            assistantId: typeof event.assistantId === 'string' ? event.assistantId : '',
+            assistantId,
             displayName: typeof event.displayName === 'string' ? event.displayName : '',
             skinId: typeof event.skinId === 'string' ? event.skinId : '',
             text,

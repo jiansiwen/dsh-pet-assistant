@@ -41,6 +41,7 @@ import type { Box } from './stage-layout.js'
 import type { AssistantSettingsPage, AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
 import type { AssistantMailAnalysesResult, AssistantMailInput, AssistantMailResult } from '../main/assistant-mail.js'
 import type { MemberAction, MemberApi, MemberCommandInputs, MemberDraft, MemberEditorContext, MemberResult } from '../member-types.js'
+import type { RolePresetApi } from '../role-preset-types.js'
 
 export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?: string }
 
@@ -536,7 +537,8 @@ export interface MemberEditorApi {
   context(): Promise<MemberEditorContext | null>
   close(): Promise<{ ok: boolean }>
   membersState(): Promise<MemberResult>
-  memberCommand<A extends MemberAction>(action: A, input: MemberCommandInputs[A]): Promise<MemberResult>
+  memberCommand<A extends MemberAction>(action: A, input: MemberCommandInputs[A], presetId?: string): Promise<MemberResult>
+  rolePresets?: RolePresetApi['rolePresets']
   memberAssist(input: { request: string; current?: MemberDraft }): Promise<MemberResult>
   /** 按成员性格生成音色描述（复用主进程的主助理模型调用）。 */
   voiceDesignAssist(input: { name?: string; personality: string }): Promise<{ ok: true; description: string; style: string } | { ok: false; error: string }>
@@ -544,7 +546,7 @@ export interface MemberEditorApi {
   onChanged(callback: () => void): () => void
 }
 
-export interface PetApi extends MemberApi {
+export interface PetApi extends MemberApi, RolePresetApi {
   /** 用主助理模型把一句话需求转成成员草稿；只返回候选，不保存。 */
   memberAssist(input: { request: string; current?: MemberDraft }): Promise<MemberResult>
   /** 打开独立的成员编辑窗口；null 表示新建。 */

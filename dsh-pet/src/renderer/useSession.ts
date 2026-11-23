@@ -36,7 +36,8 @@ export function useSession() {
       if (version !== eventVersion.current && previous && previous.bindingId !== state.bindingId) return previous
       if (previous?.bindingId === state.bindingId && (previous.cursor > state.cursor ||
           (version !== eventVersion.current && previous.cursor === state.cursor))) {
-        return { ...previous, entries: mergeEntries(state.entries, previous.entries) }
+        // 旧快照只补历史，不能复活在较新增量里被撤下的未提交片段。
+        return { ...previous, entries: mergeEntries(state.entries.filter(entry => !entry.provisional), previous.entries) }
       }
       return state
     })

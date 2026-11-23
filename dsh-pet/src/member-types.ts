@@ -187,7 +187,7 @@ export type MemberAction = keyof MemberCommandInputs
 export interface MemoryDeletePreview { previewId: string; impact: unknown }
 export interface MemberAssistDraft { draft: MemberDraft; notes: string }
 export interface MemberEditorContext { memberId: string | null; skins?: Array<{ id: string; name: string }> }
-export type MemberData = { records: MemoryRecord[] } | MemoryDeletePreview | MemberAssistDraft | { sessionId: string; title: string }
+export type MemberData = { records: MemoryRecord[] } | MemoryDeletePreview | MemberAssistDraft | { sessionId: string; title: string } | { assistantId: string }
 export type MemberResult<T = MemberData> = { ok: true; state?: MemberSnapshot; data?: T } | { ok: false; error: { code: string; message: string } }
 export interface MemberApi {
   membersState(): Promise<MemberResult>

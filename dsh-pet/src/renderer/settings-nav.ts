@@ -52,7 +52,7 @@ export function settingsNavGroups(): readonly SettingsNavGroup[] {
         { id: 'doc', title: '文档与讲解', summary: '管理授权目录、阅读与讲解方式。' },
         { id: 'voice', title: '语音与声纹', summary: '配置唤醒词、声纹、外放插话与识别服务。' },
         { id: 'learning', title: '记忆与技能', summary: '查看技能、专属词库与工作资料。' },
-        { id: 'appearance', title: '外观与交互', summary: '调整角色大小、透明度、停靠和快捷操作。' },
+        { id: 'appearance', title: '外观与交互', summary: '调整角色大小、透明度、停靠和会话框自动避边。' },
         { id: 'general', title: '其他设置', summary: '管理启动、托盘常驻、活动记录和环境检查。' },
       ],
     },

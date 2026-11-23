@@ -6,6 +6,7 @@ import type { VoiceApiInput, VoiceApiKind, VoiceApiResult } from '../voice-api-t
 import type { AssistantSettingsResult, AssistantSettingsSection } from '../assistant-settings-types.js'
 import type { AssistantMailAnalysesResult, AssistantMailInput, AssistantMailResult } from '../main/assistant-mail.js'
 import type { MemberAction, MemberCommandInputs, MemberDraft, MemberResult, MemoryRecord } from '../member-types.js'
+import type { RolePresetResult } from '../role-preset-types.js'
 import type { FirstRunDownloadResult, FirstRunReportResult } from '../main/first-run-service.js'
 import type { DownloadConfirmation } from '../main/model-resources.js'
 import type { EvidenceIntakeOutcome } from '../evidence-types.js'
@@ -103,6 +104,9 @@ contextBridge.exposeInMainWorld('petApi', {
   assistantSettingsSave: (section: AssistantSettingsSection, input: unknown) =>
     ipcRenderer.invoke('assistant-settings-save', section, input) as Promise<AssistantSettingsResult>,
   membersState: () => ipcRenderer.invoke('members-state') as Promise<MemberResult>,
+  rolePresets: () => ipcRenderer.invoke('role-presets-list') as Promise<RolePresetResult>,
+  saveRolePreset: (id: string, name: string) => ipcRenderer.invoke('role-preset-save', id, name) as Promise<RolePresetResult>,
+  applyRolePreset: (id: string, presetId: string) => ipcRenderer.invoke('role-preset-apply', id, presetId) as Promise<RolePresetResult>,
   memberMemories: (id: string) => ipcRenderer.invoke('member-memories', id) as Promise<MemberResult<{ records: MemoryRecord[] }>>,
   memberCommand: <A extends MemberAction>(action: A, input: MemberCommandInputs[A]) =>
     ipcRenderer.invoke('member-command', action, input) as Promise<MemberResult>,

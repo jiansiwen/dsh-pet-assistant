@@ -9,9 +9,10 @@ export function mergeEntries(previous: SessionEntry[], incoming: SessionEntry[])
 export function mergeSession(previous: SessionSnapshot | null, update: SessionUpdate): SessionSnapshot {
   if (!previous || previous.bindingId !== update.bindingId || update.reset) return update
   if (update.cursor < previous.cursor) return previous
+  const removed = update.removedEntryIds?.length ? new Set(update.removedEntryIds) : null
   return {
     ...update,
-    entries: mergeEntries(previous.entries, update.entries),
+    entries: mergeEntries(removed ? previous.entries.filter(entry => !removed.has(entry.id)) : previous.entries, update.entries),
     hasMore: previous.hasMore,
     beforeSeq: previous.beforeSeq,
   }

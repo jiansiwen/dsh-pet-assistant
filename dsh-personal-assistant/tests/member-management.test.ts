@@ -72,6 +72,37 @@ test('成员设置关闭团队时仍可管理；记忆及权限只接受可信�
   assert.equal((await service.request('POST', '/companion/v1/members', { ...draft, displayName: '不合法权限', allowedTools: ['bash'] })).status, 409)
 })
 
+test('一键切换只更新角色字段，保留主会话、渠道会话、职责、权限和额度', async t => {
+  const store = new TeamStore(':memory:')
+  const service = new MemberManagement({ directory: store.directory,
+    runtime: { busy: () => true } as unknown as MemberRuntime, memories: {} as never,
+    enabled: () => true, setMode: async () => {}, defaultModel: () => null, changed: () => {} })
+  const runtime = new CompanionTaskRuntime(store, new ApprovalService(store, { ttlMs: 60000, runtimeEpoch: 'test' }), { epoch: 'test' })
+  runtime.attachMemberManagement(service)
+  t.after(async () => { await runtime.dispose(); store.close() })
+  const created = await runtime.request('POST', '/companion/v1/members', {
+    ...draft, permissionMode: 'auto', capabilities: ['activity'], personality: '稳重简洁',
+  }, 'owner')
+  const id = (created.body as { createdAssistantId: string }).createdAssistantId
+  assert.ok(id, '新成员回执应给出精确目标，不按名字猜')
+  store.directory.setSession(id, '原主会话')
+  store.directory.setChannelSession(id, 'c'.repeat(64), '原渠道会话')
+  const previous = store.directory.get(id)!
+  const quota = store.directory.quota(id)
+  const endpoint = `/companion/v1/members/${id}/role-style`
+  const role = { personality: '活泼，先打招呼', skinId: 'custom-role-qa', voiceProfile: '茉莉', voiceDesign: '' }
+  const input = { ...role, expectedRevision: previous.revision }
+  assert.equal((await runtime.request('POST', endpoint, input, 'client')).status, 403)
+  assert.equal((await runtime.request('POST', endpoint, { ...input, permissionMode: 'full' }, 'owner')).status, 422)
+  assert.equal((await runtime.request('POST', endpoint, { ...input, expectedRevision: 800 }, 'owner')).status, 409)
+  assert.equal((await runtime.request('POST', endpoint, { ...input, skinId: '../shape' }, 'owner')).status, 422)
+  assert.deepEqual(store.directory.get(id), previous)
+  assert.equal((await runtime.request('POST', endpoint, input, 'owner')).status, 200)
+  assert.deepEqual(store.directory.get(id), { ...previous, ...role, revision: previous.revision + 1 })
+  assert.deepEqual(store.directory.quota(id), quota)
+  assert.equal(store.directory.getChannelSession(id, 'c'.repeat(64)), '原渠道会话')
+})
+
 test('删除成员拒绝忙碌与未结束任务，成功后从目录消失', async t => {
   const store = new TeamStore(':memory:')
   const db = new DatabaseSync(':memory:')

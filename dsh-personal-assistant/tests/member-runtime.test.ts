@@ -325,6 +325,25 @@ test('不同成员会话隔离，任务与聊天共享持久 id，重建运行�
   assert.equal(h.store.directory.quota(a.assistantId).totalUsed, 22)
 })
 
+test('切换角色不打断已经开始的一轮，下次在原会话采用新性格', async t => {
+  const h = await fixture(t)
+  const member = h.store.directory.create(draft('角色切换成员', { personality: '本轮稳重措辞' }))
+  const first = await h.start(member.assistantId)
+  assert.match(await first.driver.prompt(), /本轮稳重措辞/u)
+  h.store.directory.updateRoleStyle(member.assistantId, member.revision, {
+    skinId: 'boy-glasses', voiceProfile: '茉莉', voiceDesign: '', personality: '下一轮使用轻快口吻',
+  })
+  assert.match(await first.driver.prompt(), /本轮稳重措辞/u)
+  await complete(first.driver, 10, '原会话历史')
+  await first.activation.dispose()
+  const next = await h.start(member.assistantId)
+  assert.equal(next.child.id, first.child.id)
+  assert.doesNotMatch(await next.driver.prompt(), /本轮稳重措辞/u)
+  assert.match(await next.driver.prompt(), /下一轮使用轻快口吻/u)
+  await complete(next.driver)
+  await next.activation.dispose()
+})
+
 test('成员企微会话按机器人和聊天范围持久隔离，桌面历史与确认记忆不丢失', async t => {
   const h = await fixture(t)
   const member = h.store.directory.create(draft('企微成员', { capabilities: ['wecom'] }))

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { MIMO_PRESET_VOICES } from '../shared/speaker-voice.ts'
+import { ROLE_PERSONALITY_LIMIT } from '../role-preset-types.ts'
+import { RolePresetPreview, RolePresetSelect, useRolePresetList } from './RolePresetControls.tsx'
 import {
 MEMBER_CAPABILITIES, MEMBER_CAPABILITY_LABELS, MEMBER_KINDS, MEMBER_KIND_LABELS, MEMBER_PERMISSION_LABELS, MEMBER_PERMISSION_MODES,
   MEMBER_REPORT_LABELS, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, MEMBER_SPEECH_LABELS,
@@ -138,15 +140,19 @@ export interface MemberEditorPanelProps {
   latest?: MemberView
   workspaces?: MemberSnapshot['workspaces']
   pending: boolean
-  onSave(draft: MemberDraft, memberId: string | null, expectedRevision?: number): Promise<MemberResult>
+  onSave(draft: MemberDraft, memberId: string | null, expectedRevision?: number, presetId?: string): Promise<MemberResult>
   onDelete?(memberId: string, expectedRevision: number): Promise<MemberResult>
   onClose(): void
 }
 export function MemberEditorPanel({ member, latest, workspaces, pending, onSave, onDelete, onClose }: MemberEditorPanelProps) {
   const [form, setForm] = useState(() => initialForm(member))
+  const presets = useRolePresetList(member ? undefined : window.memberEditorApi.rolePresets)
+  const [presetId, setPresetId] = useState('')
+  const preset = presets.presets.find(item => item.id === presetId)
   const [voiceStyle, setVoiceStyle] = useState('')
   const [voiceSampleFile, setVoiceSampleFile] = useState('')
   const [voiceSampleMime, setVoiceSampleMime] = useState('')
+  const [savingVoice, setSavingVoice] = useState(false)
   // 音色三方法是后加的：旧 preload / 测试假 API 可能没有，缺了就跳过，不影响成员草稿保存。
   const voiceApi = window.memberEditorApi as unknown as {
     getVoice?: (id: string) => Promise<{ style?: string; sampleFile?: string; sampleMime?: string; profileId?: string } | null>
@@ -262,7 +268,7 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
   }, [])
   const [notes, setNotes] = useState<Note[]>([{ id: 0, role: 'assistant', text: '用一句话告诉我这个助理负责什么，我先帮你把草稿填好；你也可以直接在下面填写。' }])
   const nextNote = useRef(1)
-  const busy = pending || !!latest?.busy
+  const busy = pending || savingVoice || !!latest?.busy
   const stale = !!member && (!latest || latest.profile.revision !== revision)
   const latestForm = latest ? initialForm(latest) : null
   const differences = latestForm ? COMPARE_FIELDS.flatMap(([key, label]) => {
@@ -300,14 +306,22 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
       return
     }
     setError(''); setNotice('')
-    const result = await onSave(toDraft(form), member?.profile.assistantId ?? null, member ? revision : undefined)
-    if (!result.ok) { setError(result.error.message); return }
-    if (member) {
-      const done = voiceApi.saveVoice?.(member.profile.assistantId, {
-        style: voiceStyle, sampleFile: voiceSampleFile, sampleMime: voiceSampleMime, profileId: voiceProfileId,
-      })
-      if (done) await done.catch(() => {})
-    }
+    setSavingVoice(true)
+    try {
+      const result = await onSave(toDraft(form), member?.profile.assistantId ?? null, member ? revision : undefined, preset?.id)
+      if (!result.ok) { setError(result.error.message); return }
+      const id = member?.profile.assistantId ?? (result.data && 'assistantId' in result.data ? result.data.assistantId : undefined)
+      if (!preset && id) {
+        const done = voiceApi.saveVoice?.(id, {
+          style: voiceStyle, sampleFile: voiceSampleFile, sampleMime: voiceSampleMime, profileId: voiceProfileId,
+        })
+        if (done && !(await done.catch(() => ({ ok: false }))).ok) {
+          setError('成员已保存，但本机音色未能写入。请关闭窗口，从团队列表重新打开编辑；不要重复创建。')
+          return
+        }
+      }
+      onClose()
+    } finally { setSavingVoice(false) }
   }
 
   async function remove(): Promise<void> {
@@ -326,6 +340,14 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
       </div>
       {member && <span className="editor-badge">配置版本 {revision}</span>}
     </header>
+
+    {!member && window.memberEditorApi.rolePresets && <section className="editor-card" aria-label="套用角色方案">
+      <h2>角色方案</h2>
+      <p className="editor-hint">选择一个已保存的方案，创建时会一起设置形象、音色、动作和性格。名称、职责和权限照常配置。</p>
+      <RolePresetSelect presets={presets.presets} disabled={busy || presets.pending} value={presetId} onChange={setPresetId} label="使用已有角色方案" />
+      {preset && <RolePresetPreview preset={preset} />}
+      {presets.error && <p className="editor-error" role="alert">{presets.error}</p>}
+    </section>}
 
     <section className="editor-card editor-ai" aria-label="用一句话生成草稿">
       <label className="editor-field">
@@ -375,10 +397,10 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
       <label className="editor-field">
         <span>性格与说话风格</span>
         <div className="editor-row">
-          <button type="button" className="editor-button" disabled={busy || generatingPersona}
+          <button type="button" className="editor-button" disabled={busy || generatingPersona || !!preset}
             onClick={() => void generatePersona()}>{generatingPersona ? '正在生成…' : 'AI 生成性格'}</button>
         </div>
-        <textarea rows={2} maxLength={2000} value={form.personality} disabled={busy} onChange={event => set('personality', event.target.value)}
+        <textarea rows={2} maxLength={ROLE_PERSONALITY_LIMIT} value={preset?.personality ?? form.personality} disabled={busy || !!preset} onChange={event => set('personality', event.target.value)}
           placeholder="例：简洁直接，先给结论；不夸张，不编造" />
       </label>
       <label className="editor-field">
@@ -483,6 +505,7 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
     <details className="editor-card editor-advanced">
       <summary>高级设置：形象与声音、模型、额度</summary>
       <div className="editor-grid">
+        {preset ? <p className="editor-hint">形象、动作和音色使用「{preset.name}」。要自定义这些字段，请在上方取消套用。</p> : <>
         <label className="editor-field"><span>形象</span>
           {/*
            * 下拉里除了三个内置形象，还要列出用户在工作室做出来的自定义皮肤。
@@ -554,6 +577,7 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
           </div>
           <small>{voiceSampleFile !== '' ? voiceSampleFile.split(/[\\/]/).pop() : '选了样本就用样本里的嗓子说话（MiMo 复刻），优先于描述与预置编号。'}</small>
         </label>
+        </>}
         <label className="editor-check"><input type="checkbox" checked={form.enabled} disabled={busy} onChange={event => set('enabled', event.target.checked)} />启用这个成员</label>
         <label className="editor-field"><span>AI 生成用的模型</span>
           <select value={genModelKey} disabled={busy} onChange={event => setGenModelKey(event.target.value)}>
@@ -600,8 +624,8 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
     <p className="editor-summary">类型：{MEMBER_KIND_LABELS[form.kind].title} · 权限：{MEMBER_PERMISSION_LABELS[form.permissionMode].title} · 日额度：{limitLabel(safeInteger(form.dailyTokenLimit, 0))} · 总额度：{limitLabel(safeInteger(form.totalTokenLimit, 0))}</p>
     <footer className="editor-actions">
       {member && onDelete && <button type="button" className="editor-danger" disabled={busy || stale} onClick={() => void remove()}>删除成员…</button>}
-      <button type="button" className="editor-secondary" disabled={pending} onClick={onClose}>取消</button>
-      <button type="submit" className="editor-primary" disabled={busy || stale}>{pending ? '等待原生确认或保存…' : member ? '核对并保存…' : '核对并创建…'}</button>
+      <button type="button" className="editor-secondary" disabled={pending || savingVoice} onClick={onClose}>取消</button>
+      <button type="submit" className="editor-primary" disabled={busy || stale}>{pending || savingVoice ? '等待原生确认或保存…' : member ? '核对并保存…' : '核对并创建…'}</button>
     </footer>
   </form>
 }
@@ -651,16 +675,15 @@ export default function MemberEditorApp() {
       return { ok: false, error: { code: 'unavailable', message: '连接中断，结果可能未知；请关闭窗口后刷新团队列表核对，不会自动重发。' } }
     } finally { active.current = false; setPending(false) }
   }
-  async function save(draft: MemberDraft, memberId: string | null, expectedRevision?: number): Promise<MemberResult> {
+  async function save(draft: MemberDraft, memberId: string | null, expectedRevision?: number, presetId?: string): Promise<MemberResult> {
     if (active.current) return { ok: false, error: { code: 'busy', message: '正在处理，请稍候。' } }
     if (expectedRevision !== undefined && !memberId) return { ok: false, error: { code: 'conflict', message: '成员标识丢失，请关闭窗口后重新打开。' } }
     active.current = true
     setPending(true)
     try {
       const result = expectedRevision === undefined
-        ? await window.memberEditorApi.memberCommand('create', draft)
+        ? await window.memberEditorApi.memberCommand('create', draft, presetId)
         : await window.memberEditorApi.memberCommand('update', { id: memberId!, expectedRevision, ...draft })
-      if (result.ok) { await window.memberEditorApi.close(); return result }
       return result
     } catch {
       return { ok: false, error: { code: 'unavailable', message: '连接中断，结果可能未知；请关闭窗口后刷新团队列表核对，不会自动重发。' } }

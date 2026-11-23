@@ -161,7 +161,8 @@ interface PluginLogger {
 interface PluginContext {
   storageDomain: { open(spec: unknown): Promise<Domain<PersonalAssistantDomainSpec>> }
   effect(execute: () => () => void, label?: string): unknown
-  on(event: 'agent/status' | 'agent/disposed', listener: (payload: { agent: unknown; status?: string }) => void): unknown
+  on(event: 'agent/status' | 'agent/disposed', listener: (payload: { agent: unknown; status?: string }) => void, options?: { global?: boolean }): unknown
+  on(event: 'agent/assistant-stream', listener: (payload: { agent: unknown; frame: Parameters<SessionBridge['onAssistantStream']>[1] }) => void, options: { global: true }): unknown
   logger?(name: string): PluginLogger
   /** cordis 的「不经 inject 读服务」：没有提供时返回 undefined。假宿主可能连这个方法都没有。 */
   get?(name: string): unknown
@@ -2345,10 +2346,13 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   // 会话运行态全量转发；idle 同时驱动原有因果回复结算。
   ctx.on('agent/status', payload => {
     bridge.onAgentStatus(payload.agent, payload.status)
-  })
+  }, { global: true })
   ctx.on('agent/disposed', payload => {
     bridge.onAgentDisposed(payload.agent)
-  })
+  }, { global: true })
+  ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    bridge.onAssistantStream(agent, frame)
+  }, { global: true })
   // 插件卸载：通知宠物退场、关闭桥接服务，并按所有权释放桥接自建的会话（返回的 Promise 交给宿主等）。
   ctx.effect(() => () => bridge.dispose(), 'personal-assistant:bridge')
 

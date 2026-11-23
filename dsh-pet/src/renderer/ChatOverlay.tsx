@@ -59,12 +59,19 @@ const STOP_HINT = '停止生成：\n'
   + '后台是否停止未知，不会停掉网页里正在执行的其他请求，也不会自动重发；点名成员的团队任务会被定向终止。\n'
   + '· 没有宠物请求时（网页或原生队列发起的轮次）：与网页里的停止按钮相同，停止原生会话当前轮次。'
 
+const TOOL_STATUS: Partial<Record<string, string>> = {
+  preparing: '准备调用', pending: '等待执行', running: '执行中', completed: '已完成', error: '执行失败',
+  aborted: '已停止', interrupted: '已中断', blocked: '已拦截', 'no-result': '未取得结果', 'max-tokens': '达到输出上限',
+}
+
 const Entry = memo(function Entry({ entry }: { entry: SessionEntry }) {
+  const status = entry.kind === 'tool' && entry.status ? TOOL_STATUS[entry.status] : undefined
   if (entry.kind !== 'text') return (
     <details className={`hud-process hud-process-${entry.kind}`}>
       <summary><span className="hud-process-mark" aria-hidden>{entry.kind === 'think' ? '◇' : '›'}</span>
         <span>{entry.kind === 'think' ? '思考' : entry.name || '工具调用'}</span>
-        <span className="hud-process-preview">{entry.text || entry.status}</span>
+        <span className="hud-process-preview">{entry.text}</span>
+        {status && <span className="hud-process-status">{status}</span>}
       </summary>
       <pre>{entry.text}</pre>
       {entry.result && <pre className="hud-tool-result">{entry.result}</pre>}
@@ -188,6 +195,7 @@ export default function ChatOverlay(props: Props) {
   const currentModel = session?.model
   const modelKey = (model: { provider: string; model: string }) => JSON.stringify([model.provider, model.model])
   const choices = currentModel && !models.some(model => modelKey(model) === modelKey(currentModel)) ? [currentModel, ...models] : models
+  const modelConnected = Boolean(session?.sessionId && session.status !== 'disconnected')
   // 演示隐私模式：分界之前的一律不渲染（数据还在，只是不显示；关掉就原样回来）。
   const { visible: visibleEntries, hidden: hiddenCount } = entriesForPresentation(session?.entries ?? [], props.hiddenThroughSeq ?? null)
 
@@ -220,7 +228,7 @@ export default function ChatOverlay(props: Props) {
         {visibleEntries.map(entry => <Entry key={entry.id} entry={entry} />)}
         {/* 临时逐字尾：只画在权威条目之后。上游一旦提交权威条目，`liveTurn` 立刻变 null，
             所以这里永远不可能与同一条消息的第二份并存。复用既有 .hud-message/.is-streaming。 */}
-        {props.liveTurn && (
+        {props.liveTurn && (props.liveTurn.text || props.liveTurn.think) && (
           <div className="hud-message hud-message-assistant is-streaming" key={`live-${props.liveTurn.turnKey}`}>
             {props.liveTurn.think && !props.liveTurn.text
               ? <span className="hud-process-preview">思考中…</span>
@@ -267,9 +275,10 @@ export default function ChatOverlay(props: Props) {
             {!session?.permission && <option value="">权限不可用</option>}
             {session?.permissions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
-          <select className="hud-model" aria-label="会话模型" title={session?.capabilities.models
-            ? '切换对后续请求生效' : '当前宿主不支持在这里切换，请到应用的模型设置调整'} value={currentModel ? modelKey(currentModel) : ''}
-            disabled={changing || !session?.capabilities.models} onChange={event => {
+          <select className="hud-model" aria-label="会话模型" title={!modelConnected ? '连接 DSH 会话后可切换模型'
+            : session?.capabilities.models ? '切换对后续请求生效' : '当前 DSH 未提供会话模型切换接口，请在 DSH 会话的模型菜单切换'}
+            value={currentModel ? modelKey(currentModel) : ''}
+            disabled={changing || !modelConnected || !session?.capabilities.models || !choices.length} onChange={event => {
               const chosen = choices.find(model => modelKey(model) === event.target.value)
               if (chosen && session) void choose({ kind: 'model', bindingId: session.bindingId,
                 provider: chosen.provider, model: chosen.model, reasoningEffort: chosen.reasoningEffort })

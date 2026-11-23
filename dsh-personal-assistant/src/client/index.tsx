@@ -1064,6 +1064,10 @@ function ListPanel({ tab, result, loading, connected, busy, onOpen, priority, ex
         renderCell={renderCell}
         extra={extra}
       />
+      {tab === 'team' && (result?.state === 'rows' || result?.state === 'empty') && (
+        <button type="button" style={{ ...secondaryButton, marginTop: 10 }} disabled={busy}
+          onClick={() => onOpen('team')}>{busy ? '打开中…' : '在桌宠管理助理与角色方案'}</button>
+      )}
       {footer}
       {priority !== undefined && editing !== null && (
         <div

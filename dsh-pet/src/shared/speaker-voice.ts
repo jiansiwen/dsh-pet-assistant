@@ -60,6 +60,16 @@ export function hasSpeakerVoice(voice: SpeakerVoice | null | undefined): boolean
     || trim(voice.sampleFile) !== '' || trim(voice.sample) !== '' || trim(voice.profileId) !== ''
 }
 
+/** 读取角色方案和实际播报使用同一套成员音色继承规则。 */
+export function memberSpeakerVoice(local: SpeakerVoice | undefined, directory: SpeakerVoice | undefined, chief: SpeakerVoice): SpeakerVoice {
+  const voice: SpeakerVoice = {
+    ...local,
+    voiceId: normalizePresetId(local?.voiceId || directory?.voiceId || ''),
+    design: local?.design || directory?.design || '',
+  }
+  return hasSpeakerVoice(voice) ? voice : chief
+}
+
 /**
  * 把说话人音色裁成可叠到 ResolvedVoiceApi 上的覆盖层。
  *

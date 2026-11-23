@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import ts from 'typescript'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import * as contract from '../src/member-types.ts'
+import * as rolePresets from '../src/role-preset-types.ts'
 import type { MemberSnapshot, MemberResult, MemoryRecord } from '../src/member-types.ts'
 
 // 只在内存转译 JSX 驱动组件事件，不执行项目构建，不生成文件，不启动浏览器。
@@ -69,7 +70,10 @@ function mount(feedOnly = false) {
   }
   type Feed = { state: MemberSnapshot | null; error: string; loading: boolean; refresh(): Promise<void> }
   const module = { exports: {} as { default: (props: { feed: Feed }) => ReactNode; useMemberFeed(show: (text: string) => void): Feed } }
-  new Function('require', 'module', 'exports', compiled)((name: string) => name === 'react' ? hooks : name === '../member-types.ts' ? contract : require(name), module, module.exports)
+  new Function('require', 'module', 'exports', compiled)((name: string) => ({
+    react: hooks, '../member-types.ts': contract, '../role-preset-types.ts': rolePresets,
+    './RolePresetControls.tsx': { RolePresetControls: () => null },
+  } as Record<string, unknown>)[name] ?? require(name), module, module.exports)
   const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
   Object.defineProperty(globalThis, 'window', { configurable: true, value: { petApi: {
     membersState: async () => { reads++; return readResult },

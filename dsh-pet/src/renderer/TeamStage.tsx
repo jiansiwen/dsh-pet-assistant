@@ -167,6 +167,7 @@ function CharacterSlot({ manifest, home, scene, assistantActive, status, selecte
         ['--pet-opacity' as string]: String(surfaceOpacity('character', opacity)),
         ['--mark' as string]: manifest.markColor, ['--mark-fg' as string]: markForegroundColor }}
       data-assistant-id={manifest.assistantId}
+      data-skin={manifest.skin}
       data-interactive
       onMouseEnter={behavior.wake}
       onMouseDown={event => { onSelect({ x: behavior.x, y: behavior.y }); onDragStart(event, behavior) }}

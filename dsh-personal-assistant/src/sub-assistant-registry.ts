@@ -73,8 +73,10 @@ export class SubAssistantRegistry {
       this.sessions.set(member.assistantId, session)
     }
     session.lastUsedAt = now
+    const style = member.personality.trim()
+    const styleHint = style ? `本次回复的性格与表达风格（不改变任务和权限）：${style}\n\n` : ''
     if (session.kind === 'platform' && member.kind === 'platform') {
-      const system: SubAssistantMessage = { role: 'system', content: `${member.persona}\n\n${SUB_ASSISTANT_PROTOCOL_PROMPT}` }
+      const system: SubAssistantMessage = { role: 'system', content: `${styleHint}${member.persona}\n\n${SUB_ASSISTANT_PROTOCOL_PROMPT}` }
       const user: SubAssistantMessage = { role: 'user', content: task }
       const receipt = await (session.agent as PlatformAgent).send([system, ...session.messages, user], timeoutMs)
       if (receipt.kind === 'reply' || receipt.kind === 'out-of-scope') {
@@ -84,7 +86,7 @@ export class SubAssistantRegistry {
       }
       return receipt
     }
-    return (session.agent as CliAgent).send(task, timeoutMs)
+    return (session.agent as CliAgent).send(styleHint ? `${styleHint}任务：\n${task}` : task, timeoutMs)
   }
 
   /** 空闲回收：淘汰 lastUsedAt 距今超过 idleTtlMs 的会话；返回淘汰数。装配层周期调用。 */

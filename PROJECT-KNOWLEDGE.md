@@ -145,6 +145,7 @@ dsh web（宿主进程，常驻）
 | `<DSH_HOME>/desktop-team/team.sqlite` | 插件 | 团队库（`teamEnabled` 时） |
 | `<DSH_HOME>/dsh-pet/launch.log` | 插件 | 召唤拉起桌宠的启动日志 |
 | 桌宠 `userData/pet-settings.json` | 桌宠 | 舞台/语音/文档/会议等全部设置（`settings.ts:78`） |
+| 桌宠 `userData/role-presets.json` / `role-preset-<id>.audio` | 桌宠 | 跨总助理和成员共用的角色快照、独立音色样本；不存账号、权限或声纹 |
 | 桌宠 `userData/meeting.sqlite` | 桌宠 | 会议库（录音/转写/纪要/讲解状态，`meeting-store.ts`） |
 | 桌宠 `userData/voice-apis.json` | 桌宠 | 自配 TTS/ASR 服务，**密钥经 safeStorage 加密**（`main/index.ts:3379`） |
 | 桌宠 `userData/companion-owner.json` | 桌宠 | 运行时所有权记录（pid+startedAt+instanceId，`companion-host.ts:635`） |
@@ -245,6 +246,8 @@ dsh web（宿主进程，常驻）
 | 助手设置 | `src/assistant-settings.ts` | `src/assistant-settings-types.ts` |
 | 团队快照/提案 | `src/team-domain.ts` | `src/renderer/types.ts`（TeamSnapshot 等） |
 
+会话增量在当前绑定内按条目身份更新；`removedEntryIds` 仅撤下未提交的流式预览，例如失败重试，不能用空历史代替撤下。
+
 ## 4. 插件 dsh-personal-assistant
 
 dsh 插件（cordis 4，profile 根作用域单例），入口 `src/index.ts`（1,122 行）。
@@ -333,7 +336,7 @@ dsh 插件（cordis 4，profile 根作用域单例），入口 `src/index.ts`（
 | `evidence-import.ts` | 267 | 项目证据拉取：realpath 授权边界、文件 ≤256KB/≤400 行、`git diff` 禁 fsmonitor/textconv、批准后重读 digest 一致才登记 `modelVisible:true` |
 | `evidence-intake.ts` | 178 | 桌面壳证据收件（`POST /evidence/intake`）：kind 白名单、空正文拒收、默认 `modelVisible:false`、digest 不一致收下但警告 |
 | `assistant-settings.ts` | 364 | 助理设置服务：zod 严格校验、事务目录 journal+回滚（恢复顺序固定：先禁 wecom→恢复 secret→settings→wecom）、企微密钥 DPAPI 加密写入（仅 Windows，非 win32 报 `CREDENTIALS_UNSUPPORTED`） |
-| `session-mirror.ts` | 364 | 面板原生会话镜像：只投影真人输入（`source.kind==''|'user'`）、换绑 stale 丢弃、分页 50 条、权限白名单走 `/permission` 命令 |
+| `session-mirror.ts` | — | 旧宿主可从日志读增量；新版 DSH 经 `agent/assistant-stream` 推送当前绑定的思考、正文与工具预览，正式日志覆盖同一条目。模型走原生会话控制器，无控制器时先核对模型目录与路由，再走宿主 `Agent.model.select`；权限白名单走 `/permission`。 |
 | `pet-dir.ts` | 53 | 桌宠目录解析：`config.petDir` > `DSH_PET_DIR` > 插件同级 `dsh-pet`，缺失时返回原因供 UI 解释 |
 
 **E. 客户端（1）**：`client/index.tsx`（199 行，见 §4.2 末）。
@@ -601,6 +604,7 @@ dsh 插件（cordis 4，profile 根作用域单例），入口 `src/index.ts`（
 | `pointer-watch.ts` | 257 | 全局指针监视（仅 win32/darwin）：惰性启动、启停幂等、空闲复用、分块粘包解析 |
 | `platform.ts` | 393 | 平台能力表（`SUPPORTED_DESKTOP_ACTIONS`：Windows 真机验证 / macOS 未验证 / Linux 不支持；`SUPPORTED_AUDIO`；`SUPPORTED_POINTER_WATCH`） |
 | `settings.ts` | 229 | `pet-settings.json`（userData）：驻留模式（fixed/auto）、渲染状态、自启动；`ResidencyState` 由 `isDocked+positionHint+lastStage` 计算；损坏文件回保守缺省 |
+| `role-preset-store.ts` / `role-presets.ts` | — | 保存当前角色的四项快照；依据本机素材与语音配置校验并套用。成员使用所有者专用 `/companion/v1/members/:id/role-style` 写入窄字段，总助理沿用设置接口，均按修订号更新。创建复用成员原生确认及新成员标识回执。 |
 | `assistant-settings.ts`（main） | 162 | 助理设置 IPC：固定路径、凭据只回无密钥契约字段、密钥留空=省略不清除 |
 | `first-run.ts` / `first-run-service.ts` | 404/354 | 环境检查与模型下载计划：清单含用途/来源/许可证/大小/sha256；**打开页面只触发只读检查**，下载/申请权限都要用户点；镜像前缀非法如实报错 |
 | `model-resources.ts` | 760 | 模型资源清单（与 `setup-local-asr` 的 ps1/sh 及 `asr.ts`/`diarize.ts` 落点三方一致，测试钉住） |
@@ -683,7 +687,7 @@ WPS：wps-control.ts（定位/核验/跳页） + wps-view-target.ts（状态机�
 | `TeamStage.tsx` | 289 | 多角色舞台：共享素材、位置命中盒、场景编排；交互动画/睡眠不被抢占 |
 | `PetSprite.tsx` | 471 | 参数化角色（`p-body/p-eye/…` class 由 pet-anim.css 按 data-action 驱动），三套皮肤切换 |
 | `PortalExit.tsx` | 22 | 漩涡退场（opening 0.7s / open 旋转 / closing 1.2s，与 App 时间线对齐） |
-| `ChatOverlay.tsx` | 267 | 对话气泡层（按讲解标题切分、不执行内容、命中盒注册） |
+| `ChatOverlay.tsx` | — | 头顶会话框：渲染进行中的思考、工具与正文，按保存的 `chatDock` 定位并登记鼠标区域。自动避边的开关在「外观与交互」；会话打开时舞台不挂悬停工具栏。 |
 | `useSession.ts` / `session-view.ts` | 121/112 | 会话快照订阅与增量合并（按 seq 排序） |
 | `usePetBehavior.ts` | 322 | 定点生活行为、拖拽与会话动画；真实交互优先于随机活动 |
 | `usePetImage.ts` | 335 | 素材加载：本地 PNG + 边缘漫水填充去背，失败回退 SVG；模块级共享缓存 |

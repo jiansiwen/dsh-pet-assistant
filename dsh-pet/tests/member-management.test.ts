@@ -71,6 +71,31 @@ test('预加载仅暴露固定成员方法，不开放任意地址和凭据', as
   assert.deepEqual(invokes, [['members-state'], ['member-memories', id], ['member-command', 'mode', { enabled: false }]])
   assert.equal(exposed.companionRequest, undefined)
 })
+
+test('套用角色方案创建时先走原生确认，只对宿主回执的新助理落位', async () => {
+  const editor = { sender: {}, senderFrame: {} }
+  const preset = { personality: '亲切一些', voiceProfile: '茉莉', voiceDesign: '', skinId: 'girl-glasses' }
+  const applied: string[] = []
+  const created = 'member-唯一新成员'
+  registerMemberManagement({ getStageWindow: () => win as never, pagePath,
+    allowWindow: incoming => incoming === editor,
+    request: async (method, path, body, subject) => {
+      requests.push({ method, path, body, subject })
+      return { status: 200, body: method === 'POST' ? { createdAssistantId: created } : state }
+    },
+    prepareRole: () => ({ fields: preset, validate() {}, apply: id => { applied.push(id) } }),
+  })
+  const run = (sender: unknown) => handlers.get(MEMBER_CHANNELS.command)!(sender, 'create', draft, '方案甲')
+  assert.equal(code(await run(event())), 'invalid_input')
+  confirm = async () => ({ response: 0 })
+  assert.equal(code(await run(editor)), 'cancelled')
+  assert.deepEqual(applied, [])
+  assert.deepEqual(writes(), [])
+  confirm = async () => ({ response: 1 })
+  assert.deepEqual(await run(editor), { ok: true, data: { assistantId: created } })
+  assert.deepEqual(writes()[0]!.body, { ...draft, ...preset })
+  assert.deepEqual(applied, [created])
+})
 test('直接对象快照逐字段投影，密钥与扩展字段不混入', async () => {
   mount()
   const safe = snapshot()

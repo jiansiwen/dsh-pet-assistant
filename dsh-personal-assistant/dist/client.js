@@ -1815,6 +1815,16 @@ function ListPanel({ tab, result: result2, loading, connected, busy, onOpen, pri
         extra
       }
     ),
+    tab === "team" && (result2?.state === "rows" || result2?.state === "empty") && /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+      "button",
+      {
+        type: "button",
+        style: { ...secondaryButton, marginTop: 10 },
+        disabled: busy,
+        onClick: () => onOpen("team"),
+        children: busy ? "\u6253\u5F00\u4E2D\u2026" : "\u5728\u684C\u5BA0\u7BA1\u7406\u52A9\u7406\u4E0E\u89D2\u8272\u65B9\u6848"
+      }
+    ),
     footer,
     priority !== void 0 && editing !== null && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(
       "div",

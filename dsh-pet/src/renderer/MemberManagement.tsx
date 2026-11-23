@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { CHIEF_ROLE_ID } from '../role-preset-types.ts'
+import { RolePresetControls } from './RolePresetControls.tsx'
 import {
   MEMBER_CAPABILITY_LABELS, MEMORY_KINDS,
   type MemberAction, type MemberCommandInputs, type MemberSnapshot, type MemberView,
@@ -104,6 +106,7 @@ export default function MemberManagement({ feed }: { feed: Feed }) {
       <p className="management-hint">新增和修改会在独立窗口中打开；可以先用一句话告诉小潘你要什么助理，让它把草稿填好，你核对后再保存。</p>
       <div className="member-actions"><button type="button" className="management-button" disabled={pending || !!error}
         onClick={() => { setMemoryId(null); void openEditor(null) }}>添加自定义成员</button></div>
+      <RolePresetControls disabled={pending || !!error} targets={[{ id: CHIEF_ROLE_ID, label: '总助理' }, ...state.members.map(({ profile }) => ({ id: profile.assistantId, label: profile.displayName }))]} />
       <section aria-label="额度申请" className="team-section">
         <h4>待处理额度申请（{state.requests.filter(item => item.state === 'pending').length}）</h4>
         <p className="management-hint">达到阈值会申请，不自动批准。批准时必须明确加额（填写新上限）或重置用量，也可拒绝。</p>
