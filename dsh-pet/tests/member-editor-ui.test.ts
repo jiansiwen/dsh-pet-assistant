@@ -26,7 +26,7 @@ function text(node: ReactNode): string {
 function member(revision = 3): MemberView {
   return { profile: { assistantId: '成员甲', displayName: '研究员甲', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceProfile: '', voiceDesign: '', description: '通用研究', persona: '按证据回答',
     roleId: 'wukong', skinId: 'panda', toolPolicy: { mode: 'read-only', denyTools: [] }, enabled: true, revision, sessionId: '独立会话甲', provider: '', model: '',
-    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai', kind: 'expert', binding: null },
+    maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai', kind: 'expert', binding: null, platformAuth: null },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 0, totalReserved: 0, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }
 }
 const baseDraft: MemberDraft = { displayName: '日报助理', description: '整理日报', personality: '简洁直接', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceProfile: '', voiceDesign: '', persona: '只依据证据', skinId: 'panda',
@@ -160,5 +160,79 @@ test('外部版本变化先展示最新配置与草稿差异，明确选择覆�
     await view.flush()
     assert.equal(view.saved[0]!.expectedRevision, 4)
     assert.equal(view.saved[0]!.draft.description, '未保存的草稿')
+  } finally { view.dispose() }
+})
+
+test('平台智能体：应用 ID 可回显，签名密钥只写不回显', async () => {
+  const view = mount(member())
+  try {
+    view.choose('平台智能体', 'platform')
+    assert.equal(view.field('应用 ID（开放接口报文中的 appid）').props.value, '')
+    assert.equal(view.field('签名密钥 app_secret（未配置）').props.value, '')
+    view.change('智能体 ID（平台用 X-Agent-Id 指定智能体）', '1360')
+    view.change('应用 ID（开放接口报文中的 appid）', '10001')
+    view.change('签名密钥 app_secret（未配置）', 'member-sign')
+    view.change('签名接口地址（留空沿用本机配置）', 'https://aiagent.example.com/api/chat/realtime')
+    view.change('用户标识 user_id（留空沿用本机配置）', '10001234')
+    view.submit()
+    await view.flush()
+    assert.equal(view.saved.length, 1)
+    const binding = view.saved[0]!.draft.binding
+    assert.equal(binding?.kind, 'platform')
+    if (binding?.kind !== 'platform') throw new Error('保存体不是平台绑定')
+    assert.equal(binding.appId, '10001')
+    assert.equal(binding.signEndpoint, 'https://aiagent.example.com/api/chat/realtime')
+    assert.equal(binding.signUserId, '10001234')
+    assert.equal(view.saved[0]!.draft.appSecret, 'member-sign')
+    assert.doesNotMatch(view.text, /member-sign/u, '表单不能回显刚输入的签名密钥')
+  } finally { view.dispose() }
+})
+
+test('签名密钥已存时只显示已配置，留空保存沿用原条目标识', async () => {
+  const saved = member()
+  saved.profile.kind = 'platform'
+  saved.profile.binding = { kind: 'platform', endpoint: 'https://aiagent.example.com/api/agentChat/v1', model: '', agentId: '1360',
+    secretId: 'chat-entry', appId: '10001', appSecretId: 'vault-entry', signEndpoint: 'https://aiagent.example.com/api/chat/realtime', signUserId: '10001234' }
+  const view = mount(saved)
+  try {
+    assert.match(view.text, /签名密钥 app_secret（已配置，留空＝沿用原密钥）/u)
+    assert.equal(view.field('签名密钥 app_secret（已配置，留空＝沿用原密钥）').props.value, '')
+    assert.equal(view.field('签名接口地址（留空沿用本机配置）').props.value, 'https://aiagent.example.com/api/chat/realtime')
+    assert.equal(view.field('用户标识 user_id（留空沿用本机配置）').props.value, '10001234')
+    view.submit()
+    await view.flush()
+    assert.equal(view.saved.length, 1)
+    assert.equal(view.saved[0]!.draft.appSecret, undefined)
+    const binding = view.saved[0]!.draft.binding
+    assert.equal(binding?.kind, 'platform')
+    if (binding?.kind !== 'platform') throw new Error('保存体不是平台绑定')
+    assert.equal(binding.appId, '10001')
+    assert.equal(binding.appSecretId, 'vault-entry')
+    assert.equal(binding.signEndpoint, 'https://aiagent.example.com/api/chat/realtime')
+    assert.equal(binding.signUserId, '10001234')
+  } finally { view.dispose() }
+})
+
+test('本机专家勾选平台能力后显示平台凭据并能保存', async () => {
+  const view = mount(member())
+  try {
+    assert.doesNotMatch(view.text, /平台查询凭据/u)
+    view.change('对接外部智能助理平台', true)
+    assert.match(view.text, /平台查询凭据/u)
+    assert.match(view.text, /它的会话、性格和记忆由 DSH 负责/u)
+    view.change('应用 ID（开放接口报文中的 appid）', 'app_qa')
+    view.change('签名密钥 app_secret（未配置）', 'expert-secret')
+    view.change('签名接口地址（留空沿用本机配置）', 'https://sign.example.invalid/realtime')
+    view.change('用户标识 user_id（留空沿用本机配置）', '210')
+    view.submit()
+    await view.flush()
+    assert.equal(view.saved.length, 1)
+    const draft = view.saved[0]!.draft
+    assert.equal(draft.kind, 'expert')
+    assert.equal(draft.binding, null)
+    assert.equal(draft.platformAuth?.appId, 'app_qa')
+    assert.equal(draft.platformAuth?.signUserId, '210')
+    assert.equal(draft.platformAuth?.signEndpoint, 'https://sign.example.invalid/realtime')
+    assert.equal(draft.appSecret, 'expert-secret')
   } finally { view.dispose() }
 })

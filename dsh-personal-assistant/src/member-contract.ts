@@ -47,6 +47,14 @@ export interface PlatformBinding {
   agentId: string
   /** 指向加密密钥库中密钥条目的标识；空串=尚未配置密钥（分派时如实拒绝）。 */
   secretId: string
+  /** 开放平台应用 ID（接口报文 appid）；空串=签名查询沿用本机平台对接配置。 */
+  appId?: string
+  /** 开放平台签名密钥 app_secret 在加密密钥库中的条目标识；绝不保存明文。 */
+  appSecretId?: string
+  /** 签名接口地址；空串=沿用本机平台对接配置的 endpoint。 */
+  signEndpoint?: string
+  /** 签名查询的用户标识 user_id；空串=沿用本机平台对接配置。 */
+  signUserId?: string
 }
 export interface LocalCliBinding {
   kind: 'local-cli'
@@ -55,8 +63,20 @@ export interface LocalCliBinding {
   args: readonly string[]
 }
 export type SubAssistantBinding = PlatformBinding | LocalCliBinding
+/**
+ * 本机专家调用外部平台时使用的签名凭据。
+ *
+ * 与 PlatformBinding 分开：本机专家的 DSH 会话、人设、记忆都由 DSH 负责，
+ * 平台只是它调用的一个外部工具；凭据为空时逐项沿用本机平台对接配置。
+ */
+export interface PlatformAuth {
+  appId: string
+  appSecretId: string
+  signEndpoint: string
+  signUserId: string
+}
 /** normalize 之后的完整草稿：子助理三字段已定值，可直接并入 MemberProfile。 */
-export type NormalizedMemberDraft = MemberDraft & Required<Pick<MemberDraft, 'kind' | 'binding' | 'reportMode'>>
+export type NormalizedMemberDraft = MemberDraft & Required<Pick<MemberDraft, 'kind' | 'binding' | 'reportMode' | 'platformAuth'>>
 export interface MemberProfile extends MemberConfig {
   description: string
   personality: string
@@ -79,6 +99,8 @@ export interface MemberProfile extends MemberConfig {
   scheduleWorkspaceId?: string | null
   kind: MemberKind
   binding: SubAssistantBinding | null
+  /** 本机专家的平台查询凭据（勾选 platform 能力时生效）；platform 类型成员用 binding 里的同名字段。 */
+  platformAuth: PlatformAuth | null
 }
 export interface MemberQuotaView {
   day: string
@@ -188,4 +210,8 @@ export interface MemberDraft {
   /** 子助理两字段；缺省=expert/无绑定（normalize 补默认，旧调用方零改动）。 */
   kind?: MemberKind
   binding?: SubAssistantBinding | null
+  /** 本机专家的平台凭据；与 binding 分开，platform 类型成员用 binding 里的同名字段。 */
+  platformAuth?: PlatformAuth | null
+  /** 平台签名密钥只写不读：保存时经桥一程即入加密存储，快照与回显永不携带。 */
+  appSecret?: string
 }

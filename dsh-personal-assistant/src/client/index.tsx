@@ -840,8 +840,18 @@ function AssistantPanel({ ctx }: { ctx: ClientContext }) {
  * 最容易"看起来没错、实际全错"的一类问题。
  */
 function columnFlex(width: string | undefined): string {
-  if (width === undefined) return '1 1 0'
-  return width.endsWith('px') ? `0 0 ${width}` : width
+  // CSS flex 不接受 `fr`；写 `1.1fr` 会被整条忽略、退化成按内容撑开（表头与行就对不齐）。
+  if (width === undefined) return '1 1 0%'
+  if (width.endsWith('px')) return `0 0 ${width}`
+  const value = Number(width.replace(/fr$/u, ''))
+  return Number.isFinite(value) && value > 0 ? `${value} 1 0%` : '1 1 0%'
+}
+
+/** 列的最小宽度：`1.1fr` 按 64px 换算，保证名字/状态不被压成省略号；px 列原样。 */
+function columnMin(width: string | undefined): string {
+  if (width?.endsWith('px')) return width
+  const value = Number((width ?? '').replace(/fr$/u, ''))
+  return Number.isFinite(value) && value > 0 ? `${Math.round(value * 64)}px` : '72px'
 }
 
 /**
@@ -944,13 +954,13 @@ function TableBody({ definition, page, result, loading, connected, busy, onOpen,
             className={columnClassName(keyPrefix, column.key)}
             style={{
               flex: columnFlex(column.width),
-              minWidth: 0,
+              minWidth: columnMin(column.width),
               textAlign: rightAlignLast && index === definition.columns.length - 1 ? 'right' : 'left',
             }}
           >{column.label}</span>
         ))}
         {extra !== undefined && (
-          <span style={{ flex: columnFlex(extra.width), minWidth: 0 }}>{extra.label}</span>
+          <span style={{ flex: columnFlex(extra.width), minWidth: columnMin(extra.width) }}>{extra.label}</span>
         )}
       </div>
       {state === 'rows' && result !== undefined
@@ -967,10 +977,9 @@ function TableBody({ definition, page, result, loading, connected, busy, onOpen,
                   className={column === undefined ? undefined : columnClassName(keyPrefix, column.key)}
                   style={{
                     flex: columnFlex(column?.width),
-                    minWidth: 0,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
+                    minWidth: columnMin(column?.width),
+                    overflowWrap: 'anywhere',
+                    whiteSpace: 'normal',
                     textAlign: rightAlignLast && cellIndex === definition.columns.length - 1 ? 'right' : 'left',
                     ...(tone === undefined ? {} : { color: tone ?? TOKENS.muted }),
                   }}
@@ -1066,7 +1075,7 @@ function ListPanel({ tab, result, loading, connected, busy, onOpen, priority, ex
       />
       {tab === 'team' && (result?.state === 'rows' || result?.state === 'empty') && (
         <button type="button" style={{ ...secondaryButton, marginTop: 10 }} disabled={busy}
-          onClick={() => onOpen('team')}>{busy ? '打开中…' : '在桌宠管理助理与角色方案'}</button>
+          onClick={() => onOpen('team')}>{busy ? '打开中…' : '在桌宠编辑成员与角色'}</button>
       )}
       {footer}
       {priority !== undefined && editing !== null && (

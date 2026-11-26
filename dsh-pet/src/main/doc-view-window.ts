@@ -202,6 +202,8 @@ export interface PdfViewWindowOptions {
   readonly preloadPath?: string
   readonly width?: number
   readonly height?: number
+  /** 演讲窗口显示或获得焦点后回调：主进程据此把桌宠舞台提到演讲窗口之上，避免遮挡助理形象。 */
+  readonly onShown?: () => void
 }
 
 interface SenderLike {
@@ -253,6 +255,7 @@ export class PdfViewWindow implements DocViewTarget {
   private readonly preloadPath: string
   private readonly width: number
   private readonly height: number
+  private readonly onShown?: () => void
 
   constructor(library: Pick<DocumentLibrary, 'snapshot'>, options: PdfViewWindowOptions = {}) {
     this.grants = new DocViewGrants(library)
@@ -262,6 +265,7 @@ export class PdfViewWindow implements DocViewTarget {
     this.preloadPath = options.preloadPath ?? path.join(here, '../preload/doc-view.cjs')
     this.width = options.width ?? 820
     this.height = options.height ?? 980
+    this.onShown = options.onShown
   }
 
   show(session: DocViewTargetSession): void {
@@ -278,6 +282,7 @@ export class PdfViewWindow implements DocViewTarget {
     if (this.win && !this.win.isDestroyed()) {
       this.win.webContents.send(DOC_VIEW_CHANNELS.sessionChanged)
       if (!this.win.isVisible()) this.win.showInactive()
+      this.onShown?.()
       return
     }
     this.createWindow()
@@ -430,10 +435,10 @@ export class PdfViewWindow implements DocViewTarget {
       title: '阅读视图',
       show: false,
       /*
-        讲解是要"看着讲"的：窗口自己置顶并在显示时最大化。
-        以前它按普通窗口弹出来，被别的窗口压住、也没铺开，用户得手动点一次才能看见。
+        演讲窗口最大化展开在普通应用之上，但不设 alwaysOnTop —— 否则在 Windows 上会压住同为置顶的
+        桌宠舞台窗口，导致左下角讲解助理形象与头顶问答框被遮挡。显示/聚焦时再由主进程抬高舞台层。
       */
-      alwaysOnTop: true,
+      alwaysOnTop: false,
       autoHideMenuBar: true,
       webPreferences: {
         preload: this.preloadPath,
@@ -469,11 +474,14 @@ export class PdfViewWindow implements DocViewTarget {
     })
     win.once('ready-to-show', () => {
       win.webContents.send(DOC_VIEW_CHANNELS.sessionChanged)
-      /* 讲解一开始就铺满屏幕并抢到最前面，不再让用户手动点一下。 */
-    win.maximize()
-    win.show()
-    win.focus()
+      /* 讲解一开始就铺满屏幕，随后把桌宠舞台抬到演讲窗口之上。 */
+      win.maximize()
+      win.show()
+      win.focus()
+      this.onShown?.()
     })
+    win.on('show', () => this.onShown?.())
+    win.on('focus', () => this.onShown?.())
     void win.loadFile(this.pagePath).catch(error => {
       console.log('[dsh-pet] 阅读视图页面加载失败:', error instanceof Error ? error.message : String(error))
       this.emit({ kind: 'error', message: '阅读视图页面加载失败' })

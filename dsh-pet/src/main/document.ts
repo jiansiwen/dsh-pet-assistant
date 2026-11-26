@@ -842,12 +842,18 @@ export class DocumentLibrary {
   private readonly rootsOf: () => readonly string[]
   private readonly cache = new Map<string, OpenedDoc>()
   private readonly parsePdf: PdfParser
+  private readonly allowAnyPath: () => boolean
 
   constructor(files: DocFileSystem, rootsOf: () => readonly string[], parsePdf: PdfParser = async (bytes, options) =>
-    (await import('./doc-pdf.ts')).parsePdf(bytes, options)) {
+    (await import('./doc-pdf.ts')).parsePdf(bytes, options), allowAnyPath: () => boolean = () => false) {
     this.files = files
     this.rootsOf = rootsOf
     this.parsePdf = parsePdf
+    this.allowAnyPath = allowAnyPath
+  }
+
+  private async isAllowed(real: string): Promise<boolean> {
+    return this.allowAnyPath() || isInsideAuthorized(real, await this.authorizedRoots())
   }
 
   /** 授权目录（已落地成真实路径）。每次现算：用户随时可能在托盘上增删目录。 */
@@ -882,7 +888,7 @@ export class DocumentLibrary {
     // 用户直接给了路径：先落地再判包含，越界就拒绝，不去 stat 也不去读。
     let real: string
     try { real = await this.files.realpath(wanted) } catch { return { kind: 'denied', path: wanted } }
-    if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied', path: wanted }
+    if (!(await this.isAllowed(real))) return { kind: 'denied', path: wanted }
     const hit = await this.files.stat(real)
     if (hit === null) return { kind: 'missing', name: wanted }
     return { kind: 'found', hit }
@@ -897,7 +903,7 @@ export class DocumentLibrary {
   async open(target: string, options: Pick<PdfParseOptions, 'signal'> = {}): Promise<OpenResult> {
     let real: string
     try { real = await this.files.realpath(target) } catch { return { kind: 'denied', path: target } }
-    if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied', path: target }
+    if (!(await this.isAllowed(real))) return { kind: 'denied', path: target }
 
     const info = await this.files.stat(real)
     if (info === null) return { kind: 'missing', path: target }
@@ -932,7 +938,7 @@ export class DocumentLibrary {
       } else {
         parsed = buildOutline(info.name, await this.files.read(real))
       }
-      if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied', path: target }
+      if (!(await this.isAllowed(real))) return { kind: 'denied', path: target }
       const doc: OpenedDoc = { path: real, name: info.name, fingerprint, size, parsed }
       // 取消、超时、损坏等失败不污染成功缓存，同一文件可以重新尝试。
       if (parsed.kind !== 'pdf-error') this.cache.set(fold(real), doc)
@@ -953,7 +959,7 @@ export class DocumentLibrary {
   async snapshot(target: string, expectedFingerprint?: string, signal?: AbortSignal): Promise<SnapshotResult> {
     let real: string
     try { real = await this.files.realpath(target) } catch { return { kind: 'missing' } }
-    if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied' }
+    if (!(await this.isAllowed(real))) return { kind: 'denied' }
     if (fold(real) !== fold(target)) return { kind: 'changed', fingerprint: null }
     const info = await this.files.stat(real)
     if (info === null) return { kind: 'missing' }
@@ -966,7 +972,7 @@ export class DocumentLibrary {
       return { kind: 'unreadable', reason: error instanceof Error ? error.message : String(error) }
     }
     if (bytes.byteLength > MAX_DOC_BYTES) return { kind: 'too-big', size: bytes.byteLength }
-    if (!isInsideAuthorized(real, await this.authorizedRoots())) return { kind: 'denied' }
+    if (!(await this.isAllowed(real))) return { kind: 'denied' }
     const fingerprint = fingerprintBytes(bytes)
     if (expectedFingerprint !== undefined && fingerprint !== expectedFingerprint) return { kind: 'changed', fingerprint }
     return { kind: 'snapshot', path: real, bytes, fingerprint }
@@ -997,7 +1003,7 @@ export class DocumentLibrary {
   async authorizedForApp(target: string): Promise<{ readonly ok: true; readonly path: string } | { readonly ok: false; readonly error: string }> {
     let real: string
     try { real = await this.files.realpath(target) } catch { return { ok: false, error: '无法确认文件真实路径' } }
-    if (!isInsideAuthorized(real, await this.authorizedRoots())) {
+    if (!(await this.isAllowed(real))) {
       return { ok: false, error: '这个路径不在授权目录里' }
     }
     if (!canOpenWithApp(path.basename(real))) {

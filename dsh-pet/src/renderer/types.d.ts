@@ -53,7 +53,7 @@ export interface MemberNotice { kind: 'mail' | 'member'; text: string; memberId?
 export type SettingsPage =
   | 'workbench' | 'settings'
   | 'chat' | 'todo' | 'mail' | 'wecom' | 'report' | 'meeting'
-  | 'team' | 'doc' | 'voice' | 'appearance' | 'learning' | 'general'
+  | 'team' | 'approvals' | 'doc' | 'voice' | 'appearance' | 'learning' | 'general'
   | 'agent' | 'reminders'
   | AssistantSettingsPage
 
@@ -93,6 +93,11 @@ export interface PetState {
   continuousVoice?: boolean
   readReplies?: boolean
   meetingDocumentAutoApprove?: boolean
+  meetingIntegrityBypass?: boolean
+  meetingEgressAutoApprove?: boolean
+  skipLocalConfirm?: boolean
+  docRootsOpen?: boolean
+  meetingFastTranscribe?: boolean
   /** 本场会议人数；0 = 自动。 */
   meetingSpeakerCounts?: { mic: number; loopback: number }
   idleSleepMinutes?: number
@@ -147,6 +152,11 @@ export interface PetSettingsPatch {
   continuousVoice?: boolean
   readReplies?: boolean
   meetingDocumentAutoApprove?: boolean
+  meetingIntegrityBypass?: boolean
+  meetingEgressAutoApprove?: boolean
+  skipLocalConfirm?: boolean
+  docRootsOpen?: boolean
+  meetingFastTranscribe?: boolean
   meetingSpeakerCounts?: { mic: number; loopback: number }
   idleSleepMinutes?: number
   sleepMinutes?: number
@@ -197,6 +207,7 @@ export type PetTaskStatus =
   | 'awaiting-user'
   | 'review'
   | 'done'
+  | 'blocked'
   | 'failed'
   | 'cancelled'
   | 'unknown'
@@ -222,6 +233,8 @@ export interface TeamTaskSnapshot {
   ownerId?: string | null
   goal?: string | null
   status?: PetTaskStatus | string | null
+  toolScope?: string
+  diagnostic?: string
   artifacts?: readonly string[]
   deadlineAt?: number | null
   createdAt?: number
@@ -283,6 +296,14 @@ export interface BridgeEventPayload {
   displayName?: string
   skinId?: string
   taskId?: string
+  /** member/progress：think/text=增量片段，status=状态变化。 */
+  memberKind?: 'text' | 'think' | 'status'
+  /** member/progress：这条文本属于用户输入还是成员回复。 */
+  memberRole?: 'user' | 'assistant'
+  /** member/progress：running=正在干活，idle=本轮结束（桌宠延迟收起）。 */
+  memberStatus?: 'running' | 'idle'
+  /** 事件产生时刻；重连重放的旧进度不能把会话框重新弹出。 */
+  at?: number
   status?: PetTaskStatus | string
   artifacts?: readonly string[]
   blockers?: readonly string[]
@@ -367,6 +388,21 @@ export type DocState =
       readonly active?: boolean
       readonly sections: readonly DocSectionBrief[]
     }
+
+/** 演讲提问时的头顶只读问答投影：提问时弹出，回答结束持续保留，重新开始讲解或结束讲解时消失。 */
+export interface DocQaTurn {
+  readonly id: string
+  readonly question: string
+  readonly answer: string
+}
+
+export interface DocQaState {
+  readonly visible: boolean
+  readonly assistantId: string | null
+  readonly displayName: string
+  readonly status: 'running' | 'idle'
+  readonly turns: readonly DocQaTurn[]
+}
 
 /** 授权目录与最近用系统关联打开过的目录。两块都在查找范围内，两块都能撤。 */
 export interface DocRoots {
@@ -553,6 +589,9 @@ export interface PetApi extends MemberApi, RolePresetApi {
   openMemberEditor(memberId?: string | null): Promise<{ ok: boolean }>
   /** 只读窗口展示该成员的独立会话（宿主持久化会话文件）。 */
   viewMemberSession(memberId: string): Promise<{ ok: boolean; error?: string }>
+  /** 成员会话实时进度（只读投影）：桌宠在成员头顶显示，不打开 DSH 会话。 */
+  onMemberProgress(callback: (event: { assistantId: string; displayName: string;
+    memberKind: 'text' | 'think' | 'status'; text?: string; memberRole?: 'user' | 'assistant'; memberStatus?: 'running' | 'idle' }) => void): () => void
   onMembersChanged(callback: () => void): () => void
   getState(includeOperations?: boolean): Promise<PetState>
   getSession(beforeSeq?: number, bindingId?: string): Promise<SessionResult>
@@ -602,6 +641,9 @@ export interface PetApi extends MemberApi, RolePresetApi {
   /** 新增或删除术语；remove=true 时只按 term 删。返回最新列表。 */
   glossaryUpdate(term: string, expansion?: string, remove?: boolean): Promise<{ ok: boolean; terms?: Array<{ term: string; expansion: string }>; message?: string }>
   assistantSettingsSave(section: AssistantSettingsSection, input: unknown): Promise<AssistantSettingsResult>
+  /** 插件侧免审批开关（读取与保存，走本机所有者通道）。 */
+  approvalSwitchesState(): Promise<{ ok: boolean; switches?: Array<{ key: string; title: string; description: string; enabled: boolean }>; message?: string }>
+  approvalSwitchesSave(switches: Record<string, boolean>): Promise<{ ok: boolean; switches?: Array<{ key: string; title: string; description: string; enabled: boolean }>; message?: string }>
   /** 打开已有任务与提醒窗口；各项操作仍沿用窗口内的确认与审批。 */
   openCompanionTasks(): Promise<{ ok: boolean }>
   voiceApiState(): Promise<VoiceApiResult>
@@ -774,6 +816,10 @@ export interface PetApi extends MemberApi, RolePresetApi {
   onDocReply(callback: (reply: { index: number; text: string }) => void): void
   /** 一句话提示（讲完了、某段讲不下去）。它不属于状态，显示完就过去。 */
   onDocNotice(callback: (message: string) => void): void
+  /** 演讲提问时的头顶只读问答状态：提问时弹出，答完保留显示，重新开始讲解或结束讲解时消失。 */
+  onDocQa(callback: (state: DocQaState) => void): () => void
+  /** 手动关闭演讲问答气泡。 */
+  dismissDocQa(): void
   /**
    * 开一场会议录制。consent 必填项缺一个都会被拒：名字、来源、知情同意文本、
    * 勾选状态、保留天数。拒绝原因在 error 里，是要显示给用户的那句话。

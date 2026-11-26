@@ -51,6 +51,16 @@ interface Props {
   dock: 'top' | 'auto'
   size: { width: number; height: number }
   onResize(size: { width: number; height: number }): void
+  /** 挂靠在指定成员头顶（不传则挂在默认/选中角色头顶）；指定成员不在台上时隐藏，绝不落回总助理头顶。 */
+  anchorId?: string
+  /** 仅主会话框为 true：总助理暂时退场（如讲解交接）时允许回退到舞台默认锚点，保证随时能说话。 */
+  fallbackAnchor?: boolean
+  /** 独立的命中盒键；多框并存时避免互相覆盖鼠标穿透区域。 */
+  hitboxKey?: string
+  /** 子助理进度气泡：只读展示，不渲染底部输入框，防止用户误以为在跟总助理对话。 */
+  readOnly?: boolean
+  /** 只读模式下底部的提示语；不传则用默认成员进度说明。 */
+  readOnlyNote?: string
 }
 
 /** 停止按钮的语义提示：两种停止分开写清楚，界面不替用户猜它会停掉谁。 */
@@ -100,9 +110,19 @@ export default function ChatOverlay(props: Props) {
   useEffect(() => {
     const element = panel.current
     if (!element) return
+    const key = props.hitboxKey
     const place = () => {
-      const anchor = stageRef.current?.anchorPosition()
-      if (!anchor) return
+      const anchor = props.anchorId
+        ? (stageRef.current?.anchorPosition(props.anchorId) ?? (props.fallbackAnchor ? stageRef.current?.anchorPosition() : null))
+        : stageRef.current?.anchorPosition()
+      if (!anchor) {
+        element.style.visibility = 'hidden'
+        element.style.pointerEvents = 'none'
+        registerPanelHitbox(null, key)
+        return
+      }
+      element.style.visibility = ''
+      element.style.pointerEvents = ''
       const position = overlayPosition(
         anchor,
         { width: element.offsetWidth, height: element.offsetHeight },
@@ -114,15 +134,15 @@ export default function ChatOverlay(props: Props) {
       element.dataset.dockSide = position.side
       const rect = element.getBoundingClientRect()
       const box = { x1: Math.max(0, rect.left), y1: Math.max(0, rect.top), x2: Math.min(innerWidth, rect.right), y2: Math.min(innerHeight, rect.bottom) }
-      registerPanelHitbox(box.x2 > box.x1 && box.y2 > box.y1 ? box : null)
+      registerPanelHitbox(box.x2 > box.x1 && box.y2 > box.y1 ? box : null, key)
     }
     place()
     const stop = stageRef.current?.subscribeAnchor(place)
     const observer = new ResizeObserver(place)
     observer.observe(element)
     window.addEventListener('resize', place)
-    return () => { stop?.(); observer.disconnect(); window.removeEventListener('resize', place); registerPanelHitbox(null) }
-  }, [stageRef, props.dock])
+    return () => { stop?.(); observer.disconnect(); window.removeEventListener('resize', place); registerPanelHitbox(null, key) }
+  }, [stageRef, props.dock, props.session?.bindingId, props.anchorId, props.fallbackAnchor, props.hitboxKey])
 
   // 贴底跟随：除了权威条目，临时尾每长一个字也要跟下来 —— 否则逐字效果全发生在可视区外面。
   useEffect(() => {
@@ -190,8 +210,9 @@ export default function ChatOverlay(props: Props) {
     const timer = window.setTimeout(() => setStopNote(null), 20_000)
     return () => window.clearTimeout(timer)
   }, [stopNote])
-  const status = session?.status === 'disconnected' ? '连接已断开' : session?.status === 'waiting' ? '等待处理'
-    : running ? '正在回复' : session?.sessionId ? '会话已同步' : '尚未连接'
+  const status = props.readOnly ? (running ? '正在处理' : '已完成（只读）')
+    : session?.status === 'disconnected' ? '连接已断开' : session?.status === 'waiting' ? '等待处理'
+      : running ? '正在回复' : session?.sessionId ? '会话已同步' : '尚未连接'
   const models = session?.models ?? []
   const currentModel = session?.model
   const modelKey = (model: { provider: string; model: string }) => JSON.stringify([model.provider, model.model])
@@ -247,12 +268,15 @@ export default function ChatOverlay(props: Props) {
       {stopNote && <div className={`hud-speech hud-cancel-receipt${stopNote.state ? ` cancel-${stopNote.state}` : ''}`} role="status">
         停止结果：{stopNote.text}
       </div>}
-      {!session?.capabilities.prompt && props.onStartSession && <div className="hud-speech" role="status">助理会话未开启 <button disabled={props.sending} onClick={props.onStartSession}>开启助理会话</button></div>}
+      {!props.readOnly && !session?.capabilities.prompt && props.onStartSession && <div className="hud-speech" role="status">助理会话未开启 <button disabled={props.sending} onClick={props.onStartSession}>开启助理会话</button></div>}
       {props.speaking && <div className="hud-speech">正在朗读 <button onClick={props.onStopSpeech}>停止朗读</button></div>}
       {props.continuous && <div className="hud-speech" role="status">连续对话中，说“先这样”也可结束 <button onClick={props.onEndContinuous}>结束连续对话</button></div>}
       {!!props.queuedCount && props.queuedCount > 0 && (
         <div className="hud-speech" role="status">排队中 {props.queuedCount} 条 · 停止生成可拿回</div>
       )}
+      {props.readOnly ? (
+        <div className="hud-speech" role="note">{props.readOnlyNote ?? '成员工作进度（只读）· 交办任务请在总助理会话框里说'}</div>
+      ) : (
       <div className="hud-composer">
         <textarea ref={inputRef} value={input} onChange={event => setInput(event.target.value)} rows={2}
           aria-label="会话输入" placeholder={props.listening ? '正在聆听…' : '输入消息，Enter 发送'}
@@ -294,6 +318,7 @@ export default function ChatOverlay(props: Props) {
             disabled={props.sending || !input.trim() || !session?.capabilities.prompt} onClick={onSend}>↑</button>}
         </div>
       </div>
+      )}
       <span className="hud-anchor" aria-hidden />
       <div className="hud-resize" role="separator" aria-label="调整会话框大小" onPointerDown={startResize} />
     </section>

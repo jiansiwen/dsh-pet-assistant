@@ -320,6 +320,49 @@ export class MemberAssistant {
       : ['idle', 'walk', 'wave']
     return { name, prompt, actions: actions.length ? actions : ['idle', 'walk', 'wave'], notes: (string(parsed.notes, 500) ?? '').trim() || '已按描述填好，确认后再开始生成。' }
   }
+
+  /**
+   * 会议纪要整理：直接用指定子助理（或主助理默认）的模型走单次 LLM 流，
+   * 不创建团队任务、不抢成员会话锁、不注入人设或 structured_output 引导，
+   * 避免子助理调用 companion_meeting_minutes 时自己撞自己（member-busy）或吐出非 JSON。
+   */
+  async summarizeMinutes(input: {
+    prompt: string
+    model?: { provider: string; model: string }
+    maxTokens?: number
+  }): Promise<{ reply: string; provider: string; model: string }> {
+    const prompt = input.prompt.trim()
+    if (!prompt) throw new Error('会议转写提示词为空，无法生成纪要')
+    const chosen = input.model?.provider && input.model.model ? input.model : this.options.defaultModel()
+    if (!chosen?.provider || !chosen.model) throw new Error('当前没有可用的模型配置，无法生成会议纪要')
+    const llm = hostLlm(this.options.ctx)
+    if (!llm) throw new Error('宿主没有提供模型服务，暂时不能生成会议纪要')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 175_000)
+    let answer = ''
+    let ended: string | undefined
+    try {
+      for await (const chunk of llm.stream({
+        provider: chosen.provider,
+        model: chosen.model,
+        system: '你是专业的中文会议纪要整理助手。严格只按用户消息里的要求和字段格式输出一个合法的 JSON 对象；不要输出任何前言、说明、标题、注释或 Markdown 代码围栏，不要调用任何工具。',
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+        maxTokens: Math.min(Math.max(input.maxTokens ?? 8192, 1024), 16384),
+        temperature: 0.2,
+        signal: controller.signal,
+      })) {
+        if (chunk.type === 'text-delta') answer += chunk.text
+        else if (chunk.type === 'finish') ended = chunk.reason.kind
+      }
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('生成会议纪要超时，请重试')
+      throw error
+    } finally { clearTimeout(timer) }
+    if (ended === 'error' || ended === 'aborted') throw new Error('会议纪要模型调用未正常结束，请重试')
+    // 容错剥离模型偶发附带的前导语或 ```json 围栏；抽不出合法对象时原样返回，由上游如实报错。
+    const parsed = parseProposalJson(answer)
+    return { reply: parsed ? JSON.stringify(parsed) : answer.trim(), provider: chosen.provider, model: chosen.model }
+  }
 }
 
 function studioInstructions(): string {

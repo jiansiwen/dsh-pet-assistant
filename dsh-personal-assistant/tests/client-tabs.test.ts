@@ -65,7 +65,7 @@ describe('列表 tab 的列与状态说法', () => {
     assert.deepEqual(LIST_TABS.todo.columns.map(column => column.label), ['标题', '优先级', '来源', '状态', '到期'])
     assert.deepEqual(LIST_TABS.meeting.columns.map(column => column.label), ['时间', '名称', '状态'])
     assert.deepEqual(LIST_TABS.report.columns.map(column => column.label), ['日期', '状态', '摘要'])
-    assert.deepEqual(LIST_TABS.team.columns.map(column => column.label), ['名字', '角色', '状态', '额度'])
+    assert.deepEqual(LIST_TABS.team.columns.map(column => column.label), ['名字', '角色', '职责', '性格与形象', '状态', '额度'])
   })
 
   it('空态与读不到是两句不同的话', () => {
@@ -131,36 +131,36 @@ describe('设置摘要', () => {
  * 这几条钉的是"表格会不会错位"：少一列就整行左移，用户读到的是别人的列。
  */
 describe('parseList：分行、分列、空态与降级态', () => {
-  // 用「助理团」这张没有历史包袱的四列表来钉通用规则：待办有换列兼容要单独钉（见下一段）。
+  // 用「助理团」这张没有历史包袱的六列表来钉通用规则：待办有换列兼容要单独钉（见下一段）。
   const team = LIST_TABS.team
 
   it('正常表格：按固定分隔符切，列数与表头一致', () => {
-    const parsed = parseList('小会 | 助理1 | 在岗 | 1200/8000\n阿七 | 助理2 | 休息 | —', team)
+    const parsed = parseList('小会 | 助理1 | 会议记录 | 稳重 · 眼镜 | 在岗 | 1200/8000\n阿七 | 助理2 | 日报 | 活泼 · 熊猫 | 休息 | —', team)
     assert.equal(parsed.state, 'rows')
     assert.equal(parsed.message, null)
     assert.deepEqual(cells(parsed), [
-      ['小会', '助理1', '在岗', '1200/8000'],
-      ['阿七', '助理2', '休息', '—'],
+      ['小会', '助理1', '会议记录', '稳重 · 眼镜', '在岗', '1200/8000'],
+      ['阿七', '助理2', '日报', '活泼 · 熊猫', '休息', '—'],
     ])
   })
 
   it('分隔符是常量 " | "：单竖线不是分隔符', () => {
     assert.equal(LIST_SEPARATOR, ' | ')
-    const parsed = parseList('a | b | c | d', team)
-    assert.deepEqual(cells(parsed), [['a', 'b', 'c', 'd']])
+    const parsed = parseList('a | b | c | d | e | f', team)
+    assert.deepEqual(cells(parsed), [['a', 'b', 'c', 'd', 'e', 'f']])
     // 没有 " | " 的行不参与表格：整包只有一句话时按空态处理
-    assert.equal(parseList('a|b|c|d', team).state, 'empty')
+    assert.equal(parseList('a|b|c|d|e|f', team).state, 'empty')
   })
 
   it('少列时补 `—`，不让整行左移；空单元格也补 `—`', () => {
-    assert.deepEqual(cells(parseList('小会 | 助理1', team)), [['小会', '助理1', '—', '—']])
-    assert.deepEqual(cells(parseList('小会 |  | 在岗 | 1', team)), [['小会', '—', '在岗', '1']])
+    assert.deepEqual(cells(parseList('小会 | 助理1', team)), [['小会', '助理1', '—', '—', '—', '—']])
+    assert.deepEqual(cells(parseList('小会 |  | 职责 | 形象 | 在岗 | 1', team)), [['小会', '—', '职责', '形象', '在岗', '1']])
   })
 
   it('多列时截断到表头列数（后端加列也撑不坏别的表）', () => {
-    const parsed = parseList('a | b | c | d | 多出来的一列', team)
-    assert.equal(parsed.rows[0].cells.length, 4)
-    assert.equal(parsed.rows[0].cells[3], 'd')
+    const parsed = parseList('a | b | c | d | e | f | 多出来的一列', team)
+    assert.equal(parsed.rows[0].cells.length, 6)
+    assert.equal(parsed.rows[0].cells[5], 'f')
   })
 
   it('一句话回包：`暂时读不到…` 是降级态，其余是空态，原句照显示', () => {
@@ -252,8 +252,8 @@ describe('待办：5 列与旧 3 列兼容', () => {
     for (const id of ['report', 'meeting', 'team'] as const) {
       assert.equal(LIST_TABS[id].legacy, undefined, id)
     }
-    // 助理团四列，给三格就按原序补一格，不重排
-    assert.deepEqual(cells(parseList('小会 | 助理1 | 在岗', LIST_TABS.team)), [['小会', '助理1', '在岗', '—']])
+    // 助理团六列，给三格就按原序补三格，不重排
+    assert.deepEqual(cells(parseList('小会 | 助理1 | 在岗', LIST_TABS.team)), [['小会', '助理1', '在岗', '—', '—', '—']])
   })
 })
 
@@ -409,8 +409,8 @@ describe('隐藏尾列 trailing', () => {
     assert.equal(MEETING_HISTORY.trailing, 1)
     for (const id of ['report', 'team'] as const) assert.equal(LIST_TABS[id].trailing, undefined, id)
     // 没声明 trailing 的表，多出来的一格同样进 trailing —— 解析规则统一，不按表分叉
-    const parsed = parseList('小会 | 助理1 | 在岗 | 1200/8000 | 多出来', LIST_TABS.team)
-    assert.equal(parsed.rows[0].cells.length, 4)
+    const parsed = parseList('小会 | 助理1 | 职责 | 形象 | 在岗 | 1200/8000 | 多出来', LIST_TABS.team)
+    assert.equal(parsed.rows[0].cells.length, 6)
     assert.deepEqual(parsed.rows[0].trailing, ['多出来'])
   })
 

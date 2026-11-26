@@ -13,7 +13,7 @@ import { useGroupScene } from './useGroupScene.js'
 import { usePetBehavior, type PetAction, type PetBehavior } from './usePetBehavior.js'
 import { usePetFrames, usePetSkinImages, usePetVideos } from './usePetImage.js'
 import {
-  actionForStatus, characterHitbox, clampToViewport, isWorking, needsAttention, proactiveHitboxExtra,
+  actionForStatus, characterHitbox, clampToViewport, isWorking, needsAttention, presentationSeat, proactiveHitboxExtra,
   registerCharacterHitbox, seatPositions, unregisterCharacterHitbox,
   type ExitStage, type StageMember, type StageTaskStatus,
 } from './stage-layout.js'
@@ -26,7 +26,8 @@ export interface TeamStageHandle {
   conversationOf(assistantId: string, event: ConversationEvent): void
   freezeAll(): void
   forceAll(action: PetAction): void
-  anchorPosition(): { x: number; y: number } | null
+  /** 取指定成员（传 assistantId）或当前选中角色的头顶锚点；指定成员不在台上时返回 null，不回退到总助理。 */
+  anchorPosition(assistantId?: string): { x: number; y: number } | null
   subscribeAnchor(callback: () => void): () => void
 }
 interface CharacterSlotProps {
@@ -229,12 +230,15 @@ export interface TeamStageProps {
   /** 交接中的登场/退场角色 id 集合。 */
   enteringIds?: ReadonlySet<string> | null
   leavingIds?: ReadonlySet<string> | null
+  /** 正在进行文档演讲的角色 id：演讲期间默认站在屏幕左下角，讲完恢复原位，不改写平时保存的坐标。 */
+  presentingId?: string | null
 }
 
 export default function TeamStage({ members, assistantActive, statusByAssistant, positions, selectedId, chatOpen = false, onSelect,
   exitStage, portalPhase, showPortal = false, focusMode = false, characterSkins, idleSleepMinutes = 2, sleepMinutes = 20,
   petScale = 1, petOpacity = 1, dockedId = null,
-  onPersist, onContextMenu, onDragStart, proactive, onProactiveRespond, handleRef, enteringIds = null, leavingIds = null }: TeamStageProps) {
+  onPersist, onContextMenu, onDragStart, proactive, onProactiveRespond, handleRef, enteringIds = null, leavingIds = null,
+  presentingId = null }: TeamStageProps) {
   const cast = useMemo(() => members.filter(member => member.enabled !== false && member.assistantId)
     .map(member => manifestFor(member, characterSkins)), [members, characterSkins])
   const [viewport, setViewport] = useState(() => ({
@@ -249,9 +253,13 @@ export default function TeamStage({ members, assistantActive, statusByAssistant,
   }, [])
   const seats = useMemo(() => seatPositions(cast.length, viewport.width, viewport.height), [cast.length, viewport])
   const homes = useMemo(() => cast.map((manifest, index) => {
+    // 演讲中的助理默认站在屏幕左下角（不覆盖用户平时保存的 positions），讲完自动回到原位。
+    if (presentingId && manifest.assistantId === presentingId) {
+      return presentationSeat(viewport.width, viewport.height)
+    }
     const saved = positions?.[manifest.assistantId]
     return saved ? clampToViewport(saved, viewport.width, viewport.height) : seats[index] ?? { x: 8, y: 8 }
-  }), [cast, positions, seats, viewport])
+  }), [cast, positions, seats, viewport, presentingId])
 
   // 只把可参与场景的状态提到舞台；位置每帧更新仍留在角色内部。
   const [unavailable, setUnavailable] = useState<ReadonlySet<string>>(() => new Set())
@@ -273,9 +281,7 @@ export default function TeamStage({ members, assistantActive, statusByAssistant,
       slot = (behavior: PetBehavior | null) => {
         if (behavior) {
           behaviors.current.set(assistantId, behavior)
-          if (assistantId === selectedRef.current) {
-            for (const callback of anchorListeners.current) callback()
-          }
+          for (const callback of anchorListeners.current) callback()
           setUnavailable(previous => {
             if (previous.has(assistantId) === behavior.protected) return previous
             const next = new Set(previous)
@@ -300,7 +306,13 @@ export default function TeamStage({ members, assistantActive, statusByAssistant,
       conversationOf(assistantId, event) { behaviors.current.get(assistantId)?.conversation(event) },
       freezeAll() { for (const behavior of behaviors.current.values()) behavior.freeze() },
       forceAll(action) { for (const behavior of behaviors.current.values()) behavior.force(action) },
-      anchorPosition() {
+      anchorPosition(assistantId?: string) {
+        if (assistantId) {
+          const index = cast.findIndex(item => item.assistantId === assistantId)
+          if (index < 0) return null
+          const behavior = behaviors.current.get(assistantId)
+          return behavior ? { x: behavior.x, y: behavior.y } : homes[index] ?? null
+        }
         const index = selected ? cast.findIndex(item => item.assistantId === selected) : -1
         const behavior = selected ? behaviors.current.get(selected) : undefined
         return behavior ? { x: behavior.x, y: behavior.y } : homes[Math.max(index, 0)] ?? null

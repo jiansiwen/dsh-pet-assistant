@@ -2,7 +2,7 @@ import { z } from 'zod'
 import { MEMBER_PERSONALITY_LIMIT, MEMBER_SKIN_ID, type MemberDirectory } from './member-directory.ts'
 import type { MemberRuntime } from './member-runtime.ts'
 import { documentSessionScope } from './member-runtime.ts'
-import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberSnapshot } from './member-contract.ts'
+import { MEMBER_CAPABILITIES, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, type MemberDraft, type MemberProfile, type MemberSnapshot, type PlatformAuth } from './member-contract.ts'
 import type { MemberMemory } from './member-memory.ts'
 import { reminderScheduleSchema, type CompanionHttpResult, type ReminderSchedule } from './companion-contract.ts'
 import type { MemberScheduleRecord } from './team-domain.ts'
@@ -17,10 +17,20 @@ const roleStyle = z.object({
 const binding = z.union([
   z.object({ kind: z.literal('platform'), endpoint: z.string().trim().min(1).max(2048),
     model: z.string().trim().max(256).default(''), agentId: z.string().trim().max(128).default(''),
-    secretId: z.string().max(100).default('') }).strict(),
+    secretId: z.string().max(100).default(''),
+    appId: z.string().trim().max(128).default(''), appSecretId: z.string().max(100).default(''),
+    signEndpoint: z.string().trim().max(2048).default(''),
+    signUserId: z.string().trim().max(128).default('') }).strict(),
   z.object({ kind: z.literal('local-cli'), command: z.string().trim().min(1).max(2048),
     args: z.array(z.string().min(1).max(1024)).max(32).default([]) }).strict(),
 ])
+/** 本机专家的平台凭据；四项留空=沿用本机平台对接配置。 */
+const platformAuth = z.object({
+  appId: z.string().trim().max(128).default(''),
+  appSecretId: z.string().max(100).default(''),
+  signEndpoint: z.string().trim().max(2048).default(''),
+  signUserId: z.string().trim().max(128).default(''),
+}).strict()
 const draft = z.object({
   displayName: z.string().trim().min(1).max(80), description: z.string().trim().max(2000),
   ...roleStyle.shape,
@@ -38,8 +48,11 @@ const draft = z.object({
   kind: z.enum(['expert', 'platform', 'local-cli']).default('expert'),
   scheduleWorkspaceId: z.string().uuid().nullish(),
   binding: binding.nullish(),
+  platformAuth: platformAuth.nullish(),
   /** 平台密钥只在桥上一程（编辑器→插件），随即入加密存储，绝不回显、不入快照。 */
   apiKey: z.string().min(1).max(4096).optional(),
+  /** 开放平台签名密钥 app_secret，同样只上桥一程。 */
+  appSecret: z.string().min(1).max(4096).optional(),
 }).strict()
 const reset = z.enum(['daily', 'total', 'both'])
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject']), expectedQuotaRevision: revision,
@@ -135,6 +148,8 @@ export class MemberManagement {
       voice?(input: { name?: string; personality: string; model?: { provider: string; model: string } }): Promise<{ description: string; style: string }>
       /** 交接台词：总助把活交给某成员时四方各说一句（按各自性格生成）。 */
       handover?(input: { chiefName: string; chiefPersona: string; memberName: string; memberPersona: string; task: string }): Promise<Record<'chiefToUser' | 'chiefToMember' | 'memberToChief' | 'memberToUser' | 'memberFarewell', string>>
+      /** 会议纪要整理：用指定子助理或默认模型跑单次纯 JSON 总结，不抢成员会话锁。 */
+      summarizeMinutes?(input: { prompt: string; model?: { provider: string; model: string }; maxTokens?: number }): Promise<{ reply: string; provider: string; model: string }>
     }
     /** 子助理密钥存储（AI 智能体接入）：apiKey 在桥上换 secretId 后即销毁；删除成员时尽力清理密钥条目。 */
     secrets?: { save(input: { id?: string; apiKey: string }): { id: string }; remove?(id: string): void }
@@ -179,19 +194,63 @@ export class MemberManagement {
     if (this.options.runtime.busy(id)) throw new Error('该智能体正在工作，请任务结束后修改')
   }
   /** 密钥只在桥上一程：apiKey 随即入加密存储换成 secretId，此后草稿与快照只携带标识。 */
-  private settle(input: z.infer<typeof draft>): MemberDraft {
-    const { apiKey, binding: bound, ...rest } = input
+  private settle(input: z.infer<typeof draft>, current?: MemberProfile | null): MemberDraft {
+    const { apiKey, appSecret, binding: bound, platformAuth: auth, ...rest } = input
     if (input.scheduleWorkspaceId && !this.options.runtime.listWorkspaces?.().some(item => item.id === input.scheduleWorkspaceId)) {
       throw new Error('工作区已失效或未在 DSH 登记，请重新选择')
     }
     if (apiKey !== undefined && input.kind !== 'platform') throw new Error('只有平台子助理需要配置 API 密钥')
-    if (input.kind === 'expert') return { ...rest, binding: null }
-    if (!bound) throw new Error('子助理必须配置外部绑定（平台端点或本地工具命令）')
-    if (bound.kind === 'platform' && apiKey !== undefined) {
-      if (!this.options.secrets) throw new Error('子助理密钥存储未装配，无法保存 API 密钥')
-      bound.secretId = this.options.secrets.save({ id: bound.secretId !== '' ? bound.secretId : undefined, apiKey }).id
+    if (input.kind === 'platform') {
+      if (!bound) throw new Error('子助理必须配置外部绑定（平台端点或本地工具命令）')
+      if (bound.kind === 'platform') {
+        if (apiKey !== undefined) {
+          if (!this.options.secrets) throw new Error('子助理密钥存储未装配，无法保存 API 密钥')
+          bound.secretId = this.options.secrets.save({ id: bound.secretId !== '' ? bound.secretId : undefined, apiKey }).id
+        }
+        if (appSecret !== undefined) {
+          if (!bound.appId) throw new Error('填写签名密钥前请先填写应用 ID')
+          if (!this.options.secrets) throw new Error('子助理密钥存储未装配，无法保存签名密钥')
+          bound.appSecretId = this.options.secrets.save({ id: bound.appSecretId !== '' ? bound.appSecretId : undefined, apiKey: appSecret }).id
+        } else {
+          const previous = current?.binding?.kind === 'platform' ? current.binding : null
+          // 没带新密钥标识＝沿用旧条目（旧版编辑器不传该字段，不能据此清空）；清掉应用 ID 则连密钥一起清。
+          if (bound.appId === '') bound.appSecretId = ''
+          else if (bound.appSecretId === '') bound.appSecretId = previous?.appSecretId ?? ''
+          // 换了应用却没给新密钥：旧密钥对不上新应用，与其静默返回签名失败，不如当场要求补填。
+          if (previous && bound.appId !== (previous.appId ?? '') && bound.appSecretId !== '') {
+            throw new Error('应用 ID 已变更，请重新填写签名密钥')
+          }
+        }
+      }
+      return { ...rest, binding: bound, platformAuth: null }
     }
-    return { ...rest, binding: bound }
+    if (appSecret !== undefined && !input.capabilities.includes('platform')) {
+      throw new Error('只有勾选「对接外部智能助理平台」后才需要签名密钥')
+    }
+    const platformAuth = input.kind === 'expert' ? this.settlePlatformAuth(auth, appSecret, current) : null
+    if (input.kind === 'expert') return { ...rest, binding: null, platformAuth }
+    if (!bound) throw new Error('子助理必须配置外部绑定（平台端点或本地工具命令）')
+    return { ...rest, binding: bound, platformAuth: null }
+  }
+
+  /** 本机专家的平台凭据：与原成员值比对，换了应用必须重填密钥；四项全空按未配置处理。 */
+  private settlePlatformAuth(auth: PlatformAuth | null | undefined, appSecret: string | undefined,
+    current?: MemberProfile | null): PlatformAuth | null {
+    const next: PlatformAuth | null = auth ? { ...auth } : null
+    if (appSecret !== undefined) {
+      if (!next || next.appId === '') throw new Error('填写签名密钥前请先填写应用 ID')
+      if (!this.options.secrets) throw new Error('子助理密钥存储未装配，无法保存签名密钥')
+      next.appSecretId = this.options.secrets.save({ id: next.appSecretId !== '' ? next.appSecretId : undefined, apiKey: appSecret }).id
+    } else if (next) {
+      const previous = current?.platformAuth ?? null
+      if (next.appId === '') next.appSecretId = ''
+      else if (next.appSecretId === '') next.appSecretId = previous?.appSecretId ?? ''
+      if (previous && next.appId !== previous.appId && next.appSecretId !== '') {
+        throw new Error('应用 ID 已变更，请重新填写签名密钥')
+      }
+    }
+    if (!next) return null
+    return next.appId === '' && next.appSecretId === '' && next.signEndpoint === '' && next.signUserId === '' ? null : next
   }
   async request(method: string, pathname: string, raw: unknown): Promise<CompanionHttpResult> {
     const { directory, memories } = this.options
@@ -280,6 +339,25 @@ export class MemberManagement {
           return { status: 200, body: await this.options.assistant.studio({ request: input.request }) }
         } catch (error) {
           return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: error instanceof Error ? error.message : '形象配置助手暂时不可用' } }
+        }
+      }
+      if (method === 'POST' && pathname === '/companion/v1/members/meeting-minutes') {
+        if (!this.options.assistant?.summarizeMinutes) return { status: 503, body: { code: 'ASSIST_UNAVAILABLE', message: '纪要模型服务尚未启用' } }
+        const input = z.object({
+          prompt: z.string().trim().min(1).max(250_000),
+          assistantId: z.string().trim().max(200).optional(),
+        }).strict().parse(raw)
+        const profile = input.assistantId ? this.options.directory.get(input.assistantId) : null
+        const memberModel = profile?.provider && profile.model ? { provider: profile.provider, model: profile.model } : undefined
+        try {
+          const out = await this.options.assistant.summarizeMinutes({
+            prompt: input.prompt,
+            ...(memberModel ? { model: memberModel } : {}),
+            ...(profile?.maxTokens ? { maxTokens: profile.maxTokens } : {}),
+          })
+          return { status: 200, body: { ok: true, reply: out.reply, provider: out.provider, model: out.model } }
+        } catch (error) {
+          return { status: 503, body: { ok: false, code: 'MINUTES_LLM_FAILED', message: error instanceof Error ? error.message : '纪要模型调用失败' } }
         }
       }
       const notice = /^\/companion\/v1\/members\/mail-notices\/([a-f0-9-]{36})\/acknowledge$/iu.exec(pathname)
@@ -463,15 +541,21 @@ export class MemberManagement {
           }
           // 密钥条目尽力清理：失败不阻塞删除（孤儿条目占上限但不影响正确性）。
           const bound = profile.binding
-          if (this.options.secrets?.remove && bound && bound.kind === 'platform' && bound.secretId !== '') {
-            try { this.options.secrets.remove(bound.secretId) } catch { /* 密钥条目清理失败不影响成员删除 */ }
+          const auth = profile.platformAuth
+          if (this.options.secrets?.remove) {
+            const ids = [bound?.kind === 'platform' ? bound.secretId : '', bound?.kind === 'platform' ? bound.appSecretId ?? '' : '',
+              auth?.appSecretId ?? '']
+            for (const secretId of ids) {
+              if (secretId === '') continue
+              try { this.options.secrets.remove(secretId) } catch { /* 密钥条目清理失败不影响成员删除 */ }
+            }
           }
         } else if (update) {
           const id = update[1]
           this.idle(id)
           if (update[2] === 'update') {
             const { expectedRevision, ...input } = draft.extend({ expectedRevision: revision }).strict().parse(raw)
-            directory.update(id, expectedRevision, this.settle(input))
+            directory.update(id, expectedRevision, this.settle(input, directory.get(id)))
           } else {
             const input = z.object({ expectedQuotaRevision: revision, scope: reset }).strict().parse(raw)
             directory.resetQuota(id, input.expectedQuotaRevision, input.scope)

@@ -157,14 +157,16 @@ export const LIST_TABS: Record<ListTabId, ListTabDefinition> = {
   team: {
     command: '/assistant-team-list',
     columns: [
-      { key: 'name', label: '名字', width: '1.2fr' },
-      { key: 'role', label: '角色', width: '1.2fr' },
-      { key: 'status', label: '状态', width: '1fr' },
-      { key: 'quota', label: '额度', width: '1fr' },
+      { key: 'name', label: '名字', width: '1.1fr' },
+      { key: 'role', label: '角色', width: '0.9fr' },
+      { key: 'duty', label: '职责', width: '2.2fr' },
+      { key: 'style', label: '性格与形象', width: '2.2fr' },
+      { key: 'status', label: '状态', width: '0.7fr' },
+      { key: 'quota', label: '额度', width: '0.9fr' },
     ],
     empty: '还没有成员',
     unavailable: '暂时读不到成员列表',
-    hint: '成员与额度在桌面宠物的助理团里管理。',
+    hint: '职责、性格与形象在这里只读展示；修改请到桌面宠物的助理团。',
   },
 }
 

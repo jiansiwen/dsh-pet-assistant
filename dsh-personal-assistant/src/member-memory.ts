@@ -13,12 +13,14 @@ export class MemberMemory {
   private readonly ownerId: string
   private readonly exists: (id: string) => boolean
   private readonly invalidate: (id: string) => void
+  private readonly autoConfirm?: () => boolean
   private readonly previews = new Map<string, { memberId: string; memoryId: string; digest: string; expiresAt: number }>()
-  constructor(options: { store: MemoryStore; ownerId: string; exists(id: string): boolean; invalidate(id: string): void }) {
+  constructor(options: { store: MemoryStore; ownerId: string; exists(id: string): boolean; invalidate(id: string): void; autoConfirm?: () => boolean }) {
     this.store = options.store
     this.ownerId = options.ownerId
     this.exists = options.exists
     this.invalidate = options.invalidate
+    this.autoConfirm = options.autoConfirm
   }
   private member(id: string): void {
     if (!this.exists(id)) throw new Error('智能体不存在')
@@ -69,9 +71,16 @@ export class MemberMemory {
       sourceRefs: [], status: 'candidate', sensitivity: 'normal', createdBy: id, confirmedBy: null, revision: 1,
       createdAt: Date.now(), updatedAt: Date.now(), expiresAt: null, importBatch: null }
     if (this.store.filterRestored([probe]).blocked.length) throw new Error('这条记忆已由本人删除，不能从历史自动恢复')
-    const result = this.store.put({ ...input, scopeKind: 'role', scopeId: id, sourceRefs: raw.sourceRefs ?? [], actor: { id, isUser: false } }, Date.now())
+    const auto = this.autoConfirm?.() === true
+    const result = this.store.put({
+      ...input, scopeKind: 'role', scopeId: id, sourceRefs: raw.sourceRefs ?? [],
+      actor: auto ? { id: this.ownerId, isUser: true } : { id, isUser: false },
+    }, Date.now())
     if (!result.ok) throw new Error('记忆候选未能保存')
-    return { id: result.record.id, revision: result.record.revision, status: result.record.status, message: '候选已保存，请本人在团队记忆中确认后再用于后续回答' }
+    return {
+      id: result.record.id, revision: result.record.revision, status: result.record.status,
+      message: auto ? '已按设置里的免审批开关直接确认生效' : '候选已保存，请本人在团队记忆中确认后再用于后续回答',
+    }
   }
   private impact(id: string, memoryId: string): DeletionOutcome {
     const impact = this.store.previewDelete(memoryId, Date.now())

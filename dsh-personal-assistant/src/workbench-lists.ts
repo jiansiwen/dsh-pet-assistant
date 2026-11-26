@@ -29,7 +29,7 @@ export function cleanField(value: string | null | undefined, max = 40): string {
 
 /** 把若干行拼成回包文本。行内字段同样做一次清理，防止个别字段把列冲散。 */
 export function joinRows(rows: ReadonlyArray<ReadonlyArray<string | null | undefined>>): string {
-  return rows.map(row => row.map(cell => cleanField(cell)).join(FIELD_SEPARATOR)).join('\n')
+  return rows.map(row => row.map(cell => cleanField(cell, 500)).join(FIELD_SEPARATOR)).join('\n')
 }
 
 /** `YYYY-MM-DD HH:mm`（本机时区），表格里够短且能直接排序。 */
@@ -57,6 +57,7 @@ const TASK_STATUS_TEXT: Readonly<Record<string, string>> = {
   'awaiting-user': '待你处理',
   review: '待复核',
   done: '已完成',
+  blocked: '受阻',
   failed: '失败',
   cancelled: '已取消',
   unknown: '未知',
@@ -200,18 +201,50 @@ export function formatReportList(rows: readonly ReportListRow[] | null): string 
   return joinRows(rows.slice(0, 10).map(row => [row.date, row.state, row.summary]))
 }
 
-/** 一位成员的展示形状：名字 | 角色 | 状态 | 额度。 */
+/** 一位成员的展示形状：名字 | 角色 | 职责 | 性格与形象 | 状态 | 额度。 */
 export interface TeamListRow {
   readonly name: string
   readonly role: string
   readonly enabled: boolean
   readonly quota: string
+  /** 功能职责（成员描述）；旧调用方不传时显示 —。 */
+  readonly description?: string
+  /** 性格与表达风格。 */
+  readonly personality?: string
+  /** 形象标识（panda / boy-glasses / girl-glasses / custom-*）。 */
+  readonly skinId?: string
+  /** 音色档案名；空表示跟随总助理。 */
+  readonly voiceProfile?: string
+  /** 已绑定能力；职责为空时用它兜底说明能做什么。 */
+  readonly capabilities?: readonly string[]
+}
+
+const SKIN_LABELS: Record<string, string> = { panda: '熊猫', 'boy-glasses': '眼镜男生', 'girl-glasses': '眼镜女生' }
+
+/** 性格 + 形象 + 音色压成一列，避免表格横向撑爆。 */
+function describeStyle(row: TeamListRow): string {
+  const parts: string[] = []
+  const personality = (row.personality ?? '').trim()
+  if (personality) parts.push(cleanField(personality, 200))
+  if (row.skinId) parts.push(SKIN_LABELS[row.skinId] ?? '自定义形象')
+  const voice = (row.voiceProfile ?? '').trim()
+  if (voice) parts.push(`音色 ${cleanField(voice, 40)}`)
+  return parts.length > 0 ? parts.join('；') : EMPTY_FIELD
+}
+
+/** 职责为空时用能力标签兜底；两者都没有才是 —。 */
+function describeDuty(row: TeamListRow): string {
+  const description = (row.description ?? '').trim()
+  if (description) return cleanField(description, 300)
+  const capabilities = row.capabilities ?? []
+  return capabilities.length > 0 ? `能力：${capabilities.join('、')}` : EMPTY_FIELD
 }
 
 export function formatTeamList(rows: readonly TeamListRow[] | null): string {
   if (rows === null) return '暂时读不到成员'
   if (rows.length === 0) return '还没有成员'
-  return joinRows(rows.map(row => [row.name, describeRole(row.role), row.enabled ? '在岗' : '停用', row.quota]))
+  return joinRows(rows.map(row => [row.name, describeRole(row.role), describeDuty(row), describeStyle(row),
+    row.enabled ? '在岗' : '停用', row.quota]))
 }
 
 // ── 设置摘要（三行真值，第四行「悬停工具栏」在主进程没有设置，故不出现）─────────

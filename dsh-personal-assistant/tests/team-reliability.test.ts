@@ -56,7 +56,7 @@ test('总助理的只读任务使用独立运行与只读守卫，不放行插�
   const outcome = await f.team.runTask(task.taskId, f.parent, signal())
   assert.equal(f.requests[0]?.delivery, 'caller')
   assert.equal(f.requests[0]?.request.parent, f.parent)
-  assert.equal(outcome?.task.status, 'review')
+  assert.equal(outcome?.task.status, 'done')
   assert.equal(f.startupGuards.length, 0)
   assert.equal(f.disposed(), 1)
   for (const name of ['write', 'bash', 'desktop_team_assign', 'personal_assistant_remember', 'run_code', 'future_tool']) {
@@ -84,33 +84,66 @@ test('启动窗口守卫只拦目标子代理，不干扰普通主会话或其�
   })
   const outcome = await f.team.runTask(f.team.submitTask({ goal: '检查启动窗口' }).taskId, f.parent, signal())
   assert.equal(checked, true, '启动替身内的断言不能被运行时捕获后误报通过')
-  assert.equal(outcome?.task.status, 'review')
+  assert.equal(outcome?.task.status, 'done')
 })
 
-for (const [title, structured, status] of [
-  ['阻碍', { ...report, blockers: ['缺少证据'] }, 'review'],
-  ['待批', { ...report, needsApproval: ['需要写文件'] }, 'awaiting-approval'],
-  ['同时有阻碍与待批', { ...report, blockers: ['未完成'], needsApproval: ['写文件'] }, 'awaiting-approval'],
-  ['只有非空产物', report, 'review'],
-  ['空报告', { ...report, summary: '' }, 'review'],
-  ['无效列表', { ...report, blockers: '被错误丢弃的阻碍' }, 'review'],
+for (const [title, structured, status, reason] of [
+  ['报告有阻碍', { ...report, blockers: ['缺少证据'] }, 'blocked', /缺少证据/],
+  ['只声称需要审批', { ...report, needsApproval: ['需要写文件'] }, 'blocked', /没有.*审批/],
+  ['有阻碍也声称待批', { ...report, blockers: ['未完成'], needsApproval: ['写文件'] }, 'blocked', /未完成/],
+  ['把「无」错放进需审批', { ...report, needsApproval: ['无：仅执行查询'] }, 'done', null],
+  ['不需要文件产物的回答', { ...report, artifacts: [] }, 'done', null],
+  ['空报告', { ...report, summary: '' }, 'blocked', /结构化报告/],
+  ['无效列表', { ...report, blockers: '被错误丢弃的阻碍' }, 'blocked', /结构化报告/],
 ] as const) {
-  test(`验收：${title}不能假报完成，也不能被调度器自动重跑`, async t => {
+  test(`结单：${title}按实际结果结束，不要求点确认，也不重跑`, async t => {
     const f = fixture(t)
     f.setStart(async () => ({ ...f.run, result: Promise.resolve({ ...completed, structured }) }))
     const task = f.team.submitTask({ goal: '验收', acceptance: ['必须核验'] })
-    assert.equal((await f.team.runTask(task.taskId, f.parent, signal()))?.task.status, status)
+    const outcome = await f.team.runTask(task.taskId, f.parent, signal())
+    assert.equal(outcome?.task.status, status)
+    if (reason) {
+      assert.match(outcome?.diagnostic ?? '', reason)
+      assert.equal(f.team.taskDiagnostic(outcome!.task), outcome?.diagnostic)
+    }
+    assert.equal(f.team.confirmTask(task.taskId).ok, false)
+    assert.deepEqual(f.approvals.pendingProposals(), [])
     await f.team.runReady(f.parent, signal())
     await f.team.runTask(task.taskId, f.parent, signal())
     assert.equal(f.requests.length, 1)
   })
 }
 
+test('成员没交结构化报告但给了文本答复（如讲解提问），直接结单不判受阻', async t => {
+  const f = fixture(t)
+  f.setStart(async () => ({ ...f.run, result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: '提醒按设定的周期持续催办，直到本人回应。' }] }) }))
+  const task = f.team.submitTask({ goal: '提醒功能是怎么实现的？' })
+  const outcome = await f.team.runTask(task.taskId, f.parent, signal())
+  assert.equal(outcome?.task.status, 'done')
+  assert.equal(outcome?.diagnostic, null)
+  const done = f.team.eventsSince(0).find(event => event.type === 'reply/done' && event.taskId === task.taskId)
+  assert.match(String((done?.payload as { text?: string })?.text ?? ''), /提醒按设定的周期持续催办/)
+})
+
+test('前置任务结单后直接放行下一步，前置受阻则不启动下一步', async t => {
+  const f = fixture(t)
+  const upstream = f.team.submitTask({ goal: '先查数据' })
+  const downstream = f.team.submitTask({ goal: '整理结论', dependsOn: [upstream.taskId] })
+  assert.equal((await f.team.runTask(upstream.taskId, f.parent, signal()))?.task.status, 'done')
+  assert.equal((await f.team.runTask(downstream.taskId, f.parent, signal()))?.task.status, 'done')
+  const blocked = f.team.submitTask({ goal: '取不到数据' })
+  const notStarted = f.team.submitTask({ goal: '下游不要继续', dependsOn: [blocked.taskId] })
+  f.setStart(async () => ({ ...f.run, result: Promise.resolve({ ...completed, structured: { ...report, blockers: ['缺少证据'] } }) }))
+  assert.equal((await f.team.runTask(blocked.taskId, f.parent, signal()))?.task.status, 'blocked')
+  assert.equal((await f.team.runTask(notStarted.taskId, f.parent, signal()))?.stopReason, 'dependency-blocked')
+  assert.equal(f.requests.length, 3)
+})
+
 test('非零累计预算、副作用及未核实 provider 明确拒绝启动', async t => {
   const f = fixture(t)
   for (const input of [{ goal: '预算', budgetTokens: 100 }, { goal: '副作用', toolScope: 'side-effect' as const }]) {
     const outcome = await f.team.runTask(f.team.submitTask(input).taskId, f.parent, signal())
-    assert.equal(outcome?.task.status, 'review')
+    assert.equal(outcome?.task.status, 'blocked')
     assert.match(outcome!.stopReason, /unsupported/)
     const reply = f.store.eventsSince(0).filter(event => event.type === 'reply/done').at(-1)!
     assert.equal((reply.payload as { diagnostic: string }).diagnostic, outcome?.diagnostic)
@@ -240,7 +273,7 @@ test('恢复只对账，不重发中断任务或未知副作用，且重复恢�
 test('成员只读权限不能被任务扩大，额外禁令也进入守卫过滤', async t => {
   const f = fixture(t, { denyExpertTools: ['grep'] })
   const task = f.team.submitTask({ goal: '范围交集', ownerId: 'member-wukong', toolScope: 'side-effect' })
-  assert.equal((await f.team.runTask(task.taskId, f.parent, signal()))?.task.status, 'review')
+  assert.equal((await f.team.runTask(task.taskId, f.parent, signal()))?.task.status, 'blocked')
   assert.ok(f.childGuards[0]!({ agent: f.child, name: 'grep', signal: signal() } as never))
   assert.equal(f.childGuards[0]!({ agent: f.child, name: 'read', signal: signal() } as never), undefined)
 })
@@ -291,10 +324,10 @@ test('默认配置不设累计预算：未指定预算的任务直接启动；�
   const started = await f.team.runTask(f.team.submitTask({ goal: '默认预算' }).taskId, f.parent, signal())
   assert.equal(f.requests.length, 1)
   assert.equal(started?.task.budgetTokens, 0)
-  assert.equal(started?.task.status, 'review')
+  assert.equal(started?.task.status, 'done')
   assert.equal(f.requests[0]?.request.agentOptions, undefined, '不覆盖子代理的单次输出上限，沿用父会话')
   const refused = await f.team.runTask(f.team.submitTask({ goal: '显式预算', budgetTokens: 5000 }).taskId, f.parent, signal())
-  assert.equal(refused?.task.status, 'review')
+  assert.equal(refused?.task.status, 'blocked')
   assert.equal(refused?.stopReason, 'budget-unsupported')
   assert.match(refused?.diagnostic ?? '', /宿主没有累计硬上限/)
   assert.equal(f.requests.length, 1, '非零预算的任务没有启动')
@@ -314,7 +347,7 @@ test('只读子代理能用宿主自身层的 structured_output 交回报告，r
   })
   const outcome = await f.team.runTask(f.team.submitTask({ goal: '交回结构化结论' }).taskId, f.parent, signal())
   assert.equal(checked, true, '启动替身内的断言必须实际执行完毕')
-  assert.equal(outcome?.task.status, 'review')
+  assert.equal(outcome?.task.status, 'done')
   assert.equal(f.childGuards[0]!({ agent: f.child, name: 'structured_output', signal: signal() } as never), undefined)
   assert.ok(f.requests[0]?.request.outputSchema)
 })

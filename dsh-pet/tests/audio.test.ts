@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { INITIAL_AUDIO_STATE, nextAudio, type AudioEvent, type AudioState } from '../src/main/audio.ts'
+import { INITIAL_AUDIO_STATE, kwsTakesAudio, nextAudio, wakeListening, type AudioEffect, type AudioEvent, type AudioState, type RunningWake } from '../src/main/audio.ts'
 
 /** 穷举用的全部事件。 */
 const EVENTS: readonly AudioEvent[] = [
@@ -30,9 +30,16 @@ const EVENTS: readonly AudioEvent[] = [
 /** 开机后的正常状态：唤醒词在听，设备被它占着。 */
 const AWAKE: AudioState = nextAudio(INITIAL_AUDIO_STATE, { type: 'boot' }).state
 
-/** 录音不剥夺唤醒：会议期间只要唤醒可用，监听就应在听（共享采集/独立进程可与会议轨并存）。 */
-const wakeRunning = (s: AudioState): number =>
-  (s.holder === 'wake' || (s.holder === 'meeting' && s.meetingActive && s.wakeEnabled && !s.focus && !s.wakeUnavailable)) ? 1 : 0
+/**
+ * 录音不剥夺唤醒：会议期间只要唤醒可用，监听就应在听（共享采集/独立进程可与会议轨并存）；
+ * 会议里插话检出后交接给听写的那一段，唤醒也不停（wakeDuringHandover）。
+ * 这里刻意不调用产品代码里的 wakeListening，独立写一遍，穷举时两边互相核对。
+ */
+const wakeRunning = (s: AudioState): number => {
+  const usable = s.wakeEnabled && !s.focus && !s.wakeUnavailable
+  return (s.holder === 'wake' || (s.holder === 'meeting' && s.meetingActive && usable)
+    || (s.holder === 'dictation' && s.wakeDuringHandover && usable)) ? 1 : 0
+}
 
 describe('麦克风只有一个主人', () => {
   test('开机就把唤醒监听拉起来', () => {
@@ -259,6 +266,17 @@ describe('穷举：唤醒与插话两类监听的起停份数始终和 holder �
           assert.ok(b >= 0 && b <= 1, `插话监听份数越界：${JSON.stringify(event)} ${JSON.stringify(state)}`)
         }
         assert.equal(w, wakeRunning(turn.state), `唤醒份数与状态不一致（${JSON.stringify(event)}）`)
+        // 产品代码的"唤醒在听"判据必须与起停份数一致：KWS 收不收 PCM 就靠它。
+        assert.equal(wakeListening(turn.state), w === 1, `wakeListening 与起停份数不一致（${JSON.stringify(event)} ${JSON.stringify(state)}）`)
+        // KWS 会话在跑（按副作用起停）⇔ 主进程收它的 PCM、渲染层拿得到授权；System.Speech 在跑时不收。
+        assert.equal(kwsTakesAudio(turn.state, w === 1 ? 'kws' : null), w === 1, `KWS 在跑却不收 PCM（或反之）：${JSON.stringify(event)} ${JSON.stringify(turn.state)}`)
+        assert.equal(kwsTakesAudio(turn.state, w === 1 ? 'system' : null), false)
+        // 交接期间保留唤醒只在"听写占着、唤醒可用"时成立；任何时候都不在听写占着设备时拉起唤醒。
+        if (turn.state.wakeDuringHandover) {
+          assert.ok(turn.state.holder === 'dictation' && turn.state.wakeEnabled && !turn.state.focus && !turn.state.wakeUnavailable,
+            `交接保留唤醒的标志落在了不该在的状态：${JSON.stringify(turn.state)}`)
+        }
+        if (turn.state.holder === 'dictation') assert.ok(!turn.effects.includes('start-wake'), `听写占着设备时拉起了唤醒：${JSON.stringify(event)}`)
         const barges = (turn.state.holder === 'barge-in' ? 1 : 0) + (turn.state.bargeInMeeting ? 1 : 0)
         assert.equal(b, barges, `插话份数与 holder 不一致（${JSON.stringify(event)}）`)
         // 不变量：关着唤醒 / 专注 / 不可用时绝不会处于"唤醒在听"。
@@ -380,18 +398,21 @@ describe('会议里的自然插话（比赛链）', () => {
     assert.equal(turn.state.meetingActive, true)
   })
 
-  test('会议插话检出后可交接给听写，会议仍记为在录', () => {
+  test('会议插话检出后可交接给听写，会议仍记为在录；交接期间唤醒不停，收尾也不重起', () => {
     const listening = nextAudio(MEETING, { type: 'barge-in-requested', allowInMeeting: true }).state
     const detected = nextAudio(listening, { type: 'barge-in-detected' })
     assert.equal(detected.state.bargeHandover, true)
     const dictation = nextAudio(detected.state, { type: 'dictation-requested', source: 'barge-in' })
-    assert.deepEqual(dictation.effects, ['stop-wake', 'stop-barge-in'])
+    // 插话喊的可能正是唤醒词：这时停 KWS，它只听到头一两个字，讲解中喊名字永远没反应。
+    assert.deepEqual(dictation.effects, ['stop-barge-in'], '交接只收插话监听，唤醒继续听完这句')
     assert.equal(dictation.state.holder, 'dictation')
+    assert.equal(dictation.state.wakeDuringHandover, true)
     assert.equal(dictation.state.meetingActive, true)
     assert.equal(dictation.denied, null)
     const finished = nextAudio(dictation.state, { type: 'dictation-finished' })
-    assert.deepEqual(finished.effects, ['start-wake'], '会议还在录，听写收尾恢复唤醒而非交还设备')
+    assert.deepEqual(finished.effects, [], '唤醒一直在听：收尾不重起（不白白重载一次唤醒模型）')
     assert.equal(finished.state.holder, 'meeting')
+    assert.equal(finished.state.wakeDuringHandover, false)
   })
 
   test('会议中手动听写放开（录音不剥夺对话），插话监听的结束只停监听', () => {
@@ -433,5 +454,157 @@ describe('会议里的自然插话（比赛链）', () => {
     const barge = nextAudio(off, { type: 'barge-in-requested' })
     assert.deepEqual(barge.effects, ['start-barge-in'])
     assert.deepEqual(nextAudio(barge.state, { type: 'barge-in-finished' }).effects, ['stop-barge-in'])
+  })
+})
+
+// ── 会议录音期间的 KWS 唤醒：PCM 链路与插话交接 ─────────────────────────────
+
+/**
+ * 模拟 index.ts 的 applyAudio：按副作用起停一个 KWS 会话（start-wake 先停后起，份数始终 1），
+ * 每一步记下"KWS 会话在不在跑"与"主进程收不收它的 PCM"（kws-feed / 授权共用的判据）。
+ */
+function drive(events: readonly AudioEvent[], from: AudioState = INITIAL_AUDIO_STATE) {
+  let state = from
+  let running: RunningWake = null
+  let starts = 0
+  const steps: Array<{ event: AudioEvent; state: AudioState; running: RunningWake; effects: readonly AudioEffect[]; takes: boolean }> = []
+  for (const event of events) {
+    const turn = nextAudio(state, event)
+    state = turn.state
+    for (const effect of turn.effects) {
+      if (effect === 'start-wake') { running = 'kws'; starts++ }
+      else if (effect === 'stop-wake') running = null
+    }
+    steps.push({ event, state, running, effects: turn.effects, takes: kwsTakesAudio(state, running) })
+  }
+  return { state, running, starts, steps }
+}
+
+/** 回归前 kws-feed 入口的判据：只认 holder==='wake'。 */
+const oldFeedGate = (state: AudioState, running: RunningWake): boolean => state.holder === 'wake' && running === 'kws'
+
+describe('会议录音期间的唤醒：KWS 吃得到共享采集的 PCM', () => {
+  test('回归：会议在录（holder=meeting）时 KWS 在跑，主进程必须收它的 PCM', () => {
+    const { state, running, steps } = drive([{ type: 'boot' }, { type: 'meeting-requested' }])
+    assert.equal(state.holder, 'meeting')
+    assert.equal(running, 'kws', '开会不停唤醒（录音不剥夺唤醒）')
+    assert.deepEqual(steps[1].effects, [], '唤醒原本就在听：开会不重起')
+    assert.equal(kwsTakesAudio(state, running), true, '授权与收 PCM 都要放行')
+    // 现场故障：授权早就不看 holder 了，收 PCM 的入口却还按 holder==='wake' 拦 —— 整场会议一帧都没送进 KWS。
+    assert.equal(oldFeedGate(state, running), false)
+  })
+
+  test('System.Speech 在跑、或唤醒让路时不收 PCM', () => {
+    const meeting = drive([{ type: 'boot' }, { type: 'meeting-requested' }]).state
+    assert.equal(kwsTakesAudio(meeting, 'system'), false, 'System.Speech 自己开设备，不吃共享采集')
+    assert.equal(kwsTakesAudio(meeting, null), false)
+    const focus = nextAudio(meeting, { type: 'focus', on: true }).state
+    assert.equal(kwsTakesAudio(focus, 'kws'), false, '专注时唤醒不在听')
+    const manual = nextAudio(meeting, { type: 'dictation-requested' }).state
+    assert.equal(kwsTakesAudio(manual, 'kws'), false, '本人按键听写时唤醒让路')
+  })
+
+  test('会议 + 讲解全程：KWS 在跑的每一刻都收 PCM；插话交接不停唤醒，口令后续听让路、听完恢复', () => {
+    const script: AudioEvent[] = [
+      { type: 'boot' },
+      { type: 'meeting-requested' }, // 开始录音
+      { type: 'barge-in-requested', allowInMeeting: true }, // 讲解开播：插话监听与唤醒并存
+      { type: 'barge-in-detected' }, // 讲解声中有人开口（可能正是在喊唤醒词）
+      { type: 'dictation-requested', source: 'barge-in' }, // 交接给口令门禁的听写
+      { type: 'dictation-finished' }, // 这句收完
+      { type: 'dictation-requested', source: 'barge-in' }, // 口令后的提问窗口续听（没有检出）
+      { type: 'dictation-finished' }, // 提问收完：插话后恢复
+      { type: 'barge-in-requested', allowInMeeting: true }, // 回答 / 续讲开播
+      { type: 'barge-in-finished' }, // 播完
+      { type: 'meeting-finished' }, // 停录
+    ]
+    const { steps, starts } = drive(script)
+    for (const step of steps) {
+      assert.equal(step.takes, step.running === 'kws', `KWS 在跑与收 PCM 不一致：${JSON.stringify(step.event)} ${JSON.stringify(step.state)}`)
+    }
+    assert.deepEqual(steps.map(step => step.running === 'kws'),
+      [true, true, true, true, true, true, false, true, true, true, true],
+      '只有口令后的续听让唤醒让路，其余时刻唤醒都在听')
+    assert.deepEqual(steps[4].effects, ['stop-barge-in'], '交接只收插话监听，KWS 继续听完这句唤醒词')
+    assert.deepEqual(steps[5].effects, [], '交接听写收尾不重起 KWS')
+    assert.deepEqual(steps[6].effects, ['stop-wake'], '口令后的续听照旧让路')
+    assert.deepEqual(steps[7].effects, ['start-wake'], '续听收尾恢复唤醒')
+    assert.equal(steps[10].state.holder, 'wake')
+    assert.equal(starts, 2, '开机一次 + 续听后恢复一次；交接前后不再白白重载唤醒模型')
+    // 回归前的判据在会议里的每一步都把 PCM 拦掉。
+    assert.ok(steps.slice(1, 10).every(step => !oldFeedGate(step.state, step.running)))
+  })
+})
+
+describe('会议里插话交接期间保留的唤醒：其它开关照常收得住', () => {
+  const HANDOVER = drive([
+    { type: 'boot' },
+    { type: 'meeting-requested' },
+    { type: 'barge-in-requested', allowInMeeting: true },
+    { type: 'barge-in-detected' },
+    { type: 'dictation-requested', source: 'barge-in' },
+  ]).state
+
+  test('前提：交接中听写占着设备、唤醒仍在听', () => {
+    assert.equal(HANDOVER.holder, 'dictation')
+    assert.equal(HANDOVER.wakeDuringHandover, true)
+    assert.equal(wakeListening(HANDOVER), true)
+    assert.equal(kwsTakesAudio(HANDOVER, 'kws'), true)
+  })
+
+  test('开专注：停唤醒、听写不动；收尾不再拉起', () => {
+    const focus = nextAudio(HANDOVER, { type: 'focus', on: true })
+    assert.deepEqual(focus.effects, ['stop-wake'])
+    assert.equal(focus.state.holder, 'dictation')
+    assert.equal(focus.state.wakeDuringHandover, false)
+    assert.deepEqual(nextAudio(focus.state, { type: 'dictation-finished' }).effects, [])
+  })
+
+  test('关唤醒 / 唤醒挂掉：立刻停，收尾不拉起', () => {
+    const off = nextAudio(HANDOVER, { type: 'wake-config', enabled: false })
+    assert.deepEqual(off.effects, ['stop-wake'])
+    assert.deepEqual(nextAudio(off.state, { type: 'dictation-finished' }).effects, [])
+    const lost = nextAudio(HANDOVER, { type: 'wake-lost' })
+    assert.deepEqual(lost.effects, ['stop-wake'], '清掉自动重启定时器')
+    assert.equal(lost.state.wakeUnavailable, true)
+    assert.equal(lost.state.holder, 'dictation', '唤醒挂了不带走听写')
+    assert.deepEqual(nextAudio(lost.state, { type: 'dictation-finished' }).effects, [])
+  })
+
+  test('换引擎：先停旧的，听写收尾再起新的（听写占着设备时不拉起唤醒）', () => {
+    const changed = nextAudio(HANDOVER, { type: 'wake-engine-changed' })
+    assert.deepEqual(changed.effects, ['stop-wake'])
+    const finished = nextAudio(changed.state, { type: 'dictation-finished' })
+    assert.deepEqual(finished.effects, ['start-wake'])
+    assert.equal(finished.state.holder, 'meeting')
+  })
+
+  test('交接中会议先停了：唤醒一直在听，听写收尾记回 wake、不重起', () => {
+    const stopped = nextAudio(HANDOVER, { type: 'meeting-finished' })
+    assert.deepEqual(stopped.effects, [])
+    assert.equal(stopped.state.holder, 'dictation')
+    const finished = nextAudio(stopped.state, { type: 'dictation-finished' })
+    assert.deepEqual(finished.effects, [])
+    assert.equal(finished.state.holder, 'wake')
+    assert.equal(finished.state.wakeDuringHandover, false)
+  })
+
+  test('只认会议里检出后的交接：本人按键、未检出的续听、会议外的插话交接都照旧', () => {
+    const meeting = drive([{ type: 'boot' }, { type: 'meeting-requested' }, { type: 'barge-in-requested', allowInMeeting: true }]).state
+    // 检出之后本人去按了麦克风：按键听写照旧让路。
+    const detected = nextAudio(meeting, { type: 'barge-in-detected' }).state
+    const manual = nextAudio(detected, { type: 'dictation-requested' })
+    assert.deepEqual(manual.effects, ['stop-wake', 'stop-barge-in'])
+    assert.equal(manual.state.wakeDuringHandover, false)
+    // 没有检出的口令续听：照旧让路。
+    const relisten = nextAudio(meeting, { type: 'dictation-requested', source: 'barge-in' })
+    assert.deepEqual(relisten.effects, ['stop-wake', 'stop-barge-in'])
+    assert.equal(relisten.state.wakeDuringHandover, false)
+    // 会议外：插话监听开播时唤醒就已停了，交接只收插话监听，收尾恢复唤醒。
+    const barge = nextAudio(AWAKE, { type: 'barge-in-requested' }).state
+    const outside = nextAudio(nextAudio(barge, { type: 'barge-in-detected' }).state, { type: 'dictation-requested', source: 'barge-in' })
+    assert.deepEqual(outside.effects, ['stop-barge-in'])
+    assert.equal(outside.state.wakeDuringHandover, false)
+    assert.deepEqual(nextAudio(outside.state, { type: 'dictation-finished' }).effects, ['start-wake'])
   })
 })

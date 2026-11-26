@@ -18,7 +18,7 @@ import { PATH_TARGET_TOOLS, canonicalPath, canonicalRoot, fileVersion, gateDecis
 import { HelpTaskError } from './help-task.ts'
 import type { SessionBridge } from './bridge.ts'
 import type { TaskOutcome, TeamService } from './team.ts'
-import { REVIEW_RESOLUTIONS, type MemberConfig, type OperationRecord } from './team-domain.ts'
+import { REVIEW_RESOLUTIONS, TERMINAL_TASK_STATUSES, type MemberConfig, type OperationRecord } from './team-domain.ts'
 
 interface TeamHost {
   tools: { register(definition: unknown): () => void }
@@ -170,7 +170,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       member: { type: 'string', required: true, description: '根据目录职责自动选择的成员 assistantId 或准确名称，不是固定角色' },
       goal: { type: 'string', required: true, description: '任务目标，一句话说清要解决什么' },
       evidence: { type: 'array', items: { type: 'string' }, description: '交给成员的已知材料（文件路径、报错原文、用户原话等）' },
-      acceptance: { type: 'array', items: { type: 'string' }, description: '验收条件；当前自由文本产物需独立复核，模型自报不能标记任务完成' },
+      acceptance: { type: 'array', items: { type: 'string' }, description: '可核验的交付要求。普通分析或查询有结论即可结束；未达到要求应报告阻碍' },
       dependsOn: { type: 'array', items: { type: 'string' }, description: '前置任务 id；前置未完成时本任务留在排队状态' },
     },
     output: textOutput,
@@ -206,7 +206,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       try {
         const outcome = await team.runTask(task.taskId, context.agent, signal)
         if (!outcome) return json({ ok: false, taskId: task.taskId, error: '任务未能进入执行（可能已被并发占用或状态已变更）' })
-        return json({ ok: true, member: member.displayName, ...outcomeView(outcome) })
+        return json({ ok: !['blocked', 'failed', 'cancelled', 'unknown'].includes(outcome.task.status), member: member.displayName, ...outcomeView(outcome) })
       } catch (error) {
         return json({ ok: false, taskId: task.taskId, member: member.displayName, error: errorMessage(error) })
       }
@@ -241,6 +241,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
           goal: task.goal,
           owner: task.ownerId,
           status: task.status,
+          diagnostic: team.taskDiagnostic(task),
           revision: task.revision,
           artifacts: task.artifacts,
           dependsOn: task.dependsOn,
@@ -317,7 +318,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       if (!task) return json({ ok: false, error: `任务 ${args.taskId} 不存在` })
       const assistantId = args.assistantId ?? task.ownerId
       if (assistantId !== task.ownerId || !team.member(assistantId)?.enabled) return json({ ok: false, error: '提案成员与任务成员不符或已停用' })
-      if (['done', 'failed', 'cancelled', 'unknown'].includes(task.status)) return json({ ok: false, error: '任务已终止或结果不明，需先复核' })
+      if (TERMINAL_TASK_STATUSES.includes(task.status) || task.status === 'unknown') return json({ ok: false, error: '任务已终止或结果不明，不能提交新的操作提案' })
       const decision = gateDecision(args.tool, args.params)
       if (decision.kind !== 'gated' || decision.target !== args.target) return json({ ok: false, error: '工具不支持审批或完整参数中的目标与提案不符' })
       // 写类目标按执行器同一口径规范化成真实路径：批准绑定的必须是执行时真正会写到的位置。
@@ -349,16 +350,21 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
         risk: args.risk,
         baseHash,
       })
+      const autoApproved = options.bridge.approvalSwitch?.('teamActions') === true
+      if (autoApproved) approvals.issue(proposal.proposalId, { channel: 'desktop-shell' }, true)
       return json({
         ok: true,
         proposalId: proposal.proposalId,
-        state: proposal.state,
+        state: autoApproved ? 'approved' : proposal.state,
+        ...(autoApproved ? { autoApproved: true } : {}),
         target: proposal.target,
         baseHash,
         expiresAt: proposal.expiresAt,
-        note: '等待可信审批决定。提交提案本身不执行副作用；获批也不代表已执行——只有该任务运行中的可信执行器以完全相同的参数调用时才会消费这一次批准，'
-          + '执行结果以执行账本为准。不能在普通主会话直接调用工具代替。'
-          + (baseHash !== null ? '批准还绑定了目标文件此刻的内容版本，文件在批准后被改动就需要重新提案。' : ''),
+        note: autoApproved
+          ? '已按设置里的免审批开关自动签发批准；可信执行器以完全相同的参数调用时即可直接消费执行。'
+          : '等待可信审批决定。提交提案本身不执行副作用；获批也不代表已执行——只有该任务运行中的可信执行器以完全相同的参数调用时才会消费这一次批准，'
+            + '执行结果以执行账本为准。不能在普通主会话直接调用工具代替。'
+            + (baseHash !== null ? '批准还绑定了目标文件此刻的内容版本，文件在批准后被改动就需要重新提案。' : ''),
       })
     },
   }))
@@ -551,8 +557,9 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
       '',
       '协作规则：',
       '- 用户说"开启团队模式"、"叫上专家"：调用 desktop_team_start。',
-      '- 请求与已启用成员职责匹配时，自动选择其 assistantId 调用 desktop_team_assign，不要让用户手工挑选，也不要只口头说已分派。把必要材料写进 evidence、可核验要求写进 acceptance；不转发总助理全局偏好或其他成员记忆。拿到真实 summary/artifacts/blockers 后再汇总，并保留证据与阻碍。',
+      '- 请求与已启用成员职责匹配时，自动选择其 assistantId 调用 desktop_team_assign，不要让用户手工挑选，也不要只口头说已分派。把必要材料写进 evidence、可核验要求写进 acceptance；不转发总助理全局偏好或其他成员记忆。按实际任务状态汇报：blocked 说明 diagnostic，不请用户确认完成；review 才提示验收；确有待批卡才提示审批。',
       '- 目录标为「外部平台」或「本地 AI 工具」的成员，改用 personal_assistant_dispatch_subassistant；只转交必要任务描述，不把私人记忆或未经授权的附件交给外部服务。外部成员回执越权时由你重新分析范围，不把越权当完成。',
+      '- 获授「对接外部平台」能力的外部成员可以真正操作平台：查智能体/会话/聊天记录用 platformQuery；向平台智能体提问用 platformQuestion；用户明确要求把某个本地文件加进知识库时用 platformFilePath（写操作）。这些都由本机用该成员自己的凭据执行，以平台回执为准；失败时如实说原因，不要切回纯聊天冒充成功。',
       '- 使用目录中的准确身份。成员不存在、停用、忙碌或额度不足时如实解释；不静默换人，不替用户启用成员。',
       /*
        * 汇报方式：目录里标了「自己汇报」的成员，结论要由他自己说一遍。
@@ -581,7 +588,7 @@ export function registerTeamTools(host: TeamHost, options: TeamToolOptions): () 
     ].join('\n'),
   })
 
-  const CAPABILITY_LABELS: Record<string, string> = { wecom: '企业微信接收', mail: '邮件收发与分析', meeting: '会议记录', document: '文档讲解', activity: '活动/日报', reminders: '提醒' }
+  const CAPABILITY_LABELS: Record<string, string> = { wecom: '企业微信接收', mail: '邮件收发与分析', meeting: '会议记录', document: '文档讲解', activity: '活动/日报', reminders: '提醒', platform: '对接外部平台' }
   ctx.systemPrompt.variable('desktop_team_identity', () => '你是总助理：按成员职责与能力委派并汇总。没有合适的启用成员时，在自己的授权范围内处理，不假称已派单。')
   ctx.systemPrompt.variable('desktop_team_roster', () => {
     const members = team.roster()

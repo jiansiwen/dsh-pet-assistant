@@ -27,7 +27,7 @@ const draft: MemberDraft = { displayName: '研究员甲', personality: '', permi
   provider: '', model: '', maxTokens: 2048, capabilities: [], allowedTools: [], dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, timezone: 'Asia/Shanghai' }
 function snapshot(): MemberSnapshot {
   return { enabled: false, defaultModel: { provider: '宿主', model: '默认模型' }, members: [{ profile: { ...draft, assistantId: id, roleId: 'wukong',
-    voiceProfile: '', voiceDesign: '', toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 3, sessionId: '独立会话甲', kind: 'expert', binding: null },
+    voiceProfile: '', voiceDesign: '', toolPolicy: { mode: 'read-only', denyTools: [] }, revision: 3, sessionId: '独立会话甲', kind: 'expert', binding: null, platformAuth: null },
     quota: { day: '2026-10-28', dailyUsed: 900, totalUsed: 4000, dailyReserved: 0, totalReserved: 0, dailyTokenLimit: 1000, totalTokenLimit: 5000, thresholdPercent: 80, unknown: false, blocked: false, revision: 9 }, busy: false }],
     requests: [{ requestId, assistantId: id, reason: '日用量达到阈值', state: 'pending', createdAt: 1, quotaRevision: 9 }] }
 }
@@ -472,4 +472,22 @@ test('后端 CAS envelope 与错误不回显秘密，网络故障不自动重发
   assert.equal(postCount, 1)
   respond = async () => ({ status: 200, body: { ok: true, state } })
   assert.equal((await read()).ok, false, '不误读旧的后端 envelope')
+})
+
+test('平台签名密钥只上桥一程：确认框掩码，快照保留标识', async () => {
+  mount()
+  const platform: MemberDraft = { ...draft, displayName: '考拉', capabilities: ['platform'], kind: 'platform',
+    binding: { kind: 'platform', endpoint: 'https://aiagent.example.com/api/agentChat/v1', model: '', agentId: '1360',
+      secretId: '', appId: '10001', appSecretId: '', signEndpoint: '', signUserId: '' }, appSecret: 'only-on-bridge' }
+  const created = await command('create', platform)
+  assert.equal(created.ok, true, JSON.stringify(created))
+  const detail = dialogs.at(-1)?.detail ?? ''
+  assert.match(detail, /已输入新密钥/u)
+  assert.doesNotMatch(detail, /only-on-bridge/u)
+  assert.deepEqual(writes().at(-1)?.body, platform)
+  // 只填密钥不填应用 ID：桥侧当场拒绝，不把半套凭据送到插件
+  const bad = await command('create', { ...platform, displayName: '缺应用', binding: { ...platform.binding, appId: '' } })
+  assert.equal(bad.ok, false)
+  if (!bad.ok) assert.equal(bad.error.code, 'invalid_input')
+  assert.equal(writes().length, 1)
 })

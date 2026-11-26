@@ -14,14 +14,12 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { cardView, formatCountdown } from '../main/approval-policy.js'
-import { teamPanelView } from './team-panel.js'
+import { taskNeedsConfirmation, teamPanelView } from './team-panel.js'
 import type { TeamSnapshot } from './types.js'
 import type { CancelReceipt } from '../session-types.js'
 
 /** 还能被取消的任务状态：终态与结果不明的任务没有可停的东西，不给按钮。 */
 const CANCELLABLE = new Set(['created', 'queued', 'running', 'awaiting-approval', 'awaiting-user', 'review'])
-/** 能被本人确认完成的任务状态：等待用户动手的三态。用户是可信验收方。 */
-const CONFIRMABLE = new Set(['awaiting-approval', 'awaiting-user', 'review'])
 const RECEIPT_LABEL: Record<CancelReceipt['state'], string> = {
   'not-executed': '未执行', cancelling: '取消中', terminated: '已终止', 'partially-executed': '已部分执行', unknown: '结果未知',
 }
@@ -251,9 +249,9 @@ export default function TeamPanel({ snapshot, memberNames, onOpenApproval, bindi
                         {task.note}
                       </p>
                     )}
-                    {bindingId && (CANCELLABLE.has(task.status) || CONFIRMABLE.has(task.status)) && (
+                    {bindingId && (CANCELLABLE.has(task.status) || taskNeedsConfirmation(task.status)) && (
                       <div className="team-proposal-foot">
-                        {CONFIRMABLE.has(task.status) && (
+                        {taskNeedsConfirmation(task.status) && (
                           <button type="button" className="team-go" disabled={confirming !== null}
                             title="你已核对产物/结果，本人确认完成（模型自报不算，你的确认才算）"
                             onClick={() => void confirmTask(task.taskId)}>

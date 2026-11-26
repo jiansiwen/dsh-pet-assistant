@@ -202,6 +202,10 @@ export interface MeetingRecorderDeps {
   readonly egressTarget?: string
   /** 等模型回复的上限，到点中止，结果不采用。默认 180 秒。 */
   readonly summarizeTimeoutMs?: number
+  /** 演示免门禁：为 true 时，录音不完整/有缺口或未知也允许生成、导出与保存纪要。 */
+  readonly allowIncompleteAudio?: () => boolean
+  /** 演示加速：为 true 时跳过耗时的会后声纹重分人，直接按音轨复用录音实时字幕，几秒完成转写。 */
+  readonly fastTranscribe?: () => boolean
 }
 
 export type MeetingSummarizeFn = (prompt: string, signal?: AbortSignal) => Promise<{ ok: boolean; reply?: string; error?: string }>
@@ -1203,15 +1207,25 @@ export class MeetingRecorder {
     const diarize = this.deps.diarize ?? diarizeTimelineSamples
     const tracks = TRACK_ORDER.filter(track => (timelines.get(track)?.placements.length ?? 0) > 0)
     const counts = this.deps.speakerCounts?.() ?? { mic: 0, loopback: 0 }
-    const outcomes = await Promise.all(tracks.map(async (track): Promise<{ result?: DiarizeResult; error?: string }> => {
-      try {
-        const count = track === 'mic' ? counts.mic : counts.loopback
-        return { result: await diarize((timelines.get(track) as TrackTimeline).samples, this.deps.userDataDir,
-          count >= 1 ? { numClusters: count } : undefined) }
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error) }
+    const skipDiarize = this.deps.fastTranscribe?.() === true
+    // 两轨依次分人而非同时起两个多线程 ONNX Worker：防止双轨 8 线程把 CPU 跑满拖垮其他进程和模型请求。
+    // 打开「会议快速转写」时直接跳过重分人，走下方 fallbackSpans 复用录音实时字幕，几秒即可出稿。
+    const outcomes: Array<{ result?: DiarizeResult; error?: string }> = []
+    if (skipDiarize) {
+      for (let i = 0; i < tracks.length; i++) outcomes.push({ error: '已开启会议快速转写（按音源双轨复用实时字幕）' })
+    } else {
+      for (const track of tracks) {
+        try {
+          const count = track === 'mic' ? counts.mic : counts.loopback
+          outcomes.push({
+            result: await diarize((timelines.get(track) as TrackTimeline).samples, this.deps.userDataDir,
+              count >= 1 ? { numClusters: count } : undefined),
+          })
+        } catch (error) {
+          outcomes.push({ error: error instanceof Error ? error.message : String(error) })
+        }
       }
-    }))
+    }
     const reports: TrackReport[] = []
     const plan: PlannedSpan[] = []
     tracks.forEach((track, i) => {
@@ -1619,7 +1633,9 @@ export class MeetingRecorder {
     const meeting = this.store.getMeeting(meetingId)
     if (meeting === null) return { ok: false, error: '没有这场会议' }
     const integrity = this.getRecordingIntegrity(meetingId)
-    if (integrity !== null && integrity.status !== 'complete') return { ok: false, error: '录音不完整或停止结果未知，不能导出为完整纪要' }
+    if (this.deps.allowIncompleteAudio?.() !== true && integrity !== null && integrity.status !== 'complete') {
+      return { ok: false, error: '录音不完整或停止结果未知，不能导出为完整纪要' }
+    }
     const minutes = this.store.getMinutes(meetingId)
     if (minutes === null) return { ok: false, error: '纪要还没有生成' }
     if (minutes.undecryptable === true) return { ok: false, error: '纪要不可解密，不能导出' }
@@ -1630,6 +1646,7 @@ export class MeetingRecorder {
 
   /** 停录回执只证明当时写入过；之后仍需核验加密块及时间轴。 */
   private storedAudioComplete(meeting: MeetingRow): boolean {
+    if (this.deps.allowIncompleteAudio?.() === true) return true
     if (meeting.integrity?.status !== 'complete' || this.getRecordingIntegrity(meeting.id)?.status !== 'complete') return false
     const meetingId = meeting.id
     try {
@@ -1683,7 +1700,8 @@ export class MeetingRecorder {
     if (!Number.isSafeInteger(revision) || revision < 1 || !/^[a-f0-9]{64}$/u.test(digest)) return { ok: false, error: '纪要版本参数不对' }
     const meeting = this.store.getMeeting(meetingId)
     if (!meeting || meeting.undecryptable) return { ok: false, error: '会议不存在或无法解密' }
-    if (meeting.integrity?.status !== 'complete' || this.getRecordingIntegrity(meetingId)?.status !== 'complete') {
+    const allowIncomplete = this.deps.allowIncompleteAudio?.() === true
+    if (!allowIncomplete && (meeting.integrity?.status !== 'complete' || this.getRecordingIntegrity(meetingId)?.status !== 'complete')) {
       return { ok: false, error: '录音不完整或完整性未知，不能生成确认版文件' }
     }
     if (meeting.state !== 'transcribed') return { ok: false, error: '转写尚未完成，不能生成确认版文件' }
@@ -1739,7 +1757,7 @@ export class MeetingRecorder {
     } finally { if (fd !== undefined) { try { closeSync(fd) } catch { /* 文件结果按失败保留 */ } } }
     const artifact: MeetingMinutesArtifact = { id, meetingId, revision, digest, confirmedAt: snapshot.confirmedAt, path: target, createdAt: this.now() }
     let saved: ReturnType<MeetingStore['saveMinutesArtifact']>
-    try { saved = this.store.saveMinutesArtifact(artifact) }
+    try { saved = this.store.saveMinutesArtifact(artifact, { allowIncompleteAudio: this.deps.allowIncompleteAudio?.() === true }) }
     catch (error) { saved = { ok: false, error: `产物登记结果未知：${error instanceof Error ? error.message : String(error)}` } }
     if (!saved.ok) return { ok: false, error: `${saved.error}；文件可能已写出但不可作为有效产物，请检查 ${target}` }
     return { ok: true, artifact }
@@ -1868,7 +1886,9 @@ export class MeetingRecorder {
     if (meeting === null) return refuse('没有这场会议')
     if (meeting.state === 'recording' || this.active?.meetingId === meetingId) return refuse('会议还在录制中')
     const integrity = this.getRecordingIntegrity(meetingId)
-    if (integrity !== null && integrity.status !== 'complete') return refuse('录音不完整或停止结果未知，不发送会议文字生成完整纪要')
+    if (this.deps.allowIncompleteAudio?.() !== true && integrity !== null && integrity.status !== 'complete') {
+      return refuse('录音不完整或停止结果未知，不发送会议文字生成完整纪要')
+    }
     if (this.jobRunning) return refuse('转写正在进行，等它跑完再生成')
     if (this.minutesJobs.has(meetingId)) return refuse('这场会议的纪要正在生成')
     if (meeting.undecryptable === true) return refuse('会议信息不可解密，不发送')
@@ -2024,6 +2044,8 @@ export function createMeetingRecorder(deps: {
   summarize?: MeetingSummarizeFn
   confirmEgress?: MeetingConfirmEgressFn
   egressTarget?: string
+  allowIncompleteAudio?: () => boolean
+  fastTranscribe?: () => boolean
 }): MeetingRecorder {
   const store = new MeetingStore(deps.userDataDir, deps.storeDeps ?? {})
   return new MeetingRecorder({
@@ -2040,6 +2062,8 @@ export function createMeetingRecorder(deps: {
     ...(deps.summarize !== undefined ? { summarize: deps.summarize } : {}),
     ...(deps.confirmEgress !== undefined ? { confirmEgress: deps.confirmEgress } : {}),
     ...(deps.egressTarget !== undefined ? { egressTarget: deps.egressTarget } : {}),
+    ...(deps.allowIncompleteAudio !== undefined ? { allowIncompleteAudio: deps.allowIncompleteAudio } : {}),
+    ...(deps.fastTranscribe !== undefined ? { fastTranscribe: deps.fastTranscribe } : {}),
   })
 }
 

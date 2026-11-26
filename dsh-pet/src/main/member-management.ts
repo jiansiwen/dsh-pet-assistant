@@ -6,7 +6,7 @@ import { RolePresetError } from './role-preset-store.ts'
 import {
   MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_READ_TOOLS, MEMORY_KINDS, SUB_ASSISTANT_REPORT_MODES,
   type MemberDraft, type MemberProfile, type MemberSnapshot, type MemoryRecord,
-  type MemberResult, type MemberAction, type MemoryDeletePreview, type SubAssistantBinding,
+  type MemberResult, type MemberAction, type MemoryDeletePreview, type PlatformAuth, type SubAssistantBinding,
 } from '../member-types.ts'
 
 export const MEMBER_CHANNELS = { state: 'members-state', memories: 'member-memories', command: 'member-command', assist: 'member-assist' } as const
@@ -22,6 +22,8 @@ interface Options {
   /** 写入成功后通知界面刷新；失败不影响已经落库的结果。 */
   changed?(): void
   prepareRole?(presetId: string): PreparedMemberRole
+  /** 设置页打开「跳过本地确认弹窗」时为 true：成员管理操作不再逐页弹原生确认框。 */
+  skipConfirm?(): boolean
 }
 type RecordValue = Record<string, unknown>
 function record(value: unknown): RecordValue {
@@ -64,26 +66,39 @@ function uuid(value: unknown): string {
 export function memberPathIdentifier(value: unknown): string {
   return encodeURIComponent(identifier(value)).replace(/[!'()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
 }
-/** 原生确认弹窗展示副本：apiKey 只提示已输入，绝不回显明文（密钥只在桥上一程）。 */
+/** 原生确认弹窗展示副本：apiKey/appSecret 只提示已输入，绝不回显明文（密钥只在桥上一程）。 */
 function displayBody(body: RecordValue): RecordValue {
-  if (typeof body.apiKey !== 'string' || !body.apiKey) return body
-  return { ...body, apiKey: '（已输入新密钥；确认后保存到本机加密存储，此处不回显）' }
+  const hidden = '（已输入新密钥；确认后保存到本机加密存储，此处不回显）'
+  const next = { ...body }
+  if (typeof body.apiKey === 'string' && body.apiKey) next.apiKey = hidden
+  if (typeof body.appSecret === 'string' && body.appSecret) next.appSecret = hidden
+  return next
 }
-const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'reportMode', 'speechBy', 'persona', 'voiceProfile', 'voiceDesign', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone', 'scheduleWorkspaceId', 'kind', 'binding', 'apiKey']
+const draftKeys = ['displayName', 'description', 'personality', 'permissionMode', 'reportMode', 'speechBy', 'persona', 'voiceProfile', 'voiceDesign', 'skinId', 'enabled', 'provider', 'model', 'maxTokens', 'capabilities', 'allowedTools', 'dailyTokenLimit', 'totalTokenLimit', 'thresholdPercent', 'timezone', 'scheduleWorkspaceId', 'kind', 'binding', 'platformAuth', 'apiKey', 'appSecret']
 /** 子助理绑定（桥上白名单形状；https/回环等深度校验在插件 member-directory）。 */
 function subAssistantBinding(value: unknown): SubAssistantBinding {
   const bound = record(value)
   if (bound.kind === 'platform') {
-    keys(bound, ['kind', 'endpoint', 'model', 'agentId', 'secretId'])
+    keys(bound, ['kind', 'endpoint', 'model', 'agentId', 'secretId', 'appId', 'appSecretId', 'signEndpoint', 'signUserId'])
     return { kind: 'platform', endpoint: text(bound.endpoint, 2048), model: text(bound.model, 256),
       agentId: bound.agentId === undefined ? '' : text(bound.agentId, 128),
-      secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100) }
+      secretId: bound.secretId === undefined ? '' : text(bound.secretId, 100),
+      appId: bound.appId === undefined ? '' : text(bound.appId, 128),
+      appSecretId: bound.appSecretId === undefined ? '' : text(bound.appSecretId, 100),
+      signEndpoint: bound.signEndpoint === undefined ? '' : text(bound.signEndpoint, 2048),
+      signUserId: bound.signUserId === undefined ? '' : text(bound.signUserId, 128) }
   }
   if (bound.kind === 'local-cli') {
     keys(bound, ['kind', 'command', 'args'])
     return { kind: 'local-cli', command: text(bound.command, 2048), args: list(bound.args ?? [], item => text(item, 1024)) }
   }
   throw new Error('invalid_input')
+}
+function platformAuthValue(value: unknown): PlatformAuth {
+  const auth = record(value)
+  keys(auth, ['appId', 'appSecretId', 'signEndpoint', 'signUserId'])
+  return { appId: text(auth.appId, 128), appSecretId: text(auth.appSecretId, 100),
+    signEndpoint: text(auth.signEndpoint, 2048), signUserId: text(auth.signUserId, 128) }
 }
 function draft(value: RecordValue, writing = false): MemberDraft {
   const next: MemberDraft = {
@@ -95,16 +110,24 @@ function draft(value: RecordValue, writing = false): MemberDraft {
     totalTokenLimit: integer(value.totalTokenLimit), thresholdPercent: integer(value.thresholdPercent, 1, 100), timezone: text(value.timezone, 128),
     kind: value.kind === undefined ? undefined : choice(value.kind, MEMBER_KINDS),
     binding: value.binding === undefined || value.binding === null ? (value.binding === null ? null : undefined) : subAssistantBinding(value.binding),
+    platformAuth: value.platformAuth === undefined || value.platformAuth === null ? (value.platformAuth === null ? null : undefined) : platformAuthValue(value.platformAuth),
     apiKey: value.apiKey === undefined ? undefined : text(value.apiKey, 4096),
+    appSecret: value.appSecret === undefined ? undefined : text(value.appSecret, 4096),
     scheduleWorkspaceId: value.scheduleWorkspaceId == null ? value.scheduleWorkspaceId as null | undefined : identifier(value.scheduleWorkspaceId),
   }
   if (writing) {
     if (!next.displayName.trim() || !!next.provider.trim() !== !!next.model.trim() || next.allowedTools.length > 0) throw new Error('invalid_input')
-    if (next.apiKey !== undefined && (!next.apiKey || next.kind !== 'platform')) throw new Error('invalid_input')
+    if (next.platformAuth !== undefined && next.platformAuth !== null && !next.capabilities.includes('platform')) throw new Error('invalid_input')
+    if (next.appSecret !== undefined) {
+      const hasAuth = next.kind === 'platform'
+        ? next.binding?.kind === 'platform' && Boolean(next.binding.appId)
+        : next.kind === 'expert' && Boolean(next.platformAuth?.appId)
+      if (!next.appSecret || !hasAuth) throw new Error('invalid_input')
+    }
     new Intl.DateTimeFormat('zh-CN', { timeZone: next.timezone }).format()
   }
   // 可选字段未提供时不留空键：快照投影、确认弹窗与候选草稿的逐字段比对都按实际字段走。
-  for (const key of ['apiKey', 'kind', 'reportMode', 'binding', 'scheduleWorkspaceId'] as const) if (next[key] === undefined) delete next[key]
+  for (const key of ['apiKey', 'appSecret', 'kind', 'reportMode', 'binding', 'platformAuth', 'scheduleWorkspaceId'] as const) if (next[key] === undefined) delete next[key]
   return next
 }
 /** 所有已知回包逐字段投影，绝不将服务凭据或附带调试字段交给渲染器。 */
@@ -195,6 +218,7 @@ export function projectMemberState(value: unknown): MemberSnapshot {
         kind: p.kind === undefined || p.kind === null ? 'expert' : choice(p.kind, ['expert', 'platform', 'local-cli']),
         reportMode: p.reportMode === undefined || p.reportMode === null ? 'chief' : choice(p.reportMode, ['chief', 'self']),
         binding: p.binding === undefined || p.binding === null ? null : subAssistantBinding(p.binding),
+        platformAuth: p.platformAuth === undefined || p.platformAuth === null ? null : platformAuthValue(p.platformAuth),
       }
       return { profile, busy: bool(view.busy), quota: {
         day: text(q.day), dailyUsed: integer(q.dailyUsed), totalUsed: integer(q.totalUsed),
@@ -513,15 +537,17 @@ export function registerMemberManagement(options: Options): () => void {
         ? Array.from({ length: Math.ceil(detail.length / 750) }, (_, index) => detail.slice(index * 750, (index + 1) * 750))
         : [detail]
       let purgeMemory = false
-      for (const [index, page] of pages.entries()) {
-        const last = index === pages.length - 1
-        const answer = await dialog.showMessageBox(parent, { type: 'warning', title: labels[command.action],
-          message: `${labels[command.action]}：${target}${pages.length > 1 ? `（核对 ${index + 1}/${pages.length}，末页才能执行）` : ''}`,
-          detail: page, buttons: ['取消', last ? '确认执行' : '继续核对'], defaultId: 0, cancelId: 0, noLink: true,
-          ...(command.action === 'delete' ? { checkboxLabel: '同时清除这个成员的独立记忆（不可恢复）', checkboxChecked: false } : {}) })
-        if (!allowed(event)) return failure('denied')
-        if (answer.response !== 1) return failure('cancelled')
-        if (command.action === 'delete') purgeMemory = answer.checkboxChecked === true
+      if (options.skipConfirm?.() !== true) {
+        for (const [index, page] of pages.entries()) {
+          const last = index === pages.length - 1
+          const answer = await dialog.showMessageBox(parent, { type: 'warning', title: labels[command.action],
+            message: `${labels[command.action]}：${target}${pages.length > 1 ? `（核对 ${index + 1}/${pages.length}，末页才能执行）` : ''}`,
+            detail: page, buttons: ['取消', last ? '确认执行' : '继续核对'], defaultId: 0, cancelId: 0, noLink: true,
+            ...(command.action === 'delete' ? { checkboxLabel: '同时清除这个成员的独立记忆（不可恢复）', checkboxChecked: false } : {}) })
+          if (!allowed(event)) return failure('denied')
+          if (answer.response !== 1) return failure('cancelled')
+          if (command.action === 'delete') purgeMemory = answer.checkboxChecked === true
+        }
       }
       // 确认后重新读取忙碌和 CAS，不能在原生框停留期间悄悄修改新版本。
       const latest = projectMemberState(await request(event, 'GET', ROOT))

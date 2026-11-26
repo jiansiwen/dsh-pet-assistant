@@ -15,7 +15,7 @@ const SEGMENT: TranscriptSegment = { idx: 0, speaker: 'mic-s1', label: '参会�
   startMs: 0, endMs: 1000, text: '已确认的会议发言', source: 'asr', track: 'mic' }
 const ID = '11111111-1111-4111-8111-111111111111'
 
-function fixture(t: TestContext, options: { integrity?: MeetingIntegrity | null; failed?: boolean; artifactId?: string } = {}) {
+function fixture(t: TestContext, options: { integrity?: MeetingIntegrity | null; failed?: boolean; artifactId?: string; allowIncompleteAudio?: () => boolean } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'dsh-meeting-artifact-'))
   const data = path.join(root, 'private')
   const destination = path.join(root, 'chosen')
@@ -25,7 +25,9 @@ function fixture(t: TestContext, options: { integrity?: MeetingIntegrity | null;
     const store = new MeetingStore(data, { keyProvider: () => ({ status: 'ok', key: KEY }), now: () => 1_800_000_000_000 })
     stores.push(store)
     const recorder = new MeetingRecorder({ store, userDataDir: data, audio: event => nextAudio(INITIAL_AUDIO_STATE, event),
-      notifyRenderer: () => {}, ...(options.artifactId ? { newArtifactId: () => options.artifactId! } : {}) })
+      notifyRenderer: () => {},
+      ...(options.artifactId ? { newArtifactId: () => options.artifactId! } : {}),
+      ...(options.allowIncompleteAudio ? { allowIncompleteAudio: options.allowIncompleteAudio } : {}) })
     return { store, recorder }
   }
   const current = open()
@@ -104,6 +106,23 @@ test('没有确认、录音完整性未知或转写有失败段时，不弹保�
   assert.equal(failed.confirm().ok, true)
   assert.equal((await failed.save()).ok, false)
   assert.equal(failed.picks(), 0)
+})
+
+test('打开录音完整性免门禁开关时，有缺口的录音仍可导出和保存纪要；关闭后立即恢复拦截', async t => {
+  let bypass = true
+  const h = fixture(t, {
+    integrity: { status: 'incomplete', reasons: ['loopback 采集缺口'], tracks: {} },
+    allowIncompleteAudio: () => bypass,
+  })
+  assert.equal(h.confirm().ok, true)
+  assert.equal(h.recorder.exportMinutes(h.meetingId).ok, true)
+  const saved = await h.save()
+  assert.equal(saved.ok, true)
+  assert.ok(saved.artifact?.path)
+
+  bypass = false
+  assert.equal(h.recorder.exportMinutes(h.meetingId).ok, false)
+  assert.equal((await h.save()).ok, false)
 })
 
 test('选择目录期间版本变更或本人取消，均不写文件；伪造的摘要和修订也不能打开选择器', async t => {

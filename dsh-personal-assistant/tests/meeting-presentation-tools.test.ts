@@ -92,3 +92,30 @@ test('独立工具在桌面断开或会话换绑时如实返回失败，不编�
     assert.match(result.error, /会话.*变化|换绑/u)
   } finally { dispose() }
 })
+
+test('总助理可直接调用 personal_assistant_meeting_minutes 触发官方纪要生成与保存', async () => {
+  const tools = new Map<string, { execute(args: unknown, exec: unknown): Promise<string> }>()
+  const calls: Array<{ command: string; payload: Record<string, unknown>; timeoutMs?: number }> = []
+  const agent = {}
+  const dispose = registerMeetingPresentationTools({ tools: { register: (value: any) => { tools.set(value.name, value); return () => {} } } },
+    {
+      binding: subject => subject === agent ? '绑定甲' : null,
+      request: async (command, payload, options) => {
+        calls.push({ command, payload, timeoutMs: options?.timeoutMs })
+        return { meetingId: 'm-1', kept: 3, savedPath: 'D:/minutes/m-1.md', content: '# 会议纪要' }
+      },
+    })
+  try {
+    const minutes = tools.get('personal_assistant_meeting_minutes')!
+    const ok = JSON.parse(await minutes.execute({ meetingId: 'm-1' }, { agent, signal: new AbortController().signal }))
+    assert.equal(ok.ok, true)
+    assert.equal(ok.result.savedPath, 'D:/minutes/m-1.md')
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].command, 'meeting.minutes')
+    assert.deepEqual(calls[0].payload, { bindingId: '绑定甲', meetingId: 'm-1' })
+    assert.equal(calls[0].timeoutMs, 420_000)
+    const bad = JSON.parse(await minutes.execute({ meetingId: '   ' }, { agent, signal: new AbortController().signal }))
+    assert.equal(bad.ok, false)
+    assert.equal(calls.length, 1)
+  } finally { dispose() }
+})

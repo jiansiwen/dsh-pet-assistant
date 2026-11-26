@@ -20,14 +20,14 @@ describe('设置导航：工作与设置两组', () => {
     assert.equal(groups.length, 2)
     assert.deepEqual(groups.map(group => group.label), ['工作', '设置'])
     assert.deepEqual(groups.map(group => group.id), ['work', 'settings'])
-    assert.equal(settingsNavItems().length, 12)
+    assert.equal(settingsNavItems().length, 13)
   })
 
   it('各组标题与用途分开', () => {
     assert.deepEqual(settingsNavItems().map(item => item.title),
-      ['对话', '待办提醒', '邮件', '企业微信', '日报周报', '会议助手', '助理团设置', '文档与讲解', '语音与声纹', '记忆与技能', '外观与交互', '其他设置'])
+      ['对话', '待办提醒', '邮件', '企业微信', '日报周报', '会议助手', '助理团设置', '审批与核对', '文档与讲解', '语音与声纹', '记忆与技能', '外观与交互', '其他设置'])
     assert.deepEqual(settingsNavItems().map(item => item.id),
-      ['chat', 'todo', 'mail', 'wecom', 'report', 'meeting', 'team', 'doc', 'voice', 'learning', 'appearance', 'general'])
+      ['chat', 'todo', 'mail', 'wecom', 'report', 'meeting', 'team', 'approvals', 'doc', 'voice', 'learning', 'appearance', 'general'])
   })
 
   it('第一项是对话、最后一项是其他设置', () => {
@@ -42,14 +42,14 @@ describe('设置导航：工作与设置两组', () => {
     for (const item of settingsNavItems()) assert.ok(item.summary.length > 0, `${item.id} 缺说明`)
   })
 
-  it('工作与设置各 6 项', () => {
+  it('工作 6 项、设置 7 项', () => {
     const [work, settings] = settingsNavGroups()
     assert.equal(work.items.length, 6)
-    assert.equal(settings.items.length, 6)
+    assert.equal(settings.items.length, 7)
   })
 
   it('导航顺序连续；不在导航上的页面没有序号', () => {
-    assert.deepEqual(settingsNavItems().map(item => settingsNavOrdinal(item.id)), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+    assert.deepEqual(settingsNavItems().map(item => settingsNavOrdinal(item.id)), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
     assert.equal(settingsNavOrdinal('agent'), null)
     assert.equal(settingsNavOrdinal('reminders'), null)
   })

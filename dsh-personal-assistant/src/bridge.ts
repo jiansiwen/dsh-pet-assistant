@@ -47,6 +47,7 @@ import { documentSessionScope } from './member-runtime.ts'
 import { ApprovalError, ApprovalService } from './approval.ts'
 import type { ReportApprovalService, ReportAutoPublishResult, ReportProposal } from './report-approval.ts'
 import type { AssistantApprovalService, AssistantProposal, AssistantSubmission } from './assistant-approval.ts'
+import type { ApprovalSwitchKey, ApprovalSwitches } from './approval-switches.ts'
 import { SessionMirror, type MirrorEvent, type SessionResult } from './session-mirror.ts'
 import type { WorkbenchHandler } from './workbench.ts'
 import type { IntakeResult } from './evidence-intake.ts'
@@ -150,6 +151,8 @@ export type BridgeEventType =
   | 'notice'
   /** 子助理自行汇报（reportMode=self）：载荷自带身份四件套与结果文本，桌宠以其形象+音色播报。 */
   | 'subassistant-report'
+  /** 成员会话实时进度：只读投影，供桌宠在成员头顶显示，不持有 DSH 写句柄。 */
+  | 'member/progress'
   | TeamEventType
 
 /**
@@ -173,6 +176,12 @@ export interface BridgeEvent {
   reply?: string
   /** delta：本次增量的文本片段（显示用，不构成回复）。 */
   text?: string
+  /** member/progress：running=正在干活，idle=本轮结束（桌宠延迟收起）。 */
+  memberStatus?: 'running' | 'idle'
+  /** member/progress：think/text=增量片段，status=状态变化。 */
+  memberKind?: 'text' | 'think' | 'status'
+  /** member/progress：这条文本属于用户输入还是成员回复。 */
+  memberRole?: 'user' | 'assistant'
   error?: string
   /**
    * task：来自子代理运行结果；causal：来自本消息所属轮次的因果折叠（唯一成功的注入归属）；
@@ -601,6 +610,7 @@ export class SessionBridge {
   private reportApprovals: ReportApprovalService | null = null
   /** 日报写入方式：manual=桌面专用审批窗口批准；auto=按用户在配置里的选择直接保存。 */
   private reportApprovalMode: 'manual' | 'auto' = 'manual'
+  private approvalSwitches: ApprovalSwitches | null = null
   private assistantApprovals: AssistantApprovalService | null = null
   /** 日报工作台服务（只读视图、逐条修订、请求发布/删除）；没有批准能力。 */
   private workbench: WorkbenchHandler | null = null
@@ -997,7 +1007,7 @@ export class SessionBridge {
    */
   async submitReport(reportId: string): Promise<ReportSubmission> {
     if (!this.reportApprovals) throw new Error('日报可信审批未装配，不能发布')
-    if (this.reportApprovalMode === 'auto') {
+    if (this.reportApprovalModeName === 'auto') {
       // 自动模式：用户已在配置里打开这个开关，签发者是它，不是模型——模型仍然只调这一个入口。
       const published = await this.reportApprovals.autoPublish(reportId)
       this.notifyApprovalSnapshot()
@@ -1009,7 +1019,37 @@ export class SessionBridge {
   }
 
   get reportApprovalModeName(): 'manual' | 'auto' {
+    // 装了免审批开关就以开关为准（缺省值沿用配置里的 approvalMode），关掉开关即回到逐次审批。
+    if (this.approvalSwitches) return this.approvalSwitches.enabled('reportPublish') ? 'auto' : 'manual'
     return this.reportApprovalMode
+  }
+
+  attachApprovalSwitches(switches: ApprovalSwitches | null): void {
+    this.approvalSwitches = switches
+  }
+
+  /** 用户在设置页打开的免审批开关；未装配时一律按关处理。 */
+  approvalSwitch(key: ApprovalSwitchKey): boolean {
+    return this.approvalSwitches?.enabled(key) === true
+  }
+
+  /**
+   * 提交助理可信审批；用户已在设置页为这类操作打开免审批开关时，由本机开关代为签发并立即执行。
+   * 签发者是用户自己打开的开关，不是模型：模型仍然拿不到审批凭据，只能走这一个入口。
+   */
+  async submitAssistantAuto(submission: AssistantSubmission): Promise<{ proposal: AssistantProposal; auto?: Record<string, unknown> & { ok: boolean } }> {
+    const proposal = this.submitAssistant(submission)
+    const auto = await this.autoApproveAssistant(proposal.proposalId, submission.subject)
+    return auto ? { proposal, auto } : { proposal }
+  }
+
+  /** 已提交的助理审批：对应开关打开时立即代为签发并执行，返回执行结果；开关关着返回 null，照常等本人审批。 */
+  async autoApproveAssistant(proposalId: string, subject: string): Promise<(Record<string, unknown> & { ok: boolean }) | null> {
+    const service = this.assistantApprovals
+    if (!service || this.approvalSwitches?.autoSubject(subject) !== true) return null
+    try {
+      return await service.decide(proposalId, 'approve', this.epoch, service.approvalCapabilityToken)
+    } finally { this.notifyApprovalSnapshot() }
   }
 
   pendingReportApprovals(): ReportProposal[] {
@@ -1018,6 +1058,15 @@ export class SessionBridge {
 
   notifyApprovalSnapshot(): void {
     this.push({ type: 'team/snapshot', payload: { epoch: this.epoch, team: this.teamEnabled, ...this.teamSnapshot() } })
+  }
+
+  /** 成员会话实时进度：只读投影，桌宠据此在成员头顶显示并延迟收起。 */
+  pushMemberProgress(event: { assistantId: string; displayName: string; kind: 'text' | 'think' | 'status';
+    text?: string; status?: 'running' | 'idle'; role?: 'user' | 'assistant' }): void {
+    this.push({ type: 'member/progress', assistantId: event.assistantId, displayName: event.displayName,
+      memberKind: event.kind, ...(event.text === undefined ? {} : { text: event.text }),
+      ...(event.role === undefined ? {} : { memberRole: event.role }),
+      ...(event.status === undefined ? {} : { memberStatus: event.status }), at: Date.now() })
   }
 
   /** 子助理自行汇报（§4.6 ★①）：载荷自带身份四件套与结果文本，桌宠无需回查。 */
@@ -1031,7 +1080,7 @@ export class SessionBridge {
 
   private teamSnapshot(): {
     members: MemberConfig[]
-    tasks: Task[]
+    tasks: (Task & { diagnostic?: string })[]
     running: number
     /** 团队「暂停后续步骤」开关：暂停期间不领取新运行，在跑的照常结束。团队没开时不带。 */
     paused?: boolean
@@ -1039,7 +1088,10 @@ export class SessionBridge {
   } {
     return {
       members: this.team?.roster() ?? [],
-      tasks: this.team?.listTasks().slice(0, 50) ?? [],
+      tasks: this.team?.listTasks().slice(0, 50).map(task => {
+        const diagnostic = this.team?.taskDiagnostic(task)
+        return diagnostic ? { ...task, diagnostic } : task
+      }) ?? [],
       running: this.team?.runningCount() ?? 0,
       ...(this.team ? { paused: this.team.followupsPaused } : {}),
       // 团队关闭仍保留日报待办，重连快照不依赖事件是否曾被壳接收。
@@ -1109,6 +1161,22 @@ export class SessionBridge {
         ok: false,
         error: text ? `已取消：${text}` : '已取消，这条请求的结果不再作为回复',
         attribution: 'task',
+        taskId: typeof payload.taskId === 'string' ? payload.taskId : undefined,
+        status: typeof payload.status === 'string' ? payload.status : undefined,
+      })
+      return
+    }
+
+    if (payload.stopReason === 'member-busy') {
+      this.push({
+        type: 'reply',
+        id: requestId,
+        ok: false,
+        error: text || '成员正在处理其他请求，请稍后重试',
+        attribution: 'task',
+        assistantId: typeof payload.assistantId === 'string' ? payload.assistantId : undefined,
+        displayName: typeof payload.displayName === 'string' ? payload.displayName : undefined,
+        skinId: typeof payload.skinId === 'string' ? payload.skinId : undefined,
         taskId: typeof payload.taskId === 'string' ? payload.taskId : undefined,
         status: typeof payload.status === 'string' ? payload.status : undefined,
       })
@@ -1841,7 +1909,9 @@ export class SessionBridge {
     }
     try {
       const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
-      const body = hasBody ? JSON.parse(await this.readBody(request)) as unknown : null
+      // 会议纪要整理会携带较长的转写文本，单独放宽请求体上限，不放大其余接口。
+      const bodyLimit = url.pathname === '/companion/v1/members/meeting-minutes' ? 512_000 : 65_536
+      const body = hasBody ? JSON.parse(await this.readBody(request, bodyLimit)) as unknown : null
       const result = await runtime.request(request.method ?? 'GET', url.pathname, body, subject, url.searchParams)
       this.respond(response, result.status, result.body)
     } catch (error) {

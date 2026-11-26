@@ -56,6 +56,8 @@ export interface WorkbenchHandler {
 export interface WorkbenchApprovals {
   submitReport(reportId: string): Promise<ReportSubmission>
   submitAssistant(submission: AssistantSubmission): AssistantProposal
+  /** 本人在设置页打开对应免审批开关时立即代为签发并执行；开关关着返回 null。 */
+  autoApproveAssistant?(proposalId: string, subject: string): Promise<(Record<string, unknown> & { ok: boolean }) | null>
   pendingReportApprovals(): ReportProposal[]
   notifyApprovalSnapshot?(): void
 }
@@ -243,7 +245,7 @@ export class ReportWorkbench implements WorkbenchHandler {
       if (method === 'POST' && route === '/report/edit') return this.edit(object(body))
       if (method === 'POST' && route === '/report/publish-request') return this.publishRequest(object(body))
       if (method === 'POST' && route === '/materials/import') return this.importMaterial(object(body))
-      if (method === 'POST' && route === '/materials/share-request') return this.shareRequest(object(body))
+      if (method === 'POST' && route === '/materials/share-request') return await this.shareRequest(object(body))
       if (method === 'POST' && route === '/memories/edit') return this.editMemory(object(body))
       if (method === 'POST' && route === '/deletion/preview') return this.deletionPreview(object(body))
       // await：异步路由里的输入错误也要落到下面的 catch，回 400 而不是 500。
@@ -619,12 +621,15 @@ export class ReportWorkbench implements WorkbenchHandler {
     })
   }
 
-  private shareRequest(input: Record<string, unknown>) {
+  private async shareRequest(input: Record<string, unknown>) {
     const materials = this.deps.materials
     if (!materials) return fail(404, 'not_wired', '资料登记未装配')
     const planned = materialShareSubmission({ materials }, String(input.materialId ?? ''))
     if (!planned.ok) return fail(409, 'rejected', planned.message)
     const proposal = this.deps.approvals.submitAssistant(planned.submission)
+    const auto = await this.deps.approvals.autoApproveAssistant?.(proposal.proposalId, planned.submission.subject)
+    if (auto?.ok) return ok({ kind: 'done', autoApproved: true, result: auto.result ?? null, message: '已按设置里的免审批开关直接生效' })
+    if (auto) return fail(409, 'auto_failed', String(auto.error ?? '没有生效'))
     return ok({ proposalId: proposal.proposalId, expiresAt: proposal.expiresAt, message: '已提交可信审批：请在桌面专用审批窗口核对将发送的全文后决定；尚未发送' })
   }
 
@@ -700,6 +705,10 @@ export class ReportWorkbench implements WorkbenchHandler {
     } catch (error) {
       return fail(409, 'submit_failed', error instanceof Error ? error.message : String(error))
     }
+    // 设置页打开「删除活动与资料」等免审批开关时直接执行，如实回报结果。
+    const auto = await this.deps.approvals.autoApproveAssistant?.(proposal.proposalId, submission.subject)
+    if (auto?.ok) return ok({ kind: 'done', autoApproved: true, result: auto.result ?? null, message: '已按设置里的免审批开关直接删除' })
+    if (auto) return fail(409, 'auto_failed', String(auto.error ?? '删除没有完成'))
     return ok({
       kind: 'approval', proposalId: proposal.proposalId, expiresAt: proposal.expiresAt,
       message: '已提交可信审批：请在桌面专用审批窗口核对影响范围后确认；尚未删除任何内容',

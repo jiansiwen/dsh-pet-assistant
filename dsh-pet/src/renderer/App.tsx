@@ -7,6 +7,7 @@ import MeetingPanel from './meeting-panel.js'
 import { installMeetingSession } from './meeting-capture-session.ts'
 import VoiceApiSettings from './VoiceApiSettings.js'
 import AssistantSettings from './AssistantSettings.js'
+import ApprovalSwitchesSettings, { type LocalApprovalFlags } from './ApprovalSwitchesSettings.js'
 import MailSettings from './MailSettings.js'
 import ChatOverlay from './ChatOverlay.js'
 import PetSettingsPanel, { FastReplySettings, PresentationSettings, ResidencySettings, WorkEvidenceSettings } from './PetSettingsPanel.js'
@@ -21,7 +22,7 @@ import { PET_WIDTH } from './pet-metrics.js'
 import { HOVER_CLOSE_MS, HOVER_OPEN_MS, hoverActions, initialHover, reduceHover, type HoverEventKind } from './hover-toolbar.js'
 import { CONTINUOUS_IDLE_TIMEOUT_MS, VoiceConversation, isNarrationEcho, isVoiceStop, planInterruptInput, plausibleDirectQuestion, preferInterruptTranscript } from '../voice-conversation.ts'
 import { isExplicitContinue, isRestResume } from '../main/followup-window.ts'
-import type { VoiceTurn } from '../session-types.js'
+import type { SessionEntry, SessionSnapshot, VoiceTurn } from '../session-types.js'
 import {
   clearStageHitboxes,
   hitTest,
@@ -53,6 +54,7 @@ import type {
   CharacterMenuTarget,
   CompanionState,
   DocRoots,
+  DocQaState,
   DocState,
   OperationalState,
   PetPosition,
@@ -745,6 +747,11 @@ export default function App() {
   const [continuousVoice, setContinuousVoice] = useState(false)
   const [readReplies, setReadReplies] = useState(false)
   const [meetingDocumentAutoApprove, setMeetingDocumentAutoApprove] = useState<boolean | null>(null)
+  const [meetingIntegrityBypass, setMeetingIntegrityBypass] = useState(false)
+  const [meetingEgressAutoApprove, setMeetingEgressAutoApprove] = useState(false)
+  const [skipLocalConfirm, setSkipLocalConfirm] = useState(false)
+  const [docRootsOpen, setDocRootsOpen] = useState(false)
+  const [meetingFastTranscribe, setMeetingFastTranscribe] = useState(false)
   /** 会话框停靠方式与尺寸；默认固定在头顶，尺寸 440×560。 */
   const [chatDock, setChatDock] = useState<'top' | 'auto'>('top')
   const [chatSize, setChatSize] = useState<{ width: number; height: number }>({ width: 440, height: 560 })
@@ -772,6 +779,8 @@ export default function App() {
   const wakeListenPending = useRef<(() => void) | null>(null)
   const wakeListenTimer = useRef<ReturnType<typeof setTimeout>>()
   const listeningRef = useRef(false)
+  /** 正在进行的听写是不是口令门禁那一种（插话交接 / 口令后续听）。唤醒接管时只撤这一种。 */
+  const gatedListeningRef = useRef(false)
   /** 口令打断后的提问窗口：10 秒内没听到问题就把讲解接回去（一次只开一个）。 */
   const questionWindowRef = useRef<{ timer: number } | null>(null)
   /** 休息模式：无限期停讲、不听提问，只认整句"继续演讲"恢复（参会人互相讨论时用）。 */
@@ -804,6 +813,7 @@ export default function App() {
    * 也不该拦 —— 那条链的停止入口是「停止讲解」和朗读横条。
    */
   const [docState, setDocState] = useState<DocState>({ kind: 'idle' })
+  const [docQa, setDocQa] = useState<DocQaState>({ visible: false, assistantId: null, displayName: '', status: 'idle', turns: [] })
   const [docRoots, setDocRoots] = useState<DocRoots>({ roots: [], recent: [] })
   const [docBusy, setDocBusy] = useState(false)
   const [docResults, setDocResults] = useState<Array<{ text: string; error: boolean }>>([])
@@ -813,6 +823,10 @@ export default function App() {
   /** 团队编制。null 表示桥接还没给过数据 —— 那时按旧的单宠物模式渲染一个角色。 */
   const [members, setMembers] = useState<StageMember[] | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  /** 成员会话实时投影：来自插件 member/progress，只读显示在成员头顶，不打开 DSH 会话。 */
+  const [memberProgress, setMemberProgress] = useState<Record<string, { displayName: string; status: 'running' | 'idle'; entries: SessionEntry[] }>>({})
+  const memberProgressTimers = useRef<Record<string, number>>({})
+  const selectedIdRef = useRef<string | null>(null)
   const [positions, setPositions] = useState<Record<string, PetPosition>>({})
   const [statusByAssistant, setStatusByAssistant] = useState<Record<string, StageTaskStatus>>({})
   /** 待批准的副作用提案。这是唯一必须用户点头才能继续的事，要在面板里显眼。 */
@@ -859,6 +873,7 @@ export default function App() {
   positionsRef.current = positions
 
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const noopInputRef = useRef<HTMLTextAreaElement | null>(null)
   const interactiveRef = useRef(false)
   const dragCleanupRef = useRef<(() => void) | null>(null)
   /** 拖拽/退场标志从什么时候开始一直为真；0 = 没卡住。见 100ms 轮询里的自愈分支。 */
@@ -903,11 +918,13 @@ export default function App() {
         lingerUntil.current[member.assistantId] = 0
         continue
       }
-      const working = isWorking(statusByAssistant[member.assistantId]) || member.assistantId === presenter
+      const working = isWorking(statusByAssistant[member.assistantId])
+        || member.assistantId === presenter
+        || memberProgress[member.assistantId]?.status === 'running'
       if (working) lingerUntil.current[member.assistantId] = Number.POSITIVE_INFINITY
       else if (lingerUntil.current[member.assistantId] === Number.POSITIVE_INFINITY) lingerUntil.current[member.assistantId] = now + 10_000
     }
-  }, [members, statusByAssistant, docState])
+  }, [members, statusByAssistant, docState, memberProgress])
 
   /**
    * 交接编排：总助 ↔ 成员的讲解者切换瞬间，退场者演 0.9s 退场动画再下台，
@@ -1047,6 +1064,11 @@ export default function App() {
       setContinuousVoice(state.continuousVoice === true)
       setReadReplies(state.readReplies === true)
       setMeetingDocumentAutoApprove(state.meetingDocumentAutoApprove === true)
+      setMeetingIntegrityBypass(state.meetingIntegrityBypass === true)
+      setMeetingEgressAutoApprove(state.meetingEgressAutoApprove === true)
+      setSkipLocalConfirm(state.skipLocalConfirm === true)
+      setDocRootsOpen(state.docRootsOpen === true)
+      setMeetingFastTranscribe(state.meetingFastTranscribe === true)
       setChatDock(state.chatDock === 'auto' ? 'auto' : 'top')
       setDocSpeechMode(state.docSpeechMode === 'ai' ? 'ai' : 'source')
       if (state.docHotkeys) setDocHotkeys(state.docHotkeys)
@@ -1155,6 +1177,47 @@ export default function App() {
     setStageTick(Date.now())
     stageRef.current?.sayTo(report.assistantId, text, Math.min(4000 + text.length * 60, 12_000))
     showToast(`子助理汇报（${report.displayName || report.assistantId}）：${text}`)
+  }), [])
+  useEffect(() => window.petApi.onDocQa(setDocQa), [])
+  useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
+  /**
+   * 成员会话实时进度：插件在成员运行期间推送思考/正文增量，桌宠在成员头顶显示只读会话框。
+   * 打开的是投影，不 resume DSH 会话，所以不会占用成员写句柄。
+   * 本轮结束后保留 5 秒再收起，方便看清最后一步。
+   */
+  useEffect(() => window.petApi.onMemberProgress(event => {
+    const pending = memberProgressTimers.current[event.assistantId]
+    if (pending) { window.clearTimeout(pending); delete memberProgressTimers.current[event.assistantId] }
+    setMemberProgress(previous => {
+      const current = previous[event.assistantId] ?? { displayName: event.displayName, status: 'running' as const, entries: [] as SessionEntry[] }
+      const entries = [...current.entries]
+      if (event.memberKind === 'think' || event.memberKind === 'text') {
+        const role = event.memberRole === 'user' ? 'user' : 'assistant'
+        const last = entries[entries.length - 1]
+        if (last && last.kind === event.memberKind && last.role === role && last.streaming) {
+          entries[entries.length - 1] = { ...last, text: last.text + (event.text ?? '') }
+        } else {
+          entries.push({ id: `member-live-${event.assistantId}-${entries.length}`, seq: entries.length,
+            role, kind: event.memberKind, text: event.text ?? '', streaming: true, turn: 1 })
+        }
+      }
+      return { ...previous, [event.assistantId]: { displayName: event.displayName || current.displayName,
+        status: event.memberStatus ?? current.status, entries } }
+    })
+    if (event.memberStatus === 'running') {
+      // 成员上台显示自己头顶的只读进度气泡；绝不切换 selectedId 或占用总助理主会话框。
+      lingerUntil.current[event.assistantId] = Number.POSITIVE_INFINITY
+      setStageTick(Date.now())
+    }
+    if (event.memberStatus === 'idle') {
+      lingerUntil.current[event.assistantId] = Date.now() + 5_000
+      setStageTick(Date.now())
+      memberProgressTimers.current[event.assistantId] = window.setTimeout(() => {
+        delete memberProgressTimers.current[event.assistantId]
+        setMemberProgress(previous => { const next = { ...previous }; delete next[event.assistantId]; return next })
+        setStageTick(Date.now())
+      }, 5000)
+    }
   }), [])
   const memberFeed = useMemberFeed(showToast)
   const quotaPending = memberFeed.state?.requests.filter(item => item.state === 'pending').length ?? 0
@@ -1300,7 +1363,10 @@ export default function App() {
     setDocked({ id, edge })
   }, [cast, docked, selectedId])
 
+  const presentingIdRef = useRef<string | null>(null)
   const handlePersist = useCallback((assistantId: string, x: number, y: number) => {
+    // 演讲期间允许临时移动，但不触发贴边隐藏，也不覆写平时保存的桌面坐标。
+    if (presentingIdRef.current === assistantId) return
     const workArea = { left: 0, top: 0, width: innerWidth, height: innerHeight }
     const edge = petDock ? dockEdge({ left: x, top: y, width: PET_WIDTH, height: PET_WIDTH }, workArea) : null
     if (edge !== null) {
@@ -1661,6 +1727,7 @@ export default function App() {
     const cancelled = () => dictationCancelled.current || token !== dictationGeneration.current
       || (continuous && !(conversation.active && conversation.generation === generation))
     listeningRef.current = true
+    gatedListeningRef.current = gateInterrupt
     dictationCancelled.current = false
     // 口令式打断：先听清是不是明确口令，是才停朗读；普通声音（含助理自己的回声）不停。
     if (!gateInterrupt) window.petApi.stopSpeech()
@@ -2177,6 +2244,18 @@ export default function App() {
       const now = Date.now()
       if (now - wakeLockRef.current < 2600) return
       wakeLockRef.current = now
+      // 会议讲解中插话喊唤醒词：插话检测先把这句交给了口令门禁的听写，唤醒随后命中并接管。
+      // 这段只是叫名字，撤掉它；不撤的话应答播完要开的听写会因"正在听"被跳过，
+      // 用户接着说的问题落进口令门禁被当成闲聊忽略。
+      if (listeningRef.current && gatedListeningRef.current) {
+        dictationCancelled.current = true
+        stopDictation()
+        // 口令后的提问窗口也作废：它到点会停掉听写并续讲，不能掐断唤醒应答后的这次听写。
+        if (questionWindowRef.current !== null) {
+          window.clearTimeout(questionWindowRef.current.timer)
+          questionWindowRef.current = null
+        }
+      }
       const who = selectedId ?? cast[0]?.assistantId
       const stage = stageRef.current
       // 主进程已经用 TTS 念了应答；这里只把它显示成气泡，不再另念一遍。
@@ -2462,8 +2541,50 @@ export default function App() {
     return () => { cancelled = true; clearTimeout(timer) }
   }, [settingsPage, stageVisible])
 
+  // 当前正在演讲（含提问/答问展示中）的助理 id：演讲时默认站在左下角，并在提问时把问答框挂在它头顶。
+  const presentingId = docState.kind === 'outline' && docState.active
+    ? (docState.assistantId ?? chiefIdRef.current)
+    : docQa.visible ? (docQa.assistantId ?? chiefIdRef.current) : null
+  presentingIdRef.current = presentingId
+  // 若之前收起成边缘停靠小圆，开始演讲时自动展开，保证左下角助理形象可见。
+  useEffect(() => {
+    if (presentingId && docked !== null) setDocked(null)
+  }, [presentingId, docked])
+
   if (!stageVisible) return null
 
+  const memberBubbles = Object.entries(memberProgress).filter(([id]) => id !== chiefIdRef.current && id !== presentingId)
+  const docQaSnapshot: SessionSnapshot | null = docQa.visible && docQa.turns.length > 0 ? {
+    sessionId: null,
+    bindingId: `doc-qa:${docQa.assistantId ?? 'chief'}`,
+    cursor: 0,
+    title: `${docQa.displayName || '讲解助理'} · 演讲问答`,
+    status: docQa.status === 'running' ? 'running' : 'idle',
+    entries: docQa.turns.flatMap((turn, index) => {
+      const items: SessionEntry[] = []
+      if (turn.question) {
+        items.push({ id: `${turn.id}-q`, seq: index * 2, role: 'user', kind: 'text', text: turn.question, streaming: false, turn: index + 1 })
+      }
+      const isLast = index === docQa.turns.length - 1
+      const answering = isLast && docQa.status === 'running'
+      items.push({
+        id: `${turn.id}-a`,
+        seq: index * 2 + 1,
+        role: 'assistant',
+        kind: 'text',
+        text: turn.answer || (answering ? '正在组织回答…' : ''),
+        streaming: answering,
+        turn: index + 1,
+      })
+      return items
+    }),
+    hasMore: false,
+    model: null,
+    models: [],
+    permissions: [],
+    permission: null,
+    capabilities: { prompt: false, cancel: false, models: false, permissions: false, history: false },
+  } : null
   const runtime = companion && {
     tone: runtimeTone(companion),
     label: runtimeLabel(companion),
@@ -2500,11 +2621,14 @@ export default function App() {
         <button type="button" className="approval-banner-go" onClick={() => setSettingsPage('team')}>打开团队</button>
       </div>}
 
+      {/* 主会话框永远属于总助理，成员进度只在各自头顶独立展示，绝不占用或替换主会话框。 */}
       {panelOpen && (
         <ChatOverlay
           session={session}
           error={mirror.error}
           stageRef={stageRef}
+          anchorId={chiefIdRef.current ?? undefined}
+          fallbackAnchor
           inputRef={inputRef}
           input={input}
           setInput={value => { voiceRoundRef.current = false; setInput(value) }}
@@ -2541,6 +2665,87 @@ export default function App() {
         />
       )}
 
+      {/* 演讲提问时的头顶只读会话框：提问弹出，回答完持续保留供观看，重新开始讲解或结束演讲时自动消失。 */}
+      {docQaSnapshot && (
+        <ChatOverlay
+          key="doc-qa-bubble"
+          session={docQaSnapshot}
+          error=""
+          stageRef={stageRef}
+          anchorId={docQa.assistantId ?? chiefIdRef.current ?? undefined}
+          fallbackAnchor
+          hitboxKey="__doc_qa_panel__"
+          readOnly
+          readOnlyNote="演讲问答 · 继续讲解或结束演讲时自动收起"
+          inputRef={noopInputRef}
+          input=""
+          setInput={() => {}}
+          onSend={() => {}}
+          onClose={() => window.petApi.dismissDocQa()}
+          dock="top"
+          size={{ width: Math.min(Math.max(chatSize.width, 400), 480), height: Math.min(Math.max(chatSize.height, 260), 380) }}
+          onResize={() => {}}
+          onCommand={async () => ({ ok: false, notice: '演讲问答只读展示；继续提问直接开口或说「继续讲解」即可。' })}
+          onListen={() => {}}
+          listening={false}
+          sending={false}
+          speaking={false}
+          onStopSpeech={() => {}}
+          loadingOlder={false}
+          loadOlder={async () => {}}
+          queuedCount={0}
+        />
+      )}
+
+      {memberBubbles.map(([memberId, progress]) => {
+        const memberSnapshot: SessionSnapshot = {
+          sessionId: null,
+          bindingId: `member:${memberId}`,
+          cursor: 0,
+          title: progress.displayName,
+          status: progress.status === 'running' ? 'running' : 'idle',
+          entries: progress.entries,
+          hasMore: false,
+          model: null,
+          models: [],
+          permissions: [],
+          permission: null,
+          capabilities: { prompt: false, cancel: false, models: false, permissions: false, history: false },
+        }
+        return (
+          <ChatOverlay
+            key={`member-bubble-${memberId}`}
+            session={memberSnapshot}
+            error=""
+            stageRef={stageRef}
+            anchorId={memberId}
+            hitboxKey={`__member_panel_${memberId}`}
+            readOnly
+            inputRef={noopInputRef}
+            input=""
+            setInput={() => {}}
+            onSend={() => {}}
+            onClose={() => {
+              const pending = memberProgressTimers.current[memberId]
+              if (pending) { window.clearTimeout(pending); delete memberProgressTimers.current[memberId] }
+              setMemberProgress(previous => { const next = { ...previous }; delete next[memberId]; return next })
+            }}
+            dock={chatDock}
+            size={{ width: Math.min(chatSize.width, 340), height: Math.min(chatSize.height, 260) }}
+            onResize={() => {}}
+            onCommand={async () => ({ ok: false, notice: '这是成员会话的只读投影，要派活请用总助理会话框。' })}
+            onListen={() => {}}
+            listening={false}
+            sending={false}
+            speaking={false}
+            onStopSpeech={() => {}}
+            loadingOlder={false}
+            loadOlder={async () => {}}
+            queuedCount={0}
+          />
+        )
+      })}
+
       {settingsPage !== null && (
         <PetSettingsPanel
           page={settingsPage}
@@ -2554,12 +2759,38 @@ export default function App() {
           status={{ team: memberFeed.state ? (memberFeed.state.enabled ? '已启用' : '已关闭') : '未取得状态',
             general: runtime?.label, voice: '口令模式', meeting: operations?.meeting === 'recording' ? '正在录音' : undefined }}
           values={{ team: memberFeed.state ? `已启用成员 ${memberFeed.state.members.filter(item => item.profile.enabled).length} 位；可管理记忆范围和定时任务` : undefined,
+            approvals: `桌面免确认与加速已开 ${[meetingDocumentAutoApprove === true, meetingIntegrityBypass, meetingEgressAutoApprove, meetingFastTranscribe, skipLocalConfirm, docRootsOpen].filter(Boolean).length}/6 项；可一键全开用于演示`,
             doc: docSpeechMode === 'source' ? '原文朗读；支持用口令暂停' : '模型讲解；支持用口令暂停',
             voice: `回复朗读${readReplies ? '已开启' : '已关闭'}；唤醒与声纹可单独设置`,
             appearance: `大小 ${Math.round(petScale * 100)}%；透明度 ${Math.round(petOpacity * 100)}%；会话框自动避边${chatDock === 'auto' ? '已开启' : '已关闭'}` }}
         >
           {settingsPage === 'workbench' || settingsPage === 'settings' ? null :
-            ['general', 'appearance', 'voice', 'learning'].includes(settingsPage) ? (
+            settingsPage === 'approvals' ? (
+              <ApprovalSwitchesSettings
+                local={{
+                  meetingDocumentAutoApprove: meetingDocumentAutoApprove === true,
+                  meetingIntegrityBypass,
+                  meetingEgressAutoApprove,
+                  meetingFastTranscribe,
+                  skipLocalConfirm,
+                  docRootsOpen,
+                }}
+                onSaveLocal={async (patch: Partial<LocalApprovalFlags>) => {
+                  try {
+                    const result = await window.petApi.saveSettings(patch)
+                    if (!result.ok) return false
+                    if (typeof patch.meetingDocumentAutoApprove === 'boolean') setMeetingDocumentAutoApprove(patch.meetingDocumentAutoApprove)
+                    if (typeof patch.meetingIntegrityBypass === 'boolean') setMeetingIntegrityBypass(patch.meetingIntegrityBypass)
+                    if (typeof patch.meetingEgressAutoApprove === 'boolean') setMeetingEgressAutoApprove(patch.meetingEgressAutoApprove)
+                    if (typeof patch.meetingFastTranscribe === 'boolean') setMeetingFastTranscribe(patch.meetingFastTranscribe)
+                    if (typeof patch.skipLocalConfirm === 'boolean') setSkipLocalConfirm(patch.skipLocalConfirm)
+                    if (typeof patch.docRootsOpen === 'boolean') setDocRootsOpen(patch.docRootsOpen)
+                    return true
+                  } catch { return false }
+                }}
+                showToast={showToast}
+              />
+            ) : ['general', 'appearance', 'voice', 'learning'].includes(settingsPage) ? (
             <div className="management-general">
               {settingsPage === 'general' && <section className="management-section" aria-label="运行时与诊断">
                 <h3>运行状态</h3>
@@ -3015,6 +3246,7 @@ export default function App() {
         statusByAssistant={stageStatuses}
         enteringIds={handover.entering ? new Set([handover.entering]) : null}
         leavingIds={handover.leaving ? new Set([handover.leaving]) : null}
+        presentingId={presentingId}
         positions={positions}
         key={assetEpoch}
         selectedId={selectedId}

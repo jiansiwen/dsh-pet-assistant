@@ -162,3 +162,77 @@ test('记忆范围只接受桌面所有者按当前版本切换，切回私密�
   assert.equal(memories.get(id, Date.now())?.text, '先列结论')
   assert.equal(memories.get(id, Date.now())?.revision, revision + 2)
 })
+
+test('平台签名凭据：app_secret 只入加密存储，换应用 ID 必须重填', async t => {
+  const store = new TeamStore(':memory:')
+  t.after(() => store.close())
+  const saved: Array<{ id?: string; apiKey: string }> = []
+  const removed: string[] = []
+  const service = new MemberManagement({ directory: store.directory, runtime: { busy: () => false, listWorkspaces: () => [] } as unknown as MemberRuntime,
+    memories: {} as never, enabled: () => true, setMode: async () => {}, defaultModel: () => null, changed: () => {},
+    secrets: { save: input => { saved.push(input); return { id: input.id ?? `s-${saved.length}` } }, remove: id => { removed.push(id) } } })
+  const platform = { ...draft, displayName: '考拉', capabilities: ['platform'], kind: 'platform',
+    binding: { kind: 'platform', endpoint: 'https://aiagent.example.com/api/agentChat/v1', model: '', agentId: '1360', secretId: '', appId: '10001', appSecretId: '' } }
+  const created = await service.request('POST', '/companion/v1/members', { ...platform, appSecret: 'only-in-vault' })
+  assert.equal(created.status, 200, JSON.stringify(created.body))
+  const id = (created.body as { createdAssistantId: string }).createdAssistantId
+  const profile = store.directory.get(id)!
+  assert.equal(profile.binding?.kind, 'platform')
+  assert.equal(profile.binding?.appId, '10001')
+  assert.equal(profile.binding?.appSecretId, 's-1')
+  assert.deepEqual(saved, [{ id: undefined, apiKey: 'only-in-vault' }])
+  assert.doesNotMatch(JSON.stringify(created.body), /only-in-vault/)
+  // 留空沿用：不传 appSecret 不改密钥条目
+  const kept = await service.request('POST', `/companion/v1/members/${id}/update`, { ...platform, binding: { ...platform.binding, appSecretId: 's-1' }, expectedRevision: profile.revision })
+  assert.equal(kept.status, 200, JSON.stringify(kept.body))
+  assert.equal(store.directory.get(id)?.binding?.appSecretId, 's-1')
+  assert.equal(saved.length, 1)
+  // 换应用 ID 却没给新密钥：当场拒绝，不用旧密钥静默签错
+  const revision = store.directory.get(id)!.revision
+  const mismatch = await service.request('POST', `/companion/v1/members/${id}/update`, { ...platform, binding: { ...platform.binding, appId: '20002', appSecretId: 's-1' }, expectedRevision: revision })
+  assert.equal(mismatch.status, 409)
+  assert.match(String((mismatch.body as { message: string }).message), /应用 ID 已变更/u)
+  // 只给密钥不给应用 ID：录入层拒绝
+  const noApp = await service.request('POST', '/companion/v1/members', { ...platform, displayName: '缺应用', binding: { ...platform.binding, appId: '' }, appSecret: 'x' })
+  assert.equal(noApp.status, 409)
+  assert.match(String((noApp.body as { message: string }).message), /应用 ID/u)
+  // 删除成员时两条密钥条目都尽力清理
+  await service.request('POST', `/companion/v1/members/${id}/delete`, { expectedRevision: store.directory.get(id)!.revision })
+  assert.deepEqual(removed.sort(), ['s-1'])
+})
+
+test('本机专家的平台凭据：只留标识、换应用必须重填、四项全空不存', async t => {
+  const store = new TeamStore(':memory:')
+  t.after(() => store.close())
+  const saved: Array<{ id?: string; apiKey: string }> = []
+  const service = new MemberManagement({ directory: store.directory, runtime: { busy: () => false, listWorkspaces: () => [] } as unknown as MemberRuntime,
+    memories: {} as never, enabled: () => true, setMode: async () => {}, defaultModel: () => null, changed: () => {},
+    secrets: { save: input => { saved.push(input); return { id: input.id ?? `s-${saved.length}` } } } })
+  const expert = { ...draft, displayName: '考拉本机', capabilities: ['platform'], kind: 'expert',
+    platformAuth: { appId: '10001', appSecretId: '', signEndpoint: 'https://sign.example.invalid/realtime', signUserId: '210' },
+    appSecret: 'expert-secret' }
+  const created = await service.request('POST', '/companion/v1/members', expert)
+  assert.equal(created.status, 200, JSON.stringify(created.body))
+  const id = (created.body as { createdAssistantId: string }).createdAssistantId
+  const profile = store.directory.get(id)!
+  assert.equal(profile.kind, 'expert')
+  assert.equal(profile.binding, null)
+  assert.equal(profile.platformAuth?.appId, '10001')
+  assert.equal(profile.platformAuth?.appSecretId, 's-1')
+  assert.equal(profile.platformAuth?.signUserId, '210')
+  assert.doesNotMatch(JSON.stringify(created.body), /expert-secret/u)
+  const kept = await service.request('POST', `/companion/v1/members/${id}/update`, { ...expert, appSecret: undefined,
+    platformAuth: { ...expert.platformAuth, appSecretId: 's-1' }, expectedRevision: profile.revision })
+  assert.equal(kept.status, 200, JSON.stringify(kept.body))
+  assert.equal(store.directory.get(id)?.platformAuth?.appSecretId, 's-1')
+  assert.equal(saved.length, 1)
+  const revision = store.directory.get(id)!.revision
+  const mismatch = await service.request('POST', `/companion/v1/members/${id}/update`, { ...expert, appSecret: undefined,
+    platformAuth: { ...expert.platformAuth, appId: '20002', appSecretId: 's-1' }, expectedRevision: revision })
+  assert.equal(mismatch.status, 409)
+  assert.match(String((mismatch.body as { message: string }).message), /应用 ID 已变更/u)
+  const noCapability = await service.request('POST', '/companion/v1/members', { ...expert, displayName: '未勾平台',
+    capabilities: [], platformAuth: { ...expert.platformAuth, appSecretId: '' }, appSecret: undefined })
+  assert.equal(noCapability.status, 409)
+  assert.match(String((noCapability.body as { message: string }).message), /勾选/u)
+})

@@ -29,7 +29,7 @@ test('默认配置不设累计预算：副作用任务真实启动，工具面�
   assert.match(prompt, /副作用任务/)
   assert.ok(prompt.includes(f.workspace), '提示词说明写类工具的授权工作区')
   f.finish()
-  assert.equal((await pending)?.task.status, 'review')
+  assert.equal((await pending)?.task.status, 'blocked', '没有实际执行副作用，不能让用户确认完成')
   assert.equal(f.disposed(), 1)
 })
 
@@ -59,6 +59,7 @@ test('未批准时拦截：审批卡被驳回则不执行、不留执行账；�
   const call = f.exec('write', { file_path: target, content: '未批准' })
   const card = await f.pendingCard()
   assert.equal(card.target, target)
+  assert.equal(f.team.confirmTask(task.taskId).ok, false, '真实审批卡不能被确认完成替代')
   assert.equal(card.tool, 'write')
   assert.equal(card.risk, 'medium')
   assert.match(card.summary, /总助理请求写入/)
@@ -107,6 +108,7 @@ test('批准后只执行一次：账本记下目标、参数摘要与开始时�
   f.finish()
   const outcome = await pending
   assert.equal(outcome?.task.status, 'review', '工具成功不等于验收通过')
+  assert.equal(f.team.confirmTask(task.taskId).ok, true, '确需验收的结果仍可由本人确认完成')
   const done = f.store.eventsSince(0).filter(event => event.type === 'reply/done').at(-1)!.payload as { text: string; operations: unknown[] }
   assert.match(done.text, /^执行账本：成功 1 项/)
   assert.equal(done.operations.length, 1)
@@ -239,7 +241,7 @@ test('没有工作区时写类工具不放行；宿主工具参数不带门禁�
   const task = g.team.submitTask({ goal: '字段对不上', ownerId: 'member-tangseng', toolScope: 'side-effect' })
   const outcome = await g.team.runTask(task.taskId, g.parent, new AbortController().signal)
   assert.equal(outcome?.stopReason, 'side-effect-unsupported')
-  assert.equal(outcome?.task.status, 'review')
+  assert.equal(outcome?.task.status, 'blocked')
   assert.equal(g.requests.length, 0)
 })
 

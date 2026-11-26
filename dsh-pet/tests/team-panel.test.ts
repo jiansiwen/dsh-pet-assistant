@@ -15,6 +15,7 @@ import {
   memberRow,
   sortProposals,
   sortTasks,
+  taskNeedsConfirmation,
   taskStatusOf,
   taskTone,
   teamPanelView,
@@ -37,7 +38,7 @@ function proposal(patch: Partial<TeamProposalSnapshot> = {}): TeamProposalSnapsh
 const names = (assistantId: string): string | null =>
   ({ 'tang-seng': '总助理', 'sun-wukong': '助理1' })[assistantId] ?? null
 
-describe('TASK_STATUS_LABEL：十个状态一个都不能漏', () => {
+describe('TASK_STATUS_LABEL：任务状态不能漏', () => {
   it('插件侧的每个状态都有中文措辞，且互不相同', () => {
     const statuses = [
       'created',
@@ -47,6 +48,7 @@ describe('TASK_STATUS_LABEL：十个状态一个都不能漏', () => {
       'awaiting-user',
       'review',
       'done',
+      'blocked',
       'failed',
       'cancelled',
       'unknown',
@@ -365,6 +367,21 @@ describe('approvalBanner：对话页上那条紧凑提示', () => {
 })
 
 describe('teamPanelView：整份快照的投影', () => {
+  it('已受阻显示原因；只对人工验收或待本人完成的任务提供确认', () => {
+    const snapshot: TeamSnapshot = { team: true, tasks: [
+      task({ taskId: 'blocked', status: 'blocked', diagnostic: '取不到指定日期的日报' }),
+      task({ taskId: 'done', status: 'done', toolScope: 'read-only' }),
+      task({ taskId: 'review', status: 'review' }),
+      task({ taskId: 'approval', status: 'awaiting-approval' }),
+    ], proposals: [proposal({ taskId: 'approval' })] }
+    const view = teamPanelView(snapshot, names, NOW)
+    assert.equal(view.tasks.find(item => item.taskId === 'blocked')?.statusLabel, '受阻')
+    assert.equal(view.tasks.find(item => item.taskId === 'blocked')?.note, '取不到指定日期的日报')
+    assert.equal(view.tasks.find(item => item.taskId === 'done')?.note, null)
+    assert.deepEqual(view.tasks.filter(row => taskNeedsConfirmation(row.status)).map(row => row.taskId), ['review'])
+    assert.equal(view.proposals.length, 1, '实际待批仍显示在审批列表')
+  })
+
   it('快照为 null 时给空面板，而不是抛异常', () => {
     const view = teamPanelView(null, names, NOW)
     assert.equal(view.teamEnabled, false)

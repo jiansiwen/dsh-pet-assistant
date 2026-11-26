@@ -28,6 +28,7 @@ import {
   clampToViewport,
   clearStageHitboxes,
   hitTest,
+  presentationSeat,
   isWorking,
   needsAttention,
   PANEL_HITBOX_KEY,
@@ -284,6 +285,27 @@ describe('徘徊半径与座位间距的关系', () => {
     const gap = seats[1].x - seats[0].x
     assert.ok(gap >= PET_WIDTH, '静态必须不重叠')
     assert.ok(gap < PET_WIDTH + 2 * WANDER_RADIUS, '若这条不再成立，注释里的取舍就该重写')
+  })
+})
+
+describe('多会话框命中盒隔离', () => {
+  test('成员只读气泡与主会话框按独立键登记，收起成员气泡不清掉主会话框命中盒', () => {
+    clearStageHitboxes()
+    registerPanelHitbox({ x1: 10, y1: 10, x2: 200, y2: 200 })
+    registerPanelHitbox({ x1: 300, y1: 10, x2: 500, y2: 200 }, '__member_panel_reader')
+    assert.equal(hitTest(50, 50), true)
+    assert.equal(hitTest(350, 50), true)
+    registerPanelHitbox(null, '__member_panel_reader')
+    assert.equal(hitTest(50, 50), true, '关闭成员气泡不能把总助理主会话框清掉')
+    assert.equal(hitTest(350, 50), false)
+    clearStageHitboxes()
+  })
+
+  test('演讲默认站位在屏幕左下角且位于可视区内', () => {
+    const pos = presentationSeat(1920, 1080)
+    assert.equal(pos.x, 48)
+    assert.equal(pos.y, 1080 - PET_WIDTH - 8)
+    assert.deepEqual(clampToViewport(pos, 1920, 1080), pos)
   })
 })
 

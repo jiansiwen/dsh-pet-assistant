@@ -23,14 +23,14 @@ var __copyProps = (to, from, except, desc) => {
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // src/client/index.tsx
-var index_exports = {};
-__export(index_exports, {
+var client_exports = {};
+__export(client_exports, {
   KNOWN_COMMANDS: () => KNOWN_COMMANDS,
   apply: () => apply,
   inject: () => inject,
   parsePort: () => parsePort
 });
-module.exports = __toCommonJS(index_exports);
+module.exports = __toCommonJS(client_exports);
 var import_react = require("react");
 
 // src/client/styles.ts
@@ -382,14 +382,16 @@ var LIST_TABS = {
   team: {
     command: "/assistant-team-list",
     columns: [
-      { key: "name", label: "\u540D\u5B57", width: "1.2fr" },
-      { key: "role", label: "\u89D2\u8272", width: "1.2fr" },
-      { key: "status", label: "\u72B6\u6001", width: "1fr" },
-      { key: "quota", label: "\u989D\u5EA6", width: "1fr" }
+      { key: "name", label: "\u540D\u5B57", width: "1.1fr" },
+      { key: "role", label: "\u89D2\u8272", width: "0.9fr" },
+      { key: "duty", label: "\u804C\u8D23", width: "2.2fr" },
+      { key: "style", label: "\u6027\u683C\u4E0E\u5F62\u8C61", width: "2.2fr" },
+      { key: "status", label: "\u72B6\u6001", width: "0.7fr" },
+      { key: "quota", label: "\u989D\u5EA6", width: "0.9fr" }
     ],
     empty: "\u8FD8\u6CA1\u6709\u6210\u5458",
     unavailable: "\u6682\u65F6\u8BFB\u4E0D\u5230\u6210\u5458\u5217\u8868",
-    hint: "\u6210\u5458\u4E0E\u989D\u5EA6\u5728\u684C\u9762\u5BA0\u7269\u7684\u52A9\u7406\u56E2\u91CC\u7BA1\u7406\u3002"
+    hint: "\u804C\u8D23\u3001\u6027\u683C\u4E0E\u5F62\u8C61\u5728\u8FD9\u91CC\u53EA\u8BFB\u5C55\u793A\uFF1B\u4FEE\u6539\u8BF7\u5230\u684C\u9762\u5BA0\u7269\u7684\u52A9\u7406\u56E2\u3002"
   }
 };
 var MEETING_HISTORY_COMMAND = "/assistant-meeting-history";
@@ -1693,8 +1695,15 @@ function AssistantPanel({ ctx }) {
   ] });
 }
 function columnFlex(width) {
-  if (width === void 0) return "1 1 0";
-  return width.endsWith("px") ? `0 0 ${width}` : width;
+  if (width === void 0) return "1 1 0%";
+  if (width.endsWith("px")) return `0 0 ${width}`;
+  const value = Number(width.replace(/fr$/u, ""));
+  return Number.isFinite(value) && value > 0 ? `${value} 1 0%` : "1 1 0%";
+}
+function columnMin(width) {
+  if (width?.endsWith("px")) return width;
+  const value = Number((width ?? "").replace(/fr$/u, ""));
+  return Number.isFinite(value) && value > 0 ? `${Math.round(value * 64)}px` : "72px";
 }
 function removeKey(record3, key) {
   const next = { ...record3 };
@@ -1743,14 +1752,14 @@ function TableBody({ definition, page: page2, result: result2, loading, connecte
           className: columnClassName(keyPrefix, column.key),
           style: {
             flex: columnFlex(column.width),
-            minWidth: 0,
+            minWidth: columnMin(column.width),
             textAlign: rightAlignLast && index === definition.columns.length - 1 ? "right" : "left"
           },
           children: column.label
         },
         column.key
       )),
-      extra !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { style: { flex: columnFlex(extra.width), minWidth: 0 }, children: extra.label })
+      extra !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { style: { flex: columnFlex(extra.width), minWidth: columnMin(extra.width) }, children: extra.label })
     ] }),
     state === "rows" && result2 !== void 0 ? result2.rows.map((row, rowIndex) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { style: tableRow, children: [
       row.cells.map((cell, cellIndex) => {
@@ -1762,10 +1771,9 @@ function TableBody({ definition, page: page2, result: result2, loading, connecte
             className: column === void 0 ? void 0 : columnClassName(keyPrefix, column.key),
             style: {
               flex: columnFlex(column?.width),
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
+              minWidth: columnMin(column?.width),
+              overflowWrap: "anywhere",
+              whiteSpace: "normal",
               textAlign: rightAlignLast && cellIndex === definition.columns.length - 1 ? "right" : "left",
               ...tone === void 0 ? {} : { color: tone ?? TOKENS.muted }
             },
@@ -1822,7 +1830,7 @@ function ListPanel({ tab, result: result2, loading, connected, busy, onOpen, pri
         style: { ...secondaryButton, marginTop: 10 },
         disabled: busy,
         onClick: () => onOpen("team"),
-        children: busy ? "\u6253\u5F00\u4E2D\u2026" : "\u5728\u684C\u5BA0\u7BA1\u7406\u52A9\u7406\u4E0E\u89D2\u8272\u65B9\u6848"
+        children: busy ? "\u6253\u5F00\u4E2D\u2026" : "\u5728\u684C\u5BA0\u7F16\u8F91\u6210\u5458\u4E0E\u89D2\u8272"
       }
     ),
     footer,

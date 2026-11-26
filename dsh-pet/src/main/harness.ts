@@ -557,6 +557,7 @@ export class BridgeClient {
     subject: 'client' | 'owner',
     /** 默认沿用审批超时；模型生成类请求（如成员配置助手）由调用方放宽。 */
     timeoutMs: number = APPROVAL_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<{ status: number; body: unknown } | { status: 0; body: { code: string; message: string } }> {
     const httpMethod = method === 'POST' ? 'POST' : 'GET'
     const info = this.info
@@ -575,7 +576,7 @@ export class BridgeClient {
         method: httpMethod,
         headers,
         ...(httpMethod === 'GET' ? {} : { body: JSON.stringify(body) }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
       })
       const parsed = await response.json().catch(() => null)
       return { status: response.status, body: parsed }

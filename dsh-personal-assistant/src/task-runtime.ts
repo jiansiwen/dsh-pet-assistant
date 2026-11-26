@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { ApprovalError, ApprovalService, digestOf } from './approval.ts'
+import type { ApprovalSwitches } from './approval-switches.ts'
 import {
   CompanionError, companionCommandSchema, companionContextSchema, companionCreateSchema, companionInputSchema, companionTaskViewSchema,
   reminderResponseSchema, reminderScheduleSchema, type CompanionCommand, type CompanionCreateInput,
@@ -122,6 +123,7 @@ export class CompanionTaskRuntime {
   private retryingBusy = false
   private timer: ReturnType<typeof setInterval> | undefined
   private memberManagement: { request(method: string, pathname: string, body: unknown): Promise<CompanionHttpResult> } | null = null
+  private approvalSwitches: ApprovalSwitches | null = null
   private settings: {
     getReminderInterval(): number
     request(method: string, pathname: string, body: unknown): Promise<CompanionHttpResult>
@@ -184,6 +186,11 @@ export class CompanionTaskRuntime {
 
   attachSettings(settings: NonNullable<CompanionTaskRuntime['settings']>): void {
     this.settings = settings
+  }
+
+  /** 设置页免审批开关的读写入口（仅本人 owner 凭据可用）。 */
+  attachApprovalSwitches(switches: ApprovalSwitches): void {
+    this.approvalSwitches = switches
   }
 
   attachMemberManagement(service: NonNullable<CompanionTaskRuntime['memberManagement']>): void {
@@ -804,6 +811,15 @@ export class CompanionTaskRuntime {
         if (!this.accepting || !this.memberManagement) throw new CompanionError('DEVICE_OFFLINE', '成员管理服务尚未就绪', 503)
         return await this.memberManagement.request(method, pathname, body)
       }
+      if (pathname === '/companion/v1/approval-switches') {
+        if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '免审批开关只接受本人在桌宠设置页的操作', 403)
+        if (!this.approvalSwitches) throw new CompanionError('DEVICE_OFFLINE', '免审批开关尚未就绪', 503)
+        if (method === 'GET') return { status: 200, body: { ok: true, switches: this.approvalSwitches.view() } }
+        if (method !== 'POST') throw new CompanionError('NOT_FOUND', '接口不存在', 404)
+        const patch = (body as { switches?: unknown } | null)?.switches
+        try { return { status: 200, body: { ok: true, switches: this.approvalSwitches.update(patch) } } }
+        catch (error) { throw new CompanionError('INVALID_INPUT', error instanceof Error ? error.message : String(error), 422) }
+      }
       if (pathname === '/companion/v1/settings' || pathname.startsWith('/companion/v1/settings/')) {
         if (subject !== 'owner') throw new CompanionError('FORBIDDEN', '设置仅接受宠物面板中的本人操作', 403)
         if (!this.accepting || !this.settings) throw new CompanionError('DEVICE_OFFLINE', '配置服务尚未就绪', 503)
@@ -1031,9 +1047,10 @@ export class CompanionTaskRuntime {
       this.store.appendEvent('approval.requested', { proposalId: proposal.proposalId, taskId: task.taskId }, { taskId: task.taskId })
       record.result = { status: 202, body: { ...this.detail(task.taskId), proposalId: proposal.proposalId, requiresApproval: true } }
       this.store.saveCompanionCommand(record)
-      // 创建提醒是低风险动作：已通过身份校验的聊天/模型请求直接执行，不再要求桌面二次批准。
+      // 创建提醒默认免审批；设置页打开「待办与任务控制」免审批开关时，其余待办与任务控制请求也直接执行。
       if (subject === 'client') {
-        if (route.action === 'create' && companionCreateSchema.parse(command.payload).kind === 'reminder') {
+        if (this.approvalSwitches?.enabled('companionTasks')
+          || (route.action === 'create' && companionCreateSchema.parse(command.payload).kind === 'reminder')) {
           this.approvals.issue(proposal.proposalId, { channel: 'desktop-shell' }, true)
           return this.execute(record)
         }

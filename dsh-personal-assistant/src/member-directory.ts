@@ -4,7 +4,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { CHILD_LOCAL_TOOLS, READ_ONLY_ALLOW_TOOLS, READ_ONLY_DENY_CANDIDATES } from './gate.ts'
 import { MEMBER_CAPABILITIES, MEMBER_KINDS, MEMBER_PERMISSION_MODES, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY,
   type MemberDraft, type MemberProfile, type MemberKind, type MemberQuotaRequest, type MemberQuotaView,
-  type NormalizedMemberDraft, type SubAssistantBinding } from './member-contract.ts'
+  type NormalizedMemberDraft, type PlatformAuth, type SubAssistantBinding } from './member-contract.ts'
 import type { MemberConfig, RoleId, ToolPolicy } from './team-domain.ts'
 
 export type { MemberDraft, MemberProfile, MemberQuotaRequest, MemberQuotaView } from './member-contract.ts'
@@ -21,7 +21,7 @@ type RoleStyle = Pick<MemberDraft, 'skinId' | 'personality' | 'voiceProfile' | '
 function defaults(): Extension {
 return { description: '', personality: '', permissionMode: 'ask', reportMode: 'chief', speechBy: 'self', voiceDesign: '', provider: '', model: '', maxTokens: 16384, capabilities: [], allowedTools: [],
     dailyTokenLimit: 0, totalTokenLimit: 0, thresholdPercent: 80, timezone: 'Asia/Shanghai', sessionId: null,
-    kind: 'expert', binding: null }
+    kind: 'expert', binding: null, platformAuth: null }
 }
 
 /** 只在 TeamStore 的版本迁移事务中调用，当前版本打开时不重复建表、写默认值。 */
@@ -132,13 +132,19 @@ function normalizeBinding(kind: MemberKind, value: unknown): SubAssistantBinding
   const record = value as Record<string, unknown>
   if (kind === 'expert') throw new Error('普通成员不使用外部绑定')
   if (kind === 'platform') {
-    if (Object.keys(record).some(key => !['kind', 'endpoint', 'model', 'agentId', 'secretId'].includes(key))) throw new Error('平台绑定包含未知字段')
+    if (Object.keys(record).some(key => !['kind', 'endpoint', 'model', 'agentId', 'secretId', 'appId', 'appSecretId', 'signEndpoint', 'signUserId'].includes(key))) throw new Error('平台绑定包含未知字段')
     if (record.kind !== 'platform') throw new Error('绑定类型与成员类型不一致')
     const agentId = printable(String(record.agentId ?? ''), '智能体 ID', 128, false)
     const model = printable(String(record.model ?? ''), '平台模型名', 200, agentId === '')
     if (model === '' && agentId === '') throw new Error('平台绑定需填写模型名或智能体 ID')
+    const appId = printable(String(record.appId ?? ''), '应用 ID', 128, false)
+    const appSecretId = printable(String(record.appSecretId ?? ''), '签名密钥标识', 100, false)
+    if (appId === '' && appSecretId !== '') throw new Error('签名密钥需配合应用 ID 使用')
+    const rawSignEndpoint = printable(String(record.signEndpoint ?? ''), '签名接口地址', 2048, false)
     return { kind: 'platform', endpoint: platformEndpoint(record.endpoint), model, agentId,
-      secretId: printable(String(record.secretId ?? ''), '密钥标识', 64, false) }
+      secretId: printable(String(record.secretId ?? ''), '密钥标识', 64, false), appId, appSecretId,
+      signEndpoint: rawSignEndpoint === '' ? '' : platformEndpoint(rawSignEndpoint),
+      signUserId: printable(String(record.signUserId ?? ''), '用户标识', 128, false) }
   }
   if (Object.keys(record).some(key => !['kind', 'command', 'args'].includes(key))) throw new Error('本地工具绑定包含未知字段')
   if (record.kind !== 'local-cli') throw new Error('绑定类型与成员类型不一致')
@@ -151,13 +157,28 @@ function extension(profile: MemberProfile): Extension {
   return { description: profile.description, personality: profile.personality, permissionMode: profile.permissionMode, reportMode: profile.reportMode, speechBy: profile.speechBy, voiceDesign: profile.voiceDesign, provider: profile.provider, model: profile.model, maxTokens: profile.maxTokens,
     capabilities: profile.capabilities, allowedTools: profile.allowedTools, dailyTokenLimit: profile.dailyTokenLimit,
     totalTokenLimit: profile.totalTokenLimit, thresholdPercent: profile.thresholdPercent, timezone: profile.timezone, sessionId: profile.sessionId,
-    kind: profile.kind, binding: profile.binding, scheduleWorkspaceId: profile.scheduleWorkspaceId }
+    kind: profile.kind, binding: profile.binding, platformAuth: profile.platformAuth, scheduleWorkspaceId: profile.scheduleWorkspaceId }
 }
 function normalizeRoleStyle(style: RoleStyle): Required<RoleStyle> {
   const skinId = text(style.skinId ?? 'panda', '形象', 64) || 'panda'
   if (!MEMBER_SKIN_ID.test(skinId)) throw new Error('成员形象标识无效')
   return { skinId, personality: text(style.personality ?? '', '性格与表达风格', MEMBER_PERSONALITY_LIMIT),
     voiceProfile: text(style.voiceProfile ?? '', '音色', 200), voiceDesign: text(style.voiceDesign ?? '', '音色设计描述', 2000) }
+}
+
+function normalizePlatformAuth(value: unknown): PlatformAuth | null {
+  if (value === undefined || value === null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('平台凭据无效')
+  const record = value as Record<string, unknown>
+  if (Object.keys(record).some(key => !['appId', 'appSecretId', 'signEndpoint', 'signUserId'].includes(key))) throw new Error('平台凭据包含未知字段')
+  const appId = printable(String(record.appId ?? ''), '应用 ID', 128, false)
+  const appSecretId = printable(String(record.appSecretId ?? ''), '签名密钥标识', 100, false)
+  if (appId === '' && appSecretId !== '') throw new Error('签名密钥需配合应用 ID 使用')
+  const rawEndpoint = printable(String(record.signEndpoint ?? ''), '签名接口地址', 2048, false)
+  const auth: PlatformAuth = { appId, appSecretId,
+    signEndpoint: rawEndpoint === '' ? '' : platformEndpoint(rawEndpoint),
+    signUserId: printable(String(record.signUserId ?? ''), '用户标识', 128, false) }
+  return auth.appId === '' && auth.appSecretId === '' && auth.signEndpoint === '' && auth.signUserId === '' ? null : auth
 }
 
 function normalize(draft: MemberDraft): NormalizedMemberDraft {
@@ -183,6 +204,11 @@ const reportMode = draft.reportMode ?? 'chief'
   if (!MEMBER_KINDS.includes(kind)) throw new Error('成员类型无效')
   const binding = normalizeBinding(kind, draft.binding)
   if (kind !== 'expert' && binding === null) throw new Error('子助理必须配置外部绑定')
+  const platformAuth = normalizePlatformAuth(draft.platformAuth)
+  if (platformAuth !== null && !draft.capabilities.includes('platform')) {
+    throw new Error('平台凭据只在勾选「对接外部智能助理平台」后使用')
+  }
+  if (kind === 'platform' && platformAuth !== null) throw new Error('平台智能体的凭据配置在外部绑定里')
   const workspaceId = draft.scheduleWorkspaceId
   if (workspaceId != null && (kind !== 'expert' || !/^[a-f0-9-]{36}$/iu.test(workspaceId))) throw new Error('请选择本机成员可用的 DSH 工作区')
   return { displayName: text(draft.displayName, '成员名称', 80, true), description: text(draft.description, '职责说明', 4000),
@@ -193,7 +219,7 @@ const reportMode = draft.reportMode ?? 'chief'
     maxTokens: integer(draft.maxTokens, '单次输出额度', 1, 131072), capabilities: [...new Set(draft.capabilities)],
     allowedTools: [...new Set(draft.allowedTools)], dailyTokenLimit: integer(draft.dailyTokenLimit, '日额度'),
     totalTokenLimit: integer(draft.totalTokenLimit, '总额度'), thresholdPercent: integer(draft.thresholdPercent ?? 80, '申请阈值', 1, 100), timezone,
-    kind, binding }
+    kind, binding, platformAuth: kind === 'platform' ? null : platformAuth }
 }
 
 export class MemberDirectory {

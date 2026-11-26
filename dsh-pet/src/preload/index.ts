@@ -15,6 +15,7 @@ import type {
   BridgeEventPayload,
   CharacterMenuTarget,
   CompanionState,
+  DocQaState,
   DocReplyResult,
   DocRoots,
   DocState,
@@ -74,6 +75,8 @@ contextBridge.exposeInMainWorld('petApi', {
   overlayState: (open: boolean, boxes: Box[], settingsOpen: boolean) => ipcRenderer.send('overlay-state', { open, boxes, settingsOpen }),
   saveSettings: (patch: PetSettingsPatch) => ipcRenderer.invoke('save-settings', patch) as Promise<{ ok: boolean }>,
   assistantSettingsState: () => ipcRenderer.invoke('assistant-settings-state') as Promise<AssistantSettingsResult>,
+  approvalSwitchesState: () => ipcRenderer.invoke('assistant-approval-switches-state') as Promise<{ ok: boolean; switches?: Array<{ key: string; title: string; description: string; enabled: boolean }>; message?: string }>,
+  approvalSwitchesSave: (switches: Record<string, boolean>) => ipcRenderer.invoke('assistant-approval-switches-save', switches) as Promise<{ ok: boolean; switches?: Array<{ key: string; title: string; description: string; enabled: boolean }>; message?: string }>,
   /* 讲解口令打断后的提问窗口超时：把被暂停的讲解接回去。 */
   docResume: (reason?: 'timeout' | 'continue') => ipcRenderer.invoke('doc-resume', reason) as Promise<{ ok: boolean; error?: string }>,
   /** 口令打断后的即时应答（预合成短句，讲解人音色）。 */
@@ -257,6 +260,9 @@ contextBridge.exposeInMainWorld('petApi', {
   /** 子助理自行汇报（self 模式）：主进程已按成员音色播报，这里只出角色气泡。 */
   onSubassistantReport: (callback: (report: { assistantId: string; displayName: string; skinId: string; text: string }) => void) =>
     listen('subassistant-report', callback),
+  /** 成员会话实时进度（只读投影）：桌宠在成员头顶显示，不打开 DSH 会话、不占写句柄。 */
+  onMemberProgress: (callback: (event: { assistantId: string; displayName: string; memberKind: 'text' | 'think' | 'status';
+    text?: string; memberRole?: 'user' | 'assistant'; memberStatus?: 'running' | 'idle' }) => void) => listen('member/progress', callback),
   onCompanionState: (callback: (state: CompanionState) => void) => {
     subscribe('companion-state', state => callback(state as CompanionState))
   },
@@ -308,6 +314,8 @@ contextBridge.exposeInMainWorld('petApi', {
   onDocNotice: (callback: (message: string) => void) => {
     subscribe('doc-notice', message => callback(typeof message === 'string' ? message : ''))
   },
+  onDocQa: (callback: (state: DocQaState) => void) => listen('doc-qa', callback),
+  dismissDocQa: () => ipcRenderer.send('doc-qa-dismiss'),
   // ===== 会议闭环（P6）=====
   // 音频采集在渲染层（getUserMedia），主进程只做加密落盘、仲裁与转写。
   // 停止是两段式：meeting-stop 让渲染层停流并冲刷最后一块，渲染层推完再调

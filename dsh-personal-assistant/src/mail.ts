@@ -246,6 +246,13 @@ export async function proposeMail(deps: MailToolDeps, config: MailConfig, draft:
       },
     })
     proposalId = proposal.proposalId
+    // 用户在设置页打开「发送邮件」免审批开关时，由开关代为签发并立即发送，回包给真实回执。
+    const auto = typeof deps.bridge.autoApproveAssistant === 'function' ? await deps.bridge.autoApproveAssistant(proposalId, 'mail') : null
+    if (auto?.ok) {
+      return { ok: true, pending: false, sent: true, autoApproved: true, proposalId, intentId, result: auto.result ?? null,
+        message: '已按设置里的免审批开关直接发送，回执见 result。' }
+    }
+    if (auto) return { ok: false, pending: false, autoApproved: true, proposalId, intentId, state: auto.state ?? 'failed', error: String(auto.error ?? '发送失败') }
     return { ok: true, pending: true, proposalId, intentId,
       message: '已在桌面审批窗口生成待确认邮件；批准后才会发送。批准前不要声称已发送。' }
   } catch (error) {

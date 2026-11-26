@@ -38,7 +38,22 @@ export const MEMBER_KIND_LABELS: Record<MemberKind, { title: string; hint: strin
   platform: { title: '平台智能体', hint: '接入外部 AI 平台的智能体（OpenAI 兼容 API），需要端点与密钥，模型名或智能体 ID 至少填一项。' },
   'local-cli': { title: '本地 AI 工具', hint: '常驻本地命令行 AI 工具（如 Claude Code、Qoder），上下文由工具自持。' },
 }
-export type PlatformBinding = { kind: 'platform'; endpoint: string; model: string; agentId: string; secretId: string }
+export type PlatformBinding = { kind: 'platform'; endpoint: string; model: string; agentId: string; secretId: string
+  /** 开放平台应用 ID（签名报文 appid）；空串=签名查询沿用本机平台对接配置。 */
+  appId?: string
+  /** 签名密钥 app_secret 的加密条目标识；绝不保存明文。 */
+  appSecretId?: string
+  /** 签名接口地址；空串=沿用本机平台对接配置的 endpoint。 */
+  signEndpoint?: string
+  /** 签名查询的用户标识 user_id；空串=沿用本机平台对接配置。 */
+  signUserId?: string }
+/** 本机专家的平台查询凭据；与 binding 分开，四项留空=沿用本机配置。 */
+export interface PlatformAuth {
+  appId: string
+  appSecretId: string
+  signEndpoint: string
+  signUserId: string
+}
 export type LocalCliBinding = { kind: 'local-cli'; command: string; args: string[] }
 export type SubAssistantBinding = PlatformBinding | LocalCliBinding
 /** 汇报模式：chief=总助理汇总播报；self=子助理直接以其形象与音色播报（两种模式总助理都收到结果文本）。 */
@@ -75,8 +90,12 @@ export interface MemberDraft {
   timezone: string
   kind?: MemberKind
   binding?: SubAssistantBinding | null
+  /** 本机专家的平台凭据；platform 类型成员用 binding 里的同名字段。 */
+  platformAuth?: PlatformAuth | null
   /** 平台密钥只写不读：仅在保存时经桥送插件加密存储，快照与回显永不携带。 */
   apiKey?: string
+  /** 开放平台签名密钥 app_secret，同样只写不读。 */
+  appSecret?: string
 }
 export interface MemberProfile extends MemberDraft {
   assistantId: string
@@ -87,6 +106,7 @@ export interface MemberProfile extends MemberDraft {
   kind: MemberKind
   reportMode: SubAssistantReportMode
   binding: SubAssistantBinding | null
+  platformAuth: PlatformAuth | null
 }
 export interface MemberQuotaView {
   day: string

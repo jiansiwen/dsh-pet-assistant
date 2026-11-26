@@ -37,7 +37,7 @@ export function registerMeetingPresentationTools(host: { tools: { register(defin
     if (!include || include.includes('personal_assistant_meeting_recording'))
     disposers.push(host.tools.register(defineTool({
       name: 'personal_assistant_meeting_recording',
-      description: '独立控制会议录音：start 只在用户明确要求录音时使用，按桌面设置自动审批或由本人确认；stop 只停止录音；status 查询状态。不会读取或讲解文档。用户同时要求录音和讲解时，分别调用本工具和文档讲解工具。',
+      description: '独立控制会议录音：start 只在用户明确要求录音时使用，按桌面设置自动审批或由本人确认；stop 只停止录音；status 查询状态。不会读取或讲解文档。停录后要生成官方会议纪要请直接调用 personal_assistant_meeting_minutes，不要轮询产物列表。',
       parameters: {
         action: { type: 'string', required: true, enum: ['start', 'stop', 'status'], description: '开始、停止或查询录音' },
         name: { type: 'string', description: '开始时的会议名称；省略为会议录音' },
@@ -64,6 +64,23 @@ export function registerMeetingPresentationTools(host: { tools: { register(defin
         }
         if (!only(args, ['action'])) return JSON.stringify({ ok: false, error: '录音状态查询参数无效' })
         return runIndependent('meeting.status', {}, exec, 10_000)
+      },
+    })))
+    if (!include || include.includes('personal_assistant_meeting_minutes'))
+    disposers.push(host.tools.register(defineTool({
+      name: 'personal_assistant_meeting_minutes',
+      description: '为已结束的会议生成官方会议纪要。会自动等待本机转写收尾，调用负责会议的子助理模型整理带来源核验的正式纪要；若开启免确认模式会自动确认并落盘保存为 Markdown 文件，直接返回纪要正文（content）与文件路径（savedPath）。用户要求生成会议纪要时，先停录（如仍在录），然后直接调用本工具，不要用命令行 sleep 干等，也不要自己手写替代官方纪要。',
+      parameters: {
+        meetingId: { type: 'string', description: '可选：指定会议编号；省略则使用最近一场已结束的会议' },
+      }, output,
+      async execute(raw: unknown, exec) {
+        const args = record(raw) ?? {}
+        if (!only(args, ['meetingId']) || (args.meetingId !== undefined && !validText(args.meetingId, 200))) {
+          return JSON.stringify({ ok: false, error: '会议编号无效' })
+        }
+        return runIndependent('meeting.minutes',
+          args.meetingId === undefined ? {} : { meetingId: String(args.meetingId).trim() },
+          exec, 420_000)
       },
     })))
     if (!include || include.includes('personal_assistant_document_presentation'))

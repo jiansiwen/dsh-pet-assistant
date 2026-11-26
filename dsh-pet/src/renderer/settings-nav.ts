@@ -49,6 +49,7 @@ export function settingsNavGroups(): readonly SettingsNavGroup[] {
       label: '设置',
       items: [
         { id: 'team', title: '助理团设置', summary: '管理成员、记忆范围、额度与定时任务。' },
+        { id: 'approvals', title: '审批与核对', summary: '逐项开关各类审批、核对与确认弹窗，支持演示时一键免审批。' },
         { id: 'doc', title: '文档与讲解', summary: '管理授权目录、阅读与讲解方式。' },
         { id: 'voice', title: '语音与声纹', summary: '配置唤醒词、声纹、外放插话与识别服务。' },
         { id: 'learning', title: '记忆与技能', summary: '查看技能、专属词库与工作资料。' },

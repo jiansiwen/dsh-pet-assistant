@@ -148,13 +148,20 @@ describe('日报列表 /assistant-report-list', () => {
 })
 
 describe('成员列表 /assistant-team-list', () => {
-  test('有数据：名字 | 角色 | 状态 | 额度', () => {
+  test('有数据：名字 | 角色 | 职责 | 性格与形象 | 状态 | 额度', () => {
     const text = formatTeamList([
-      { name: '小会', role: 'wukong', enabled: true, quota: '1200/8000' },
-      { name: '小助', role: 'custom', enabled: false, quota: '—' },
+      { name: '小会', role: 'wukong', enabled: true, quota: '1200/8000',
+        description: '整理会议纪要', personality: '简洁直接', skinId: 'boy-glasses', voiceProfile: '茉莉' },
+      { name: '小助', role: 'custom', enabled: false, quota: '—', capabilities: ['mail'] },
     ])
-    assert.deepEqual(lines(text)[0].split(FIELD_SEPARATOR), ['小会', '助理1', '在岗', '1200/8000'])
-    assert.deepEqual(lines(text)[1].split(FIELD_SEPARATOR), ['小助', '自定义', '停用', '—'])
+    assert.deepEqual(lines(text)[0].split(FIELD_SEPARATOR),
+      ['小会', '助理1', '整理会议纪要', '简洁直接；眼镜男生；音色 茉莉', '在岗', '1200/8000'])
+    assert.deepEqual(lines(text)[1].split(FIELD_SEPARATOR), ['小助', '自定义', '能力：mail', '—', '停用', '—'])
+  })
+
+  test('职责为空时用能力兜底；两者都没有显示 —', () => {
+    const text = formatTeamList([{ name: '空', role: 'custom', enabled: true, quota: '0/0', capabilities: [] }])
+    assert.deepEqual(lines(text)[0].split(FIELD_SEPARATOR), ['空', '自定义', '—', '—', '在岗', '0/0'])
   })
 
   test('空数据 / 读不到', () => {

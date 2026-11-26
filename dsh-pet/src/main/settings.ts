@@ -30,6 +30,16 @@ export interface PetSettings {
   readReplies?: boolean
   /** 本人请求的会议录音与文档讲解是否跳过逐次原生确认。 */
   meetingDocumentAutoApprove?: boolean
+  /** 演示免门禁：录音存在缺口或完整性未知时，仍允许生成、导出、保存会议纪要。 */
+  meetingIntegrityBypass?: boolean
+  /** 演示免确认：用模型生成会议纪要时跳过「发送会议文字给模型」原生确认弹窗。 */
+  meetingEgressAutoApprove?: boolean
+  /** 演示免确认：跳过审批二次弹窗、成员管理、待办窗口及会议操作里的本地确认框。 */
+  skipLocalConfirm?: boolean
+  /** 演示免限制：允许打开和讲解本机任意路径的文档，不再局限于授权目录。 */
+  docRootsOpen?: boolean
+  /** 演示加速：停录后跳过耗时数分钟的声纹重分人，直接复用录音实时字幕并按本机/对方双轨分组，几秒完成转写与纪要。 */
+  meetingFastTranscribe?: boolean
   /**
    * 每条音轨的发言人数，0 = 自动。分人模型停录后按这个数聚类。
    *
@@ -229,6 +239,11 @@ function normalize(raw: Partial<PetSettings>): PetSettings {
   merged.continuousVoice = merged.continuousVoice === true
   merged.readReplies = merged.readReplies === true
   merged.meetingDocumentAutoApprove = typeof raw.meetingDocumentAutoApprove === 'boolean' ? raw.meetingDocumentAutoApprove : true
+  merged.meetingIntegrityBypass = raw.meetingIntegrityBypass === true
+  merged.meetingEgressAutoApprove = raw.meetingEgressAutoApprove === true
+  merged.skipLocalConfirm = raw.skipLocalConfirm === true
+  merged.docRootsOpen = raw.docRootsOpen === true
+  merged.meetingFastTranscribe = raw.meetingFastTranscribe === true
   const speakerCounts = (merged.meetingSpeakerCounts ?? {}) as { mic?: unknown; loopback?: unknown }
   const validCount = (value: unknown): number => (typeof value === 'number' && Number.isInteger(value)
     && value >= 0 && value <= 6 ? value : 0)

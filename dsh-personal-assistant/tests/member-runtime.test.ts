@@ -269,14 +269,19 @@ test('文档 scoped 会话写句柄持续被占：丢弃旧绑定并新建，不
   assert.equal(await question, '本次成员回复')
 })
 
-test('桌面持久成员会话写句柄持续被占：如实拒绝，不静默换新', async t => {
+test('桌面持久成员会话写句柄持续被占：新建替代会话继续，旧会话不删', async t => {
   const h = await fixture(t)
   const member = h.store.directory.create(draft('持久成员'))
   const first = await h.start(member.assistantId)
   await complete(first.driver)
   await first.activation.dispose()
   h.resumeBusy(6)
-  await assert.rejects(() => h.start(member.assistantId), /成员持久会话不可用/u)
+  const next = await h.start(member.assistantId)
+  assert.notEqual(next.child.id, first.child.id)
+  assert.equal(h.store.directory.get(member.assistantId)?.sessionId, next.child.id)
+  assert.equal(h.calls.filter(item => item.kind === 'create').length, 2)
+  await complete(next.driver)
+  await next.activation.dispose()
 })
 
 test('具备文档能力的成员可用只读三件套核对工作区代码，普通成员不行', async t => {
@@ -791,10 +796,54 @@ test('团队接线保留任务账本、通用成员和已保存启用状态，�
   const outcome = await running
   assert.equal(outcome?.stopReason, 'completed')
   assert.equal(outcome?.report?.summary, '已整理')
-  assert.equal(outcome?.task.status, 'review')
+  assert.equal(outcome?.task.status, 'done')
   assert.equal(h.store.listRuns(task.taskId)[0]?.childSessionId, driver.agent.id)
   assert.equal(h.store.directory.quota(member.assistantId).totalUsed, 9)
   assert.equal(h.runtime.busy(), false)
+  await team.dispose()
+})
+
+test('活动成员桌面派单按日报导出回执结单，失败不采信模型自报，企微不能导出', async t => {
+  const h = await fixture(t)
+  const name = 'personal_assistant_export_daily_report'
+  h.root.tools.register(defineTool({ name, description: '测试日报导出回执',
+    parameters: { date: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, text) => [{ type: 'text', text }] },
+    execute: async ({ date }) => JSON.stringify(date === '2026-11-24'
+      ? { exported: true, savedPath: 'D:/reports/drafts/2026-11-24-r1.md' }
+      : { exported: false, error: '该日期没有可导出的日报草稿' }),
+  }))
+  const approvals = new ApprovalService(h.store, { ttlMs: 60_000, runtimeEpoch: '成员测试' })
+  const team = new TeamService(h.root, h.store, { teamId: '测试团队', provider: 'spawn', members: h.runtime,
+    maxConcurrentInference: 1, maxConcurrentSideEffect: 1, taskTimeoutMs: 2000, defaultBudgetTokens: 0,
+    seats: [], denyExpertTools: [], approvals, logger: quiet })
+  t.after(() => team.dispose())
+  const member = h.store.directory.create(draft('史官', { capabilities: ['activity'] }))
+  for (const [date, status] of [['2026-11-24', 'done'], ['2026-11-23', 'blocked']] as const) {
+    const task = team.submitTask({ goal: `导出 ${date} 的日报`, ownerId: member.assistantId })
+    const running = team.runTask(task.taskId, {} as Agent, new AbortController().signal)
+    const driver = await h.next()
+    assert.equal((await driver.tool(name, { date })).isError, false)
+    await driver.tool('structured_output', { summary: '已经生成文件', artifacts: ['文件'], blockers: [], needsApproval: [] })
+    await complete(driver)
+    const outcome = await running
+    assert.equal(outcome?.task.status, status)
+    if (status === 'blocked') {
+      assert.match(team.taskDiagnostic(outcome!.task) ?? '', /没有可导出的日报草稿/)
+      assert.doesNotMatch(outcome?.report?.summary ?? '', /已经生成文件/)
+      assert.deepEqual(outcome?.task.artifacts, [])
+    } else {
+      assert.match(outcome?.report?.summary ?? '', /2026-11-24-r1\.md/)
+      assert.ok(outcome?.task.artifacts.includes('D:/reports/drafts/2026-11-24-r1.md'))
+    }
+    assert.equal(team.confirmTask(task.taskId).ok, false)
+  }
+  h.allowChannelFollowup()
+  const started = await h.runtime.start(member.assistantId, [{ type: 'text', text: '企微任务' }], new AbortController().signal, '企微任务', 'wecom')
+  const driver = await h.next()
+  assert.equal((await driver.tool(name, { date: '2026-11-24' })).isError, true)
+  await complete(driver)
+  await started.activation.dispose()
   await team.dispose()
 })
 

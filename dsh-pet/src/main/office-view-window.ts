@@ -51,6 +51,8 @@ interface Options {
   open(target: string): Promise<{ ok: true; doc: OfficeDoc } | { ok: false; error: string }>
   read(doc: OfficeDoc): Promise<Uint8Array>
   check(doc: OfficeDoc): Promise<{ ok: true } | { ok: false; error: string }>
+  /** 演讲窗口显示或聚焦后回调：主进程据此把桌宠舞台抬到演讲窗口之上。 */
+  onShown?(): void
 }
 
 export class OfficeViewWindow {
@@ -82,6 +84,7 @@ export class OfficeViewWindow {
     if (this.win && !this.win.isDestroyed()) {
       this.win.webContents.send('office-view-session-changed')
       this.win.show(); this.win.focus()
+      this.options.onShown?.()
       return { ok: true }
     }
     return await this.create()
@@ -181,7 +184,9 @@ export class OfficeViewWindow {
       ses.setPermissionCheckHandler(() => false)
       ses.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !/^(file|data|blob|devtools):/i.test(details.url) }))
     }
-    win.once('ready-to-show', () => { win.show(); win.focus() })
+    win.once('ready-to-show', () => { win.maximize(); win.show(); win.focus(); this.options.onShown?.() })
+    win.on('show', () => this.options.onShown?.())
+    win.on('focus', () => this.options.onShown?.())
     win.on('enter-full-screen', () => { if (!win.isDestroyed()) win.webContents.send(OFFICE_VIEW_CHANNELS.fullscreenChanged, true) })
     win.on('leave-full-screen', () => { if (!win.isDestroyed()) win.webContents.send(OFFICE_VIEW_CHANNELS.fullscreenChanged, false) })
     win.on('closed', () => {

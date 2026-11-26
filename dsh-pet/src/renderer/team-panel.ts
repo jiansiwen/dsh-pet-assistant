@@ -21,6 +21,7 @@ export const TASK_STATUS_LABEL: Record<PetTaskStatus, string> = {
   'awaiting-user': '等你回话',
   review: '等复核',
   done: '已完成',
+  blocked: '受阻',
   failed: '失败了',
   cancelled: '已取消',
   unknown: '结果未知',
@@ -47,6 +48,7 @@ export function taskTone(status: PetTaskStatus): TaskTone {
       return 'active'
     case 'done':
       return 'ok'
+    case 'blocked':
     case 'failed':
       return 'bad'
     case 'cancelled':
@@ -68,6 +70,11 @@ export function taskStatusOf(task: Pick<TeamTaskSnapshot, 'status'>): PetTaskSta
   return 'unknown'
 }
 
+/** 真正的操作审批只在审批卡里点，不能用「确认完成」替代。 */
+export function taskNeedsConfirmation(status: PetTaskStatus): boolean {
+  return status === 'review' || status === 'awaiting-user'
+}
+
 /**
  * 排序权重：需要用户动手的排最前，已经结束的排最后。
  *
@@ -81,10 +88,11 @@ const STATUS_ORDER: Record<PetTaskStatus, number> = {
   running: 3,
   queued: 4,
   created: 5,
-  failed: 6,
-  unknown: 7,
-  done: 8,
-  cancelled: 9,
+  blocked: 6,
+  failed: 7,
+  unknown: 8,
+  done: 9,
+  cancelled: 10,
 }
 
 /**
@@ -108,10 +116,10 @@ export function sortTasks(tasks: readonly TeamTaskSnapshot[]): TeamTaskSnapshot[
 /**
  * "做完了但没有产物"的提示。
  *
- * 只在 done 且产物为空时给。其它状态下没有产物是正常的——还没做完，哪来的产物。
+ * 只读任务的交付可以是一条答复，不一定有文件产物。
  */
-export function artifactNote(task: Pick<TeamTaskSnapshot, 'status' | 'artifacts'>): string | null {
-  if (taskStatusOf(task) !== 'done') return null
+export function artifactNote(task: Pick<TeamTaskSnapshot, 'status' | 'artifacts' | 'toolScope'>): string | null {
+  if (taskStatusOf(task) !== 'done' || task.toolScope === 'read-only') return null
   const count = task.artifacts?.length ?? 0
   return count === 0 ? '说做完了，但没交出产物' : null
 }
@@ -127,7 +135,7 @@ export function deadlineNote(task: Pick<TeamTaskSnapshot, 'deadlineAt' | 'status
   if (typeof deadlineAt !== 'number') return null
   const status = taskStatusOf(task)
   // 已经结束的任务不再提示逾期：那只会重复一个已经发生过的坏消息。
-  if (status === 'done' || status === 'cancelled') return null
+  if (status === 'done' || status === 'blocked' || status === 'cancelled') return null
   if (deadlineAt <= now) return '已经过了截止时间'
   const sameDay = new Date(deadlineAt).toDateString() === new Date(now).toDateString()
   return sameDay ? '今天到期' : null
@@ -142,7 +150,7 @@ export interface TaskRow {
   /** 负责人的显示名；没有就 null，界面上不显示这一行。 */
   owner: string | null
   artifactCount: number
-  /** 需要用户留意的一句话（没有产物 / 逾期）。null 表示这一行不用显示。 */
+  /** 需要用户留意的一句话（受阻说明、缺少产物或逾期）。null 表示这一行不用显示。 */
   note: string | null
 }
 
@@ -162,7 +170,7 @@ export interface MemberRow {
 /**
  * 算在"手头有活"里的状态。
  *
- * done / failed / cancelled / unknown 不算：那四种是已经结束或已经说不清的，
+ * 已结束、受阻和结果不明的任务不算，
  * 把它们计进成员的工作量，名牌上的数字会一直挂着一个下不去的假负载。
  */
 const ACTIVE_STATUSES: ReadonlySet<PetTaskStatus> = new Set([
@@ -284,7 +292,7 @@ export function teamPanelView(
     members: members.map(member => memberRow(member, tasks, proposals)),
     tasks: sortTasks(tasks).map(task => {
       const status = taskStatusOf(task)
-      const note = artifactNote(task) ?? deadlineNote(task, now)
+      const note = (typeof task.diagnostic === 'string' ? task.diagnostic.trim() : '') || artifactNote(task) || deadlineNote(task, now)
       return {
         taskId: task.taskId,
         goal: task.goal?.trim() || '（没有写目标）',

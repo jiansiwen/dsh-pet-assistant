@@ -356,6 +356,12 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
         } catch (error) { dropTarget(targetId); throw error }
         guardOrigin(session.signal, () => { if (targets.get(targetId) === entry) dropTarget(targetId) })
         if (targets.get(targetId) !== entry) return reject('请求已取消，读取授权已撤销')
+        const auto = await deps.bridge.autoApproveAssistant?.(proposal.proposalId, subject)
+        if (auto && !auto.ok) return reject(String(auto.error ?? '自动批准未生效'))
+        if (auto?.ok) {
+          return JSON.stringify({ ok: true, pending: false, autoApproved: true, targetId,
+            message: vision ? '已按设置里的免审批开关批准一次截图分析；请切回所列窗口并继续。' : '已按设置里的免审批开关批准一次读取；请切回该窗口并继续。' })
+        }
         return JSON.stringify({ ok: true, pending: true, targetId, proposalId: proposal.proposalId,
           message: vision ? '尚未截屏或发送。请在桌面专用审批窗口核对全部屏幕、问题、模型和留存，再切回所列窗口并继续。'
             : '尚未读取控件。请在桌面专用审批窗口核对目标并批准，然后切回目标窗口再继续。' })
@@ -372,8 +378,8 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
    * 但"批准一次、切回目标、执行时重新核验"这套流程必须完全一致**。
    * 复制一份迟早会漂移，那时候两条路径的安全强度就不一样了。
    */
-  const submitAuthorized = (session: { id: string; signal: AbortSignal; isCurrent(): boolean },
-    entry: TargetGrant, targetId: string, fixed: Record<string, unknown> & { target: Target; control: Control }, name: string): string => {
+  const submitAuthorized = async (session: { id: string; signal: AbortSignal; isCurrent(): boolean },
+    entry: TargetGrant, targetId: string, fixed: Record<string, unknown> & { target: Target; control: Control }, name: string): Promise<string> => {
     if (session.signal.aborted || !session.isCurrent()) throw new BeforeEffectError('请求已取消或桌面会话已切换，未提交操作')
     if (actions.size >= 32) throw new Error('待处理的电脑操作过多，请先核查')
     const actionId = randomUUID(), subject = `computer:action:${actionId}`
@@ -392,6 +398,12 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
     } catch (error) { actions.delete(actionId); throw error }
     guardOrigin(session.signal, () => { if (actions.get(actionId) === grant) dropAction(actionId) })
     if (actions.get(actionId) !== grant) return reject('请求已取消，操作许可已撤销')
+    const auto = await deps.bridge.autoApproveAssistant?.(proposal.proposalId, subject)
+    if (auto && !auto.ok) return reject(String(auto.error ?? '自动批准未生效'))
+    if (auto?.ok) {
+      return JSON.stringify({ ok: true, pending: false, autoApproved: true, actionId,
+        message: '已按设置里的免审批开关批准这一次操作；请切回目标窗口后继续执行。' })
+    }
     return JSON.stringify({ ok: true, pending: true, actionId, proposalId: proposal.proposalId,
       message: '已提交桌面审批；批准本身不会执行。请切回目标窗口后再继续执行，取消可撤销许可。' })
   }
@@ -412,7 +424,7 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
         if (probe.ok !== true || !observedTarget || !sameTarget(entry.target, observedTarget) || !control) throw new Error('目标窗口或控件无法确认，未提交操作')
         if (control.isPassword && (intent.action === 'type' || intent.action === 'key')) throw new Error('受保护的密码控件不能由电脑工具输入或发送按键')
         const fixed = { ...intent, target: entry.target, control }
-        return submitAuthorized(session, entry, String(args.targetId), fixed, name)
+        return await submitAuthorized(session, entry, String(args.targetId), fixed, name)
       } catch (error) { return reject(error) }
     },
   }))
@@ -449,7 +461,7 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
         if (!control) throw new Error('控件身份不完整，未提交操作')
         if (control.isPassword && intent.action === 'setvalue') throw new Error('受保护的密码控件不能由电脑工具写入')
         const fixed = { ...intent, target: entry.target, control }
-        return submitAuthorized(session, entry, String(args.targetId), fixed, name)
+        return await submitAuthorized(session, entry, String(args.targetId), fixed, name)
       } catch (error) { return reject(error) }
     },
   }))
@@ -515,6 +527,12 @@ export function registerComputerTools(host: { tools: { register(definition: unkn
               truncated: result.truncated, verified: false }
           },
         })
+        const auto = await deps.bridge.autoApproveAssistant?.(proposal.proposalId, 'computer:command')
+        if (auto) {
+          return JSON.stringify({ ok: auto.ok, pending: false, autoApproved: true, command: shown, cwd: spec.cwd,
+            ...(auto.ok ? { result: auto.result ?? null } : { state: auto.state ?? 'failed', error: String(auto.error ?? '执行失败') }),
+            message: '已按设置里的免审批开关直接执行一次。退出码 0 只说明进程正常结束，不代表业务目标达成。' })
+        }
         return JSON.stringify({ ok: true, pending: true, proposalId: proposal.proposalId, command: shown,
           cwd: spec.cwd, timeoutSeconds: spec.timeoutSeconds,
           message: '已提交桌面审批；批准后才会执行一次。退出码 0 只说明进程正常结束，不代表业务目标达成。' })

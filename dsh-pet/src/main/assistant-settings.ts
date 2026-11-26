@@ -3,6 +3,10 @@ import { pathToFileURL } from 'node:url'
 import { ASSISTANT_SETTINGS_LIMITS as LIMITS, type AssistantAgentSettings, type AssistantSettingsInputs, type AssistantSettingsResult, type AssistantSettingsSection, type AssistantSettingsSnapshot } from '../assistant-settings-types.ts'
 
 export const ASSISTANT_SETTINGS_CHANNELS = { state: 'assistant-settings-state', save: 'assistant-settings-save' } as const
+/** 插件侧免审批开关的读写通道（经 owner 凭据直达 /companion/v1/approval-switches）。 */
+export const ASSISTANT_APPROVAL_SWITCHES_CHANNELS = { state: 'assistant-approval-switches-state', save: 'assistant-approval-switches-save' } as const
+export interface ApprovalSwitchRow { key: string; title: string; description: string; enabled: boolean }
+export type ApprovalSwitchesResult = { ok: true; switches: ApprovalSwitchRow[] } | { ok: false; message: string }
 /** 专属词库的读写通道；与设置共用发送方校验，但回包是列表而不是配置投影。 */
 export const ASSISTANT_GLOSSARY_CHANNELS = { state: 'assistant-glossary-state', update: 'assistant-glossary-update' } as const
 export type GlossaryResult =
@@ -329,9 +333,49 @@ export function registerAssistantSettings(options: Options): () => void {
     saving = true
     try { return await call(event, section, parsed) } finally { saving = false }
   })
+  const switchesCall = async (event: IpcMainInvokeEvent, switches?: Record<string, boolean>): Promise<ApprovalSwitchesResult> => {
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    let result: { status: number; body: unknown }
+    try {
+      result = switches === undefined
+        ? await options.request('GET', '/companion/v1/approval-switches', undefined, 'owner')
+        : await options.request('POST', '/companion/v1/approval-switches', { switches }, 'owner')
+    } catch { return { ok: false, message: '尚未连接到 DSH 插件，暂时无法读取或保存插件免审批开关。' } }
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (result.status !== 200) {
+      const msg = typeof (result.body as { message?: unknown })?.message === 'string' ? (result.body as { message: string }).message : '免审批开关没有保存成功。'
+      return { ok: false, message: msg }
+    }
+    const raw = (result.body as { switches?: unknown } | null)?.switches
+    if (!Array.isArray(raw)) return { ok: false, message: '插件返回的开关列表格式不完整。' }
+    return {
+      ok: true,
+      switches: raw.map(item => {
+        const row = item as Record<string, unknown>
+        return {
+          key: String(row.key ?? ''),
+          title: String(row.title ?? ''),
+          description: String(row.description ?? ''),
+          enabled: row.enabled === true,
+        }
+      }).filter(item => item.key !== ''),
+    }
+  }
+  ipcMain.handle(ASSISTANT_APPROVAL_SWITCHES_CHANNELS.state, async event => switchesCall(event))
+  ipcMain.handle(ASSISTANT_APPROVAL_SWITCHES_CHANNELS.save, async (event, patch: unknown): Promise<ApprovalSwitchesResult> => {
+    if (!allowed(event)) return { ok: false, message: '请求不是来自当前舞台的本地入口，未执行。' }
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return { ok: false, message: '开关参数格式不正确。' }
+    const cleaned: Record<string, boolean> = {}
+    for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+      if (typeof value !== 'boolean') return { ok: false, message: `开关 ${key} 只能是开或关。` }
+      cleaned[key] = value
+    }
+    return switchesCall(event, cleaned)
+  })
   return () => {
     disposed = true
     for (const channel of Object.values(ASSISTANT_SETTINGS_CHANNELS)) ipcMain.removeHandler(channel)
+    for (const channel of Object.values(ASSISTANT_APPROVAL_SWITCHES_CHANNELS)) ipcMain.removeHandler(channel)
     for (const channel of Object.values(ASSISTANT_GLOSSARY_CHANNELS)) ipcMain.removeHandler(channel)
     ipcMain.removeHandler(ASSISTANT_ARTIFACTS_CHANNEL)
     for (const channel of Object.values(ASSISTANT_SKILLS_CHANNELS)) ipcMain.removeHandler(channel)

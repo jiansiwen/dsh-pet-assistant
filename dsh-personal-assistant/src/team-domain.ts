@@ -365,6 +365,7 @@ export const TASK_STATUSES = [
   'awaiting-user',
   'review',
   'done',
+  'blocked',
   'failed',
   'cancelled',
   'unknown',
@@ -398,7 +399,7 @@ export function normalizeSource(raw: unknown): TaskSource {
 }
 
 /** 终态：不再接受新的执行步骤，只接受复核或重新开任务。 */
-export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ['done', 'failed', 'cancelled']
+export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ['done', 'blocked', 'failed', 'cancelled']
 
 export interface Task {
   readonly taskId: string
@@ -2239,6 +2240,12 @@ export class TeamStore {
       payload: JSON.parse(String(row.payload)),
       createdAt: Number(row.created_at),
     }))
+  }
+
+  latestTaskDiagnostic(taskId: string): string | null {
+    const row = this.db.prepare(`SELECT json_extract(payload, '$.diagnostic') AS diagnostic
+      FROM events_outbox WHERE task_id = ? AND type = 'reply/done' ORDER BY seq DESC LIMIT 1`).get(taskId)
+    return typeof row?.diagnostic === 'string' ? row.diagnostic : null
   }
 
   /** 只清理本应用拥有的过期事件，保留窗口按毫秒配置。 */

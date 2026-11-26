@@ -64,11 +64,13 @@ export class ApprovalWindow {
   private disposed = false
   private deciding = false
   private readonly bridge: BridgeClient
+  private readonly skipNativeConfirm: () => boolean
 
   // 显式字段而不是参数属性：Node 的 strip-only TypeScript 只擦类型、不改写语法，
   // 参数属性会让本文件无法被 node --test 直接导入，而 index.ts 传递导入了它。
-  constructor(bridge: BridgeClient) {
+  constructor(bridge: BridgeClient, skipNativeConfirm: () => boolean = () => false) {
     this.bridge = bridge
+    this.skipNativeConfirm = skipNativeConfirm
   }
 
   /**
@@ -204,7 +206,7 @@ export class ApprovalWindow {
     if (this.deciding) return { ok: false, error: '正在处理当前决定，请勿重复点击' }
     this.deciding = true
     try {
-      if (decision === 'approve' && needsNativeConfirm(proposal)) {
+      if (decision === 'approve' && needsNativeConfirm(proposal) && !this.skipNativeConfirm()) {
         const confirmed = await this.confirmNatively(view)
         if (!confirmed) return { ok: false, error: '你在确认框里选择了不批准，这条提案还没有被批准' }
       }

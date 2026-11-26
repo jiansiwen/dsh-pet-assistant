@@ -420,6 +420,8 @@ export interface HelpEpisodeToolOptions {
   readonly helpContexts: HelpContextStore
   /** 把读取范围交给可信审批（桌面专用审批窗口）；bridge.submitAssistant 满足这个形状。 */
   submit(submission: AssistantSubmission): { proposalId: string }
+  /** 用户在设置页打开「读取目录与文件授权」免审批开关时立即代为签发；开关关着返回 null。 */
+  approveNow?(proposalId: string, subject: string): Promise<(Record<string, unknown> & { ok: boolean }) | null>
   now?: () => number
 }
 
@@ -508,6 +510,12 @@ export function registerHelpEpisodeTools(host: EpisodeToolHost, options: HelpEpi
             },
           })
           options.episodes.markScopePending(episode.id, candidate.id, proposal.proposalId, now())
+          const auto = await options.approveNow?.(proposal.proposalId, 'help')
+          if (auto?.ok) {
+            return json({ pending: false, status: 'done', autoApproved: true, episodeId: episode.id, scope, result: auto.result ?? null,
+              message: '已按设置里的免审批开关直接授权，可以读取所选范围。' })
+          }
+          if (auto) return json({ pending: false, autoApproved: true, error: String(auto.error ?? '授权未生效') })
           return json({
             pending: true, status: 'pending', proposalId: proposal.proposalId, episodeId: episode.id, scope,
             message: '尚未授权，也还没有读取任何内容。请用户在桌面专用审批窗口核对范围后批准；聊天里的确认不能代替。',

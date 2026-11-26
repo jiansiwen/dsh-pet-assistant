@@ -6,7 +6,7 @@ import {
 MEMBER_CAPABILITIES, MEMBER_CAPABILITY_LABELS, MEMBER_KINDS, MEMBER_KIND_LABELS, MEMBER_PERMISSION_LABELS, MEMBER_PERMISSION_MODES,
   MEMBER_REPORT_LABELS, MEMBER_REPORT_MODES, MEMBER_SPEECH_BY, MEMBER_SPEECH_LABELS,
   type MemberCapability, type MemberDraft, type MemberEditorContext, type MemberKind, type MemberPermissionMode, type MemberReportMode,
-  type MemberResult, type MemberSnapshot, type MemberSpeechBy, type MemberView, type SubAssistantReportMode,
+  type MemberResult, type MemberSnapshot, type MemberSpeechBy, type MemberView, type PlatformAuth, type SubAssistantReportMode,
 } from '../member-types.ts'
 
 const CAPABILITY_HINTS: Record<MemberCapability, string> = {
@@ -29,12 +29,13 @@ type DraftForm = Omit<MemberDraft, 'maxTokens' | 'dailyTokenLimit' | 'totalToken
   maxTokens: string; dailyTokenLimit: string; totalTokenLimit: string; thresholdPercent: string
   kind: MemberKind; reportMode: SubAssistantReportMode
   endpoint: string; platformModel: string; agentId: string; secretId: string
+  appId: string; appSecretId: string; appSecret: string; signEndpoint: string; signUserId: string
   command: string; argsText: string
   apiKey: string
 }
 const COMPARE_FIELDS: ReadonlyArray<readonly [keyof DraftForm, string]> = [
   ['displayName', '名称'], ['description', '职责'], ['personality', '性格'], ['persona', '工作要求'],
-['kind', '成员类型'], ['reportMode', '汇报模式'], ['endpoint', '平台端点'], ['platformModel', '平台模型'], ['agentId', '智能体 ID'],
+['kind', '成员类型'], ['reportMode', '汇报模式'], ['endpoint', '平台端点'], ['platformModel', '平台模型'], ['agentId', '智能体 ID'], ['appId', '应用 ID'], ['signEndpoint', '签名接口地址'], ['signUserId', '用户标识'],
   ['command', '工具命令'], ['argsText', '工具参数'],
   ['permissionMode', '权限'], ['skinId', '形象'], ['enabled', '启用状态'], ['capabilities', '能力'],
   ['provider', '模型服务商'], ['model', '模型'], ['maxTokens', '单次最大输出量'], ['dailyTokenLimit', '日额度'],
@@ -58,6 +59,7 @@ function localTimezone(): string {
 function initialForm(member: MemberView | null): DraftForm {
   const p = member?.profile
   const binding = p?.binding ?? null
+  const auth = p?.platformAuth ?? null
   return {
     displayName: p?.displayName ?? '新成员', description: p?.description ?? '', personality: p?.personality ?? '',
     permissionMode: p?.permissionMode ?? 'ask', reportMode: p?.reportMode ?? 'chief', speechBy: p?.speechBy ?? 'self',
@@ -71,17 +73,26 @@ function initialForm(member: MemberView | null): DraftForm {
     endpoint: binding?.kind === 'platform' ? binding.endpoint : DEFAULT_PLATFORM_ENDPOINT, platformModel: binding?.kind === 'platform' ? binding.model : '',
     agentId: binding?.kind === 'platform' ? binding.agentId : '',
     secretId: binding?.kind === 'platform' ? binding.secretId : '',
+    appId: binding?.kind === 'platform' ? binding.appId ?? '' : auth?.appId ?? '',
+    appSecretId: binding?.kind === 'platform' ? binding.appSecretId ?? '' : auth?.appSecretId ?? '', appSecret: '',
+    signEndpoint: binding?.kind === 'platform' ? binding.signEndpoint ?? '' : auth?.signEndpoint ?? '',
+    signUserId: binding?.kind === 'platform' ? binding.signUserId ?? '' : auth?.signUserId ?? '',
     command: binding?.kind === 'local-cli' ? binding.command : '', argsText: binding?.kind === 'local-cli' ? binding.args.join(' ') : '',
     apiKey: '',
   }
 }
 function fromDraft(draft: MemberDraft): DraftForm {
-  const { kind, reportMode, binding, apiKey, ...rest } = draft
+  const { kind, reportMode, binding, platformAuth, apiKey, ...rest } = draft
   const bound = binding ?? null
+  const auth = platformAuth ?? null
   return { ...rest, kind: kind ?? 'expert', reportMode: reportMode ?? 'chief',
     endpoint: bound?.kind === 'platform' ? bound.endpoint : '', platformModel: bound?.kind === 'platform' ? bound.model : '',
     agentId: bound?.kind === 'platform' ? bound.agentId : '',
     secretId: bound?.kind === 'platform' ? bound.secretId : '',
+    appId: bound?.kind === 'platform' ? bound.appId ?? '' : auth?.appId ?? '',
+    appSecretId: bound?.kind === 'platform' ? bound.appSecretId ?? '' : auth?.appSecretId ?? '', appSecret: '',
+    signEndpoint: bound?.kind === 'platform' ? bound.signEndpoint ?? '' : auth?.signEndpoint ?? '',
+    signUserId: bound?.kind === 'platform' ? bound.signUserId ?? '' : auth?.signUserId ?? '',
     command: bound?.kind === 'local-cli' ? bound.command : '', argsText: bound?.kind === 'local-cli' ? bound.args.join(' ') : '',
     apiKey: '',
     capabilities: [...draft.capabilities], allowedTools: [], maxTokens: String(draft.maxTokens),
@@ -94,25 +105,41 @@ function safeInteger(value: string, fallback: number, min = 0): number {
 /** 给 AI 的基准草稿；表单临时空值用默认值补齐，不用于保存。 */
 /** 由表单构建外部绑定；expert 成员恒为 null（绑定变化会清空子助理会话，属预期）。 */
 function bindingOf(form: DraftForm): MemberDraft['binding'] {
-  if (form.kind === 'platform') return { kind: 'platform', endpoint: form.endpoint.trim(), model: form.platformModel.trim(), agentId: form.agentId.trim(), secretId: form.secretId }
+  if (form.kind === 'platform') return { kind: 'platform', endpoint: form.endpoint.trim(), model: form.platformModel.trim(), agentId: form.agentId.trim(), secretId: form.secretId,
+    appId: form.appId.trim(), appSecretId: form.appId.trim() ? form.appSecretId : '', signEndpoint: form.signEndpoint.trim(),
+    signUserId: form.signUserId.trim() }
   if (form.kind === 'local-cli') return { kind: 'local-cli', command: form.command.trim(), args: form.argsText.split(/\s+/).filter(Boolean) }
   return null
+}
+/** 平台端点可接受的形状：https 或本机回环；签名接口地址留空时沿用本机配置。 */
+function safeEndpoint(value: string): boolean {
+  if (value === '') return true
+  try {
+    const url = new URL(value)
+    if (!/^https?:$/.test(url.protocol)) return false
+    return url.protocol === 'https:' || /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(url.host)
+  } catch { return false }
 }
 /** 基础形状校验：深度校验（https/回环、未知字段）在插件录入侧完成，错误如实回显。 */
 function validBinding(form: DraftForm): boolean {
   if (form.kind === 'platform') {
-    try {
-      const url = new URL(form.endpoint.trim())
-      if (!/^https?:$/.test(url.protocol)) return false
-      if (url.protocol === 'http:' && !/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(url.host)) return false
-    } catch { return false }
+    if (!safeEndpoint(form.endpoint.trim()) || form.endpoint.trim() === '') return false
+    if (!safeEndpoint(form.signEndpoint.trim())) return false
     return form.platformModel.trim().length > 0 || form.agentId.trim().length > 0
   }
   if (form.kind === 'local-cli') return form.command.trim().length > 0
   return true
 }
+/** 本机专家勾选平台能力时保存的平台凭据；四项全空按未配置处理。 */
+function platformAuthOf(form: DraftForm): PlatformAuth | null {
+  if (form.kind !== 'expert' || !form.capabilities.includes('platform')) return null
+  const appId = form.appId.trim()
+  const auth = { appId, appSecretId: appId === '' ? '' : form.appSecretId,
+    signEndpoint: form.signEndpoint.trim(), signUserId: form.signUserId.trim() }
+  return auth.appId === '' && auth.appSecretId === '' && auth.signEndpoint === '' && auth.signUserId === '' ? null : auth
+}
 function formDraft(form: DraftForm, member: MemberView | null): MemberDraft {
-  const { endpoint, platformModel, agentId, secretId, command, argsText, apiKey, ...rest } = form
+  const { endpoint, platformModel, agentId, secretId, appId, appSecretId, appSecret, signEndpoint, signUserId, command, argsText, apiKey, ...rest } = form
   return {
     ...rest, displayName: rest.displayName.trim() || '新成员', provider: rest.provider.trim(), model: rest.model.trim(),
     maxTokens: safeInteger(rest.maxTokens, member?.profile.maxTokens ?? 16384, 1),
@@ -120,7 +147,7 @@ function formDraft(form: DraftForm, member: MemberView | null): MemberDraft {
     totalTokenLimit: safeInteger(rest.totalTokenLimit, member?.profile.totalTokenLimit ?? 0),
     thresholdPercent: safeInteger(rest.thresholdPercent, member?.profile.thresholdPercent ?? 80, 1),
     timezone: rest.timezone.trim() || localTimezone(), allowedTools: [],
-    kind: rest.kind, reportMode: rest.reportMode, binding: bindingOf(form),
+    kind: rest.kind, reportMode: rest.reportMode, binding: bindingOf(form), platformAuth: platformAuthOf(form),
     ...(rest.kind !== 'expert' ? { scheduleWorkspaceId: null } : {}),
   }
 }
@@ -131,12 +158,16 @@ function validDraft(form: DraftForm): boolean {
   if (Number(form.maxTokens) > 131072 || Number(form.thresholdPercent) > 100 || !form.displayName.trim()
     || !!form.model.trim() !== !!form.provider.trim() || !form.timezone.trim()) return false
   if (!validBinding(form)) return false
+  if (form.appSecret.trim() && !form.appId.trim()) return false
   try { new Intl.DateTimeFormat('zh-CN', { timeZone: form.timezone }).format(); return true } catch { return false }
 }
 function toDraft(form: DraftForm): MemberDraft {
   const draft = formDraft(form, null)
   // 平台密钥只在用户本次填了才上桥：留空＝沿用已存密钥；经桥后即入加密存储，永不回显。
   if (form.kind === 'platform' && form.apiKey.trim()) draft.apiKey = form.apiKey.trim()
+  if (form.appSecret.trim() && (form.kind === 'platform' || (form.kind === 'expert' && form.capabilities.includes('platform')))) {
+    draft.appSecret = form.appSecret.trim()
+  }
   return draft
 }
 
@@ -417,7 +448,7 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
 
     <section className="editor-card" aria-label="能力">
       <h2>它可以做什么</h2>
-      <p className="editor-hint">不选也能创建：只有职责提示词的助理也可以工作。绑定能力后，相关消息和工具才会交给它。</p>
+      <p className="editor-hint">不选也能创建：只有职责提示词的助理也可以工作。本机成员按勾选项获得相关工具；平台智能体的只读平台查询由 DSH 代为执行。</p>
       <div className="editor-capabilities">
         {MEMBER_CAPABILITIES.map(capability => <label key={capability} className={form.capabilities.includes(capability) ? 'is-selected' : undefined}>
           <input type="checkbox" checked={form.capabilities.includes(capability)} disabled={busy}
@@ -459,9 +490,33 @@ export function MemberEditorPanel({ member, latest, workspaces, pending, onSave,
         <label className="editor-field"><span>智能体 ID（平台用 X-Agent-Id 指定智能体）</span>
           <input autoComplete="off" maxLength={128} value={form.agentId} disabled={busy} onChange={event => set('agentId', event.target.value)}
             placeholder="例：1464" /></label>
-        <label className="editor-field"><span>API 密钥{form.secretId ? '（已配置，留空＝沿用原密钥）' : '（未配置）'}</span>
+        <label className="editor-field"><span>聊天 API 密钥{form.secretId ? '（已配置，留空＝沿用原密钥）' : '（未配置）'}</span>
           <input type="password" autoComplete="new-password" maxLength={4096} value={form.apiKey} disabled={busy}
-            onChange={event => set('apiKey', event.target.value)} placeholder={form.secretId ? '留空保持不变' : '保存在本机加密存储，不会回显'} /></label>
+            onChange={event => set('apiKey', event.target.value)} placeholder={form.secretId ? '留空保持不变' : '保存在本机加密存储，不会回显'} />
+          <small>只用于和上面这个智能体聊天。</small></label>
+      </div>}
+      {(form.kind === 'platform' || (form.kind === 'expert' && form.capabilities.includes('platform'))) && <div className="editor-subsection" aria-label="平台查询凭据">
+        <h3>{form.kind === 'platform' ? '只读查询凭据' : '平台查询凭据'}</h3>
+        <p className="editor-hint">{form.kind === 'platform'
+          ? '让这个成员列出平台智能体、查会话/聊天记录、向平台智能体提问、上传知识库时使用；接口要求应用 ID 与平台分配的签名密钥。它们和上面的聊天密钥不是同一个，下面四项留空时沿用本机平台对接配置。'
+          : '勾选「对接外部智能助理平台」后，这个本机专家可以查平台、问平台智能体、上传知识库。它的会话、性格和记忆由 DSH 负责，平台只是它调用的工具；下面四项留空时沿用本机配置。'}</p>
+        <div className="editor-grid">
+          <label className="editor-field"><span>应用 ID（开放接口报文中的 appid）</span>
+            <input autoComplete="off" maxLength={128} value={form.appId} disabled={busy} onChange={event => set('appId', event.target.value)}
+              placeholder="例：app_xxxxxxxx" /></label>
+          <label className="editor-field"><span>签名密钥 app_secret{form.appSecretId ? '（已配置，留空＝沿用原密钥）' : '（未配置）'}</span>
+            <input type="password" autoComplete="new-password" maxLength={4096} value={form.appSecret} disabled={busy}
+              onChange={event => set('appSecret', event.target.value)} placeholder={form.appSecretId ? '留空保持不变' : '保存在本机加密存储，不会回显'} />
+            <small>换了应用 ID 需要重新填写；不会用来聊天，也不会进模型上下文。</small></label>
+          <label className="editor-field"><span>签名接口地址（留空沿用本机配置）</span>
+            <input autoComplete="off" maxLength={2048} value={form.signEndpoint} disabled={busy} onChange={event => set('signEndpoint', event.target.value)}
+              placeholder="例：https://aiagent.lakala.com/api/chat/realtime" />
+            <small>要与上面的凭据同环境；只影响平台查询，不改聊天端点。</small></label>
+          <label className="editor-field"><span>用户标识 user_id（留空沿用本机配置）</span>
+            <input autoComplete="off" maxLength={128} value={form.signUserId} disabled={busy} onChange={event => set('signUserId', event.target.value)}
+              placeholder="例：210" />
+            <small>平台账号的用户标识；查出来的会话和记录属于这个用户。</small></label>
+        </div>
       </div>}
       {form.kind === 'local-cli' && <div className="editor-grid">
         <label className="editor-field"><span>工具命令（绝对路径或命令名）</span>

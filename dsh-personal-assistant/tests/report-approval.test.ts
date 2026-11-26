@@ -283,6 +283,68 @@ for (const stopMode of ['正常停止', '停止抛错', '停止后仍活动'] as
   })
 }
 
+test('跨日读取史官存下的草稿并直接导出：文件原文一致，隔离今日与正式发布', async t => {
+  const f = fixture(t)
+  const tools = new Map<string, { execute(args: unknown): Promise<string> }>()
+  registerAssistantTools({
+    tools: { register(definition) {
+      const tool = definition as { name: string; execute(args: unknown): Promise<string> }
+      tools.set(tool.name, tool)
+      return () => undefined
+    } },
+    systemPrompt: { section: () => () => undefined, variable: () => () => undefined },
+  }, {
+    getDay: (date: string) => ({ date, spans: [], events: [], notes: [], interpretedUpto: 0 }),
+    modeDescription: () => '测试中',
+    stop: () => assert.fail('导出草稿不能停止采集'),
+  } as unknown as ActivityTracker, {
+    reportDir: f.options.reportDir, bridge: f.bridge, reports: f.reports,
+    memories: {} as MemoryStore, maxInjectedMemories: 0, legacyCopiesRetained: false,
+    captureBlockedReason: () => '测试不允许采集', enableTeamMode: () => ({ toolsRegistered: false }),
+    disableTeamMode: async () => ({ ok: true }),
+  })
+  const call = async (name: string, args: unknown = {}) => JSON.parse(await tools.get(`personal_assistant_${name}`)!.execute(args))
+  const date = '2026-09-18'
+  assert.equal((await call('get_draft', { date })).draft, CONTENT)
+  assert.equal((await call('today', { date, detail: 'full' })).date, date)
+  const yesterday = new Date()
+  yesterday.setDate(yesterday.getDate() - 1)
+  assert.equal((await call('today', { date: '昨天' })).date, localDateOf(yesterday.getTime()))
+  assert.equal((await call('save_draft', { date: '2026-09-17', content: '另一日的草稿' })).reportId, 'daily:2026-09-17')
+  assert.equal((await call('get_draft', { date: '2026-02-30' })).hasDraft, false)
+  assert.equal((await call('export_daily_report', { date: '2026-09-16' })).exported, false)
+  assert.equal((await call('export_daily_report', { date: '../跨目录' })).exported, false)
+  const exported = await call('export_daily_report', { date })
+  assert.equal(exported.exported, true)
+  assert.equal(exported.published, false)
+  assert.equal(exported.revision, 1)
+  assert.equal(exported.digest, sha256(CONTENT))
+  assert.equal(exported.savedPath, path.join(f.options.reportDir, 'drafts', `${date}-r1.md`))
+  assert.equal(readFileSync(exported.savedPath, 'utf8'), CONTENT)
+  assert.equal((await call('export_daily_report', { date })).alreadyCurrent, true)
+  writeFileSync(exported.savedPath, '用户修改后的内容')
+  assert.equal((await call('export_daily_report', { date })).exported, false)
+  assert.equal(readFileSync(exported.savedPath, 'utf8'), '用户修改后的内容')
+  assert.equal(f.reports.current(REPORT_ID)?.state, 'draft')
+  assert.equal(f.reports.current(`daily:${localDateOf(Date.now())}`), null)
+  assert.equal(existsSync(path.join(f.options.reportDir, `${date}.md`)), false)
+  assert.deepEqual(f.service.pendingProposals(), [])
+  assert.equal(f.state.stops, 0)
+  assert.equal(f.state.publishes, 0)
+
+  f.bridge.attachReportApprovals(f.service, 'auto')
+  const saved = await call('export_daily_report', { date })
+  assert.equal(saved.exported, true)
+  assert.equal(saved.published, true)
+  assert.equal(saved.savedPath, path.join(f.options.reportDir, `${date}.md`))
+  assert.equal(readFileSync(saved.savedPath, 'utf8'), CONTENT)
+  assert.equal(f.reports.current(REPORT_ID)?.state, 'archived')
+  assert.equal((await call('export_daily_report', { date })).alreadyCurrent, true)
+  assert.equal(f.state.publishes, 1, '反复导出复用原有、已验证的正式文件')
+  assert.equal(f.state.stops, 0)
+  assert.deepEqual(f.service.pendingProposals(), [])
+})
+
 test('非团队工具与真实 HTTP：confirm 只读，独立凭据审批，重连快照能看日报全文', async t => {
   const f = fixture(t)
   const tools = new Map<string, { execute(args: unknown): Promise<string> }>()

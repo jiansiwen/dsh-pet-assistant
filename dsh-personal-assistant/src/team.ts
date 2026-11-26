@@ -64,6 +64,10 @@ export interface TeamOptions {
   /** 审批账目；副作用席位的子代理靠它在真实调用点校验批准。 */
   readonly approvals: ApprovalService
   readonly logger: TeamLogger
+  /** 用户打开「任务结果免验收」开关时为 true：已执行的结果直接结单，不再停在「等复核」。 */
+  readonly autoAcceptResults?: () => boolean
+  /** 用户打开「团队写文件与执行命令」开关时为 true：帮助任务改动/验证提案自动批准。 */
+  readonly autoApproveActions?: () => boolean
   /**
    * 帮助授权来源（HelpContextStore）。给出时才开放帮助任务的读取、改动提案与验证命令（M2-06）；
    * 不给时这些工具不注册，unknown 人工复核照常可用。
@@ -452,6 +456,7 @@ export class TeamService {
       store, approvals: options.approvals, teamId: options.teamId, chiefId: () => this.chief().assistantId,
       scopes: options.helpScopes, episodes: options.episodes, logger: options.logger,
       schedule: options.helpExecution?.schedule, commitHooks: options.helpExecution?.commitHooks, env: options.helpExecution?.env,
+      autoApproveActions: options.autoApproveActions, autoAcceptResults: options.autoAcceptResults,
     })
   }
 
@@ -575,6 +580,10 @@ export class TeamService {
     return this.getTask(taskId) ? this.store.listRuns(taskId) : []
   }
 
+  taskDiagnostic(task: Task): string | null {
+    return ['blocked', 'failed', 'review'].includes(task.status) ? this.store.latestTaskDiagnostic(task.taskId) : null
+  }
+
   eventsSince(seq: number, limit = 200): TeamEvent[] {
     const events: TeamEvent[] = []
     let cursor = seq
@@ -641,7 +650,7 @@ export class TeamService {
     if (!task) return null
     // 待批、复核、未知及运行中均不能重新领取，避免重发已发生的副作用。
     if (!['created', 'queued'].includes(task.status)) {
-      return { task, report: null, stopReason: task.status, diagnostic: '只领取新建或排队任务；其余状态需人工复核' }
+      return { task, report: null, stopReason: task.status, diagnostic: '任务已开始或已结算，不会重复执行' }
     }
     const refuse = (status: TaskStatus, stopReason: string, diagnostic: string): TaskOutcome => this.store.transaction(() => {
       const updated = this.setStatus(task, status) ?? task
@@ -658,14 +667,17 @@ export class TeamService {
     const member = this.store.getMember(task.ownerId)
     if (!member?.enabled) return refuse('failed', 'owner-unavailable', '任务成员不存在或已停用，不会替换成员')
     const managed = this.options.members
-    if (!managed && task.budgetTokens !== 0) return refuse('review', 'budget-unsupported', BUDGET_REFUSAL)
+    if (!managed && task.budgetTokens !== 0) return refuse('blocked', 'budget-unsupported', BUDGET_REFUSAL)
     if (managed?.busy(member.assistantId)) return refuse('queued', 'member-busy', '成员正在处理其他请求，任务保持排队')
     const denied = [...this.options.denyExpertTools, ...member.toolPolicy.denyTools]
     // 持久成员路径只认已配置的能力门禁，任务范围和旧任务预算都不能扩大成员权限。
     const sideEffect = !managed && task.toolScope === 'side-effect' && member.toolPolicy.mode === 'side-effect'
     const plan = sideEffect ? this.sideEffectPlan(parentAgent, denied) : null
-    if (sideEffect && !plan) return refuse('review', 'side-effect-unsupported', SIDE_EFFECT_REFUSAL)
-    if (!managed && this.options.provider !== 'spawn') return refuse('review', 'provider-unsupported', '只读隔离目前仅核实 spawn 的独立描述符；未启动其他 provider')
+    if (sideEffect && !plan) return refuse('blocked', 'side-effect-unsupported', SIDE_EFFECT_REFUSAL)
+    if (!managed && this.options.provider !== 'spawn') return refuse('blocked', 'provider-unsupported', '只读隔离目前仅核实 spawn 的独立描述符；未启动其他 provider')
+    const blockedDependency = task.dependsOn.map(id => this.getTask(id))
+      .find(dep => dep && dep.status !== 'done' && TERMINAL_TASK_STATUSES.includes(dep.status))
+    if (blockedDependency) return refuse('blocked', 'dependency-blocked', `前置任务「${blockedDependency.goal}」已结束但没有完成`)
     if (!this.dependenciesSatisfied(task)) return refuse('queued', 'queued', '前置任务尚未通过验收')
     if (this.liveRuns.size >= this.options.maxConcurrentInference) return refuse('queued', 'queued', '推理额度已满')
     if (plan && this.sideEffectRunning() >= this.options.maxConcurrentSideEffect) return refuse('queued', 'queued', '副作用执行额度已满')
@@ -746,7 +758,7 @@ export class TeamService {
       runSignal.throwIfAborted()
       // 先停增量再结算：否则最后一拍可能落到 reply/done 之后，气泡先定稿、又冒出半个尾巴。
       stopDelta()
-      outcome = this.settle(taskId, runId, member, claimed, result)
+      outcome = this.settle(taskId, runId, member, claimed, result, memberRun)
     } catch (error) {
       const stopReason = runSignal.aborted ? (controller.signal.aborted ? String(controller.signal.reason) : 'aborted')
         : live.run ? 'infrastructure-error' : 'start-rejected'
@@ -820,7 +832,7 @@ export class TeamService {
 
   private buildPrompt(member: MemberConfig, task: Task, plan: SideEffectPlan | null): ContentBlock[] {
     const permission = this.options.members
-      ? '【权限】只使用本成员配置允许的工具，执行门禁以成员运行时为准。邮件与普通任务继续使用原入口的本人审批。不得使用命令、写删文件、全局记忆、权限配置或再委派工具；任务不能扩大能力或额度。'
+      ? '【权限】只使用本成员配置允许的工具，执行门禁以成员运行时为准。日报本机导出只允许调用指定日报工具，不得用通用文件工具替代。邮件与普通任务继续使用原入口的本人审批。不得使用命令、任意写删文件、全局记忆、权限配置或再委派工具；任务不能扩大能力或额度。'
       : plan ? [
           `【权限】本次是副作用任务，由可信执行器把关。可直接使用的只有观测工具${plan.observe.length > 0 ? `（${plan.observe.join('、')}）` : ''}；`
             + `需要审批的副作用工具只有：${plan.gated.join('、')}。`,
@@ -843,7 +855,7 @@ export class TeamService {
         ? `【验收条件】\n${task.acceptance.map((item) => `- ${item}`).join('\n')}`
         : '',
       permission,
-      '【产出】按结构化输出返回：summary 给结论；artifacts 逐条写清可核验的产物或证据及其来源；blockers 写阻碍；needsApproval 写需要批准的副作用计划。没有证据支撑的判断只能进 blockers，不能写进 artifacts。',
+      '【产出】按结构化输出返回：summary 给结论；artifacts 写实际取得的文件或证据；blockers 写未办成的原因；needsApproval 写尚需批准的真实事项。无阻碍或不需批准时对应字段传空数组 []，不要写「无」。不能把未执行或只提交审批说成已完成。',
     ]
     return [{ type: 'text', text: sections.filter((section) => section.length > 0).join('\n\n') }]
   }
@@ -935,8 +947,8 @@ export class TeamService {
     return this.recentReports.map(item => `- ${item.member}：${item.text}`).join('\n')
   }
 
-  /** 只有产物可核验才算完成；跑完但拿不出证据的进复核，不伪装成功；副作用结果不明的进 unknown。 */
-  private settle(taskId: string, runId: string, member: MemberConfig, task: Task, result: SubagentResult): TaskOutcome {
+  /** 只读答复直接结单；未办成则受阻；产生需独立验收的副作用才复核。运行中真实审批由审批卡处理。 */
+  private settle(taskId: string, runId: string, member: MemberConfig, task: Task, result: SubagentResult, memberRun?: MemberActivation): TaskOutcome {
     const report = this.parseReport(result.structured)
     if (result.stopReason !== 'completed') return { ...this.stopRun(taskId, runId, result.stopReason, result.diagnostic ?? '子代理未正常完成'), report }
     return this.store.transaction(() => {
@@ -949,44 +961,67 @@ export class TeamService {
         const updated = current.status === 'running' ? this.setStatus(current, 'unknown') ?? current : current
         return { task: updated, report: null, stopReason: 'task-changed', diagnostic: '任务已变化，迟到报告不能覆盖当前状态' }
       }
-      const artifacts = report?.artifacts ?? []
+      const reportExport = memberRun?.reportExport
+      const exportError = reportExport && 'error' in reportExport ? reportExport.error : null
+      const exportedPath = reportExport && 'path' in reportExport ? reportExport.path : null
+      const artifacts = exportError ? [] : [...new Set([...(exportedPath ? [exportedPath] : []), ...(report?.artifacts ?? [])])]
       this.markUncertainOperations(taskId, '子代理结束时仍未结算，结果待人工核查')
       // 账本以真实工具生命周期为准；模型 summary 说「做完了」不能把结果不明的副作用改成成功。
       const operations = this.store.listOperations(taskId)
       const uncertain = operations.filter(operation => operation.state === 'unknown').length
-      // 自由文本产物及验收条件没有可信核验器，模型自报非空不能作为验收通过。
-      const status: TaskStatus = uncertain > 0 ? 'unknown'
-        : report && report.needsApproval.length > 0 ? 'awaiting-approval' : 'review'
+      const applied = operations.some(operation => operation.state === 'succeeded')
+      const failed = operations.find(operation => operation.state === 'failed' || operation.state === 'abandoned')
+      const review = applied || memberRun?.reviewRequired === true
+      // 成员没交结构化报告、但已经给出文字答复（讲解追问、口头问答）时，答复本身就是结果，不判受阻。
+      const answer = report?.summary ?? this.outputText(result)
+      const blocker = exportError
+        ?? (failed ? failed.resultDetail || '实际操作未成功' : null)
+        ?? (report && report.blockers.length > 0 ? report.blockers.join('；')
+          : report && report.needsApproval.length > 0 ? `操作尚未执行，没有可继续的任务审批：${report.needsApproval.join('；')}`
+            : !report && answer === '' ? '成员没有给出答复，也没有提交结构化报告，无法确认任务结果'
+              : task.toolScope === 'side-effect' && !applied && !memberRun?.reviewRequired && !exportedPath ? '没有取得实际操作的执行回执' : null)
+      // 用户在设置里打开「任务结果免验收」时，已执行的结果直接结单，不再等本人点「确认完成」。
+      const needsReview = review && this.options.autoAcceptResults?.() !== true
+      const status: TaskStatus = uncertain > 0 ? 'unknown' : blocker ? 'blocked' : needsReview ? 'review' : 'done'
       const diagnostic = uncertain > 0 ? `有 ${uncertain} 项副作用结果不明，需人工核查；禁止自动重试`
-        : !report ? '结构化报告无效，需要复核' : report.needsApproval.length > 0 ? '存在待批准事项'
-          : report.blockers.length > 0 ? '存在阻碍，需要复核' : '产物及验收条件尚未独立核验，不能标记完成'
+        : blocker ?? (needsReview ? '操作已执行，实际产物或业务结果需要本人验收' : null)
+      // 成员的文字不能生成待批卡；任务结束后未获批准的运行内提案也不会再被消费。
+      const summary = status === 'blocked' ? `任务受阻：${diagnostic}` : status === 'unknown' ? `任务结果不明：${diagnostic}`
+        : exportedPath && !answer.includes(exportedPath) ? `${answer}\n日报文件：${exportedPath}` : answer || '已完成。'
+      const blockers = status === 'blocked' && diagnostic ? [diagnostic] : report?.blockers ?? []
+      const settledReport = report ? { ...report, summary, artifacts, blockers, needsApproval: [] } : null
       this.store.finishRun(runId, 'succeeded', result.stopReason, report ? `artifacts:${artifacts.length}` : null)
       const updated = this.setStatus(current, status, { artifacts })!
       this.store.appendEvent('run/ended', { runId, taskId, state: status, stopReason: result.stopReason, diagnostic, summary: report?.summary ?? null },
         { taskId, assistantId: member.assistantId })
       for (const artifact of artifacts) this.store.appendEvent('task/artifact', { taskId, artifact }, { taskId, assistantId: member.assistantId })
       const ledger = ledgerLine(operations)
-      const text = report?.summary ?? this.fallbackText(result)
-      this.recentReports.push({ at: Date.now(), member: member.displayName, text: text.slice(0, 1200) })
+      this.recentReports.push({ at: Date.now(), member: member.displayName, text: summary.slice(0, 1200) })
       if (this.recentReports.length > 5) this.recentReports.shift()
       this.store.appendEvent('reply/done', {
         requestId: updated.originRequestId, taskId, assistantId: member.assistantId, displayName: member.displayName,
-        skinId: member.skinId, status, text: ledger ? `${ledger}\n${text}` : text, diagnostic,
-        artifacts, blockers: report?.blockers ?? [], needsApproval: report?.needsApproval ?? [],
+        skinId: member.skinId, status, text: ledger ? `${ledger}\n${summary}` : summary, diagnostic,
+        artifacts, blockers, needsApproval: [],
         ...operations.length > 0
           ? { operations: operations.map(operation => ({ operationId: operation.operationId, kind: operation.kind, target: operation.target ?? null, state: operation.state })) }
           : {},
       }, { taskId, assistantId: member.assistantId })
-      return { task: updated, report, stopReason: result.stopReason, diagnostic }
+      return { task: updated, report: settledReport, stopReason: result.stopReason, diagnostic }
     })
   }
 
-  private fallbackText(result: SubagentResult): string {
-    const text = result.output
+  private outputText(result: SubagentResult): string {
+    // 宿主版本可能不返回 output（或只给结构化结果）；缺了就按空输出处理。
+    const output = Array.isArray(result.output) ? result.output : []
+    return output
       .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
       .map((block) => block.text)
       .join('\n')
       .trim()
+  }
+
+  private fallbackText(result: SubagentResult): string {
+    const text = this.outputText(result)
     if (text.length > 0) return text
     return result.diagnostic ? `任务未产出结论：${result.diagnostic}` : '任务未产出结论。'
   }
@@ -998,7 +1033,8 @@ export class TeamService {
       Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim().length > 0)
     if (typeof raw.summary !== 'string' || !raw.summary.trim() ||
         !strings(raw.artifacts) || !strings(raw.blockers) || !strings(raw.needsApproval)) return null
-    return { summary: raw.summary, artifacts: raw.artifacts, blockers: raw.blockers, needsApproval: raw.needsApproval }
+    const hasItem = (item: string) => !/^(?:无(?:新增|阻碍|待批|需审批|需批准)?|none|不适用)(?:$|[：:；;，,。.!！])/iu.test(item.trim())
+    return { summary: raw.summary, artifacts: raw.artifacts, blockers: raw.blockers.filter(hasItem), needsApproval: raw.needsApproval.filter(hasItem) }
   }
 
   /** 扫描可执行任务并按并发上限推进；返回本轮真正跑过的任务结果。 */
@@ -1127,14 +1163,12 @@ export class TeamService {
   }
 
   /**
-   * 本人复核确认：把"等你点头/等复核/等你回话"的任务标记完成。
-   * 模型自报"做完了"不构成成功，但**用户本人**是可信验收方——他在面板上核对产物后点确认，
-   * 才允许 done。只接受 waiting 三态，其余状态拒绝，避免把在跑/已终止的任务误改。
+   * 只验收结果或确认本人的待办。真正的操作审批必须在独立审批卡处理，不能用「确认完成」替代。
    */
   confirmTask(taskId: string): { ok: boolean; status?: TaskStatus; message: string } {
     const task = this.getTask(taskId)
     if (!task) return { ok: false, message: `任务 ${taskId} 不存在` }
-    if (!['awaiting-approval', 'awaiting-user', 'review'].includes(task.status)) {
+    if (!['awaiting-user', 'review'].includes(task.status)) {
       return { ok: false, status: task.status, message: `任务当前状态（${task.status}）不需要确认，或已终止` }
     }
     const updated = this.setStatus(task, 'done')

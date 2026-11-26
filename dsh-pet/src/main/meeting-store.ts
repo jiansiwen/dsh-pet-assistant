@@ -1338,7 +1338,7 @@ export class MeetingStore {
   }
 
   /** 文件写出后再次持锁比对确认版本，冲突时不登记可交接的产物。 */
-  saveMinutesArtifact(artifact: MeetingMinutesArtifact): { ok: true } | { ok: false; error: string } {
+  saveMinutesArtifact(artifact: MeetingMinutesArtifact, options?: { allowIncompleteAudio?: boolean }): { ok: true } | { ok: false; error: string } {
     const key = this.ensureKey()
     if (!key.ok) return key
     let begun = false
@@ -1348,7 +1348,8 @@ export class MeetingStore {
       const meeting = this.getMeeting(artifact.meetingId)
       const minutes = this.getMinutes(artifact.meetingId)
       const segments = this.getSegments(artifact.meetingId)
-      if (!meeting || meeting.undecryptable || meeting.integrity?.status !== 'complete' || meeting.state !== 'transcribed'
+      const integrityOk = options?.allowIncompleteAudio === true || meeting?.integrity?.status === 'complete'
+      if (!meeting || meeting.undecryptable || !integrityOk || meeting.state !== 'transcribed'
         || !minutes || minutes.undecryptable || minutes.state !== 'confirmed' || minutes.confirmedAt !== artifact.confirmedAt
         || minutes.revision !== artifact.revision || meeting.segmentsRevision !== artifact.revision || minutes.digest !== artifact.digest
         || sha256Hex(minutes.content) !== artifact.digest

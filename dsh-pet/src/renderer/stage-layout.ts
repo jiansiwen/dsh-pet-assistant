@@ -188,9 +188,9 @@ export function unregisterCharacterHitbox(assistantId: string): void {
   hitboxes.delete(assistantId)
 }
 
-export function registerPanelHitbox(box: Box | null): void {
-  if (box) hitboxes.set(PANEL_HITBOX_KEY, box)
-  else hitboxes.delete(PANEL_HITBOX_KEY)
+export function registerPanelHitbox(box: Box | null, key = PANEL_HITBOX_KEY): void {
+  if (box) hitboxes.set(key, box)
+  else hitboxes.delete(key)
 }
 
 /** 舞台卸载或测试之间清空，否则上一个实例留下的盒子会让穿透判断永远命中。 */
@@ -232,6 +232,18 @@ export function seatPositions(count: number, width: number, height: number): Arr
     x: Math.round(Math.min(Math.max(start + index * spacing, minX), maxX)),
     y,
   }))
+}
+
+/**
+ * 文档演讲时助理的默认站位：屏幕左下角，留出边距且贴底，避免挡住文档正文中央，
+ * 头顶也留出充足空间用来弹出提问回答框。
+ */
+export function presentationSeat(width: number, height: number): { x: number; y: number } {
+  const maxX = Math.max(STAGE_MARGIN, width - PET_WIDTH - STAGE_MARGIN)
+  // 左下角留出 40px 边距，既不挡文档正文中央，也不误触贴边吸附。
+  const x = Math.min(STAGE_MARGIN + 40, maxX)
+  const y = Math.max(STAGE_MARGIN, height - PET_WIDTH - STAGE_MARGIN)
+  return { x: Math.round(x), y: Math.round(y) }
 }
 
 /**

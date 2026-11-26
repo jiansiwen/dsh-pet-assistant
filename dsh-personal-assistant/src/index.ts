@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { ApprovalService } from './approval.ts'
 import { AssistantApprovalService, snapshotDigest } from './assistant-approval.ts'
+import { ApprovalSwitches } from './approval-switches.ts'
 import { SessionBridge, type HostAgents, type SessionHost } from './bridge.ts'
 import { Classifier } from './classifier.ts'
 import type { Config as ConfigType } from './config.ts'
@@ -459,7 +460,7 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
     // ── 通用外部平台对接配置（配置驱动，代码不绑定公司；secret 只存配置不回显）──
     register({
       name: 'assistant-platform-get',
-      description: '读取外部智能助理平台对接配置（只读，secret 掩码）',
+      description: '读取外部平台签名连接器配置（只读，app_secret 掩码；不是成员聊天 API 密钥）',
       recordInput: false,
       async handler() {
         const c = readPlatformConfig(home)
@@ -468,7 +469,7 @@ function mountUserCommands(ctx: PluginContext, deps: UserCommandDeps): boolean {
     })
     register({
       name: 'assistant-platform-set',
-      description: '配置外部平台对接：enabled/endpoint/appid/channel/secret/signTemplate/userId/assistId/timeoutMs（key=value 空格分隔）',
+      description: '配置外部平台签名连接器：enabled/endpoint/appid/channel/secret（开放平台 app_secret）/signTemplate/userId/assistId/timeoutMs（key=value 空格分隔）',
       recordInput: false,
       async handler(invocation) {
         const allowedKeys = ['enabled', 'endpoint', 'appid', 'channel', 'secret', 'signTemplate', 'userId', 'assistId', 'timeoutMs'] as const
@@ -1170,6 +1171,10 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     evidenceIntake: request => evidenceIntakeHandler?.(request)
       ?? { ok: false, error: '证据库还在初始化，请稍后重试' },
   })
+  // 免审批开关：本人在桌宠设置页逐项打开后，对应环节直接执行；日报与记忆两项缺省沿用配置里的 approvalMode。
+  const approvalSwitches = new ApprovalSwitches(path.join(home, 'personal-assistant', 'approval-switches.json'),
+    { reportPublish: config.approvalMode === 'auto', memoryWrite: config.approvalMode === 'auto' })
+  bridge.attachApprovalSwitches(approvalSwitches)
   memberCwd = () => {
     let bound: string | null = null
     try { bound = bridge.boundSessionCwd() } catch { /* 取不到就退回下面的逻辑 */ }
@@ -1206,6 +1211,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     ledger: teamStore,
     maxDispatchDepth: config.maxDispatchDepth,
     timeoutMs: config.subAssistantTimeoutMs,
+    platformConfig: () => readPlatformConfig(home),
+    resolveSecret: secretId => subAssistantSecrets.resolve(secretId),
     // 汇报分发（§4.6 ★①）：self 模式完成后推桥接事件，桌宠以其形象+音色播报。
     onSelfReport: report => bridge.notifySubAssistantReport(report),
   })
@@ -1216,6 +1223,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const memberMemories = new MemberMemory({
     store: memories, ownerId: teamStore.companionIdentity().principalId,
     exists: id => teamStore.directory.get(id) !== null,
+    autoConfirm: () => approvalSwitches.enabled('memberMemory'),
     invalidate: id => {
       if (memberRuntime.busy(id)) throw new Error('成员正在工作，请结束后修改记忆')
       // 成员每次续聊重新装配记忆，修改规则不使原会话编号丢失。
@@ -1228,6 +1236,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   directory: teamStore.directory, defaultModel: () => resolveDefaultModel(home),
     log,
     enabled: () => teamRuntime !== null,
+    autoPermission: () => approvalSwitches.enabled('memberPermission'),
     /*
      * 显式转成三个函数，不能用对象展开：`memberMemories` 是类实例，
      * 方法在原型上，`{...instance}` 只拷自有字段，展开之后一个方法都没有。
@@ -1267,7 +1276,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       if (!config) throw new Error('邮箱值守还没有配置 IMAP，请先运行 setup-mail.mjs')
       return await readUnreadMail(config, await decryptSecret(home), { limit })
     },
-    platform: { config: () => readPlatformConfig(home) },
+    platform: { config: () => readPlatformConfig(home), secret: (secretId: string) => subAssistantSecrets.resolve(secretId) },
+    onProgress: event => bridge.pushMemberProgress(event),
     memberSchedule: {
       list: assistantId => teamStore.listMemberSchedules().filter(s => s.assistantId === assistantId)
         .map(s => ({ scheduleId: s.scheduleId, title: s.title, prompt: s.prompt, channel: s.channel, enabled: s.enabled,
@@ -1464,6 +1474,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     },
   })
   companionRuntime.attachSettings(settings)
+  companionRuntime.attachApprovalSwitches(approvalSwitches)
   const channelManager = new ChannelManager({
     store: teamStore,
     epoch: bridge.epoch,
@@ -1738,6 +1749,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const enableTeamMode = (): { toolsRegistered: boolean } => {
     if (teamRuntime) return { toolsRegistered: teamRuntime.toolsRegistered }
     teamRuntime = mountTeam(ctx, config, { home, bridge, logger, log, helpContexts, helpEpisodes, store: teamStore, approvals: teamApprovals, members: memberRuntime,
+      autoAcceptResults: () => approvalSwitches.enabled('taskResults'),
+      autoApproveActions: () => approvalSwitches.enabled('teamActions'),
       onAccepted: (task, runId) => skillFormation.record(task.ownerId, task.goal, true, { ref: `team:${runId}`,
         sample: { goal: task.goal, acceptance: '本人复核产物并确认', artifacts: `登记产物 ${task.artifacts.length} 项`, updatedAt: task.updatedAt } }) })
     // 总开关关闭时团队服务照常上台（宠物团队页可用），但委派工具不注入主会话。
@@ -2069,9 +2082,9 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
     enableTeamMode,
     disableTeamMode,
-    approvalMode: () => config.approvalMode,
+    approvalMode: () => bridge.approvalSwitch('memoryWrite') ? 'auto' : 'manual',
     subAssistantDispatch: {
-      dispatch: (assistantId, task, dispatchId) => subAssistantDispatch.dispatch(assistantId, task, dispatchId),
+      dispatch: (assistantId, task, dispatchId, request) => subAssistantDispatch.dispatch(assistantId, task, dispatchId, request),
     },
     memberSchedules: { request: (method, pathname, body) => memberManagement.request(method, pathname, body) },
   }))
@@ -2115,6 +2128,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     episodes: helpEpisodes,
     helpContexts,
     submit: submission => bridge.submitAssistant(submission),
+    approveNow: (proposalId, subject) => bridge.autoApproveAssistant(proposalId, subject),
   }))
 
   /**
@@ -2125,7 +2139,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
   const proposeCaptureScope = (): void => {
     const snapshot = structuredClone(describeCaptureScope(tracker.captureTitles))
     const digest = snapshotDigest(snapshot)
-    bridge.submitAssistant({
+    const proposal = bridge.submitAssistant({
       subject: 'capture',
       tool: 'personal_assistant_ack_capture_scope',
       summary: '批准前台活动采集范围。应用、可选标题与空闲指标保存在本机，活动证据可能发往当前会话模型服务商用于解释和日报；不读聊天正文，不采集键鼠内容。',
@@ -2138,6 +2152,8 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
         return { acked: true }
       },
     })
+    // 设置页打开「活动采集与工作事项确认」免审批开关时直接生效，不再等审批卡。
+    void bridge.autoApproveAssistant(proposal.proposalId, 'capture').catch(() => undefined)
   }
 
   /** 当前采集事实：在录 / 想录但没起来（等范围或权限）/ 被配置拦住 / 关着。 */
@@ -2291,12 +2307,17 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
       members: () => {
         try {
           return teamStore.listMembers().map(member => {
+            const profile = teamStore.directory.get(member.assistantId)
             let quota = '—'
             try {
               const view = teamStore.directory.quota(member.assistantId)
               quota = view.unknown ? '—' : `${view.dailyUsed}/${view.dailyTokenLimit}`
             } catch { quota = '—' }
-            return { name: member.displayName, role: member.roleId, enabled: member.enabled, quota }
+            return { name: member.displayName, role: member.roleId, enabled: member.enabled, quota,
+              description: profile?.description ?? (member.roleId === 'tangseng' ? '统筹派活、汇总结果、转交审批' : ''),
+              personality: profile?.personality ?? '',
+              skinId: profile?.skinId ?? member.skinId, voiceProfile: profile?.voiceProfile ?? member.voiceProfile,
+              capabilities: profile?.capabilities ?? [] }
           })
         } catch { return null }
       },
@@ -2308,7 +2329,7 @@ export async function apply(ctx: PluginContext, config: ConfigType): Promise<voi
     legacyCopiesRetained: config.migrateLegacy && !config.deleteLegacyAfterMigration,
     // 记忆改写：工作台自己不能改，只能把"改成什么"提成可信待批，由用户在审批窗口看新旧全文后点头。
     memoryWrites: {
-      approvalMode: () => config.approvalMode,
+      approvalMode: () => bridge.approvalSwitch('memoryWrite') ? 'auto' : 'manual',
       proposeMemoryEdit: ({ memoryId, text, topic, before, scopeLabel: label }) => {
         const snapshot = { memoryId, before, after: { text, topic: topic ?? before.topic }, scope: label }
         const digest = snapshotDigest(snapshot)
@@ -2448,6 +2469,8 @@ interface MountTeamDeps {
   approvals: ApprovalService
   members: MemberRuntime
   onAccepted?: import('./team.ts').TeamOptions['onAccepted']
+  autoAcceptResults?: () => boolean
+  autoApproveActions?: () => boolean
 }
 
 /**
@@ -2486,6 +2509,8 @@ function mountTeam(ctx: PluginContext, config: ConfigType, deps: MountTeamDeps):
     episodes: deps.helpEpisodes,
     members: deps.members,
     onAccepted: deps.onAccepted,
+    autoAcceptResults: deps.autoAcceptResults,
+    autoApproveActions: deps.autoApproveActions,
   })
   team.ensureRoster()
   // 挂载后立即对账上次进程中断的任务：还挂着 running 的任务/运行/副作用一律记成

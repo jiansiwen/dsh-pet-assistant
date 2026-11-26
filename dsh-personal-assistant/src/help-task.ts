@@ -65,6 +65,10 @@ export interface HelpTaskOptions {
   readonly commitHooks?: CommitHooks
   /** 查程序与传给验证命令的环境来源；默认 process.env。 */
   readonly env?: NodeJS.ProcessEnv
+  /** 设置页打开「团队写文件与执行命令」免审批开关时为 true：改动和验证提案提交后自动签发批准。 */
+  readonly autoApproveActions?: () => boolean
+  /** 设置页打开「任务结果免验收」免审批开关时为 true：改动已应用时不强制停在 review。 */
+  readonly autoAcceptResults?: () => boolean
 }
 
 export class HelpTaskError extends Error {
@@ -395,14 +399,19 @@ export class HelpTaskService {
       return created
     })
     for (const old of superseded) if (old.proposalId) this.options.approvals.expire(old.proposalId, `被第 ${revision} 版改动提案取代`)
+    const autoApproved = this.options.autoApproveActions?.() === true
+    if (autoApproved) this.options.approvals.issue(proposal.proposalId, { channel: 'desktop-shell' }, true)
     this.refresh(task.taskId)
     return {
       ok: true, proposalId: proposal.proposalId, changeId, revision, digest: proposal.paramsDigest, expiresAt: proposal.expiresAt,
+      ...(autoApproved ? { autoApproved: true } : {}),
       files: review.files.map(file => ({ path: file.path, action: file.action, added: file.added, removed: file.removed, baseHash: file.baseHash, newHash: file.newHash })),
       totalAdded: review.totalAdded, totalRemoved: review.totalRemoved, reviewTruncated: review.truncated,
       supersededRevisions: superseded.map(change => change.revision),
-      note: '尚未写入任何文件。用户在桌面审批窗口核对差异并批准后，由可信执行器应用（应用前重读基线哈希，外部改过就冲突暂停、零写入）；'
-        + '批准只对这一版生效，改内容必须重新提案。可以用 desktop_team_wait 等待结果。',
+      note: autoApproved
+        ? '已按设置里的免审批开关自动签发批准，正在由可信执行器应用改动；可以用 desktop_team_wait 等待结果。'
+        : '尚未写入任何文件。用户在桌面审批窗口核对差异并批准后，由可信执行器应用（应用前重读基线哈希，外部改过就冲突暂停、零写入）；'
+          + '批准只对这一版生效，改内容必须重新提案。可以用 desktop_team_wait 等待结果。',
     }
   }
 
@@ -522,11 +531,16 @@ export class HelpTaskService {
       return created
     })
     for (const old of superseded) if (old.proposalId) this.options.approvals.expire(old.proposalId, '被新的验证命令取代')
+    const autoApproved = this.options.autoApproveActions?.() === true
+    if (autoApproved) this.options.approvals.issue(proposal.proposalId, { channel: 'desktop-shell' }, true)
     this.refresh(task.taskId)
     return {
       ok: true, proposalId: proposal.proposalId, verificationId, program: resolved.path, args, cwd, timeoutMs: record.timeoutMs,
+      ...(autoApproved ? { autoApproved: true } : {}),
       afterChange: applied ? { changeId: applied.changeId, revision: applied.revision } : null, expiresAt: proposal.expiresAt,
-      note: '尚未运行。用户在桌面审批窗口批准后由可信执行器运行一次，真实退出码与截断输出写进账本；退出码不是 0 就不能说修复完成。',
+      note: autoApproved
+        ? '已按设置里的免审批开关自动签发批准，正在由可信执行器运行验证命令；可以用 desktop_team_wait 等待结果。'
+        : '尚未运行。用户在桌面审批窗口批准后由可信执行器运行一次，真实退出码与截断输出写进账本；退出码不是 0 就不能说修复完成。',
     }
   }
 
@@ -1284,6 +1298,10 @@ export class HelpTaskService {
         ...(verification ? [`验证通过：${displayCommand(path.basename(verification.program), verification.args)}（退出码 0）`] : []),
       ]
       this.setTaskStatus(taskId, 'done', artifacts)
+      return
+    }
+    if (verdict.state === 'applied-unverified' && this.options.autoAcceptResults?.() === true) {
+      this.setTaskStatus(taskId, 'done')
       return
     }
     this.setTaskStatus(taskId, verdict.state === 'applied-unverified' || verdict.state === 'verification-failed' ? 'review' : 'awaiting-user')
